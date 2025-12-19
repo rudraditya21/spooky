@@ -9,6 +9,8 @@
 //! TODO: Add startup banner and version information
 //! TODO: Implement proper process lifecycle management
 
+//! TODO: Setup the client and use that for proxing request rather than client for every request
+
 use clap::{Parser};
 
 // proxy http3 server QUIC + HTTP/3
@@ -66,7 +68,7 @@ async fn main() {
     // Parse CLI arguments
     let cli = Cli::parse();
 
-    let config_path = cli.config.unwrap_or_else(|| "config.yaml".to_string());
+    let config_path = cli.config.unwrap_or_else(|| "./config/config.yaml".to_string());
 
     // Read configuration file
     let config_yaml = match config::loader::read_config(&config_path) {
@@ -91,7 +93,9 @@ async fn main() {
     info!("Log level set to: {}", config_yaml.log.level);
     debug!("Configuration: {:?}", config_yaml);
 
-    let proxy_server = proxy::Server::new(config_yaml)
+    // proxy_client = proxy::Client::new()
+
+    let proxy_server = proxy::Server::new(config_yaml) // pass 2 arguments config_yaml & proxy_client
         .await
         .expect("Failed to create server");
 

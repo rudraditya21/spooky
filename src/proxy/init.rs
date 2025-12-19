@@ -22,8 +22,7 @@ impl Server {
             rustls::crypto::ring::default_provider()
         );
 
-        debug!("Loading TLS certificates from: cert={}, key={}", 
-               config.listen.tls.cert, config.listen.tls.key);
+        debug!("Loading TLS certificates from: cert={}, key={}", config.listen.tls.cert, config.listen.tls.key);
         let (certs, key) = load_tls(
             &config.listen.tls.cert,
             &config.listen.tls.key

@@ -106,7 +106,7 @@ async fn main() {
                                         }
 
                                         if let Err(e) = stream
-                                            .send_data(Bytes::from("Hello from HTTP/3 server!"))
+                                            .send_data(Bytes::from("Hello from HTTP/3 server!\n"))
                                             .await
                                         {
                                             eprintln!("Failed to send data: {e:?}");

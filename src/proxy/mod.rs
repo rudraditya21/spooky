@@ -1,6 +1,5 @@
 //! HTTP/3 Load Balancer Server Implementation
 //! 
-//! TODO: Implement proper backend server selection using configured strategy
 //! TODO: Add health check monitoring for backend servers
 //! TODO: Implement request forwarding to selected backend
 //! TODO: Add response aggregation and error handling
@@ -22,4 +21,11 @@ pub mod process;
 pub struct Server {
     pub endpoint: quinn::Endpoint,
     pub config: Config,
+    // pub client: Client,
 }
+
+
+// #[derive(Clone)] 
+// pub struct Client{
+
+// }
