@@ -96,3 +96,6 @@ config.yaml
 
 # Certificates
 certs/
+
+# Internal docs
+docs/internal/
