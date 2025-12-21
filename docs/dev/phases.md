@@ -1,110 +1,127 @@
 # Development Phases
 
-This document outlines the development phases for the Spooky HTTP/3 Load Balancer project and tracks completion status for each phase.
+## Phase 1: Foundation (✅ COMPLETED)
 
-## Phase 1: Foundation & Setup ✅ **COMPLETED**
+**Duration**: 2-3 weeks  
+**Objectives**:
+- Project structure and module organization
+- Dependency selection and setup
+- Basic configuration system
+- CLI interface
 
-**Objective**: Establish project structure, dependencies, and basic configuration management.
-
-### Completed Features:
-- ✅ Project structure and module organization
-- ✅ Dependency management (Cargo.toml)
-- ✅ Configuration system (YAML-based)
-- ✅ TLS certificate loading utilities
-- ✅ Basic CLI argument parsing
+**Deliverables**:
+- ✅ Working Rust project
+- ✅ YAML configuration parsing
+- ✅ Command-line argument handling
 - ✅ Logging infrastructure
+
+**Completed**:
+- All foundation deliverables shipped (project compiles, CLI+config+logging working).
+
+**Remaining**:
+- None; ongoing work should focus on later phases.
+
+## Phase 2: HTTP/3 Server (🔄 IN PROGRESS)
+
+**Duration**: 3-4 weeks
+**Objectives**:
+- QUIC connection establishment
+- HTTP/3 protocol handling
+- Request routing to backends
+- Basic load balancing
+
+**Deliverables**:
+- ✅ HTTP/3 server accepting connections
+- ✅ Request processing and routing logic
+- ✅ Request forwarding to backends (full request/response including bodies)
+- ✅ Backend selection with load balancing (random strategy)
+
+**Completed**:
+- Quinn endpoint boots with TLS and accepts HTTP/3 connections.
+- Request routing loop and random backend selection wired into proxy.
+- Full HTTP/3 request forwarding implementation with body streaming.
+
+**Remaining**:
+- Add connection reuse for backend connections (currently creates new QUIC client per request).
+- Add configurable SNI/TLS for backend connections.
+- Add graceful shutdown/signal handling for the server lifecycle.
+- Introduce alternative load balancing strategies (round-robin, least-connection, weight-based, IP hash).
+
+## Phase 3: Production Features (🔄 IN PROGRESS)
+
+**Duration**: 4-6 weeks
+**Objectives**:
+- Health checks for backends
+- Metrics collection and reporting
+- Configuration validation
+- Error handling and recovery
+
+**Deliverables**:
 - ✅ Configuration validation
+- 🔄 Basic error handling and recovery (still heavily `expect`/`unwrap` based)
+- 📋 Backend health monitoring (configuration supported, implementation pending)
+- 📋 Metrics collection and reporting
 
-**Files Implemented:**
-- `src/main.rs` - Main application entry point
-- `src/config/` - Configuration management system
-- `src/utils/tls.rs` - TLS certificate handling
-- `docs/development.md` - Project documentation
+**Completed**:
+- Comprehensive configuration validation prevents invalid configs (protocol/port/tls/backends/weights).
+- Health check configuration structure exists but monitoring not implemented.
 
----
+**Remaining**:
+- Replace `expect`/`unwrap` paths with structured error handling and retries.
+- Implement actual health check subsystem and integrate with backend selection.
+- Add metrics/tracing endpoints and operational visibility.
+- Add dynamic weight updates via `/metric` endpoints.
 
-## Phase 2: Core HTTP/3 Server 🔄 **IN PROGRESS**
+## Phase 4: Advanced Load Balancing (📋 PLANNED)
 
-**Objective**: Implement the fundamental HTTP/3 server with QUIC transport.
+**Duration**: 3-4 weeks  
+**Objectives**:
+- Additional algorithms (least connections, IP hash)
+- Session persistence
+- Dynamic backend management
+- Performance optimization
 
-### Completed Features:
-- ✅ QUIC server setup with TLS
-- ✅ HTTP/3 protocol handling
-- ✅ Basic request/response processing
-- ✅ Connection management
+**Deliverables**:
+- 📋 Multiple load balancing algorithms
+- 📋 Session affinity
+- 📋 Hot reconfiguration
 
-### In Progress:
-- 🔄 Backend server configuration integration
-- 🔄 Request routing logic
+**Completed**:
+- None (planning stage).
 
-**Files Implemented:**
-- `src/proxy/mod.rs` - Main HTTP/3 server implementation
+**Remaining**:
+- Design and implement additional LB algorithms.
+- Build session persistence layer and hot reload pipeline.
 
----
+## Phase 5: Enterprise Features (📋 PLANNED)
 
-## Phase 3: Load Balancing Logic 🔄 **IN PROGRESS**
+**Duration**: 4-6 weeks  
+**Objectives**:
+- Authentication and authorization
+- Rate limiting
+- Advanced monitoring
+- High availability
 
-**Objective**: Implement core load balancing functionality.
+**Deliverables**:
+- 📋 User authentication
+- 📋 Rate limiting
+- 📋 Monitoring dashboard
+- 📋 Clustering support
 
-### Completed Features:
-- ✅ Random load balancing strategy (basic implementation)
-- ✅ Backend server structure definition
+**Completed**:
+- None (planning stage).
 
-### In Progress:
-- 🔄 Load balancing strategy selection
-- 🔄 Backend server management
-- 🔄 Request forwarding to backends
-- 🔄 QUIC client connections for backend communication
-
-### Planned Features:
-- 📋 Round-robin load balancing
-- 📋 Least connections algorithm
-- 📋 Weighted load balancing
-- 📋 IP hash-based routing
-
-**Files Implemented:**
-- `src/lb/random.rs` - Basic random selection strategy
-
----
-
-## Phase 4: Production Features 📋 **PLANNED**
-
-**Objective**: Add production-ready features for reliability and monitoring.
-
-### Planned Features:
-- 📋 Health checking system for backend servers
-- 📋 Circuit breaker pattern for unhealthy backends
-- 📋 Metrics collection and monitoring endpoints
-- 📋 Graceful shutdown handling
-- 📋 Configuration hot-reload capability
-- 📋 Request/response transformation capabilities
-
----
-
-## Phase 5: Advanced Features 📋 **PLANNED**
-
-**Objective**: Implement advanced load balancing features and tooling.
-
-### Planned Features:
-- 📋 Additional load balancing algorithms (least response time)
-- 📋 Integration tests
-- 📋 Performance benchmarks
-- 📋 CLI tools for server management
-- 📋 Docker containerization
-- 📋 Kubernetes deployment manifests
-
----
+**Remaining**:
+- Define authn/z, rate limiting, monitoring, and HA stories; implement per roadmap.
 
 ## Current Status Summary
 
 | Phase | Status | Completion |
 |-------|--------|------------|
 | **Phase 1** | ✅ Completed | 100% |
-| **Phase 2** | 🔄 In Progress | 80% |
-| **Phase 3** | 🔄 In Progress | 25% |
+| **Phase 2** | 🔄 In Progress | 85% |
+| **Phase 3** | 🔄 In Progress | 30% |
 | **Phase 4** | 📋 Planned | 0% |
 | **Phase 5** | 📋 Planned | 0% |
 
-**Overall Project Completion: ~40%**
-
-The project has a solid foundation with working HTTP/3 server capabilities and is actively progressing through the core load balancing implementation phase.
+**Overall Project Completion: ~45%**
