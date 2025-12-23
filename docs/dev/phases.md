@@ -1,127 +1,321 @@
-# Development Phases
+# HTTP/3 / QUIC Load Balancer – Development Roadmap
 
-## Phase 1: Foundation (✅ COMPLETED)
+This document describes the phased development plan for a production-grade HTTP/3 (QUIC) L7 load balancer implemented in Rust using Quinn, h3, h3-quinn, and rustls.
 
-**Duration**: 2-3 weeks  
-**Objectives**:
-- Project structure and module organization
-- Dependency selection and setup
-- Basic configuration system
-- CLI interface
+The roadmap is based on the current implementation state and extends it toward a production-ready, industry-standard system. Each phase defines objectives, concrete deliverables, and the algorithms or mechanisms involved.
 
-**Deliverables**:
-- ✅ Working Rust project
-- ✅ YAML configuration parsing
-- ✅ Command-line argument handling
-- ✅ Logging infrastructure
+---
 
-**Completed**:
-- All foundation deliverables shipped (project compiles, CLI+config+logging working).
+## Phase 1: Foundation (Completed)
 
-**Remaining**:
-- None; ongoing work should focus on later phases.
+**Status**: Completed  
+**Duration**: 2–3 weeks
 
-## Phase 2: HTTP/3 Server (🔄 IN PROGRESS)
+### Objectives
+- Establish project structure and module boundaries
+- Select and integrate core dependencies
+- Implement configuration system and defaults
+- Provide CLI entry point and logging initialization
 
-**Duration**: 3-4 weeks
-**Objectives**:
-- QUIC connection establishment
-- HTTP/3 protocol handling
-- Request routing to backends
-- Basic load balancing
-
-**Deliverables**:
-- ✅ HTTP/3 server accepting connections
-- ✅ Request processing and routing logic
-- ✅ Request forwarding to backends (full request/response including bodies)
-- ✅ Backend selection with load balancing (random strategy)
-
-**Completed**:
-- Quinn endpoint boots with TLS and accepts HTTP/3 connections.
-- Request routing loop and random backend selection wired into proxy.
-- Full HTTP/3 request forwarding implementation with body streaming.
-
-**Remaining**:
-- Add connection reuse for backend connections (currently creates new QUIC client per request).
-- Add configurable SNI/TLS for backend connections.
-- Add graceful shutdown/signal handling for the server lifecycle.
-- Introduce alternative load balancing strategies (round-robin, least-connection, weight-based, IP hash).
-
-## Phase 3: Production Features (🔄 IN PROGRESS)
-
-**Duration**: 4-6 weeks
-**Objectives**:
-- Health checks for backends
-- Metrics collection and reporting
+### Deliverables
+- Compilable Rust project with clean module layout
+- YAML configuration loading with defaults
 - Configuration validation
-- Error handling and recovery
+- CLI interface (`spooky`)
+- Logging via `env_logger` with configurable log level
 
-**Deliverables**:
-- ✅ Configuration validation
-- 🔄 Basic error handling and recovery (still heavily `expect`/`unwrap` based)
-- 📋 Backend health monitoring (configuration supported, implementation pending)
-- 📋 Metrics collection and reporting
+### Notes
+- This phase is considered frozen.
+- Architectural invariants established here should not change without a design review.
 
-**Completed**:
-- Comprehensive configuration validation prevents invalid configs (protocol/port/tls/backends/weights).
-- Health check configuration structure exists but monitoring not implemented.
+---
 
-**Remaining**:
-- Replace `expect`/`unwrap` paths with structured error handling and retries.
-- Implement actual health check subsystem and integrate with backend selection.
-- Add metrics/tracing endpoints and operational visibility.
-- Add dynamic weight updates via `/metric` endpoints.
+## Phase 2: HTTP/3 Proxy Core
 
-## Phase 4: Advanced Load Balancing (📋 PLANNED)
+**Status**: In progress  
+**Duration**: 4–5 weeks
 
-**Duration**: 3-4 weeks  
-**Objectives**:
-- Additional algorithms (least connections, IP hash)
-- Session persistence
-- Dynamic backend management
-- Performance optimization
+This phase transitions the system from a functional prototype to a structurally correct HTTP/3 L7 proxy.
 
-**Deliverables**:
-- 📋 Multiple load balancing algorithms
-- 📋 Session affinity
-- 📋 Hot reconfiguration
+---
 
-**Completed**:
-- None (planning stage).
+### 2.1 QUIC and HTTP/3 Listener
 
-**Remaining**:
-- Design and implement additional LB algorithms.
-- Build session persistence layer and hot reload pipeline.
+**Status**: Completed
 
-## Phase 5: Enterprise Features (📋 PLANNED)
+#### Deliverables
+- QUIC endpoint initialization using Quinn
+- TLS configuration using rustls
+- ALPN configured for `h3`
+- HTTP/3 server connection handling using `h3` and `h3-quinn`
+- Accept loop for incoming QUIC connections
 
-**Duration**: 4-6 weeks  
-**Objectives**:
-- Authentication and authorization
-- Rate limiting
-- Advanced monitoring
-- High availability
+#### Invariants
+- QUIC is terminated at the load balancer
+- HTTP/3 is always handled at Layer 7
+- No protocol pass-through mode
 
-**Deliverables**:
-- 📋 User authentication
-- 📋 Rate limiting
-- 📋 Monitoring dashboard
-- 📋 Clustering support
+---
 
-**Completed**:
-- None (planning stage).
+### 2.2 Request Processing and Proxying
 
-**Remaining**:
-- Define authn/z, rate limiting, monitoring, and HA stories; implement per roadmap.
+**Status**: Completed
 
-## Current Status Summary
+#### Deliverables
+- Full HTTP/3 request handling
+- Streaming of request and response bodies
+- Header propagation between client and backend
+- Proper error mapping (e.g., 502, 503)
 
-| Phase | Status | Completion |
-|-------|--------|------------|
-| **Phase 1** | ✅ Completed | 100% |
-| **Phase 2** | 🔄 In Progress | 85% |
-| **Phase 3** | 🔄 In Progress | 30% |
-| **Phase 4** | 📋 Planned | 0% |
-| **Phase 5** | 📋 Planned | 0% |
+#### Known Limitations
+- Backend QUIC client connections are currently created per request
 
-**Overall Project Completion: ~45%**
+---
+
+### 2.3 Backend Connection Reuse and Pooling
+
+**Status**: Required (Critical)
+
+This is a mandatory step for production readiness.
+
+#### Objectives
+- Eliminate per-request QUIC client creation
+- Enable stream multiplexing over persistent backend connections
+- Reduce handshake latency and resource usage
+
+#### Deliverables
+- Shared QUIC client endpoint per load balancer instance
+- Persistent QUIC connections per backend
+- Backend connection pool abstraction
+- Stream acquisition and release per request
+- Idle connection reaping
+
+#### Algorithms / Mechanisms
+- Round-robin stream allocation within a backend
+- Maximum concurrent streams per connection
+- Connection health tracking
+
+---
+
+### 2.4 Load Balancing Algorithms (Baseline)
+
+**Status**: Partial
+
+#### Implemented
+- Random backend selection
+
+#### To Add
+- Round-robin
+- Weighted round-robin
+- Least-connections
+
+#### Notes
+- These algorithms operate independently of health logic
+- Backend selection must be abstracted behind a strategy interface
+
+---
+
+### 2.5 Graceful Lifecycle Management
+
+**Status**: Planned
+
+#### Deliverables
+- Signal handling (SIGINT, SIGTERM)
+- Stop accepting new connections on shutdown
+- Drain active streams
+- Enforced shutdown timeout
+
+#### Mechanisms
+- Atomic accept-state flag
+- Connection draining timers
+
+---
+
+## Phase 3: Reliability, Health, and Observability
+
+**Status**: In progress  
+**Duration**: 4–6 weeks
+
+This phase focuses on making the system operable under failure and load.
+
+---
+
+### 3.1 Structured Error Handling
+
+#### Objectives
+- Remove `unwrap` and `expect` from runtime paths
+- Introduce a unified error model
+
+#### Deliverables
+- Error taxonomy:
+  - Client errors
+  - Backend errors
+  - Internal errors
+- Retry eligibility classification
+- Centralized error reporting
+
+---
+
+### 3.2 Backend Health Monitoring
+
+#### Active Health Checks
+- Periodic HTTP/3 health probes
+- Configurable interval and timeout
+
+#### Passive Health Checks
+Triggered by:
+- Request timeouts
+- QUIC stream resets
+- Consecutive 5xx responses
+
+#### Health State Machine
+```
+
+Healthy → Degraded → Unhealthy → Recovering → Healthy
+
+```
+
+#### Algorithms
+- Failure threshold (N failures within T seconds)
+- Exponential backoff for recovery attempts
+
+---
+
+### 3.3 Circuit Breakers
+
+#### Scope
+- Per-backend circuit breakers
+
+#### States
+```
+
+Closed → Open → Half-Open → Closed
+
+```
+
+#### Algorithms
+- Hystrix-style circuit breaker
+- Limited trial requests in half-open state
+
+---
+
+### 3.4 Observability
+
+#### Metrics
+- Requests per second
+- Request latency (P50, P90, P99)
+- Backend latency
+- QUIC handshake latency
+- Active connections
+- Stream resets
+
+Metrics should be exposed in Prometheus format.
+
+#### Logging
+Structured logs including:
+- Request ID
+- Backend ID
+- Retry count
+- Error category
+
+#### Tracing
+- OpenTelemetry integration
+- Span per request
+- Trace context propagation
+
+---
+
+## Phase 4: Advanced Load Balancing and Traffic Control
+
+**Status**: Planned  
+**Duration**: 3–4 weeks
+
+---
+
+### 4.1 Advanced Load Balancing Algorithms
+
+#### Algorithms
+- Least-latency (EWMA)
+- Power-of-two choices (P2C)
+- Consistent hashing (Rendezvous hashing)
+
+#### Data Tracked
+- Backend inflight requests
+- Rolling latency metrics
+- Error rates
+
+---
+
+### 4.2 Session Persistence
+
+#### Use Cases
+- Sticky sessions
+- Cache affinity
+
+#### Strategies
+- Source IP hash
+- Header or cookie-based hashing
+
+---
+
+### 4.3 Dynamic Backend Management
+
+#### Deliverables
+- Runtime backend enable/disable
+- Dynamic weight updates
+- Canary deployment support
+
+#### Mechanisms
+- Versioned configuration objects
+- RCU-style configuration swap
+
+---
+
+## Phase 5: Enterprise and Scale Features
+
+**Status**: Planned  
+**Duration**: 4–6 weeks
+
+---
+
+### 5.1 Rate Limiting and Abuse Protection
+
+#### Algorithms
+- Token bucket
+- Leaky bucket
+
+#### Scope
+- Per-IP
+- Per-CID
+- Per-backend
+
+---
+
+### 5.2 Authentication and Authorization (Optional)
+
+- mTLS
+- API key validation
+- JWT verification (gateway mode)
+
+---
+
+### 5.3 High Availability and Scaling
+
+#### Features
+- Stateless load balancer instances
+- Anycast-friendly behavior
+- Externalized or shared health state (optional)
+
+---
+
+### 5.4 Performance Hardening
+
+#### Areas
+- Async fairness audits
+- Lock contention reduction
+- Memory growth analysis
+
+#### Optional (Advanced)
+- eBPF UDP fast path
+- io_uring-based I/O
+- Kernel bypass techniques
