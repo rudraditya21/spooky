@@ -5,8 +5,15 @@
 //! TODO: Implement weighted round-robin strategy
 //! TODO: Implement IP hash strategy
 //! TODO: Implement least response time strategy
-//! TODO: Add strategy trait definition
-//! TODO: Add strategy factory/registry
-//! TODO: Add configuration for strategy selection
+
+use crate::config::config::Backend;
 
 pub mod random;
+
+pub struct Random {
+    backends: &[Backend]
+}
+
+pub trait LoadBalancer: Send + Sync {
+    fn pick(&self, key: &str) -> String;
+}
