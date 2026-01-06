@@ -1,87 +1,128 @@
-# Development
+# Development Guide
 
-This markdown file is about the development of this project.
+This document combines the internal and LLM-oriented development notes into a single source of truth. It reflects the current (work-in-progress) shape of the repository rather than the aspirational proxy module that was removed.
 
-## What we are doing?
+## Prerequisites
 
-We are using rust for its speed and will built this load balancer on the HTTP3/QUIC protocols
- 
+| Requirement | Notes |
+| --- | --- |
+| Rust toolchain | `rustup` with Rust 1.70+ |
+| Cargo | ships with Rust; needed for builds/tests |
+| OpenSSL / LibreSSL | required for local certificate generation |
+| curl with HTTP/3 (optional) | useful for smoke tests |
 
-
-## Folder Structure
-
-```text
-spooky/
-├── Cargo.toml              # Main manifest
-├── Cargo.lock
-├── config.yaml             # Main configuration file
-├── config.sample.yaml      # Sample configuration
-├── certs/                  # TLS certificates
-│   ├── cert.der
-│   └── key.der
-│
-├── src/
-│   ├── main.rs             # Main entry point
-│   ├── bin/
-│   │   └── server.rs       # Server binary entry point
-│   ├── config/             # Configuration management
-│   │   ├── mod.rs
-│   │   ├── config.rs       # Configuration structures
-│   │   ├── default.rs      # Default configuration values
-│   │   └── validator.rs    # Configuration validation logic
-│   ├── proxy/              # HTTP/3 server implementation
-│   │   └── mod.rs          # Main proxy server logic
-│   ├── lb/                 # Load balancing strategies
-│   │   ├── mod.rs
-│   │   └── random.rs       # Random selection strategy (basic implementation)
-│   ├── utils/              # Utility functions
-│   │   ├── mod.rs
-│   │   └── tls.rs          # TLS certificate loading utilities
-│   └── health/             # Health checking (planned)
-│       ├── mod.rs
-│       ├── checker.rs
-│       └── monitor.rs
-│
-├── docs/                   # Project documentation
-│   ├── development.md      # This file
-│   ├── roadmap.md
-│   ├── protocols/
-│   │   ├── http3.md
-│   │   └── quic.md
-│   ├── dev/
-│   │   └── h3-server.md
-│   └── gen-cert.md         # Certificate generation guide
-│
-├── target/                 # Build artifacts
-├── LICENSE.md
-├── README.md
-└── COPYRIGHT.md
+```bash
+# Install/upgrade toolchain
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+rustc --version
+cargo --version
 ```
 
-### Current Implementation Status
+## Project Setup
 
-**✅ Implemented:**
-- Basic HTTP/3 server with QUIC ✅
-- Configuration management (YAML) ✅
-- TLS certificate handling ✅
-- Random load balancing strategy (basic implementation) ✅
-- Logging infrastructure ✅
-- CLI argument parsing ✅
-- Configuration validation ✅
+```bash
+git clone <repo-url>
+cd spooky
+cargo fetch # pre-download deps
+```
 
-**🔄 In Progress:**
-- Load balancing strategy implementation (backend selection logic) 🔄
-- Backend server management and configuration 🔄
-- Request forwarding logic to backend servers 🔄
-- QUIC client connections for backend communication 🔄
+### Build & Test
 
-**📋 Planned:**
-- Additional load balancing strategies (round-robin, least connections, etc.)
-- Health checking system for backend servers
-- Metrics and monitoring endpoints
-- Configuration hot-reload capability
-- Graceful shutdown handling
-- Integration tests
-- Performance benchmarks
-- Circuit breaker pattern for unhealthy backends
-- Request/response transformation capabilities
+```bash
+# Debug build
+cargo build
+
+# Release build
+cargo build --release
+
+# Lint / basic checks
+cargo check
+cargo clippy
+
+# Unit tests (none yet, but keep the habit)
+cargo test
+```
+
+## Repository Layout
+
+```
+spooky/
+├── Cargo.toml
+├── config/
+│   ├── config.yaml          # default runtime config
+│   └── config.sample.yaml
+├── docs/                    # architecture, roadmap, internal notes
+├── rustconf/, blog/, wiki/  # writing + presentation material
+├── src/
+│   ├── main.rs              # CLI + process bootstrap
+│   ├── config/              # serde models, defaults, validation
+│   ├── edge/                # QUIC listener built on quiche
+│   ├── bridge/              # HTTP/3 headers → HTTP/2 request helper
+│   ├── transport/           # HTTP/2 client wrapper (unused yet)
+│   ├── lb/                  # Random balancer placeholder
+│   ├── utils/               # TLS helpers
+│   └── security/            # reserved for future work (empty today)
+├── bins/server.rs           # standalone HTTP/3 demo using quinn
+└── certs/                   # DO NOT COMMIT real keys; regenerate locally
+```
+
+### Module Overview
+
+| Module | Status | Notes |
+| --- | --- | --- |
+| `src/main.rs` | ✅ | CLI parsing via `clap`, config loading, logger init, spins `edge::QUICListener` loop. |
+| `src/config` | ✅ | YAML structures, defaults, and validator. `health_check.interval` currently expects strings; config file must match. |
+| `src/edge` | 🚧 | Binds QUIC socket via `quiche` but `poll()` is still a stub; no packets handled yet. |
+| `src/lb` | 🚧 | Random picker skeleton; trait signatures mismatched and not wired into the listener. |
+| `src/bridge` | 🧩 | Converts HTTP/3 headers into an `http::Request<()>`. Needs integration once streams are plumbed through. |
+| `src/transport` | 🧩 | HTTP/2 client built on `hyper`. Not yet invoked. |
+| `src/utils::tls` | ✅ | Loads DER-formatted cert/key pairs for both the listener and sample binaries. |
+| `bins/server.rs` | ✅ | Minimal HTTP/3 server using Quinn/H3 for local testing. |
+
+## Development Workflow
+
+1. Create a feature branch (`git checkout -b feature/<name>`).
+2. Build and run `cargo check` frequently; the project is unstable and easy to break.
+3. Keep documentation aligned with the actual modules—avoid referencing the removed `proxy/` tree.
+4. Run tests (even if empty) before opening a PR to ensure dependencies still compile.
+5. Update this file or the architecture doc when modules move or new subsystems appear.
+
+### Coding Standards
+
+- 4-space indentation, `rustfmt` defaults.
+- `snake_case` for modules/functions, `PascalCase` for types.
+- Prefer small, focused modules; add doc comments (`//!`) for new subsystems.
+- Log via `log` macros; avoid `println!` except in throwaway binaries/tests.
+
+## Current Implementation Status
+
+**Finished / Working**
+- CLI + configuration loader/validator
+- env_logger-based logging setup
+- TLS loading helper (DER + PKCS#8)
+- Standalone Quinn/H3 demo binary
+
+**Partially Implemented**
+- QUIC listener (`edge::QUICListener`) – socket + TLS configuration done, IO loop missing
+- Load balancer trait/random picker – compiles only after API reconciliation
+- Documentation: high-level architecture reflects the quiche plan but still mentions future pieces
+
+**Not Yet Started**
+- HTTP/3 request handling, forwarding into HTTP/2
+- Health checking / metrics / observability
+- Additional balancers, connection pooling, graceful shutdown, hot reload
+
+## Testing & Debugging Tips
+
+- Use `RUST_LOG=debug` when running binaries to surface validator/log output.
+- `cargo run -- --config ./config/config.yaml` uses the default config path; point it at temp configs while the YAML schema churns.
+- For HTTP/3 clients, `curl --http3` plus `--cacert certs/ca-cert.pem` is the easiest compatibility check once the listener handles traffic.
+
+## Certificate Hygiene
+
+The repo currently contains sample keys for convenience, but long term every developer should:
+1. Run `make certs-clean certs-ca` to generate fresh material.
+2. Keep only `san.conf` + documentation under version control.
+3. Point `config.yaml` at the DER outputs under `certs/`.
+
+Expect this workflow to change once the TLS story is hardened; track updates in `docs/strong-cert.md`.
