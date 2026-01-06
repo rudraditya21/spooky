@@ -59,7 +59,7 @@ pub struct HealthCheck {
     pub path: String,       // "/health"
 
     #[serde(default = "get_default_interval")]
-    pub interval: String,   // "5s" (could later parse into Duration)
+    pub interval: u64,   // "5000" (write in number of milli seconds)
 }
 
 #[derive(Debug, Deserialize, Clone)]
