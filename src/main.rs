@@ -21,7 +21,9 @@ pub mod config;
 pub mod utils;
 pub mod lb;
 
-pub mod proxy;
+pub mod edge;
+pub mod bridge;
+pub mod transport;
 
 use crate::config::validator::{validate as validate_config};
 
@@ -87,18 +89,10 @@ async fn main() {
         error!("Configuration validation failed. Exiting...");
         std::process::exit(1);
     }
-    
-    // Initialize logger with config log level
-    info!("Starting Spooky HTTP/3 Proxy Server");
-    info!("Log level set to: {}", config_yaml.log.level);
-    debug!("Configuration: {:?}", config_yaml);
 
-    // proxy_client = proxy::Client::new()
+    let spooky = edge::QUICListener::new(config_yaml);
 
-    let proxy_server = proxy::Server::new(config_yaml) // pass 2 arguments config_yaml & proxy_client
-        .await
-        .expect("Failed to create server");
-
-    info!("Server initialized successfully");
-    proxy_server.run().await;
+    loop {
+        spooky.poll();
+    }
 }
