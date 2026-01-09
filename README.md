@@ -1,5 +1,12 @@
 # Spooky
 
+<img 
+    src="./spooky.png"
+    style="display:block;margin:auto;"
+    width="240"
+    height="240"
+/>
+
 **HTTP/3 load balancer in Rust: terminate QUIC at the edge, serve HTTP/2 backends**
 
 Spooky bridges HTTP/3 clients to HTTP/2 backends. It terminates QUIC connections, converts streams to HTTP/2 requests, and routes them across upstream servers.
@@ -20,10 +27,19 @@ HTTP/3 is real, but most backends still speak HTTP/2. Spooky lets you deploy HTT
 
 - CLI with YAML configuration
 - TLS 1.3 with custom certificates
-- QUIC listener (quiche-based)
+- QUIC listener (quiche-based) (quiche uses BoringSSL and builds it via cmake)
 - Modular architecture (edge/bridge/transport)
 - Random load balancing (placeholder)
 - Health check scaffolding
+
+## Dependencies
+
+```sh
+# also install rust
+
+sudo apt update
+sudo apt install -y cmake build-essential pkg-config
+```
 
 ## Quick Start
 
