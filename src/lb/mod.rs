@@ -10,10 +10,10 @@ use crate::config::config::Backend;
 
 pub mod random;
 
-pub struct Random {
-    backends: &[Backend]
+pub struct Random<'l> {
+    backends: &'l[Backend],
 }
 
-pub trait LoadBalancer: Send + Sync {
-    fn pick(&self, key: &str) -> String;
+pub trait LoadBalancer<'l> {
+    fn pick(&'l self, key: &str) -> Option<&'l Backend>;
 }

@@ -1,25 +1,43 @@
-
-use hyper::{Client, Request, Body};
-use hyper::client::HttpConnector;
-use hyper::client::conn::Builder;
+use hyper::{Request, rt::Executor};
+use hyper_util::client::legacy::{Client, connect::HttpConnector};
+use http_body_util::Full;
+use hyper::body::Bytes;
 
 pub struct H2Client {
-    client: Client<HttpConnector, Body>,
+    client: Client<HttpConnector, Full<Bytes>>,
 }
+use std::future::Future;
+
+#[derive(Clone, Copy)]
+struct TokioExecutor;
+
+impl<F> Executor<F> for TokioExecutor
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    fn execute(&self, fut: F) {
+        tokio::spawn(fut);
+    }
+}
+
 
 impl H2Client {
     pub fn new() -> Self {
         let mut http = HttpConnector::new();
         http.enforce_http(false);
 
-        let client = Client::builder()
+        let client = Client::builder(TokioExecutor)
             .http2_only(true)
             .build(http);
 
         Self { client }
     }
 
-    pub async fn send(&self, req: Request<Body>) -> hyper::Result<hyper::Response<Body>> {
+    pub async fn send(
+        &self,
+        req: Request<Full<Bytes>>,
+    ) -> Result<hyper::Response<hyper::body::Incoming>, hyper_util::client::legacy::Error> {
         self.client.request(req).await
     }
 }

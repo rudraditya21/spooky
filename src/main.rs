@@ -14,7 +14,7 @@
 use clap::{Parser};
 
 // proxy http3 server QUIC + HTTP/3
-use log::{info, debug, error, LevelFilter};
+use log::{error, LevelFilter};
 use env_logger;
 
 pub mod config;

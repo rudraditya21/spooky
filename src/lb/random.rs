@@ -5,14 +5,14 @@ use rand::{seq::SliceRandom, thread_rng};
 
 use crate::{config::config::Backend, lb::Random};
 
-impl Random {
-    pub fn new(backends: &[Backend]) -> Self {
+impl<'l> Random<'l> {
+    pub fn new(backends: &'l[Backend]) -> Self {
         Self { backends }
     }
 }
 
-impl super::lb::LoadBalancer for Random {
-    fn pick(&self, _: &str) -> Option<&Backend> {
+impl<'l> super::LoadBalancer<'l> for Random<'l> {
+    fn pick(&'l self, _: &str) -> Option<&'l Backend> {   
         let mut rng = thread_rng();
 
         let healthy_backends: Vec<&Backend> = self.backends.iter().filter(|b| b.is_healthy()).collect();
