@@ -6,16 +6,17 @@ use rand::{seq::SliceRandom, thread_rng};
 use crate::{config::config::Backend, lb::Random};
 
 impl<'l> Random<'l> {
-    pub fn new(backends: &'l[Backend]) -> Self {
+    pub fn new(backends: &'l [Backend]) -> Self {
         Self { backends }
     }
 }
 
 impl<'l> super::LoadBalancer<'l> for Random<'l> {
-    fn pick(&'l self, _: &str) -> Option<&'l Backend> {   
+    fn pick(&'l self, _: &str) -> Option<&'l Backend> {
         let mut rng = thread_rng();
 
-        let healthy_backends: Vec<&Backend> = self.backends.iter().filter(|b| b.is_healthy()).collect();
+        let healthy_backends: Vec<&Backend> =
+            self.backends.iter().filter(|b| b.is_healthy()).collect();
 
         match healthy_backends.choose(&mut rng) {
             Some(random_backend) => {
