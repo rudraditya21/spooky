@@ -30,9 +30,13 @@ pub fn get_default_log_level() -> String {
 }
 
 pub fn get_default_load_balancing() -> LoadBalancing {
-    LoadBalancing { lb_type: String::from("weight-based") }
+    LoadBalancing {
+        lb_type: String::from("weight-based"),
+    }
 }
 
 pub fn get_default_log() -> Log {
-    Log { level: String::from("info") }
+    Log {
+        level: String::from("info"),
+    }
 }

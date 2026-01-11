@@ -6,7 +6,10 @@ pub fn validate(config: &Config) -> bool {
 
     // --- Validate protocol ---
     if config.listen.protocol != "http3" {
-        error!("Invalid protocol: expected 'http3', found '{}'", config.listen.protocol);
+        error!(
+            "Invalid protocol: expected 'http3', found '{}'",
+            config.listen.protocol
+        );
         return false;
     }
 
@@ -54,12 +57,15 @@ pub fn validate(config: &Config) -> bool {
         }
 
         if backend.weight == 0 {
-            error!("Backend weight is invalid (0) for backend id '{}'", backend.id);
+            error!(
+                "Backend weight is invalid (0) for backend id '{}'",
+                backend.id
+            );
             return false;
         }
     }
 
     info!("Configuration validation passed successfully");
-    
+
     true
 }
