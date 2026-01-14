@@ -1,22 +1,45 @@
 # Spooky
 
-**The first production-ready HTTP/3 load balancer written in Rust**
+<img 
+    src="./spooky.png"
+    style="display:block;margin:auto;"
+    width="240"
+    height="240"
+/>
 
-Spooky is built for the modern web: QUIC-native, fast, and designed for environments where nginx's experimental HTTP/3 support isn't enough.
+**HTTP/3 load balancer in Rust: terminate QUIC at the edge, serve HTTP/2 backends**
+
+Spooky bridges HTTP/3 clients to HTTP/2 backends. It terminates QUIC connections, converts streams to HTTP/2 requests, and routes them across upstream servers.
 
 ---
 
 ## Why Spooky?
 
+HTTP/3 is real, but most backends still speak HTTP/2. Spooky lets you deploy HTTP/3 at the edge without rewriting your entire infrastructure. Built in Rust for performance, safety, and async-first design.
+
 ---
 
-## Features
+## Current Status
 
-- HTTP/3 (QUIC) protocol
-- Load balancing: weight-based, least connection, IP hash, round-robin
-- Health monitoring with configurable intervals
-- TLS support with custom certificates
-- Dynamic weight updates via `/metric` endpoints
+**Work in progress.** Core architecture is complete (QUIC termination, stream conversion, modular routing). Request forwarding and load balancing are being wired up.
+
+## Features (Implemented)
+
+- CLI with YAML configuration
+- TLS 1.3 with custom certificates
+- QUIC listener (quiche-based) (quiche uses BoringSSL and builds it via cmake)
+- Modular architecture (edge/bridge/transport)
+- Random load balancing (placeholder)
+- Health check scaffolding
+
+## Dependencies
+
+```sh
+# also install rust
+
+sudo apt update
+sudo apt install -y cmake build-essential pkg-config
+```
 
 ## Quick Start
 
@@ -24,13 +47,10 @@ Spooky is built for the modern web: QUIC-native, fast, and designed for environm
 # Build
 cargo build
 
-# Run
-cargo run --bin spooky
+# Run sample HTTP/3 server (for testing)
+cargo run --bin server -- --port 7777
 
-# Want sample http3 server on port 7001
-cargo run --bin server -- --port 7001
-
-# Run with config
+# Run spooky with config (QUIC listener starts but forwarding is stubbed)
 ./target/debug/spooky --config config.yaml
 ```
 
@@ -38,35 +58,44 @@ cargo run --bin server -- --port 7001
 
 ```yaml
 listen:
-  protocol: http3
-  port: 9889
-  address: "0.0.0.0"
-  tls:
-    cert: /path/to/cert
-    key: /path/to/key
+    protocol: http3
+    port: 9889
+    address: "0.0.0.0"
+    tls:
+        cert: "/path/to/cert.der"
+        key: "/path/to/key.der"
 
 backends:
-  - id: "backend1"
-    address: "10.0.1.100:8080"
-    weight: 100
-    health_check:
-      path: "/health"
-      interval: 5s
+    -   id: "backend1"
+        address: "10.0.1.100:8080"
+        weight: 100
+        health_check:
+            path: "/health"
+            interval: 5000  # milliseconds
 
 load_balancing:
-  type: weight-based
+    type: random  # currently only random implemented
+
+log:
+    level: info
 ```
 
-You can generate certificates using [gen-cert.md](docs/gen-cert.md)
+Generate certificates: [docs/gen-cert.md](docs/gen-cert.md)
 
-## Check if Proxy is Running
+## Architecture
 
-```bash
-# Check UDP port 9889
-sudo netstat -tulnp | grep 9889
-sudo ss -tulnp | grep 9889
-```
+- **Edge** (`src/edge/`): QUIC listener with quiche
+- **Bridge** (`src/bridge/`): HTTP/3 → HTTP/2 conversion
+- **Transport** (`src/transport/`): HTTP/2 client for backends
+
+See: [docs/architecture.md](docs/architecture.md)
+
+## Development
+
+- [Development Guide](docs/development.md)
+- [Roadmap](docs/roadmap.md)
+- [References](docs/references.md)
 
 ## License
 
-ELv2 - see [LICENSE](LICENSE.md)
+ELv2 - see [LICENSE.md](LICENSE.md)

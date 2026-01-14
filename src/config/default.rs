@@ -21,8 +21,8 @@ pub fn get_default_path() -> String {
     String::from("/health")
 }
 
-pub fn get_default_interval() -> String {
-    String::from("5s")
+pub fn get_default_interval() -> u64 {
+    5000
 }
 
 pub fn get_default_log_level() -> String {
@@ -30,9 +30,13 @@ pub fn get_default_log_level() -> String {
 }
 
 pub fn get_default_load_balancing() -> LoadBalancing {
-    LoadBalancing { lb_type: String::from("weight-based") }
+    LoadBalancing {
+        lb_type: String::from("weight-based"),
+    }
 }
 
 pub fn get_default_log() -> Log {
-    Log { level: String::from("info") }
+    Log {
+        level: String::from("info"),
+    }
 }
