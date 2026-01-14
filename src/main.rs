@@ -9,8 +9,6 @@
 //! TODO: Add startup banner and version information
 //! TODO: Implement proper process lifecycle management
 
-//! TODO: Setup the client and use that for proxing request rather than client for every request
-
 use clap::Parser;
 use log::error;
 
@@ -21,6 +19,8 @@ pub mod utils;
 pub mod bridge;
 pub mod edge;
 pub mod transport;
+
+use log::info;
 
 use crate::config::validator::validate as validate_config;
 
@@ -34,15 +34,6 @@ struct Cli {
 
 #[tokio::main]
 async fn main() {
-    // TODO: Add startup banner with version and build info
-
-    // TODO: Implement signal handling for graceful shutdown (SIGTERM, SIGINT)
-    // TODO: Add panic hook for proper error reporting
-    // TODO: Implement proper error handling instead of expect() calls
-    // TODO: Add startup health checks before accepting connections
-    // TODO: Add metrics server startup
-    // TODO: Implement proper process lifecycle management
-
     // Parse CLI arguments
     let cli = Cli::parse();
 
@@ -68,9 +59,10 @@ async fn main() {
         std::process::exit(1);
     }
 
-    let spooky = edge::QUICListener::new(config_yaml);
+    info!("Spooky is starting");
+    let mut spooky = edge::QUICListener::new(config_yaml);
 
-    loop {
+    // loop {
         spooky.poll();
-    }
+    // }
 }
