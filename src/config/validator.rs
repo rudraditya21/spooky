@@ -65,7 +65,7 @@ pub fn validate(config: &Config) -> bool {
         }
     }
 
-    info!("Configuration validation passed successfully");
+    info!("Configuration validation passed successfully\n");
 
     true
 }
