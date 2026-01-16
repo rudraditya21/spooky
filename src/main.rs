@@ -62,7 +62,7 @@ async fn main() {
     info!("Spooky is starting");
     let mut spooky = edge::QUICListener::new(config_yaml);
 
-    // loop {
+    loop {
         spooky.poll();
-    // }
+    }
 }

@@ -64,6 +64,13 @@ pub struct LoadBalancing {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Log {
+    // whisper -> trace
+    // haunt -> debug
+    // spooky -> info
+    // scream -> warn
+    // poltergeist -> error
+    // silence -> off
+
     #[serde(default = "get_default_log_level")]
     pub level: String, // "info, warn, error"
 }
