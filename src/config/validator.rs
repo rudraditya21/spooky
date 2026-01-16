@@ -1,6 +1,12 @@
 use crate::config::config::Config;
 use log::{error, info};
 
+pub const VALID_LOG_LEVELS: &[&str] = &[
+    "whisper", "haunt", "spooky", "scream", "poltergeist", "silence",
+    "trace", "debug", "info", "warn", "error", "off",
+];
+
+
 pub fn validate(config: &Config) -> bool {
     info!("Starting configuration validation...");
 
@@ -9,6 +15,15 @@ pub fn validate(config: &Config) -> bool {
         error!(
             "Invalid protocol: expected 'http3', found '{}'",
             config.listen.protocol
+        );
+        return false;
+    }
+
+    // --- Validate Log level ---
+    if !VALID_LOG_LEVELS.iter().any(|lvl| lvl.eq_ignore_ascii_case(&config.log.level)) {
+        error!(
+            "Invalid Log Leve: {}",
+            config.log.level
         );
         return false;
     }
