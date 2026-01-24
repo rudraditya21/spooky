@@ -2,13 +2,10 @@ use std::{collections::HashMap, net::UdpSocket};
 
 use core::net::SocketAddr;
 
-use std::collections::hash_map::Entry;
-
-use log::{debug, error};
+use log::{debug, error, info};
 use quiche::Config;
 
 use crate::{config::config::Config as SpookyConfig, edge::{QUICListener, QuicConnection}};
-
 
 
 impl QUICListener {
@@ -42,12 +39,9 @@ impl QUICListener {
     pub fn get_or_create_connection(
         &mut self, 
         peer: SocketAddr, 
+        local_addr: SocketAddr,
         packets: &[u8]
     ) -> Option<&mut QuicConnection> {
-
-        // if let Some(connection) = self.connections.get_mut(&peer) {
-        //     return Some(connection);
-        // }
 
         let mut buf = packets.to_vec();
         let header = match quiche::Header::from_slice(
@@ -63,56 +57,73 @@ impl QUICListener {
 
         let scid = header.dcid.clone();
 
-        let local_addr = match self.socket.local_addr() {
-            Ok(addr) => addr,
-            Err(_) => return None,
-        };
-
-        match self.connections.entry(peer) {
-            Entry::Occupied(e) => Some(e.into_mut()),
-
-            Entry::Vacant(e) => {
-                let mut quic_connection = quiche::accept(
-                    &scid, 
-                    None, 
-                    local_addr, 
-                    peer, 
-                    &mut self.quic_config
-                ).ok()?;
-                
-                let h3_connection = quiche::h3::Connection::with_transport(
-                &mut quic_connection,
-                &quiche::h3::Config::new().unwrap(),
-                ).ok()?;
-
-            Some(e.insert(QuicConnection { 
-                quic: quic_connection,
-                h3: h3_connection 
-            }))
-            }
+        if self.connections.contains_key(&peer) {
+            return self.connections.get_mut(&peer);
         }
 
-        
+        let mut quic_connection = quiche::accept(
+            &scid,
+            None,
+            local_addr,
+            peer,
+            &mut self.quic_config
+        ).ok()?;
+
+        let h3_connection = quiche::h3::Connection::with_transport(
+            &mut quic_connection,
+            &quiche::h3::Config::new().unwrap()
+        ).ok()?;
+
+        self.connections.insert(
+            peer, 
+            QuicConnection {
+                quic: quic_connection,
+                h3: h3_connection,
+                peer_address: peer
+            }
+        );
+
+        self.connections.get_mut(&peer)
+             
     }
 
     pub fn poll(&mut self) {
-        // loop {
 
-            // // Read a UDP datagram and feed it into quiche.
-            // let (len, peer) = match self.socket.recv_from(&mut self.recv_buf) {
-            //     Ok(v) => v,
-            //     Err(_) => return,
-            // };
-            
-            // let connection = match self.get_or_create_connection(peer, &self.recv_buf[..len]) {
-            //     Some(conn) => conn,
-            //     None => continue,
-            // };
 
-            // if let Err(e) = connection.quic.recv(&self.recv_buf[..len], info)
-        // }
+        // Read a UDP datagram and feed it into quiche.
+        let (len, peer) = match self.socket.recv_from(&mut self.recv_buf) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+
+        info!("Length of data recived: {}", len);
+
+        let local_addr = match self.socket.local_addr() {
+            Ok(addr) => addr,
+            Err(_) => return,
+        };
+
+        // copy the data for memory safety
+        let mut recv_data = self.recv_buf[..len].to_vec();
+
+        // info!("recvied some data {:?}", recv_data);
+        
+        let connection = match self.get_or_create_connection(peer, local_addr, &recv_data) {
+            Some(conn) => conn,
+            None => return,
+        };
+        
+        let recv_info = quiche::RecvInfo {
+            from: peer,
+            to: local_addr
+        };
+
+        if let Err(e) = connection.quic.recv(&mut recv_data, recv_info) {
+            error!("QUIC recv failed: {:?}", e);
+            return;
+        }
             
-            // Convert HTTP/3 headers with bridge::h3_to_h2.
+        // Convert HTTP/3 headers with bridge::h3_to_h2.
         // Forward the normalized request via the HTTP/2 client.
     }
 }
