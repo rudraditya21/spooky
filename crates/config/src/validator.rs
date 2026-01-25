@@ -1,4 +1,4 @@
-use crate::config::config::Config;
+use crate::config::Config;
 use log::{error, info};
 
 pub const VALID_LOG_LEVELS: &[&str] = &[

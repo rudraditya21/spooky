@@ -14,7 +14,7 @@
 
 * [x] **Foundation (✅ Complete)**
   * Rust workspace with proper module structure
-  * HTTP/3 server using Quinn
+  * HTTP/3 server using quiche
   * TLS certificate handling
   * YAML configuration system
   * Structured logging
@@ -177,4 +177,3 @@ Rather than 10k stars, focus on:
 * **Phase 3**: Production-hardened with resilience features
 * **Phase 4**: Feature-rich with advanced routing
 * **Phase 5**: Cloud-native with K8s integration
-

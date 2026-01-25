@@ -47,11 +47,8 @@ sudo apt install -y cmake build-essential pkg-config
 # Build
 cargo build
 
-# Run sample HTTP/3 server (for testing)
-cargo run --bin server -- --port 7777
-
 # Run spooky with config (QUIC listener starts but forwarding is stubbed)
-./target/debug/spooky --config config.yaml
+cargo run -p spooky -- --config ./config/config.yaml
 ```
 
 ## Configuration
@@ -84,9 +81,9 @@ Generate certificates: [docs/gen-cert.md](docs/gen-cert.md)
 
 ## Architecture
 
-- **Edge** (`src/edge/`): QUIC listener with quiche
-- **Bridge** (`src/bridge/`): HTTP/3 → HTTP/2 conversion
-- **Transport** (`src/transport/`): HTTP/2 client for backends
+- **Edge** (`crates/edge/`): QUIC listener with quiche
+- **Bridge** (`crates/bridge/`): HTTP/3 → HTTP/2 conversion
+- **Transport** (`crates/transport/`): HTTP/2 client for backends
 
 See: [docs/architecture.md](docs/architecture.md)
 

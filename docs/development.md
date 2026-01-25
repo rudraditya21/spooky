@@ -52,17 +52,15 @@ spooky/
 │   ├── config.yaml          # default runtime config
 │   └── config.sample.yaml
 ├── docs/                    # architecture, roadmap, internal notes
-├── rustconf/, blog/, wiki/  # writing + presentation material
-├── src/
-│   ├── main.rs              # CLI + process bootstrap
+├── spooky/                  # main application crate
+│   └── src/                 # CLI + process bootstrap
+├── crates/
 │   ├── config/              # serde models, defaults, validation
 │   ├── edge/                # QUIC listener built on quiche
 │   ├── bridge/              # HTTP/3 headers → HTTP/2 request helper
 │   ├── transport/           # HTTP/2 client wrapper (unused yet)
 │   ├── lb/                  # Random balancer placeholder
-│   ├── utils/               # TLS helpers
-│   └── security/            # reserved for future work (empty today)
-├── bins/server.rs           # standalone HTTP/3 demo using quinn
+│   └── utils/               # TLS helpers
 └── certs/                   # DO NOT COMMIT real keys; regenerate locally
 ```
 
@@ -70,14 +68,13 @@ spooky/
 
 | Module | Status | Notes |
 | --- | --- | --- |
-| `src/main.rs` | ✅ | CLI parsing via `clap`, config loading, logger init, spins `edge::QUICListener` loop. |
-| `src/config` | ✅ | YAML structures, defaults, and validator. `health_check.interval` currently expects strings; config file must match. |
-| `src/edge` | 🚧 | Binds QUIC socket via `quiche` but `poll()` is still a stub; no packets handled yet. |
-| `src/lb` | 🚧 | Random picker skeleton; trait signatures mismatched and not wired into the listener. |
-| `src/bridge` | 🧩 | Converts HTTP/3 headers into an `http::Request<()>`. Needs integration once streams are plumbed through. |
-| `src/transport` | 🧩 | HTTP/2 client built on `hyper`. Not yet invoked. |
-| `src/utils::tls` | ✅ | Loads DER-formatted cert/key pairs for both the listener and sample binaries. |
-| `bins/server.rs` | ✅ | Minimal HTTP/3 server using Quinn/H3 for local testing. |
+| `spooky/src/main.rs` | ✅ | CLI parsing via `clap`, config loading, logger init, spins `spooky_edge::QUICListener` loop. |
+| `crates/config` | ✅ | YAML structures, defaults, and validator. `health_check.interval` expects a numeric millisecond value. |
+| `crates/edge` | 🚧 | Binds QUIC socket via `quiche` but `poll()` is still a stub; no packets handled yet. |
+| `crates/lb` | 🚧 | Random picker skeleton; trait signatures mismatched and not wired into the listener. |
+| `crates/bridge` | 🧩 | Converts HTTP/3 headers into an `http::Request<()>`. Needs integration once streams are plumbed through. |
+| `crates/transport` | 🧩 | HTTP/2 client built on `hyper`. Not yet invoked. |
+| `crates/utils` | ✅ | Loads DER-formatted cert/key pairs for TLS helpers. |
 
 ## Development Workflow
 
@@ -100,10 +97,9 @@ spooky/
 - CLI + configuration loader/validator
 - env_logger-based logging setup
 - TLS loading helper (DER + PKCS#8)
-- Standalone Quinn/H3 demo binary
 
 **Partially Implemented**
-- QUIC listener (`edge::QUICListener`) – socket + TLS configuration done, IO loop missing
+- QUIC listener (`spooky_edge::QUICListener`) – socket + TLS configuration done, IO loop missing
 - Load balancer trait/random picker – compiles only after API reconciliation
 - Documentation: high-level architecture reflects the quiche plan but still mentions future pieces
 
@@ -115,7 +111,7 @@ spooky/
 ## Testing & Debugging Tips
 
 - Use `RUST_LOG=debug` when running binaries to surface validator/log output.
-- `cargo run -- --config ./config/config.yaml` uses the default config path; point it at temp configs while the YAML schema churns.
+- `cargo run -p spooky -- --config ./config/config.yaml` uses the default config path; point it at temp configs while the YAML schema churns.
 - For HTTP/3 clients, `curl --http3` plus `--cacert certs/ca-cert.pem` is the easiest compatibility check once the listener handles traffic.
 
 ## Certificate Hygiene

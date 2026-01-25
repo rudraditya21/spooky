@@ -1,0 +1,10 @@
+[package]
+name = "spooky-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+log.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true

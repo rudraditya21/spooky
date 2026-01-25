@@ -19,14 +19,12 @@
 
 | Dependency | License | Commercial Use | Notes |
 |------------|---------|----------------|-------|
-| `quinn` | Apache-2.0/MIT | ✅ Yes | Core QUIC implementation |
+| `quiche` | BSD-2-Clause | ✅ Yes | QUIC + HTTP/3 implementation |
 | `tokio` | MIT | ✅ Yes | Async runtime |
 | `serde` | Apache-2.0/MIT | ✅ Yes | Serialization |
 | `serde_yaml` | MIT | ✅ Yes | YAML support |
 | `clap` | Apache-2.0/MIT | ✅ Yes | CLI parsing |
-| `rustls` | Apache-2.0/ISC | ✅ Yes | TLS implementation |
-| `h3` | MIT | ✅ Yes | HTTP/3 protocol |
-| `h3-quinn` | MIT | ✅ Yes | HTTP/3 over QUIC |
+| `rustls-pki-types` | Apache-2.0/ISC | ✅ Yes | TLS certificate types |
 | `bytes` | MIT | ✅ Yes | Byte utilities |
 | `rand` | Apache-2.0/MIT | ✅ Yes | Random number generation |
 | `log` | Apache-2.0/MIT | ✅ Yes | Logging |
@@ -58,5 +56,5 @@ cd spooky
 cargo build --release
 
 # Run with config
-./target/release/spooky --config config.yaml
+./target/release/spooky --config ./config/config.yaml
 ```

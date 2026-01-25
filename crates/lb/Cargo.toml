@@ -1,0 +1,10 @@
+[package]
+name = "spooky-lb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+log.workspace = true
+rand.workspace = true
+spooky-config = { path = "../config" }

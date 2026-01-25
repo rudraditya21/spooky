@@ -12,10 +12,10 @@ backends:
         weight: 100  # server can have /metric route for weight-based balancing
         health_check:
             path: "/health"
-            interval: 5s
+            interval: 5000
 
 load_balancing:
-    type: weight-based  # weight-based, least_connection, ip-hash, round-robin
+    type: random  # random, least_connection, ip-hash, round-robin
 
 log:
   level: info

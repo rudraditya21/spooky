@@ -1,4 +1,4 @@
-use crate::config::config::{LoadBalancing, Log};
+use crate::config::{LoadBalancing, Log};
 
 // default values
 pub fn get_default_protocol() -> String {
@@ -31,7 +31,7 @@ pub fn get_default_log_level() -> String {
 
 pub fn get_default_load_balancing() -> LoadBalancing {
     LoadBalancing {
-        lb_type: String::from("weight-based"),
+        lb_type: String::from("random"),
     }
 }
 
