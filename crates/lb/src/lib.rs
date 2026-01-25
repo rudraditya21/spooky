@@ -6,7 +6,7 @@
 //! TODO: Implement IP hash strategy
 //! TODO: Implement least response time strategy
 
-use crate::config::config::Backend;
+use spooky_config::config::Backend;
 
 pub mod random;
 

@@ -1,0 +1,9 @@
+[package]
+name = "spooky-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+http.workspace = true
+quiche.workspace = true

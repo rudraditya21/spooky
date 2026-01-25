@@ -1,6 +1,6 @@
 use std::fs;
 
-use crate::config::config::Config;
+use crate::config::Config;
 
 pub fn read_config(filename: &str) -> Result<Config, String> {
     // TODO: Add support for multiple config file formats (YAML, JSON, TOML)

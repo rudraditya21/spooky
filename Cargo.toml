@@ -1,35 +1,32 @@
-[package]
-name = "spooky"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+members = [
+    "spooky",
+    "crates/config",
+    "crates/utils",
+    "crates/edge",
+    "crates/bridge",
+    "crates/transport",
+    "crates/lb",
+]
+resolver = "2"
 
-[[bin]]
-name = "server"
-path = "bins/server.rs"
-
-[dependencies]
+[workspace.dependencies]
+bytes = "1.10.1"
+clap = { version = "4.5.49", features = ["derive"] }
+env_logger = "0.11.3"
+http = "1.3.1"
+http-body-util = "0.1"
+hyper = "1"
+hyper-util = { version = "0.1", features = ["full"] }
+log = "0.4.28"
+quiche = "0.24.6"
+rand = "0.8"
+rustls-pki-types = "1.12.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9.34"
 tokio = { version = "1", features = ["full"] }
-rand = "0.8"
 
-clap = { version = "4.5.49", features = ["derive"] }
-clap_derive = { version = "4.0.0-rc.1" }
-
-quinn = "0.11.9"
-rustls = { version = "0.23.31", features = ["ring"] }
-rustls-pki-types = "1.12.0"
-
-h3 = "0.0.8"
-h3-quinn = "0.0.10"
-http = "1.3.1"
-
-bytes = "1.10.1"
-
-log = "0.4.28"
-env_logger = "0.11.3"
-quiche = "0.24.6"
-
-hyper = "1"
-hyper-util = { version = "0.1", features = ["full"] }
-http-body-util = "0.1"
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Elastic-2.0"

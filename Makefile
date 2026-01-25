@@ -1,19 +1,13 @@
-.PHONY: run run-server build build-server build-spooky clean certs certs-selfsigned certs-ca certs-clean certs-verify
+.PHONY: run build build-spooky clean certs certs-selfsigned certs-ca certs-clean certs-verify
 
 run:
-	cargo run --bin spooky
-
-run-server:
-	cargo run --bin server -- --port ${PORT}
+	cargo run -p spooky --bin spooky
 
 build:
 	cargo build --release
 
-build-server:
-	cargo build --bin server --release
-
 build-spooky:
-	cargo build --bin spooky --release
+	cargo build -p spooky --bin spooky --release
 
 # Certificate generation targets
 certs-selfsigned:
@@ -80,4 +74,3 @@ certs-clean:
 
 clean:
 	rm -f target/release/spooky
-	rm -f target/release/server

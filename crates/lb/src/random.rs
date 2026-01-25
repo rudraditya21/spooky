@@ -3,7 +3,9 @@ use log::{error, info};
 
 use rand::{seq::SliceRandom, thread_rng};
 
-use crate::{config::config::Backend, lb::Random};
+use spooky_config::config::Backend;
+
+use crate::Random;
 
 impl<'l> Random<'l> {
     pub fn new(backends: &'l [Backend]) -> Self {

@@ -30,13 +30,13 @@ The new spooky build terminates QUIC at the edge with `quiche`, translates HTTP/
 
 | Path | Responsibility | Current Notes |
 | --- | --- | --- |
-| `src/main.rs` | CLI + bootstrap | Parses flags, loads YAML config, initializes logging, spawns the listener loop. |
-| `src/config` | Config structs/defaults/validator | Ensures TLS paths, backend IDs, and load-balancing mode are sane before boot. |
-| `src/edge` | QUIC listener built on `quiche` | Binds UDP socket, configures TLS. `poll()` is currently a stub awaiting packet handling. |
-| `src/bridge` | HTTP/3 header normalization | Converts QPACK-decoded headers (`quiche::h3::NameValue`) into `http::Request<()>` for reuse by the H2 client. |
-| `src/transport` | HTTP/2 client wrapper (`hyper`) | Creates HTTP/2-only clients to reach existing infrastructure. Integration pending. |
-| `src/lb` | Load-balancing trait + algorithms | `Random` exists as a placeholder; other strategies/health integration will extend this module. |
-| `src/utils` | TLS helpers | Loads DER cert/key pairs and shared crypto helpers used by both the edge and the sample server. |
+| `spooky/src/main.rs` | CLI + bootstrap | Parses flags, loads YAML config, initializes logging, spawns the listener loop. |
+| `crates/config` | Config structs/defaults/validator | Ensures TLS paths, backend IDs, and load-balancing mode are sane before boot. |
+| `crates/edge` | QUIC listener built on `quiche` | Binds UDP socket, configures TLS. `poll()` is currently a stub awaiting packet handling. |
+| `crates/bridge` | HTTP/3 header normalization | Converts QPACK-decoded headers (`quiche::h3::NameValue`) into `http::Request<()>` for reuse by the H2 client. |
+| `crates/transport` | HTTP/2 client wrapper (`hyper`) | Creates HTTP/2-only clients to reach existing infrastructure. Integration pending. |
+| `crates/lb` | Load-balancing trait + algorithms | `Random` exists as a placeholder; other strategies/health integration will extend this module. |
+| `crates/utils` | TLS helpers | Loads DER cert/key pairs and shared crypto helpers. |
 
 ## Flow
 

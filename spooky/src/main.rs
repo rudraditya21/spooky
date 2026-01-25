@@ -10,19 +10,9 @@
 //! TODO: Implement proper process lifecycle management
 
 use clap::Parser;
-use log::error;
+use log::{error, info};
 
-pub mod config;
-pub mod lb;
-pub mod utils;
-
-pub mod bridge;
-pub mod edge;
-pub mod transport;
-
-use log::info;
-
-use crate::config::validator::validate as validate_config;
+use spooky_config::validator::validate as validate_config;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -42,7 +32,7 @@ async fn main() {
         .unwrap_or_else(|| "./config/config.yaml".to_string());
 
     // Read configuration file
-    let config_yaml = match config::loader::read_config(&config_path) {
+    let config_yaml = match spooky_config::loader::read_config(&config_path) {
         Ok(cfg) => cfg,
         Err(err_msg) => {
             eprintln!("Error loading config: {}", err_msg);
@@ -51,7 +41,7 @@ async fn main() {
     };
 
     // Initialize the Logger
-    utils::logger::init_logger(&config_yaml.log.level);
+    spooky_utils::logger::init_logger(&config_yaml.log.level);
 
     // Validate Configurations
     if validate_config(&config_yaml) == false {
@@ -60,7 +50,7 @@ async fn main() {
     }
 
     info!("Spooky is starting");
-    let mut spooky = edge::QUICListener::new(config_yaml);
+    let mut spooky = spooky_edge::QUICListener::new(config_yaml);
 
     loop {
         spooky.poll();

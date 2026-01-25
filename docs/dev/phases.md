@@ -1,6 +1,6 @@
 # HTTP/3 / QUIC Load Balancer – Development Roadmap
 
-This document describes the phased development plan for a production-grade HTTP/3 (QUIC) L7 load balancer implemented in Rust using Quinn, h3, h3-quinn, and rustls.
+This document describes the phased development plan for a production-grade HTTP/3 (QUIC) L7 load balancer implemented in Rust using quiche and rustls tooling for certificates.
 
 The roadmap is based on the current implementation state and extends it toward a production-ready, industry-standard system. Each phase defines objectives, concrete deliverables, and the algorithms or mechanisms involved.
 
@@ -44,10 +44,10 @@ This phase transitions the system from a functional prototype to a structurally 
 **Status**: Completed
 
 #### Deliverables
-- QUIC endpoint initialization using Quinn
+- QUIC endpoint initialization using quiche
 - TLS configuration using rustls
 - ALPN configured for `h3`
-- HTTP/3 server connection handling using `h3` and `h3-quinn`
+- HTTP/3 server connection handling using quiche `h3`
 - Accept loop for incoming QUIC connections
 
 #### Invariants

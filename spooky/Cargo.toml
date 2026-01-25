@@ -1,0 +1,20 @@
+[package]
+name = "spooky"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "spooky"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+log.workspace = true
+tokio.workspace = true
+quiche.workspace = true
+rand.workspace = true
+
+spooky-config = { path = "../crates/config" }
+spooky-edge = { path = "../crates/edge" }
+spooky-utils = { path = "../crates/utils" }

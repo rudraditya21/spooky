@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-use crate::config::default::{
+use crate::default::{
     get_default_address, get_default_interval, get_default_load_balancing, get_default_log,
     get_default_log_level, get_default_path, get_default_port, get_default_protocol,
     get_default_weight,
