@@ -2,20 +2,26 @@
 
 ## Overview
 
-**Spooky** is a high-performance HTTP/3 load balancer written in Rust. It distributes incoming HTTP/3 requests across multiple backend servers, supporting modern web protocols with enterprise-grade features.
+Spooky is an in-progress HTTP/3 edge proxy written in Rust. The long-term goal is to terminate QUIC at the edge, translate HTTP/3 streams into HTTP/2 requests, and steer them across configurable backends. The current codebase contains the scaffolding (CLI, YAML configuration, TLS bootstrap, modules for bridging to HTTP/2) but the request forwarding logic is not yet wired up.
 
-## Core Features
+## Current Capabilities
 
-- HTTP/3 protocol support (QUIC transport)
-- Load balancing algorithms (random, round-robin, least connections)
-- TLS 1.3 encryption
-- Backend health monitoring
-- Metrics collection
-- Configuration via YAML
+- **CLI + configuration** – `clap`-based argument parsing with a `--config` flag, YAML loader/validator, and log-level controls.
+- **TLS bootstrap** – DER/PKCS#8 loader (`utils::tls`) plus `quiche` listener configuration in `src/edge`.
+- **QUIC listener stub** – `edge::QUICListener` binds a UDP socket via `quiche` and prepares HTTP/3 settings; the `poll()` loop is still a placeholder.
+- **Random balancer placeholder** – `lb::Random` exists but does not yet conform to a finalized trait signature.
+- **HTTP/3 → HTTP/2 bridge pieces** – `bridge::h3_to_h2` and `transport::H2Client` modules exist, waiting to be connected to the listener.
+- **Sample HTTP/3 server** – `bins/server.rs` uses Quinn/H3 for local testing and experimentation.
 
-## Commercial License Analysis
+## Features Still Under Construction
 
-### Dependencies
+- End-to-end request forwarding between HTTP/3 clients and HTTP/2 backends.
+- Additional load-balancing algorithms (round-robin, weight-aware, least connections, etc.).
+- Backend health checking, circuit breakers, and metrics/telemetry.
+- Graceful shutdown, connection pooling, and runtime configuration reload.
+- Production-ready documentation (quickstarts, tutorials, operations guides).
+
+## Dependency & License Snapshot
 
 | Dependency | License | Commercial Use | Notes |
 |------------|---------|----------------|-------|
@@ -30,16 +36,9 @@
 | `log` | Apache-2.0/MIT | ✅ Yes | Logging |
 | `env_logger` | Apache-2.0/MIT | ✅ Yes | Logger implementation |
 
-### License Compatibility
+All dependencies remain permissively licensed, so commercial and closed-source builds are permitted. No copyleft licenses are present.
 
-All dependencies are compatible with commercial use. No GPL licenses or copyleft restrictions. All dependencies use permissive licenses (Apache-2.0, MIT, ISC) that allow:
-
-- Commercial software development
-- Proprietary software
-- SaaS offerings
-- Closed-source derivatives
-
-## Requirements
+## Runtime Requirements
 
 - Rust 1.70+
 - Linux/macOS/Windows
