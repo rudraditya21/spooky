@@ -7,13 +7,35 @@ use std::{
 
 use core::net::SocketAddr;
 
+use bytes::Bytes;
+use http_body_util::BodyExt;
 use log::{debug, error, info};
 use quiche::Config;
 use quiche::h3::NameValue;
+use spooky_bridge::h3_to_h2::{build_h2_request, BridgeError};
+use spooky_transport::h2_client::H2Client;
+use tokio::runtime::Handle;
 
 use spooky_config::config::Config as SpookyConfig;
 
 use crate::{QuicConnection, QUICListener, RequestEnvelope};
+
+#[derive(Debug)]
+enum ProxyError {
+    Bridge(BridgeError),
+    Transport(String),
+}
+
+fn is_hop_header(name: &str) -> bool {
+    matches!(
+        name,
+        "connection"
+            | "keep-alive"
+            | "proxy-connection"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
 
 
 impl QUICListener {
@@ -45,13 +67,16 @@ impl QUICListener {
 
         debug!("Listening on {}", socket_address);
 
-        let h3_config = Arc::new(quiche::h3::Config::new().expect("Failed to create HTTP/3 config"));
+        let h3_config =
+            Arc::new(quiche::h3::Config::new().expect("Failed to create HTTP/3 config"));
+        let h2_client = Arc::new(H2Client::new());
 
         Self { 
             socket, 
             config, 
             quic_config,
             h3_config,
+            h2_client,
             recv_buf: [0; 65535],
             send_buf: [0; 65535],
             connections: HashMap::new()
@@ -139,6 +164,13 @@ impl QUICListener {
 
         let mut recv_data = self.recv_buf[..len].to_vec();
 
+        let backend_addr = self
+            .config
+            .backends
+            .first()
+            .map(|backend| backend.address.clone());
+        let h2_client = self.h2_client.clone();
+
         let should_remove;
 
         {
@@ -157,7 +189,9 @@ impl QUICListener {
             connection.last_activity = Instant::now();
 
             if connection.quic.is_established() || connection.quic.is_in_early_data() {
-                if let Err(e) = Self::handle_h3(connection) {
+                if let Err(e) =
+                    Self::handle_h3(connection, backend_addr.as_deref(), &h2_client)
+                {
                     error!("HTTP/3 handling failed: {:?}", e);
                 }
             }
@@ -235,7 +269,11 @@ impl QUICListener {
         }
     }
 
-    fn handle_h3(connection: &mut QuicConnection) -> Result<(), quiche::h3::Error> {
+    fn handle_h3(
+        connection: &mut QuicConnection,
+        backend_addr: Option<&str>,
+        h2_client: &H2Client,
+    ) -> Result<(), quiche::h3::Error> {
         let mut body_buf = [0u8; 65_535];
 
         if connection.h3.is_none() {
@@ -294,16 +332,14 @@ impl QUICListener {
                 }
                 Ok((stream_id, quiche::h3::Event::Finished)) => {
                     if let Some(req) = connection.streams.remove(&stream_id) {
-                        let resp_headers = vec![
-                            quiche::h3::Header::new(b":status", b"200"),
-                            quiche::h3::Header::new(b"content-type", b"text/plain"),
-                            quiche::h3::Header::new(b"server", b"spooky"),
-                        ];
-
-                        h3.send_response(&mut connection.quic, stream_id, &resp_headers, false)?;
-
-                        let body = format!("spooky edge ok: {} {}\n", req.method, req.path);
-                        h3.send_body(&mut connection.quic, stream_id, body.as_bytes(), true)?;
+                        Self::handle_request_finish(
+                            h3,
+                            &mut connection.quic,
+                            stream_id,
+                            req,
+                            backend_addr,
+                            h2_client,
+                        )?;
                     }
                 }
                 Ok((stream_id, quiche::h3::Event::Reset(_))) => {
@@ -316,6 +352,142 @@ impl QUICListener {
             }
         }
 
+        Ok(())
+    }
+
+    fn handle_request_finish(
+        h3: &mut quiche::h3::Connection,
+        quic: &mut quiche::Connection,
+        stream_id: u64,
+        req: RequestEnvelope,
+        backend_addr: Option<&str>,
+        h2_client: &H2Client,
+    ) -> Result<(), quiche::h3::Error> {
+        let backend_addr = match backend_addr {
+            Some(addr) => addr,
+            None => {
+                return Self::send_simple_response(
+                    h3,
+                    quic,
+                    stream_id,
+                    http::StatusCode::SERVICE_UNAVAILABLE,
+                    b"no backend configured\n",
+                );
+            }
+        };
+
+        if req.method.is_empty() || req.path.is_empty() {
+            return Self::send_simple_response(
+                h3,
+                quic,
+                stream_id,
+                http::StatusCode::BAD_REQUEST,
+                b"invalid request\n",
+            );
+        }
+
+        match Self::forward_request(backend_addr, h2_client, req) {
+            Ok((status, headers, body)) => {
+                Self::send_backend_response(h3, quic, stream_id, status, &headers, &body)
+            }
+            Err(ProxyError::Bridge(err)) => {
+                error!("Bridge error: {:?}", err);
+                Self::send_simple_response(
+                    h3,
+                    quic,
+                    stream_id,
+                    http::StatusCode::BAD_REQUEST,
+                    b"invalid request\n",
+                )
+            }
+            Err(ProxyError::Transport(err)) => {
+                error!("Transport error: {}", err);
+                Self::send_simple_response(
+                    h3,
+                    quic,
+                    stream_id,
+                    http::StatusCode::BAD_GATEWAY,
+                    b"upstream error\n",
+                )
+            }
+        }
+    }
+
+    fn forward_request(
+        backend_addr: &str,
+        h2_client: &H2Client,
+        req: RequestEnvelope,
+    ) -> Result<(http::StatusCode, http::HeaderMap, Bytes), ProxyError> {
+        let request = build_h2_request(
+            backend_addr,
+            &req.method,
+            &req.path,
+            &req.headers,
+            &req.body,
+        )
+        .map_err(ProxyError::Bridge)?;
+
+        let response = run_blocking(|| async { h2_client.send(request).await })
+            .map_err(|e| ProxyError::Transport(format!("send: {e}")))?;
+
+        let (parts, body) = response.into_parts();
+
+        let body_bytes = run_blocking(|| async { body.collect().await.map(|c| c.to_bytes()) })
+            .map_err(|e| ProxyError::Transport(format!("body: {e}")))?;
+
+        Ok((parts.status, parts.headers, body_bytes))
+    }
+
+    fn send_backend_response(
+        h3: &mut quiche::h3::Connection,
+        quic: &mut quiche::Connection,
+        stream_id: u64,
+        status: http::StatusCode,
+        headers: &http::HeaderMap,
+        body: &Bytes,
+    ) -> Result<(), quiche::h3::Error> {
+        let mut resp_headers = Vec::with_capacity(headers.len() + 2);
+
+        resp_headers.push(quiche::h3::Header::new(
+            b":status",
+            status.as_str().as_bytes(),
+        ));
+
+        for (name, value) in headers.iter() {
+            if is_hop_header(name.as_str()) || name == http::header::CONTENT_LENGTH {
+                continue;
+            }
+            resp_headers.push(quiche::h3::Header::new(
+                name.as_str().as_bytes(),
+                value.as_bytes(),
+            ));
+        }
+
+        resp_headers.push(quiche::h3::Header::new(
+            b"content-length",
+            body.len().to_string().as_bytes(),
+        ));
+
+        h3.send_response(quic, stream_id, &resp_headers, false)?;
+        h3.send_body(quic, stream_id, body, true)?;
+        Ok(())
+    }
+
+    fn send_simple_response(
+        h3: &mut quiche::h3::Connection,
+        quic: &mut quiche::Connection,
+        stream_id: u64,
+        status: http::StatusCode,
+        body: &[u8],
+    ) -> Result<(), quiche::h3::Error> {
+        let resp_headers = vec![
+            quiche::h3::Header::new(b":status", status.as_str().as_bytes()),
+            quiche::h3::Header::new(b"content-type", b"text/plain"),
+            quiche::h3::Header::new(b"content-length", body.len().to_string().as_bytes()),
+        ];
+
+        h3.send_response(quic, stream_id, &resp_headers, false)?;
+        h3.send_body(quic, stream_id, body, true)?;
         Ok(())
     }
 
@@ -336,4 +508,22 @@ impl QUICListener {
             }
         }
     }
+}
+
+fn run_blocking<F, Fut, T, E>(f: F) -> Result<T, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Debug,
+{
+    let result = match Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(f())),
+        Err(_) => {
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|e| format!("runtime: {e}"))?;
+            rt.block_on(f())
+        }
+    };
+
+    result.map_err(|e| format!("runtime error: {e:?}"))
 }

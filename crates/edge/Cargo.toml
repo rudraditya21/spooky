@@ -8,8 +8,21 @@ license.workspace = true
 log.workspace = true
 quiche.workspace = true
 spooky-config = { path = "../config" }
+spooky-bridge = { path = "../bridge" }
+spooky-transport = { path = "../transport" }
+bytes.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 rand.workspace = true
 rcgen = "0.12"
 tempfile = "3"
+bytes.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+tokio.workspace = true

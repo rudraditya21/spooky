@@ -1,5 +1,5 @@
 use std::{
-    net::UdpSocket,
+    net::SocketAddr,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -7,9 +7,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+use bytes::Bytes;
+use http_body_util::Full;
+use hyper::{body::Incoming, service::service_fn, Request, Response};
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use rand::RngCore;
 use rcgen::{Certificate, CertificateParams, SanType};
 use tempfile::{tempdir, TempDir};
+use tokio::net::TcpListener;
 
 use spooky_config::config::{
     Backend, Config, HealthCheck, Listen, LoadBalancing, Log, Tls,
@@ -33,7 +38,7 @@ fn write_test_certs(dir: &TempDir) -> (String, String) {
     )
 }
 
-fn make_config(port: u32, cert: String, key: String) -> Config {
+fn make_config(port: u32, backend_addr: String, cert: String, key: String) -> Config {
     Config {
         listen: Listen {
             protocol: "http3".to_string(),
@@ -43,7 +48,7 @@ fn make_config(port: u32, cert: String, key: String) -> Config {
         },
         backends: vec![Backend {
             id: "backend1".to_string(),
-            address: "127.0.0.1:1".to_string(),
+            address: backend_addr,
             weight: 1,
             health_check: HealthCheck {
                 path: "/health".to_string(),
@@ -59,8 +64,30 @@ fn make_config(port: u32, cert: String, key: String) -> Config {
     }
 }
 
-fn run_h3_client(addr: std::net::SocketAddr) -> Result<String, String> {
-    let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
+async fn start_h2_backend() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = listener.accept().await {
+            let io = TokioIo::new(stream);
+            let service = service_fn(|_req: Request<Incoming>| async move {
+                Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from(
+                    "backend ok\n",
+                ))))
+            });
+
+            let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, service)
+                .await;
+        }
+    });
+
+    addr
+}
+
+fn run_h3_client(addr: SocketAddr) -> Result<String, String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
     let local_addr = socket.local_addr().map_err(|e| e.to_string())?;
 
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)
@@ -186,26 +213,28 @@ fn run_h3_client(addr: std::net::SocketAddr) -> Result<String, String> {
 }
 
 #[test]
-fn http3_request_is_accepted_and_parsed() {
+fn http3_to_http2_roundtrip() {
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
-    let config = make_config(0, cert, key);
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let backend_addr = rt.block_on(start_h2_backend());
+    let config = make_config(0, backend_addr.to_string(), cert, key);
     let mut listener = QUICListener::new(config);
-    let addr = listener.socket.local_addr().unwrap();
+    let listen_addr = listener.socket.local_addr().unwrap();
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop_flag = stop.clone();
 
-    let rt = tokio::runtime::Runtime::new().expect("runtime");
     let handle = rt.spawn_blocking(move || {
         while !stop_flag.load(Ordering::Relaxed) {
             listener.poll();
         }
     });
 
-    let body = run_h3_client(addr).expect("client request failed");
+    let body = run_h3_client(listen_addr).expect("client request failed");
     stop.store(true, Ordering::Relaxed);
     handle.abort();
 
-    assert!(body.contains("upstream error"));
+    assert!(body.contains("backend ok"));
 }

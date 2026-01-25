@@ -3,6 +3,7 @@ use std::{collections::HashMap, net::UdpSocket, sync::Arc, time::Instant};
 use core::net::SocketAddr;
 
 use spooky_config::config::Config;
+use spooky_transport::h2_client::H2Client;
 
 pub mod quic_listener;
 
@@ -11,6 +12,7 @@ pub struct QUICListener {
     pub config: Config,
     pub quic_config: quiche::Config,
     pub h3_config: Arc<quiche::h3::Config>,
+    pub h2_client: Arc<H2Client>,
 
     pub recv_buf: [u8; 65535], // array initialization, let arr [<data type>, <no of elements>] = [<value of all>, <no of elements>]
     pub send_buf: [u8; 65535],
