@@ -8,3 +8,8 @@ license.workspace = true
 log.workspace = true
 quiche.workspace = true
 spooky-config = { path = "../config" }
+
+[dev-dependencies]
+rand.workspace = true
+rcgen = "0.12"
+tempfile = "3"

@@ -22,7 +22,15 @@ pub struct QuicConnection {
     pub quic: quiche::Connection,
     pub h3: Option<quiche::h3::Connection>,
     pub h3_config: Arc<quiche::h3::Config>,
+    pub streams: HashMap<u64, RequestEnvelope>,
 
     pub peer_address: SocketAddr,
     pub last_activity: Instant,
+}
+
+pub struct RequestEnvelope {
+    pub method: String,
+    pub path: String,
+    pub headers: Vec<(Vec<u8>, Vec<u8>)>,
+    pub body: Vec<u8>,
 }

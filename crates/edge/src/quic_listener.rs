@@ -1,4 +1,9 @@
-use std::{collections::HashMap, net::UdpSocket, sync::Arc, time::Instant};
+use std::{
+    collections::HashMap,
+    net::UdpSocket,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use core::net::SocketAddr;
 
@@ -8,7 +13,7 @@ use quiche::h3::NameValue;
 
 use spooky_config::config::Config as SpookyConfig;
 
-use crate::{QuicConnection, QUICListener};
+use crate::{QuicConnection, QUICListener, RequestEnvelope};
 
 
 impl QUICListener {
@@ -17,6 +22,9 @@ impl QUICListener {
         
         let socket = UdpSocket::bind(socket_address.as_str())
             .expect("Failed to bind UDP socker");
+        socket
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("Failed to set UDP read timeout");
 
         let mut quic_config = Config::new(quiche::PROTOCOL_VERSION).expect("REASON");
         
@@ -90,6 +98,7 @@ impl QUICListener {
                 quic: quic_connection,
                 h3: None,
                 h3_config: self.h3_config.clone(),
+                streams: HashMap::new(),
                 peer_address: peer,
                 last_activity: Instant::now(),
             }
@@ -103,6 +112,13 @@ impl QUICListener {
         // Read a UDP datagram and feed it into quiche.
         let (len, peer) = match self.socket.recv_from(&mut self.recv_buf) {
             Ok(v) => v,
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                self.handle_timeouts();
+                return;
+            }
             Err(_) => return,
         };
 
@@ -123,30 +139,83 @@ impl QUICListener {
 
         let mut recv_data = self.recv_buf[..len].to_vec();
 
-        let connection = match self.get_or_create_connection(peer, local_addr, &recv_data) {
-            Some(conn) => conn,
-            None => return,
-        };
+        let should_remove;
 
-        let recv_info = quiche::RecvInfo { from: peer, to: local_addr };
+        {
+            let connection = match self.get_or_create_connection(peer, local_addr, &recv_data) {
+                Some(conn) => conn,
+                None => return,
+            };
 
-        if let Err(e) = connection.quic.recv(&mut recv_data, recv_info) {
-            error!("QUIC recv failed: {:?}", e);
+            let recv_info = quiche::RecvInfo { from: peer, to: local_addr };
+
+            if let Err(e) = connection.quic.recv(&mut recv_data, recv_info) {
+                error!("QUIC recv failed: {:?}", e);
+                return;
+            }
+
+            connection.last_activity = Instant::now();
+
+            if connection.quic.is_established() || connection.quic.is_in_early_data() {
+                if let Err(e) = Self::handle_h3(connection) {
+                    error!("HTTP/3 handling failed: {:?}", e);
+                }
+            }
+
+            let mut send_buf = [0u8; 65_535];
+
+            Self::flush_send(&socket, &mut send_buf, connection);
+            Self::handle_timeout(&socket, &mut send_buf, connection);
+
+            should_remove = connection.quic.is_closed();
+        }
+
+        if should_remove {
+            self.connections.remove(&peer);
+        }
+    }
+
+    fn handle_timeouts(&mut self) {
+        if self.connections.is_empty() {
             return;
         }
 
-        connection.last_activity = Instant::now();
+        let socket = match self.socket.try_clone() {
+            Ok(sock) => sock,
+            Err(e) => {
+                error!("Failed to clone UDP socket: {:?}", e);
+                return;
+            }
+        };
 
-        if connection.quic.is_established() || connection.quic.is_in_early_data() {
-            if let Err(e) = Self::handle_h3(connection) {
-                error!("HTTP/3 handling failed: {:?}", e);
+        let mut send_buf = [0u8; 65_535];
+        let mut to_remove = Vec::new();
+
+        for (peer, connection) in self.connections.iter_mut() {
+            let timeout = match connection.quic.timeout() {
+                Some(timeout) => timeout,
+                None => {
+                    if connection.quic.is_closed() {
+                        to_remove.push(*peer);
+                    }
+                    continue;
+                }
+            };
+
+            if connection.last_activity.elapsed() >= timeout {
+                connection.quic.on_timeout();
+                connection.last_activity = Instant::now();
+                Self::flush_send(&socket, &mut send_buf, connection);
+            }
+
+            if connection.quic.is_closed() {
+                to_remove.push(*peer);
             }
         }
 
-        let mut send_buf = [0u8; 65_535];
-
-        Self::flush_send(&socket, &mut send_buf, connection);
-        Self::handle_timeout(&socket, &mut send_buf, connection);
+        for peer in to_remove {
+            self.connections.remove(&peer);
+        }
     }
 
     fn handle_timeout(
@@ -184,43 +253,62 @@ impl QUICListener {
         loop {
             match h3.poll(&mut connection.quic) {
                 Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
-                    let mut method = None;
-                    let mut path = None;
+                    let mut method = String::new();
+                    let mut path = String::new();
+                    let mut headers = Vec::with_capacity(list.len());
 
                     for header in list {
+                        headers.push((header.name().to_vec(), header.value().to_vec()));
                         match header.name() {
-                            b":method" => method = Some(String::from_utf8_lossy(header.value()).to_string()),
-                            b":path" => path = Some(String::from_utf8_lossy(header.value()).to_string()),
+                            b":method" => method = String::from_utf8_lossy(header.value()).to_string(),
+                            b":path" => path = String::from_utf8_lossy(header.value()).to_string(),
                             _ => {}
                         }
                     }
 
-                    if let (Some(m), Some(p)) = (method, path) {
-                        info!("HTTP/3 request {} {}", m, p);
+                    let envelope = RequestEnvelope {
+                        method: method.clone(),
+                        path: path.clone(),
+                        headers,
+                        body: Vec::new(),
+                    };
+
+                    connection.streams.insert(stream_id, envelope);
+
+                    if !method.is_empty() && !path.is_empty() {
+                        info!("HTTP/3 request {} {}", method, path);
                     }
-
-                    let resp_headers = vec![
-                        quiche::h3::Header::new(b":status", b"200"),
-                        quiche::h3::Header::new(b"content-type", b"text/plain"),
-                        quiche::h3::Header::new(b"server", b"spooky"),
-                    ];
-
-                    h3.send_response(&mut connection.quic, stream_id, &resp_headers, false)?;
-
-                    let body = b"spooky edge ok\n";
-                    h3.send_body(&mut connection.quic, stream_id, body, true)?;
                 }
                 Ok((stream_id, quiche::h3::Event::Data)) => {
                     loop {
                         match h3.recv_body(&mut connection.quic, stream_id, &mut body_buf) {
-                            Ok(_) => {}
+                            Ok(read) => {
+                                if let Some(req) = connection.streams.get_mut(&stream_id) {
+                                    req.body.extend_from_slice(&body_buf[..read]);
+                                }
+                            }
                             Err(quiche::h3::Error::Done) => break,
                             Err(e) => return Err(e),
                         }
                     }
                 }
-                Ok((_stream_id, quiche::h3::Event::Finished)) => {}
-                Ok((_stream_id, quiche::h3::Event::Reset(_))) => {}
+                Ok((stream_id, quiche::h3::Event::Finished)) => {
+                    if let Some(req) = connection.streams.remove(&stream_id) {
+                        let resp_headers = vec![
+                            quiche::h3::Header::new(b":status", b"200"),
+                            quiche::h3::Header::new(b"content-type", b"text/plain"),
+                            quiche::h3::Header::new(b"server", b"spooky"),
+                        ];
+
+                        h3.send_response(&mut connection.quic, stream_id, &resp_headers, false)?;
+
+                        let body = format!("spooky edge ok: {} {}\n", req.method, req.path);
+                        h3.send_body(&mut connection.quic, stream_id, body.as_bytes(), true)?;
+                    }
+                }
+                Ok((stream_id, quiche::h3::Event::Reset(_))) => {
+                    connection.streams.remove(&stream_id);
+                }
                 Ok((_stream_id, quiche::h3::Event::PriorityUpdate)) => {}
                 Ok((_stream_id, quiche::h3::Event::GoAway)) => {}
                 Err(quiche::h3::Error::Done) => break,
