@@ -4,6 +4,7 @@ use core::net::SocketAddr;
 
 use spooky_config::config::Config;
 use spooky_transport::h2_client::H2Client;
+use spooky_lb::{BackendPool, LoadBalancing};
 
 pub mod quic_listener;
 
@@ -13,6 +14,8 @@ pub struct QUICListener {
     pub quic_config: quiche::Config,
     pub h3_config: Arc<quiche::h3::Config>,
     pub h2_client: Arc<H2Client>,
+    pub backend_pool: BackendPool,
+    pub load_balancer: LoadBalancing,
 
     pub recv_buf: [u8; 65535], // array initialization, let arr [<data type>, <no of elements>] = [<value of all>, <no of elements>]
     pub send_buf: [u8; 65535],
@@ -33,6 +36,7 @@ pub struct QuicConnection {
 pub struct RequestEnvelope {
     pub method: String,
     pub path: String,
+    pub authority: Option<String>,
     pub headers: Vec<(Vec<u8>, Vec<u8>)>,
     pub body: Vec<u8>,
 }

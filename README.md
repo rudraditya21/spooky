@@ -71,7 +71,7 @@ backends:
             interval: 5000  # milliseconds
 
 load_balancing:
-    type: random  # currently only random implemented
+    type: random  # random, round-robin, consistent-hash
 
 log:
     level: info

@@ -15,7 +15,7 @@ backends:
             interval: 5000
 
 load_balancing:
-    type: random  # random, least_connection, ip-hash, round-robin
+    type: random  # random, round-robin, consistent-hash
 
 log:
   level: info

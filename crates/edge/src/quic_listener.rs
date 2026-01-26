@@ -13,6 +13,7 @@ use log::{debug, error, info};
 use quiche::Config;
 use quiche::h3::NameValue;
 use spooky_bridge::h3_to_h2::{build_h2_request, BridgeError};
+use spooky_lb::{BackendPool, LoadBalancing};
 use spooky_transport::h2_client::H2Client;
 use tokio::runtime::Handle;
 
@@ -35,6 +36,18 @@ fn is_hop_header(name: &str) -> bool {
             | "transfer-encoding"
             | "upgrade"
     )
+}
+
+fn request_hash_key(req: &RequestEnvelope) -> String {
+    if let Some(authority) = &req.authority {
+        return authority.clone();
+    }
+
+    if !req.path.is_empty() {
+        return req.path.clone();
+    }
+
+    req.method.clone()
 }
 
 
@@ -70,6 +83,9 @@ impl QUICListener {
         let h3_config =
             Arc::new(quiche::h3::Config::new().expect("Failed to create HTTP/3 config"));
         let h2_client = Arc::new(H2Client::new());
+        let backend_pool = BackendPool::new(config.backends.clone());
+        let load_balancer = LoadBalancing::from_config(&config.load_balancing.lb_type)
+            .expect("Invalid load balancing configuration");
 
         Self { 
             socket, 
@@ -77,25 +93,26 @@ impl QUICListener {
             quic_config,
             h3_config,
             h2_client,
+            backend_pool,
+            load_balancer,
             recv_buf: [0; 65535],
             send_buf: [0; 65535],
             connections: HashMap::new()
         }
     }
 
-    // Get existing connection or get new one
-    pub fn get_or_create_connection(
-        &mut self, 
-        peer: SocketAddr, 
+    fn take_or_create_connection(
+        &mut self,
+        peer: SocketAddr,
         local_addr: SocketAddr,
-        packets: &[u8]
-    ) -> Option<&mut QuicConnection> {
+        packets: &[u8],
+    ) -> Option<QuicConnection> {
+        if let Some(connection) = self.connections.remove(&peer) {
+            return Some(connection);
+        }
 
         let mut buf = packets.to_vec();
-        let header = match quiche::Header::from_slice(
-            &mut buf, 
-            quiche::MAX_CONN_ID_LEN
-        ) {
+        let header = match quiche::Header::from_slice(&mut buf, quiche::MAX_CONN_ID_LEN) {
             Ok(hdr) => hdr,
             Err(_) => {
                 error!("Wrong QUIC HEADER");
@@ -104,33 +121,17 @@ impl QUICListener {
         };
 
         let scid = header.dcid.clone();
+        let quic_connection =
+            quiche::accept(&scid, None, local_addr, peer, &mut self.quic_config).ok()?;
 
-        if self.connections.contains_key(&peer) {
-            return self.connections.get_mut(&peer);
-        }
-
-        let quic_connection = quiche::accept(
-            &scid,
-            None,
-            local_addr,
-            peer,
-            &mut self.quic_config
-        ).ok()?;
-
-        self.connections.insert(
-            peer, 
-            QuicConnection {
-                quic: quic_connection,
-                h3: None,
-                h3_config: self.h3_config.clone(),
-                streams: HashMap::new(),
-                peer_address: peer,
-                last_activity: Instant::now(),
-            }
-        );
-
-        self.connections.get_mut(&peer)
-             
+        Some(QuicConnection {
+            quic: quic_connection,
+            h3: None,
+            h3_config: self.h3_config.clone(),
+            streams: HashMap::new(),
+            peer_address: peer,
+            last_activity: Instant::now(),
+        })
     }
 
     pub fn poll(&mut self) {
@@ -164,48 +165,40 @@ impl QUICListener {
 
         let mut recv_data = self.recv_buf[..len].to_vec();
 
-        let backend_addr = self
-            .config
-            .backends
-            .first()
-            .map(|backend| backend.address.clone());
         let h2_client = self.h2_client.clone();
 
-        let should_remove;
+        let mut connection = match self.take_or_create_connection(peer, local_addr, &recv_data) {
+            Some(conn) => conn,
+            None => return,
+        };
 
-        {
-            let connection = match self.get_or_create_connection(peer, local_addr, &recv_data) {
-                Some(conn) => conn,
-                None => return,
-            };
+        let recv_info = quiche::RecvInfo { from: peer, to: local_addr };
 
-            let recv_info = quiche::RecvInfo { from: peer, to: local_addr };
-
-            if let Err(e) = connection.quic.recv(&mut recv_data, recv_info) {
-                error!("QUIC recv failed: {:?}", e);
-                return;
-            }
-
-            connection.last_activity = Instant::now();
-
-            if connection.quic.is_established() || connection.quic.is_in_early_data() {
-                if let Err(e) =
-                    Self::handle_h3(connection, backend_addr.as_deref(), &h2_client)
-                {
-                    error!("HTTP/3 handling failed: {:?}", e);
-                }
-            }
-
-            let mut send_buf = [0u8; 65_535];
-
-            Self::flush_send(&socket, &mut send_buf, connection);
-            Self::handle_timeout(&socket, &mut send_buf, connection);
-
-            should_remove = connection.quic.is_closed();
+        if let Err(e) = connection.quic.recv(&mut recv_data, recv_info) {
+            error!("QUIC recv failed: {:?}", e);
+            return;
         }
 
-        if should_remove {
-            self.connections.remove(&peer);
+        connection.last_activity = Instant::now();
+
+        if connection.quic.is_established() || connection.quic.is_in_early_data() {
+            if let Err(e) = Self::handle_h3(
+                &mut connection,
+                &h2_client,
+                &mut self.backend_pool,
+                &mut self.load_balancer,
+            ) {
+                error!("HTTP/3 handling failed: {:?}", e);
+            }
+        }
+
+        let mut send_buf = [0u8; 65_535];
+
+        Self::flush_send(&socket, &mut send_buf, &mut connection);
+        Self::handle_timeout(&socket, &mut send_buf, &mut connection);
+
+        if !connection.quic.is_closed() {
+            self.connections.insert(peer, connection);
         }
     }
 
@@ -271,8 +264,9 @@ impl QUICListener {
 
     fn handle_h3(
         connection: &mut QuicConnection,
-        backend_addr: Option<&str>,
         h2_client: &H2Client,
+        backend_pool: &mut BackendPool,
+        load_balancer: &mut LoadBalancing,
     ) -> Result<(), quiche::h3::Error> {
         let mut body_buf = [0u8; 65_535];
 
@@ -293,6 +287,7 @@ impl QUICListener {
                 Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
                     let mut method = String::new();
                     let mut path = String::new();
+                    let mut authority = None;
                     let mut headers = Vec::with_capacity(list.len());
 
                     for header in list {
@@ -300,6 +295,9 @@ impl QUICListener {
                         match header.name() {
                             b":method" => method = String::from_utf8_lossy(header.value()).to_string(),
                             b":path" => path = String::from_utf8_lossy(header.value()).to_string(),
+                            b":authority" | b"host" => {
+                                authority = Some(String::from_utf8_lossy(header.value()).to_string())
+                            }
                             _ => {}
                         }
                     }
@@ -307,6 +305,7 @@ impl QUICListener {
                     let envelope = RequestEnvelope {
                         method: method.clone(),
                         path: path.clone(),
+                        authority,
                         headers,
                         body: Vec::new(),
                     };
@@ -337,8 +336,9 @@ impl QUICListener {
                             &mut connection.quic,
                             stream_id,
                             req,
-                            backend_addr,
                             h2_client,
+                            backend_pool,
+                            load_balancer,
                         )?;
                     }
                 }
@@ -360,22 +360,10 @@ impl QUICListener {
         quic: &mut quiche::Connection,
         stream_id: u64,
         req: RequestEnvelope,
-        backend_addr: Option<&str>,
         h2_client: &H2Client,
+        backend_pool: &mut BackendPool,
+        load_balancer: &mut LoadBalancing,
     ) -> Result<(), quiche::h3::Error> {
-        let backend_addr = match backend_addr {
-            Some(addr) => addr,
-            None => {
-                return Self::send_simple_response(
-                    h3,
-                    quic,
-                    stream_id,
-                    http::StatusCode::SERVICE_UNAVAILABLE,
-                    b"no backend configured\n",
-                );
-            }
-        };
-
         if req.method.is_empty() || req.path.is_empty() {
             return Self::send_simple_response(
                 h3,
@@ -386,12 +374,51 @@ impl QUICListener {
             );
         }
 
+        if backend_pool.is_empty() {
+            return Self::send_simple_response(
+                h3,
+                quic,
+                stream_id,
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                b"no backend configured\n",
+            );
+        }
+
+        let key = request_hash_key(&req);
+        let backend_index = match load_balancer.pick(&key, backend_pool) {
+            Some(index) => index,
+            None => {
+                return Self::send_simple_response(
+                    h3,
+                    quic,
+                    stream_id,
+                    http::StatusCode::SERVICE_UNAVAILABLE,
+                    b"no healthy backends\n",
+                );
+            }
+        };
+
+        let backend_addr = match backend_pool.address(backend_index) {
+            Some(addr) => addr,
+            None => {
+                return Self::send_simple_response(
+                    h3,
+                    quic,
+                    stream_id,
+                    http::StatusCode::SERVICE_UNAVAILABLE,
+                    b"invalid backend\n",
+                );
+            }
+        };
+
         match Self::forward_request(backend_addr, h2_client, req) {
             Ok((status, headers, body)) => {
+                backend_pool.mark_success(backend_index);
                 Self::send_backend_response(h3, quic, stream_id, status, &headers, &body)
             }
             Err(ProxyError::Bridge(err)) => {
                 error!("Bridge error: {:?}", err);
+                backend_pool.mark_failure(backend_index);
                 Self::send_simple_response(
                     h3,
                     quic,
@@ -402,6 +429,7 @@ impl QUICListener {
             }
             Err(ProxyError::Transport(err)) => {
                 error!("Transport error: {}", err);
+                backend_pool.mark_failure(backend_index);
                 Self::send_simple_response(
                     h3,
                     quic,
