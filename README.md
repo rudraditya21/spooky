@@ -79,6 +79,21 @@ log:
 
 Generate certificates: [docs/gen-cert.md](docs/gen-cert.md)
 
+## Testing
+
+```bash
+# Full workspace test suite
+cargo test
+
+# LB integration tests (requires UDP/TCP sockets)
+cargo test -p spooky-edge --test lb_integration
+
+# Multi-node manual LB scripts
+./scripts/lb-round-robin.sh
+./scripts/lb-consistent-hash.sh
+./scripts/lb-random.sh
+```
+
 ## Architecture
 
 - **Edge** (`crates/edge/`): QUIC listener with quiche

@@ -19,12 +19,13 @@ use tokio::runtime::Handle;
 
 use spooky_config::config::Config as SpookyConfig;
 
-use crate::{QuicConnection, QUICListener, RequestEnvelope};
+use crate::{Metrics, QuicConnection, QUICListener, RequestEnvelope};
 
 #[derive(Debug)]
 enum ProxyError {
     Bridge(BridgeError),
     Transport(String),
+    Timeout,
 }
 
 fn is_hop_header(name: &str) -> bool {
@@ -48,6 +49,17 @@ fn request_hash_key(req: &RequestEnvelope) -> String {
     }
 
     req.method.clone()
+}
+
+const BACKEND_TIMEOUT: Duration = Duration::from_secs(2);
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn lb_name(lb: &LoadBalancing) -> &'static str {
+    match lb {
+        LoadBalancing::RoundRobin(_) => "round-robin",
+        LoadBalancing::ConsistentHash(_) => "consistent-hash",
+        LoadBalancing::Random(_) => "random",
+    }
 }
 
 
@@ -86,6 +98,7 @@ impl QUICListener {
         let backend_pool = BackendPool::new(config.backends.clone());
         let load_balancer = LoadBalancing::from_config(&config.load_balancing.lb_type)
             .expect("Invalid load balancing configuration");
+        let metrics = Metrics::default();
 
         Self { 
             socket, 
@@ -95,10 +108,59 @@ impl QUICListener {
             h2_client,
             backend_pool,
             load_balancer,
+            metrics,
+            draining: false,
+            drain_start: None,
             recv_buf: [0; 65535],
             send_buf: [0; 65535],
             connections: HashMap::new()
         }
+    }
+
+    pub fn start_draining(&mut self) {
+        if self.draining {
+            return;
+        }
+        self.draining = true;
+        self.drain_start = Some(Instant::now());
+        info!("Draining connections");
+    }
+
+    pub fn drain_complete(&mut self) -> bool {
+        if !self.draining {
+            return self.connections.is_empty();
+        }
+
+        if self.connections.is_empty() {
+            return true;
+        }
+
+        if let Some(start) = self.drain_start {
+            if start.elapsed() >= DRAIN_TIMEOUT {
+                self.close_all();
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn close_all(&mut self) {
+        let socket = match self.socket.try_clone() {
+            Ok(sock) => sock,
+            Err(e) => {
+                error!("Failed to clone UDP socket: {:?}", e);
+                return;
+            }
+        };
+
+        let mut send_buf = [0u8; 65_535];
+        for connection in self.connections.values_mut() {
+            let _ = connection.quic.close(true, 0x0, b"draining");
+            Self::flush_send(&socket, &mut send_buf, connection);
+        }
+
+        self.connections.clear();
     }
 
     fn take_or_create_connection(
@@ -109,6 +171,10 @@ impl QUICListener {
     ) -> Option<QuicConnection> {
         if let Some(connection) = self.connections.remove(&peer) {
             return Some(connection);
+        }
+
+        if self.draining {
+            return None;
         }
 
         let mut buf = packets.to_vec();
@@ -187,6 +253,7 @@ impl QUICListener {
                 &h2_client,
                 &mut self.backend_pool,
                 &mut self.load_balancer,
+                &self.metrics,
             ) {
                 error!("HTTP/3 handling failed: {:?}", e);
             }
@@ -267,6 +334,7 @@ impl QUICListener {
         h2_client: &H2Client,
         backend_pool: &mut BackendPool,
         load_balancer: &mut LoadBalancing,
+        metrics: &Metrics,
     ) -> Result<(), quiche::h3::Error> {
         let mut body_buf = [0u8; 65_535];
 
@@ -308,8 +376,10 @@ impl QUICListener {
                         authority,
                         headers,
                         body: Vec::new(),
+                        start: Instant::now(),
                     };
 
+                    metrics.inc_total();
                     connection.streams.insert(stream_id, envelope);
 
                     if !method.is_empty() && !path.is_empty() {
@@ -339,6 +409,7 @@ impl QUICListener {
                             h2_client,
                             backend_pool,
                             load_balancer,
+                            metrics,
                         )?;
                     }
                 }
@@ -363,7 +434,9 @@ impl QUICListener {
         h2_client: &H2Client,
         backend_pool: &mut BackendPool,
         load_balancer: &mut LoadBalancing,
+        metrics: &Metrics,
     ) -> Result<(), quiche::h3::Error> {
+        let start = req.start;
         if req.method.is_empty() || req.path.is_empty() {
             return Self::send_simple_response(
                 h3,
@@ -399,7 +472,7 @@ impl QUICListener {
         };
 
         let backend_addr = match backend_pool.address(backend_index) {
-            Some(addr) => addr,
+            Some(addr) => addr.to_string(),
             None => {
                 return Self::send_simple_response(
                     h3,
@@ -411,14 +484,29 @@ impl QUICListener {
             }
         };
 
-        match Self::forward_request(backend_addr, h2_client, req) {
+        info!(
+            "Selected backend {} via {}",
+            backend_addr,
+            lb_name(load_balancer)
+        );
+
+        match Self::forward_request(&backend_addr, h2_client, req) {
             Ok((status, headers, body)) => {
                 backend_pool.mark_success(backend_index);
+                metrics.inc_success();
+                let latency = start.elapsed().as_millis();
+                info!(
+                    "Upstream {} status {} latency_ms {}",
+                    backend_addr, status, latency
+                );
                 Self::send_backend_response(h3, quic, stream_id, status, &headers, &body)
             }
             Err(ProxyError::Bridge(err)) => {
                 error!("Bridge error: {:?}", err);
                 backend_pool.mark_failure(backend_index);
+                metrics.inc_failure();
+                let latency = start.elapsed().as_millis();
+                info!("Upstream {} status 400 latency_ms {}", backend_addr, latency);
                 Self::send_simple_response(
                     h3,
                     quic,
@@ -430,12 +518,31 @@ impl QUICListener {
             Err(ProxyError::Transport(err)) => {
                 error!("Transport error: {}", err);
                 backend_pool.mark_failure(backend_index);
+                metrics.inc_failure();
+                metrics.inc_backend_error();
+                let latency = start.elapsed().as_millis();
+                info!("Upstream {} status 502 latency_ms {}", backend_addr, latency);
                 Self::send_simple_response(
                     h3,
                     quic,
                     stream_id,
                     http::StatusCode::BAD_GATEWAY,
                     b"upstream error\n",
+                )
+            }
+            Err(ProxyError::Timeout) => {
+                error!("Backend timeout");
+                backend_pool.mark_failure(backend_index);
+                metrics.inc_failure();
+                metrics.inc_timeout();
+                let latency = start.elapsed().as_millis();
+                info!("Upstream {} status 503 latency_ms {}", backend_addr, latency);
+                Self::send_simple_response(
+                    h3,
+                    quic,
+                    stream_id,
+                    http::StatusCode::SERVICE_UNAVAILABLE,
+                    b"upstream timeout\n",
                 )
             }
         }
@@ -455,13 +562,29 @@ impl QUICListener {
         )
         .map_err(ProxyError::Bridge)?;
 
-        let response = run_blocking(|| async { h2_client.send(request).await })
-            .map_err(|e| ProxyError::Transport(format!("send: {e}")))?;
+        let response = run_blocking(|| async {
+            tokio::time::timeout(BACKEND_TIMEOUT, h2_client.send(request)).await
+        })
+        .map_err(|e| ProxyError::Transport(format!("send: {e}")))?;
+
+        let response = match response {
+            Ok(inner) => inner.map_err(|e| ProxyError::Transport(format!("send: {e:?}")))?,
+            Err(_) => return Err(ProxyError::Timeout),
+        };
 
         let (parts, body) = response.into_parts();
 
-        let body_bytes = run_blocking(|| async { body.collect().await.map(|c| c.to_bytes()) })
-            .map_err(|e| ProxyError::Transport(format!("body: {e}")))?;
+        let body_bytes = run_blocking(|| async {
+            tokio::time::timeout(BACKEND_TIMEOUT, body.collect()).await
+        })
+        .map_err(|e| ProxyError::Transport(format!("body: {e}")))?;
+
+        let body_bytes = match body_bytes {
+            Ok(inner) => inner.map(|c| c.to_bytes()).map_err(|e| {
+                ProxyError::Transport(format!("body: {e:?}"))
+            })?,
+            Err(_) => return Err(ProxyError::Timeout),
+        };
 
         Ok((parts.status, parts.headers, body_bytes))
     }
@@ -538,20 +661,17 @@ impl QUICListener {
     }
 }
 
-fn run_blocking<F, Fut, T, E>(f: F) -> Result<T, String>
+fn run_blocking<F, Fut, T>(f: F) -> Result<T, String>
 where
     F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Result<T, E>>,
-    E: std::fmt::Debug,
+    Fut: std::future::Future<Output = T>,
 {
-    let result = match Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(f())),
+    match Handle::try_current() {
+        Ok(handle) => Ok(tokio::task::block_in_place(|| handle.block_on(f()))),
         Err(_) => {
             let rt = tokio::runtime::Runtime::new()
                 .map_err(|e| format!("runtime: {e}"))?;
-            rt.block_on(f())
+            Ok(rt.block_on(f()))
         }
-    };
-
-    result.map_err(|e| format!("runtime error: {e:?}"))
+    }
 }
