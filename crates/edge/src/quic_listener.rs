@@ -76,8 +76,15 @@ impl QUICListener {
 
         let mut quic_config = Config::new(quiche::PROTOCOL_VERSION).expect("REASON");
         
-        let _ = quic_config.load_cert_chain_from_pem_file(&config.listen.tls.cert);
-        let _ = quic_config.load_priv_key_from_pem_file(&config.listen.tls.key);
+        match quic_config.load_cert_chain_from_pem_file(&config.listen.tls.cert) {
+            Ok(_) => debug!("Certificate loaded successfully"),
+            Err(e) => error!("Failed to load certificate: {:?}", e),
+        }
+
+        match quic_config.load_priv_key_from_pem_file(&config.listen.tls.key) {
+            Ok(_) => debug!("Private key loaded successfully"),
+            Err(e) => error!("Failed to load private key: {:?}", e),
+        }
         quic_config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL).unwrap();
         quic_config.set_max_idle_timeout(5000);
         quic_config.set_max_recv_udp_payload_size(1350);
@@ -194,8 +201,10 @@ impl QUICListener {
 
         // let scid = header.dcid.clone();
         let scid = quiche::ConnectionId::from_ref(&scid_bytes);
+        let odcid = header.dcid.clone();
+        
         let quic_connection =
-            quiche::accept(&scid, Some(&header.scid), local_addr, peer, &mut self.quic_config).ok()?;
+            quiche::accept(&scid, Some(&odcid), local_addr, peer, &mut self.quic_config).ok()?;
 
         Some(QuicConnection {
             quic: quic_connection,
