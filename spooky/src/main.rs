@@ -1,13 +1,4 @@
 //! Spooky HTTP/3 Load Balancer - Main Entry Point
-//!
-//! TODO: Implement graceful shutdown signal handling
-//! TODO: Implement proper error handling for server initialization
-//! TODO: Add health check endpoint for load balancer itself
-//! TODO: Add metrics collection and monitoring endpoints
-//! TODO: Implement configuration hot-reload capability
-//! TODO: Add structured logging with request tracing
-//! TODO: Add startup banner and version information
-//! TODO: Implement proper process lifecycle management
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},

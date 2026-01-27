@@ -16,6 +16,7 @@ http.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
 tokio.workspace = true
+rand.workspace = true
 
 [dev-dependencies]
 rand.workspace = true

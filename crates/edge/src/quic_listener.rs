@@ -12,6 +12,7 @@ use http_body_util::BodyExt;
 use log::{debug, error, info};
 use quiche::Config;
 use quiche::h3::NameValue;
+use rand::RngCore;
 use spooky_bridge::h3_to_h2::{build_h2_request, BridgeError};
 use spooky_lb::{BackendPool, LoadBalancing};
 use spooky_transport::h2_client::H2Client;
@@ -88,7 +89,9 @@ impl QUICListener {
         quic_config.set_initial_max_streams_bidi(100);
         quic_config.set_initial_max_streams_uni(100);
         quic_config.set_disable_active_migration(true);
-        quic_config.enable_early_data();
+        quic_config.verify_peer(false); // for local development
+        // quic_config.enable_early_data(); diable 0-RTT (h3 does not need this to work)
+        // curl will attempt 0-RTT, your server can’t validate it, TLS aborts.
 
         debug!("Listening on {}", socket_address);
 
@@ -186,9 +189,13 @@ impl QUICListener {
             }
         };
 
-        let scid = header.dcid.clone();
+        let mut scid_bytes = [0u8; 16]; // scid must be >= 8 bytes, 16 is perfect
+        rand::thread_rng().fill_bytes(&mut scid_bytes);
+
+        // let scid = header.dcid.clone();
+        let scid = quiche::ConnectionId::from_ref(&scid_bytes);
         let quic_connection =
-            quiche::accept(&scid, None, local_addr, peer, &mut self.quic_config).ok()?;
+            quiche::accept(&scid, Some(&header.scid), local_addr, peer, &mut self.quic_config).ok()?;
 
         Some(QuicConnection {
             quic: quic_connection,
