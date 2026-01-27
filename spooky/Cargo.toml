@@ -14,6 +14,10 @@ log.workspace = true
 tokio.workspace = true
 quiche.workspace = true
 rand.workspace = true
+bytes.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 
 spooky-config = { path = "../crates/config" }
 spooky-edge = { path = "../crates/edge" }

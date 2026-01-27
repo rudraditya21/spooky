@@ -9,6 +9,11 @@
 //! TODO: Add startup banner and version information
 //! TODO: Implement proper process lifecycle management
 
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
 use clap::Parser;
 use log::{error, info};
 
@@ -52,7 +57,22 @@ async fn main() {
     info!("Spooky is starting");
     let mut spooky = spooky_edge::QUICListener::new(config_yaml);
 
-    loop {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_flag = shutdown.clone();
+
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        shutdown_flag.store(true, Ordering::Relaxed);
+    });
+
+    while !shutdown.load(Ordering::Relaxed) {
         spooky.poll();
     }
+
+    spooky.start_draining();
+    while !spooky.drain_complete() {
+        spooky.poll();
+    }
+
+    info!("Spooky shutdown complete");
 }

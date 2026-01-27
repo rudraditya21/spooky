@@ -6,6 +6,16 @@ pub const VALID_LOG_LEVELS: &[&str] = &[
     "trace", "debug", "info", "warn", "error", "off",
 ];
 
+pub const VALID_LB_TYPES: &[&str] = &[
+    "random",
+    "round-robin",
+    "round_robin",
+    "rr",
+    "consistent-hash",
+    "consistent_hash",
+    "ch",
+];
+
 
 pub fn validate(config: &Config) -> bool {
     info!("Starting configuration validation...");
@@ -24,6 +34,18 @@ pub fn validate(config: &Config) -> bool {
         error!(
             "Invalid Log Leve: {}",
             config.log.level
+        );
+        return false;
+    }
+
+    // --- Validate load balancing type ---
+    if !VALID_LB_TYPES
+        .iter()
+        .any(|lb| lb.eq_ignore_ascii_case(&config.load_balancing.lb_type))
+    {
+        error!(
+            "Invalid load balancing type: {}",
+            config.load_balancing.lb_type
         );
         return false;
     }

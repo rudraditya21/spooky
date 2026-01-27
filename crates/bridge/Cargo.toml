@@ -7,3 +7,5 @@ license.workspace = true
 [dependencies]
 http.workspace = true
 quiche.workspace = true
+bytes.workspace = true
+http-body-util.workspace = true
