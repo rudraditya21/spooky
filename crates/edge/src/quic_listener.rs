@@ -12,6 +12,7 @@ use http_body_util::BodyExt;
 use log::{debug, error, info};
 use quiche::Config;
 use quiche::h3::NameValue;
+use rand::RngCore;
 use spooky_bridge::h3_to_h2::{build_h2_request, BridgeError};
 use spooky_lb::{BackendPool, LoadBalancing};
 use spooky_transport::h2_client::H2Client;
@@ -75,8 +76,15 @@ impl QUICListener {
 
         let mut quic_config = Config::new(quiche::PROTOCOL_VERSION).expect("REASON");
         
-        let _ = quic_config.load_cert_chain_from_pem_file(&config.listen.tls.cert);
-        let _ = quic_config.load_priv_key_from_pem_file(&config.listen.tls.key);
+        match quic_config.load_cert_chain_from_pem_file(&config.listen.tls.cert) {
+            Ok(_) => debug!("Certificate loaded successfully"),
+            Err(e) => error!("Failed to load certificate: {:?}", e),
+        }
+
+        match quic_config.load_priv_key_from_pem_file(&config.listen.tls.key) {
+            Ok(_) => debug!("Private key loaded successfully"),
+            Err(e) => error!("Failed to load private key: {:?}", e),
+        }
         quic_config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL).unwrap();
         quic_config.set_max_idle_timeout(5000);
         quic_config.set_max_recv_udp_payload_size(1350);
@@ -88,7 +96,9 @@ impl QUICListener {
         quic_config.set_initial_max_streams_bidi(100);
         quic_config.set_initial_max_streams_uni(100);
         quic_config.set_disable_active_migration(true);
-        quic_config.enable_early_data();
+        quic_config.verify_peer(false); // for local development
+        // quic_config.enable_early_data(); // diable 0-RTT (h3 does not need this to work)
+        // curl will attempt 0-RTT, your server can’t validate it, TLS aborts.
 
         debug!("Listening on {}", socket_address);
 
@@ -186,7 +196,19 @@ impl QUICListener {
             }
         };
 
-        let scid = header.dcid.clone();
+        // If this is a 0-RTT packet without a valid token, we need to reject it
+        if header.ty == quiche::Type::Initial && header.token.is_some() {
+            debug!("Received 0-RTT attempt, will negotiate fresh connection");
+            // return None;
+        }
+
+        let mut scid_bytes = [0u8; 16]; // scid must be >= 8 bytes, 16 is perfect
+        rand::thread_rng().fill_bytes(&mut scid_bytes);
+
+        // let scid = header.dcid.clone();
+        let scid = quiche::ConnectionId::from_ref(&scid_bytes);
+        // let odcid = header.dcid.clone();
+        
         let quic_connection =
             quiche::accept(&scid, None, local_addr, peer, &mut self.quic_config).ok()?;
 
@@ -229,23 +251,45 @@ impl QUICListener {
             }
         };
 
-        let mut recv_data = self.recv_buf[..len].to_vec();
+        let recv_data = self.recv_buf[..len].to_vec();
 
         let h2_client = self.h2_client.clone();
 
         let mut connection = match self.take_or_create_connection(peer, local_addr, &recv_data) {
-            Some(conn) => conn,
-            None => return,
+            Some(conn) => {
+                debug!("Got connection for {}", peer);
+                conn
+            },
+            None => {
+                error!("Failed to create connection for {}", peer);
+                return;
+            }
         };
 
         let recv_info = quiche::RecvInfo { from: peer, to: local_addr };
 
-        if let Err(e) = connection.quic.recv(&mut recv_data, recv_info) {
+        if let Err(e) = connection.quic.recv(&mut self.recv_buf[..len], recv_info) {
             error!("QUIC recv failed: {:?}", e);
             return;
         }
 
+        if let Some(err) = connection.quic.peer_error() {
+            error!("🔴 Peer error: {:?}", err);
+        }
+
+        if let Some(err) = connection.quic.local_error() {
+            error!("🔴 Local error: {:?}", err);
+        }
+
+
         connection.last_activity = Instant::now();
+
+        // Debug logs
+        debug!("QUIC connection state - established: {}, in_early_data: {}, closed: {}", 
+            connection.quic.is_established(),
+            connection.quic.is_in_early_data(), 
+            connection.quic.is_closed()
+        );
 
         if connection.quic.is_established() || connection.quic.is_in_early_data() {
             if let Err(e) = Self::handle_h3(
@@ -643,9 +687,13 @@ impl QUICListener {
     }
 
     fn flush_send(socket: &UdpSocket, send_buf: &mut [u8], connection: &mut QuicConnection) {
+        let mut packet_count = 0;
+
         loop {
             match connection.quic.send(send_buf) {
                 Ok((write, send_info)) => {
+                    packet_count += 1;
+                    debug!("Sending {} bytes to {}", write, send_info.to);
                     if let Err(e) = socket.send_to(&send_buf[..write], send_info.to) {
                         error!("Failed to send UDP packet: {:?}", e);
                         break;
@@ -657,6 +705,10 @@ impl QUICListener {
                     break;
                 }
             }
+        }
+
+        if packet_count > 0 {
+            debug!("Sent {} packets", packet_count);
         }
     }
 }

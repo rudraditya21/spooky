@@ -3,8 +3,8 @@ listen:
     port: 9889
     address: "0.0.0.0"
     tls:
-        cert: "/path/to/cert"
-        key: "/path/to/key"
+        cert: "/path/to/cert" # --> use .pem
+        key: "/path/to/key" # --> use .pem
 
 backends:
     -   id: "backend1"

@@ -53,31 +53,33 @@ cargo run -p spooky -- --config ./config/config.yaml
 
 ## Configuration
 
+[Sample Config File](./config/config.sample.yaml)
+
 ```yaml
 listen:
     protocol: http3
     port: 9889
     address: "0.0.0.0"
     tls:
-        cert: "/path/to/cert.der"
-        key: "/path/to/key.der"
+        cert: "/path/to/cert.pem" 
+        key: "/path/to/key.pem" 
 
 backends:
     -   id: "backend1"
         address: "10.0.1.100:8080"
-        weight: 100
+        weight: 100  # server can have /metric route for weight-based balancing
         health_check:
             path: "/health"
-            interval: 5000  # milliseconds
+            interval: 5000
 
 load_balancing:
     type: random  # random, round-robin, consistent-hash
 
 log:
-    level: info
+  level: info
 ```
 
-Generate certificates: [docs/gen-cert.md](docs/gen-cert.md)
+Generate certificates: [Generate](docs/strong-cert.md))
 
 ## Testing
 
