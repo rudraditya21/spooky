@@ -11,7 +11,7 @@ use std::{
 use core::net::SocketAddr;
 
 use spooky_config::config::Config;
-use spooky_transport::h2_client::H2Client;
+use spooky_transport::h2_pool::H2Pool;
 use spooky_lb::{BackendPool, LoadBalancing};
 
 pub mod quic_listener;
@@ -21,7 +21,7 @@ pub struct QUICListener {
     pub config: Config,
     pub quic_config: quiche::Config,
     pub h3_config: Arc<quiche::h3::Config>,
-    pub h2_client: Arc<H2Client>,
+    pub h2_pool: Arc<H2Pool>,
     pub backend_pool: BackendPool,
     pub load_balancer: LoadBalancing,
     pub metrics: Metrics,

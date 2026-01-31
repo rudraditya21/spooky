@@ -15,7 +15,7 @@ use quiche::h3::NameValue;
 use rand::RngCore;
 use spooky_bridge::h3_to_h2::{build_h2_request, BridgeError};
 use spooky_lb::{BackendPool, LoadBalancing};
-use spooky_transport::h2_client::H2Client;
+use spooky_transport::h2_pool::{H2Pool, PoolError};
 use tokio::runtime::Handle;
 
 use spooky_config::config::Config as SpookyConfig;
@@ -53,6 +53,7 @@ fn request_hash_key(req: &RequestEnvelope) -> String {
 }
 
 const BACKEND_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_INFLIGHT_PER_BACKEND: usize = 64;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn lb_name(lb: &LoadBalancing) -> &'static str {
@@ -104,7 +105,12 @@ impl QUICListener {
 
         let h3_config =
             Arc::new(quiche::h3::Config::new().expect("Failed to create HTTP/3 config"));
-        let h2_client = Arc::new(H2Client::new());
+        let backend_addresses = config
+            .backends
+            .iter()
+            .map(|backend| backend.address.clone())
+            .collect::<Vec<_>>();
+        let h2_pool = Arc::new(H2Pool::new(backend_addresses, MAX_INFLIGHT_PER_BACKEND));
         let backend_pool = BackendPool::new(config.backends.clone());
         let load_balancer = LoadBalancing::from_config(&config.load_balancing.lb_type)
             .expect("Invalid load balancing configuration");
@@ -115,7 +121,7 @@ impl QUICListener {
             config, 
             quic_config,
             h3_config,
-            h2_client,
+            h2_pool,
             backend_pool,
             load_balancer,
             metrics,
@@ -253,7 +259,7 @@ impl QUICListener {
 
         let recv_data = self.recv_buf[..len].to_vec();
 
-        let h2_client = self.h2_client.clone();
+        let h2_pool = self.h2_pool.clone();
 
         let mut connection = match self.take_or_create_connection(peer, local_addr, &recv_data) {
             Some(conn) => {
@@ -294,7 +300,7 @@ impl QUICListener {
         if connection.quic.is_established() || connection.quic.is_in_early_data() {
             if let Err(e) = Self::handle_h3(
                 &mut connection,
-                &h2_client,
+                &h2_pool,
                 &mut self.backend_pool,
                 &mut self.load_balancer,
                 &self.metrics,
@@ -375,7 +381,7 @@ impl QUICListener {
 
     fn handle_h3(
         connection: &mut QuicConnection,
-        h2_client: &H2Client,
+        h2_pool: &H2Pool,
         backend_pool: &mut BackendPool,
         load_balancer: &mut LoadBalancing,
         metrics: &Metrics,
@@ -450,7 +456,7 @@ impl QUICListener {
                             &mut connection.quic,
                             stream_id,
                             req,
-                            h2_client,
+                            h2_pool,
                             backend_pool,
                             load_balancer,
                             metrics,
@@ -475,7 +481,7 @@ impl QUICListener {
         quic: &mut quiche::Connection,
         stream_id: u64,
         req: RequestEnvelope,
-        h2_client: &H2Client,
+        h2_pool: &H2Pool,
         backend_pool: &mut BackendPool,
         load_balancer: &mut LoadBalancing,
         metrics: &Metrics,
@@ -534,7 +540,7 @@ impl QUICListener {
             lb_name(load_balancer)
         );
 
-        match Self::forward_request(&backend_addr, h2_client, req) {
+        match Self::forward_request(&backend_addr, h2_pool, req) {
             Ok((status, headers, body)) => {
                 backend_pool.mark_success(backend_index);
                 metrics.inc_success();
@@ -594,7 +600,7 @@ impl QUICListener {
 
     fn forward_request(
         backend_addr: &str,
-        h2_client: &H2Client,
+        h2_pool: &H2Pool,
         req: RequestEnvelope,
     ) -> Result<(http::StatusCode, http::HeaderMap, Bytes), ProxyError> {
         let request = build_h2_request(
@@ -607,12 +613,17 @@ impl QUICListener {
         .map_err(ProxyError::Bridge)?;
 
         let response = run_blocking(|| async {
-            tokio::time::timeout(BACKEND_TIMEOUT, h2_client.send(request)).await
+            tokio::time::timeout(BACKEND_TIMEOUT, h2_pool.send(backend_addr, request)).await
         })
         .map_err(|e| ProxyError::Transport(format!("send: {e}")))?;
 
         let response = match response {
-            Ok(inner) => inner.map_err(|e| ProxyError::Transport(format!("send: {e:?}")))?,
+            Ok(inner) => inner.map_err(|e| match e {
+                PoolError::UnknownBackend(name) => {
+                    ProxyError::Transport(format!("unknown backend: {name}"))
+                }
+                PoolError::Send(err) => ProxyError::Transport(format!("send: {err:?}")),
+            })?,
             Err(_) => return Err(ProxyError::Timeout),
         };
 
