@@ -46,7 +46,13 @@ async fn main() {
     }
 
     info!("Spooky is starting");
-    let mut spooky = spooky_edge::QUICListener::new(config_yaml);
+    let mut spooky = match spooky_edge::QUICListener::new(config_yaml) {
+        Ok(listener) => listener,
+        Err(e) => {
+            error!("Failed to create QUIC listener: {}", e);
+            std::process::exit(1);
+        }
+    };
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_flag = shutdown.clone();

@@ -2,8 +2,7 @@ use std::{
     collections::HashMap,
     net::UdpSocket,
     sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, atomic::{AtomicU64, Ordering}
     },
     time::Instant,
 };
