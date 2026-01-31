@@ -1,20 +1,20 @@
 use std::{
     collections::HashMap,
     net::UdpSocket,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 use core::net::SocketAddr;
 
 use bytes::Bytes;
-use http_body_util::BodyExt;
+use http_body_util::{BodyExt, Full};
 use log::{debug, error, info};
 use quiche::Config;
 use quiche::h3::NameValue;
 use rand::RngCore;
 use spooky_bridge::h3_to_h2::{build_h2_request, BridgeError};
-use spooky_lb::{BackendPool, LoadBalancing};
+use spooky_lb::{BackendPool, HealthTransition, LoadBalancing};
 use spooky_transport::h2_pool::{H2Pool, PoolError};
 use tokio::runtime::Handle;
 
@@ -111,10 +111,12 @@ impl QUICListener {
             .map(|backend| backend.address.clone())
             .collect::<Vec<_>>();
         let h2_pool = Arc::new(H2Pool::new(backend_addresses, MAX_INFLIGHT_PER_BACKEND));
-        let backend_pool = BackendPool::new(config.backends.clone());
+        let backend_pool = Arc::new(Mutex::new(BackendPool::new(config.backends.clone())));
         let load_balancer = LoadBalancing::from_config(&config.load_balancing.lb_type)
             .expect("Invalid load balancing configuration");
         let metrics = Metrics::default();
+
+        Self::spawn_health_checks(backend_pool.clone(), h2_pool.clone());
 
         Self { 
             socket, 
@@ -301,7 +303,7 @@ impl QUICListener {
             if let Err(e) = Self::handle_h3(
                 &mut connection,
                 &h2_pool,
-                &mut self.backend_pool,
+                &self.backend_pool,
                 &mut self.load_balancer,
                 &self.metrics,
             ) {
@@ -382,7 +384,7 @@ impl QUICListener {
     fn handle_h3(
         connection: &mut QuicConnection,
         h2_pool: &H2Pool,
-        backend_pool: &mut BackendPool,
+        backend_pool: &Arc<Mutex<BackendPool>>,
         load_balancer: &mut LoadBalancing,
         metrics: &Metrics,
     ) -> Result<(), quiche::h3::Error> {
@@ -482,7 +484,7 @@ impl QUICListener {
         stream_id: u64,
         req: RequestEnvelope,
         h2_pool: &H2Pool,
-        backend_pool: &mut BackendPool,
+        backend_pool: &Arc<Mutex<BackendPool>>,
         load_balancer: &mut LoadBalancing,
         metrics: &Metrics,
     ) -> Result<(), quiche::h3::Error> {
@@ -497,7 +499,11 @@ impl QUICListener {
             );
         }
 
-        if backend_pool.is_empty() {
+        let backend_len = backend_pool
+            .lock()
+            .map(|pool| pool.len())
+            .unwrap_or(0);
+        if backend_len == 0 {
             return Self::send_simple_response(
                 h3,
                 quic,
@@ -508,7 +514,11 @@ impl QUICListener {
         }
 
         let key = request_hash_key(&req);
-        let backend_index = match load_balancer.pick(&key, backend_pool) {
+        let backend_index = {
+            let pool = backend_pool.lock().expect("backend pool lock");
+            load_balancer.pick(&key, &pool)
+        };
+        let backend_index = match backend_index {
             Some(index) => index,
             None => {
                 return Self::send_simple_response(
@@ -521,8 +531,12 @@ impl QUICListener {
             }
         };
 
-        let backend_addr = match backend_pool.address(backend_index) {
-            Some(addr) => addr.to_string(),
+        let backend_addr = {
+            let pool = backend_pool.lock().expect("backend pool lock");
+            pool.address(backend_index).map(|addr| addr.to_string())
+        };
+        let backend_addr = match backend_addr {
+            Some(addr) => addr,
             None => {
                 return Self::send_simple_response(
                     h3,
@@ -542,7 +556,19 @@ impl QUICListener {
 
         match Self::forward_request(&backend_addr, h2_pool, req) {
             Ok((status, headers, body)) => {
-                backend_pool.mark_success(backend_index);
+                let transition = backend_pool
+                    .lock()
+                    .ok()
+                    .and_then(|mut pool| {
+                        if status.is_server_error() {
+                            pool.mark_failure(backend_index)
+                        } else {
+                            pool.mark_success(backend_index)
+                        }
+                    });
+                if let Some(transition) = transition {
+                    Self::log_health_transition(&backend_addr, transition);
+                }
                 metrics.inc_success();
                 let latency = start.elapsed().as_millis();
                 info!(
@@ -553,7 +579,13 @@ impl QUICListener {
             }
             Err(ProxyError::Bridge(err)) => {
                 error!("Bridge error: {:?}", err);
-                backend_pool.mark_failure(backend_index);
+                let transition = backend_pool
+                    .lock()
+                    .ok()
+                    .and_then(|mut pool| pool.mark_failure(backend_index));
+                if let Some(transition) = transition {
+                    Self::log_health_transition(&backend_addr, transition);
+                }
                 metrics.inc_failure();
                 let latency = start.elapsed().as_millis();
                 info!("Upstream {} status 400 latency_ms {}", backend_addr, latency);
@@ -567,7 +599,13 @@ impl QUICListener {
             }
             Err(ProxyError::Transport(err)) => {
                 error!("Transport error: {}", err);
-                backend_pool.mark_failure(backend_index);
+                let transition = backend_pool
+                    .lock()
+                    .ok()
+                    .and_then(|mut pool| pool.mark_failure(backend_index));
+                if let Some(transition) = transition {
+                    Self::log_health_transition(&backend_addr, transition);
+                }
                 metrics.inc_failure();
                 metrics.inc_backend_error();
                 let latency = start.elapsed().as_millis();
@@ -582,7 +620,13 @@ impl QUICListener {
             }
             Err(ProxyError::Timeout) => {
                 error!("Backend timeout");
-                backend_pool.mark_failure(backend_index);
+                let transition = backend_pool
+                    .lock()
+                    .ok()
+                    .and_then(|mut pool| pool.mark_failure(backend_index));
+                if let Some(transition) = transition {
+                    Self::log_health_transition(&backend_addr, transition);
+                }
                 metrics.inc_failure();
                 metrics.inc_timeout();
                 let latency = start.elapsed().as_millis();
@@ -720,6 +764,93 @@ impl QUICListener {
 
         if packet_count > 0 {
             debug!("Sent {} packets", packet_count);
+        }
+    }
+
+    fn log_health_transition(addr: &str, transition: HealthTransition) {
+        match transition {
+            HealthTransition::BecameHealthy => {
+                info!("Backend {} became healthy", addr);
+            }
+            HealthTransition::BecameUnhealthy => {
+                error!("Backend {} became unhealthy", addr);
+            }
+        }
+    }
+
+    fn spawn_health_checks(backend_pool: Arc<Mutex<BackendPool>>, h2_pool: Arc<H2Pool>) {
+        let entries = {
+            let pool = match backend_pool.lock() {
+                Ok(pool) => pool,
+                Err(_) => return,
+            };
+            pool.all_indices()
+                .into_iter()
+                .filter_map(|index| {
+                    let address = pool.address(index)?.to_string();
+                    let health = pool.health_check(index)?;
+                    Some((index, address, health))
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let handle = match Handle::try_current() {
+            Ok(handle) => handle,
+            Err(_) => {
+                error!("Health checks disabled: no Tokio runtime available");
+                return;
+            }
+        };
+
+        for (index, address, health) in entries {
+            let backend_pool = backend_pool.clone();
+            let h2_pool = h2_pool.clone();
+            let handle = handle.clone();
+            handle.spawn(async move {
+                let interval = Duration::from_millis(health.interval.max(1));
+                let timeout = Duration::from_millis(health.timeout_ms.max(1));
+                let path = if health.path.is_empty() {
+                    "/".to_string()
+                } else {
+                    health.path.clone()
+                };
+
+                loop {
+                    tokio::time::sleep(interval).await;
+
+                    let request = match http::Request::builder()
+                        .method("GET")
+                        .uri(format!("http://{address}{path}"))
+                        .body(Full::new(Bytes::new()))
+                    {
+                        Ok(req) => req,
+                        Err(_) => continue,
+                    };
+
+                    let result = tokio::time::timeout(timeout, h2_pool.send(&address, request))
+                        .await;
+
+                    let healthy = match result {
+                        Ok(Ok(response)) => response.status().is_success(),
+                        _ => false,
+                    };
+
+                    let transition = match backend_pool.lock() {
+                        Ok(mut pool) => {
+                            if healthy {
+                                pool.mark_success(index)
+                            } else {
+                                pool.mark_failure(index)
+                            }
+                        }
+                        Err(_) => None,
+                    };
+
+                    if let Some(transition) = transition {
+                        Self::log_health_transition(&address, transition);
+                    }
+                }
+            });
         }
     }
 }

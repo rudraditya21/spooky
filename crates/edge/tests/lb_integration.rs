@@ -225,6 +225,10 @@ fn round_robin_across_backends() {
             health_check: HealthCheck {
                 path: "/health".to_string(),
                 interval: 1000,
+                timeout_ms: 1000,
+                failure_threshold: 3,
+                success_threshold: 1,
+                cooldown_ms: 0,
             },
         },
         Backend {
@@ -234,6 +238,10 @@ fn round_robin_across_backends() {
             health_check: HealthCheck {
                 path: "/health".to_string(),
                 interval: 1000,
+                timeout_ms: 1000,
+                failure_threshold: 3,
+                success_threshold: 1,
+                cooldown_ms: 0,
             },
         },
     ];
@@ -284,6 +292,10 @@ fn consistent_hash_is_stable_per_authority() {
             health_check: HealthCheck {
                 path: "/health".to_string(),
                 interval: 1000,
+                timeout_ms: 1000,
+                failure_threshold: 3,
+                success_threshold: 1,
+                cooldown_ms: 0,
             },
         },
         Backend {
@@ -293,6 +305,10 @@ fn consistent_hash_is_stable_per_authority() {
             health_check: HealthCheck {
                 path: "/health".to_string(),
                 interval: 1000,
+                timeout_ms: 1000,
+                failure_threshold: 3,
+                success_threshold: 1,
+                cooldown_ms: 0,
             },
         },
     ];

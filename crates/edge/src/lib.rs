@@ -3,7 +3,7 @@ use std::{
     net::UdpSocket,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Instant,
 };
@@ -22,7 +22,7 @@ pub struct QUICListener {
     pub quic_config: quiche::Config,
     pub h3_config: Arc<quiche::h3::Config>,
     pub h2_pool: Arc<H2Pool>,
-    pub backend_pool: BackendPool,
+    pub backend_pool: Arc<Mutex<BackendPool>>,
     pub load_balancer: LoadBalancing,
     pub metrics: Metrics,
     pub draining: bool,

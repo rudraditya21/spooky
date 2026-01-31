@@ -6,15 +6,24 @@ use std::{
 use rand::Rng;
 use spooky_config::config::Backend;
 
-const FAILURE_THRESHOLD: u32 = 3;
-const COOLDOWN: Duration = Duration::from_secs(10);
 const DEFAULT_REPLICAS: u32 = 64;
 
 #[derive(Clone)]
 pub struct BackendState {
     backend: Backend,
     consecutive_failures: u32,
-    unhealthy_until: Option<Instant>,
+    health_state: HealthState,
+}
+
+#[derive(Clone)]
+enum HealthState {
+    Healthy,
+    Unhealthy { until: Instant, successes: u32 },
+}
+
+pub enum HealthTransition {
+    BecameHealthy,
+    BecameUnhealthy,
 }
 
 impl BackendState {
@@ -22,36 +31,62 @@ impl BackendState {
         Self {
             backend,
             consecutive_failures: 0,
-            unhealthy_until: None,
+            health_state: HealthState::Healthy,
         }
     }
 
     pub fn is_healthy(&self) -> bool {
-        match self.unhealthy_until {
-            Some(until) => Instant::now() >= until,
-            None => true,
-        }
+        matches!(self.health_state, HealthState::Healthy)
     }
 
     pub fn address(&self) -> &str {
         &self.backend.address
     }
 
+    pub fn health_check(&self) -> &spooky_config::config::HealthCheck {
+        &self.backend.health_check
+    }
+
     pub fn weight(&self) -> u32 {
         self.backend.weight.max(1)
     }
 
-    pub fn mark_success(&mut self) {
-        self.consecutive_failures = 0;
-        self.unhealthy_until = None;
+    pub fn record_success(&mut self) -> Option<HealthTransition> {
+        match &mut self.health_state {
+            HealthState::Healthy => {
+                self.consecutive_failures = 0;
+                None
+            }
+            HealthState::Unhealthy { until, successes } => {
+                if Instant::now() < *until {
+                    return None;
+                }
+
+                *successes += 1;
+                if *successes >= self.backend.health_check.success_threshold {
+                    self.consecutive_failures = 0;
+                    self.health_state = HealthState::Healthy;
+                    return Some(HealthTransition::BecameHealthy);
+                }
+                None
+            }
+        }
     }
 
-    pub fn mark_failure(&mut self) {
+    pub fn record_failure(&mut self) -> Option<HealthTransition> {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-        if self.consecutive_failures >= FAILURE_THRESHOLD {
-            self.consecutive_failures = 0;
-            self.unhealthy_until = Some(Instant::now() + COOLDOWN);
+        let threshold = self.backend.health_check.failure_threshold;
+        if self.consecutive_failures < threshold {
+            return None;
         }
+
+        self.consecutive_failures = 0;
+        let cooldown = Duration::from_millis(self.backend.health_check.cooldown_ms);
+        self.health_state = HealthState::Unhealthy {
+            until: Instant::now() + cooldown,
+            successes: 0,
+        };
+        Some(HealthTransition::BecameUnhealthy)
     }
 }
 
@@ -77,16 +112,22 @@ impl BackendPool {
         self.backends.get(index).map(|b| b.address())
     }
 
-    pub fn mark_success(&mut self, index: usize) {
+    pub fn mark_success(&mut self, index: usize) -> Option<HealthTransition> {
         if let Some(backend) = self.backends.get_mut(index) {
-            backend.mark_success();
+            return backend.record_success();
         }
+        None
     }
 
-    pub fn mark_failure(&mut self, index: usize) {
+    pub fn mark_failure(&mut self, index: usize) -> Option<HealthTransition> {
         if let Some(backend) = self.backends.get_mut(index) {
-            backend.mark_failure();
+            return backend.record_failure();
         }
+        None
+    }
+
+    pub fn health_check(&self, index: usize) -> Option<spooky_config::config::HealthCheck> {
+        self.backends.get(index).map(|b| b.health_check().clone())
     }
 
     pub fn healthy_indices(&self) -> Vec<usize> {
@@ -249,6 +290,10 @@ mod tests {
             health_check: spooky_config::config::HealthCheck {
                 path: "/health".to_string(),
                 interval: 1000,
+                timeout_ms: 1000,
+                failure_threshold: 3,
+                success_threshold: 1,
+                cooldown_ms: 0,
             },
         }
     }
@@ -313,5 +358,17 @@ mod tests {
 
         let mut rr = RoundRobin::new();
         assert!(rr.pick(&pool).is_none());
+    }
+
+    #[test]
+    fn backend_recovers_after_success_threshold() {
+        let mut pool = BackendPool::new(vec![backend("a", "10.0.0.1:1", 1)]);
+        pool.mark_failure(0);
+        pool.mark_failure(0);
+        pool.mark_failure(0);
+
+        assert!(pool.healthy_indices().is_empty());
+        pool.mark_success(0);
+        assert_eq!(pool.healthy_indices(), vec![0]);
     }
 }
