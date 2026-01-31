@@ -25,6 +25,22 @@ pub fn get_default_interval() -> u64 {
     5000
 }
 
+pub fn get_default_health_timeout() -> u64 {
+    1000
+}
+
+pub fn get_default_failure_threshold() -> u32 {
+    3
+}
+
+pub fn get_default_success_threshold() -> u32 {
+    2
+}
+
+pub fn get_default_cooldown_ms() -> u64 {
+    5_000
+}
+
 pub fn get_default_log_level() -> String {
     String::from("info")
 }

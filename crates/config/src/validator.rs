@@ -100,6 +100,46 @@ pub fn validate(config: &Config) -> bool {
             );
             return false;
         }
+
+        if backend.health_check.interval == 0 {
+            error!(
+                "Health check interval is invalid (0) for backend id '{}'",
+                backend.id
+            );
+            return false;
+        }
+
+        if backend.health_check.timeout_ms == 0 {
+            error!(
+                "Health check timeout is invalid (0) for backend id '{}'",
+                backend.id
+            );
+            return false;
+        }
+
+        if backend.health_check.failure_threshold == 0 {
+            error!(
+                "Health check failure threshold is invalid (0) for backend id '{}'",
+                backend.id
+            );
+            return false;
+        }
+
+        if backend.health_check.success_threshold == 0 {
+            error!(
+                "Health check success threshold is invalid (0) for backend id '{}'",
+                backend.id
+            );
+            return false;
+        }
+
+        if backend.health_check.cooldown_ms == 0 {
+            error!(
+                "Health check cooldown is invalid (0) for backend id '{}'",
+                backend.id
+            );
+            return false;
+        }
     }
 
     info!("Configuration validation passed successfully\n");

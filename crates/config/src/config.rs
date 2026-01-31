@@ -1,9 +1,10 @@
 use serde::Deserialize;
 
 use crate::default::{
-    get_default_address, get_default_interval, get_default_load_balancing, get_default_log,
-    get_default_log_level, get_default_path, get_default_port, get_default_protocol,
-    get_default_weight,
+    get_default_address, get_default_cooldown_ms, get_default_failure_threshold,
+    get_default_health_timeout, get_default_interval, get_default_load_balancing,
+    get_default_log, get_default_log_level, get_default_path, get_default_port,
+    get_default_protocol, get_default_success_threshold, get_default_weight,
 };
 
 #[derive(Debug, Deserialize, Clone)]
@@ -54,6 +55,18 @@ pub struct HealthCheck {
 
     #[serde(default = "get_default_interval")]
     pub interval: u64, // "5000" (write in number of milli seconds)
+
+    #[serde(default = "get_default_health_timeout")]
+    pub timeout_ms: u64,
+
+    #[serde(default = "get_default_failure_threshold")]
+    pub failure_threshold: u32,
+
+    #[serde(default = "get_default_success_threshold")]
+    pub success_threshold: u32,
+
+    #[serde(default = "get_default_cooldown_ms")]
+    pub cooldown_ms: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
