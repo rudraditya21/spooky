@@ -23,10 +23,22 @@ use spooky_config::config::Config as SpookyConfig;
 use crate::{Metrics, QuicConnection, QUICListener, RequestEnvelope};
 
 #[derive(Debug)]
-enum ProxyError {
+pub enum ProxyError {
     Bridge(BridgeError),
     Transport(String),
     Timeout,
+    Tls(String) // For TLS cred loading failure
+}
+
+impl std::fmt::Display for ProxyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProxyError::Bridge(err) => write!(f, "Bridge error: {}", err),
+            ProxyError::Transport(msg) => write!(f, "Transport error: {}", msg),
+            ProxyError::Timeout => write!(f, "Backend timeout"),
+            ProxyError::Tls(msg) => write!(f, "TLS error: {}", msg),
+        }
+    }
 }
 
 fn is_hop_header(name: &str) -> bool {
@@ -66,7 +78,7 @@ fn lb_name(lb: &LoadBalancing) -> &'static str {
 
 
 impl QUICListener {
-    pub fn new(config: SpookyConfig) -> Self {
+    pub fn new(config: SpookyConfig) -> Result<Self, ProxyError> {
         let socket_address = format!("{}:{}", &config.listen.address, &config.listen.port);
         
         let socket = UdpSocket::bind(socket_address.as_str())
@@ -79,13 +91,18 @@ impl QUICListener {
         
         match quic_config.load_cert_chain_from_pem_file(&config.listen.tls.cert) {
             Ok(_) => debug!("Certificate loaded successfully"),
-            Err(e) => error!("Failed to load certificate: {:?}", e),
+            Err(e) => return Err(ProxyError::Tls(format!(
+                 "Failed to load certificate '{}': {}", config.listen.tls.cert, e
+            )))
         }
 
         match quic_config.load_priv_key_from_pem_file(&config.listen.tls.key) {
             Ok(_) => debug!("Private key loaded successfully"),
-            Err(e) => error!("Failed to load private key: {:?}", e),
+            Err(e) => return Err(ProxyError::Tls(format!(
+                "Failed to load key '{}': {}", config.listen.tls.key, e
+            ))),
         }
+
         quic_config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL).unwrap();
         quic_config.set_max_idle_timeout(5000);
         quic_config.set_max_recv_udp_payload_size(1350);
@@ -118,7 +135,7 @@ impl QUICListener {
 
         Self::spawn_health_checks(backend_pool.clone(), h2_pool.clone());
 
-        Self { 
+        Ok(Self { 
             socket, 
             config, 
             quic_config,
@@ -132,7 +149,7 @@ impl QUICListener {
             recv_buf: [0; 65535],
             send_buf: [0; 65535],
             connections: HashMap::new()
-        }
+        })
     }
 
     pub fn start_draining(&mut self) {
@@ -186,15 +203,7 @@ impl QUICListener {
         peer: SocketAddr,
         local_addr: SocketAddr,
         packets: &[u8],
-    ) -> Option<QuicConnection> {
-        if let Some(connection) = self.connections.remove(&peer) {
-            return Some(connection);
-        }
-
-        if self.draining {
-            return None;
-        }
-
+    ) -> Option<(QuicConnection, Vec<u8>)> {
         let mut buf = packets.to_vec();
         let header = match quiche::Header::from_slice(&mut buf, quiche::MAX_CONN_ID_LEN) {
             Ok(hdr) => hdr,
@@ -203,6 +212,17 @@ impl QUICListener {
                 return None;
             }
         };
+
+        let dcid_bytes = header.dcid.as_ref().to_vec();
+
+        if let Some(mut connection) = self.connections.remove(&dcid_bytes) {
+            connection.peer_address = peer;
+            return Some((connection, dcid_bytes));
+        }
+
+        if self.draining {
+            return None;
+        }
 
         // If this is a 0-RTT packet without a valid token, we need to reject it
         if header.ty == quiche::Type::Initial && header.token.is_some() {
@@ -220,14 +240,16 @@ impl QUICListener {
         let quic_connection =
             quiche::accept(&scid, None, local_addr, peer, &mut self.quic_config).ok()?;
 
-        Some(QuicConnection {
+        let connection = QuicConnection {
             quic: quic_connection,
             h3: None,
             h3_config: self.h3_config.clone(),
             streams: HashMap::new(),
             peer_address: peer,
             last_activity: Instant::now(),
-        })
+        };
+
+        Some((connection, dcid_bytes))
     }
 
     pub fn poll(&mut self) {
@@ -263,7 +285,7 @@ impl QUICListener {
 
         let h2_pool = self.h2_pool.clone();
 
-        let mut connection = match self.take_or_create_connection(peer, local_addr, &recv_data) {
+        let (mut connection, dcid) = match self.take_or_create_connection(peer, local_addr, &recv_data) {
             Some(conn) => {
                 debug!("Got connection for {}", peer);
                 conn
@@ -317,7 +339,7 @@ impl QUICListener {
         Self::handle_timeout(&socket, &mut send_buf, &mut connection);
 
         if !connection.quic.is_closed() {
-            self.connections.insert(peer, connection);
+            self.connections.insert(dcid, connection);
         }
     }
 
@@ -337,12 +359,12 @@ impl QUICListener {
         let mut send_buf = [0u8; 65_535];
         let mut to_remove = Vec::new();
 
-        for (peer, connection) in self.connections.iter_mut() {
+        for (dcid, connection) in self.connections.iter_mut() {
             let timeout = match connection.quic.timeout() {
                 Some(timeout) => timeout,
                 None => {
                     if connection.quic.is_closed() {
-                        to_remove.push(*peer);
+                        to_remove.push(dcid.clone());
                     }
                     continue;
                 }
@@ -355,12 +377,12 @@ impl QUICListener {
             }
 
             if connection.quic.is_closed() {
-                to_remove.push(*peer);
+                to_remove.push(dcid.clone());
             }
         }
 
-        for peer in to_remove {
-            self.connections.remove(&peer);
+        for dcid in to_remove {
+            self.connections.remove(&dcid);
         }
     }
 
@@ -637,6 +659,21 @@ impl QUICListener {
                     stream_id,
                     http::StatusCode::SERVICE_UNAVAILABLE,
                     b"upstream timeout\n",
+                )
+            }
+            Err(ProxyError::Tls(err)) => {
+                error!("TLS configuration error during request processing: {}", err);
+                // TLS errors during request processing indicate server misconfiguration
+                // Don't mark backend as failed since this is a local TLS issue
+                metrics.inc_failure();
+                let latency = start.elapsed().as_millis();
+                info!("TLS error for stream {} latency_ms {}", stream_id, latency);
+                Self::send_simple_response(
+                    h3,
+                    quic,
+                    stream_id,
+                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                    b"internal server error\n",
                 )
             }
         }

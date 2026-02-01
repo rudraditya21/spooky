@@ -2,8 +2,7 @@ use std::{
     collections::HashMap,
     net::UdpSocket,
     sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, atomic::{AtomicU64, Ordering}
     },
     time::Instant,
 };
@@ -31,7 +30,7 @@ pub struct QUICListener {
     pub recv_buf: [u8; 65535], // array initialization, let arr [<data type>, <no of elements>] = [<value of all>, <no of elements>]
     pub send_buf: [u8; 65535],
 
-    pub connections: HashMap<SocketAddr, QuicConnection>, // future: key by dcid/scid instead of peer addr
+    pub connections: HashMap<Vec<u8>, QuicConnection>, // KEY: DCID (destination connection id)
 }
 
 pub struct QuicConnection {

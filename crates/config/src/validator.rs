@@ -66,13 +66,24 @@ pub fn validate(config: &Config) -> bool {
     }
 
     // --- Validate TLS certs ---
-    if config.listen.tls.cert.is_empty() {
-        error!("TLS certificate path is missing");
+    if !std::path::Path::new(&config.listen.tls.cert).exists() {
+        error!("TLS certificate file does not exist: {}", config.listen.tls.cert);
         return false;
     }
-
-    if config.listen.tls.key.is_empty() {
-        error!("TLS key path is missing");
+    
+    if !std::path::Path::new(&config.listen.tls.key).exists() {
+        error!("TLS private key file does not exist: {}", config.listen.tls.key);
+        return false;
+    }
+    
+    // Optional: Try to read the files to ensure they're accessible
+    if let Err(e) = std::fs::read(&config.listen.tls.cert) {
+        error!("Cannot read TLS certificate file '{}': {}", config.listen.tls.cert, e);
+        return false;
+    }
+    
+    if let Err(e) = std::fs::read(&config.listen.tls.key) {
+        error!("Cannot read TLS private key file '{}': {}", config.listen.tls.key, e);
         return false;
     }
 
