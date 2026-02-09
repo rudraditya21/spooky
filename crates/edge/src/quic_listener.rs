@@ -464,22 +464,63 @@ impl QUICListener {
 
         // First, try to find existing connection by DCID
         let lookup_key = header.dcid.as_ref().to_vec();
+        debug!("Looking up connection with DCID: {:?}", hex::encode(&lookup_key));
         let (mut connection, scid) = if let Some(mut conn) = self.connections.remove(&lookup_key) {
             conn.peer_address = peer;
             debug!("Found existing connection for {}", peer);
             (conn, lookup_key)
         } else {
-            // No existing connection found, try to create new one
+            // Check if there's an existing connection from the same peer
+            // This handles cases where the client uses different DCIDs for the same connection
+            let mut found_peer_connection = None;
+            for (key, conn) in &self.connections {
+                if conn.peer_address == peer {
+                    found_peer_connection = Some(key.clone());
+                    break;
+                }
+            }
+
+            if let Some(peer_key) = found_peer_connection {
+                debug!("Found existing connection from same peer {}, trying with key: {:?}",
+                       peer, hex::encode(&peer_key));
+                if let Some(mut conn) = self.connections.remove(&peer_key) {
+                    conn.peer_address = peer;
+                    debug!("Using existing peer connection for {}", peer);
+                    (conn, peer_key)
+                } else {
+                    // This shouldn't happen, but fallback to creating new connection
+                    match self.take_or_create_connection(peer, local_addr, &recv_data) {
+                        Some(conn) => {
+                            debug!("Created new connection for {}", peer);
+                            conn
+                        },
+                        None => {
+                            debug!("Dropping packet for unknown connection from {} (DCID: {:?})",
+                                   peer, hex::encode(&lookup_key));
+                            return;
+                        }
+                    }
+                }
+            } else {
+                debug!("No existing connection found for DCID or peer, checking all connections...");
+                // Debug: check what connections we have
+                for (key, conn) in &self.connections {
+                    debug!("Existing connection DCID: {:?}, peer: {}", hex::encode(key), conn.peer_address);
+                }
+
+                // No existing connection found, try to create new one
                 match self.take_or_create_connection(peer, local_addr, &recv_data) {
                     Some(conn) => {
                         debug!("Created new connection for {}", peer);
                         conn
                     },
                     None => {
-                        debug!("Dropping packet for unknown connection from {}", peer);
+                        debug!("Dropping packet for unknown connection from {} (DCID: {:?})",
+                               peer, hex::encode(&lookup_key));
                         return;
                     }
                 }
+            }
         };
 
         let recv_info = quiche::RecvInfo { from: peer, to: local_addr };
