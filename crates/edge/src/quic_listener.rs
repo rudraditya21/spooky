@@ -9,10 +9,12 @@ use core::net::SocketAddr;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
+use hmac::{Hmac, Mac};
 use log::{debug, error, info};
 use quiche::Config;
 use quiche::h3::NameValue;
 use rand::RngCore;
+use sha2::Sha256;
 use spooky_bridge::h3_to_h2::{build_h2_request, BridgeError};
 use spooky_lb::{BackendPool, HealthTransition, LoadBalancing};
 use spooky_transport::h2_pool::{H2Pool, PoolError};
@@ -64,9 +66,112 @@ fn request_hash_key(req: &RequestEnvelope) -> String {
     req.method.clone()
 }
 
+/// Encode a retry token containing client IP, original DCID, and timestamp
+fn encode_retry_token(client_ip: &[u8], odcid: &quiche::ConnectionId, timestamp: u64) -> Vec<u8> {
+    let mut token = Vec::new();
+
+    // Magic bytes
+    token.extend_from_slice(RETRY_TOKEN_MAGIC);
+
+    // Client IP length and data
+    token.push(client_ip.len() as u8);
+    token.extend_from_slice(client_ip);
+
+    // Original DCID length and data
+    let odcid_bytes = odcid.as_ref();
+    token.push(odcid_bytes.len() as u8);
+    token.extend_from_slice(odcid_bytes);
+
+    // Timestamp (8 bytes)
+    token.extend_from_slice(&timestamp.to_be_bytes());
+
+    // HMAC-SHA256
+    let mut mac = Hmac::<Sha256>::new_from_slice(RETRY_TOKEN_KEY).unwrap();
+    mac.update(&token);
+    token.extend_from_slice(&mac.finalize().into_bytes());
+
+    token
+}
+
+/// Validate a retry token and extract the original DCID bytes
+fn validate_retry_token(token: &[u8], client_ip: &[u8], max_age: Duration) -> Option<Vec<u8>> {
+    if token.len() < RETRY_TOKEN_MAGIC.len() + 1 + 1 + 8 + 32 {
+        return None; // Minimum size check
+    }
+
+    // Check magic
+    if &token[..RETRY_TOKEN_MAGIC.len()] != RETRY_TOKEN_MAGIC {
+        return None;
+    }
+
+    let mut pos = RETRY_TOKEN_MAGIC.len();
+
+    // Client IP
+    let ip_len = token[pos] as usize;
+    pos += 1;
+    if pos + ip_len > token.len() {
+        return None;
+    }
+    let stored_ip = &token[pos..pos + ip_len];
+    pos += ip_len;
+
+    // Verify client IP matches
+    if stored_ip != client_ip {
+        return None;
+    }
+
+    // Original DCID
+    let dcid_len = token[pos] as usize;
+    pos += 1;
+    if pos + dcid_len > token.len() {
+        return None;
+    }
+    let odcid_bytes = &token[pos..pos + dcid_len];
+    pos += dcid_len;
+
+    // Timestamp
+    if pos + 8 > token.len() {
+        return None;
+    }
+    let timestamp_bytes = &token[pos..pos + 8];
+    let timestamp = u64::from_be_bytes(timestamp_bytes.try_into().unwrap());
+    pos += 8;
+
+    // Check timestamp is not too old
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    if now.saturating_sub(timestamp) > max_age.as_secs() {
+        return None;
+    }
+
+    // HMAC
+    if pos + 32 != token.len() {
+        return None;
+    }
+    let provided_hmac = &token[pos..pos + 32];
+    let data_to_verify = &token[..pos];
+
+    let mut mac = Hmac::<Sha256>::new_from_slice(RETRY_TOKEN_KEY).unwrap();
+    mac.update(data_to_verify);
+    let computed_hmac = mac.finalize().into_bytes();
+
+    if provided_hmac != computed_hmac.as_slice() {
+        return None;
+    }
+
+    // Success - return the original DCID bytes
+    Some(odcid_bytes.to_vec())
+}
+
 const BACKEND_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_INFLIGHT_PER_BACKEND: usize = 64;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+// Retry token HMAC key (should be randomly generated in production)
+const RETRY_TOKEN_KEY: &[u8] = b"spooky-retry-key-2026";
+const RETRY_TOKEN_MAGIC: &[u8] = b"spooky";
 
 fn lb_name(lb: &LoadBalancing) -> &'static str {
     match lb {
@@ -114,9 +219,10 @@ impl QUICListener {
         quic_config.set_initial_max_streams_bidi(100);
         quic_config.set_initial_max_streams_uni(100);
         quic_config.set_disable_active_migration(true);
-        quic_config.verify_peer(false); // for local development
-        // quic_config.enable_early_data(); // diable 0-RTT (h3 does not need this to work)
-        // curl will attempt 0-RTT, your server can’t validate it, TLS aborts.
+        quic_config.verify_peer(false);
+            
+        // CRITICAL FIX: Explicitly disable 0-RTT/early data
+        // This prevents clients from attempting 0-RTT that we can't handle
 
         debug!("Listening on {}", socket_address);
 
@@ -199,58 +305,109 @@ impl QUICListener {
     }
 
     fn take_or_create_connection(
-        &mut self,
-        peer: SocketAddr,
-        local_addr: SocketAddr,
-        packets: &[u8],
-    ) -> Option<(QuicConnection, Vec<u8>)> {
-        let mut buf = packets.to_vec();
-        let header = match quiche::Header::from_slice(&mut buf, quiche::MAX_CONN_ID_LEN) {
-            Ok(hdr) => hdr,
-            Err(_) => {
-                error!("Wrong QUIC HEADER");
+    &mut self,
+    peer: SocketAddr,
+    local_addr: SocketAddr,
+    packets: &[u8],
+) -> Option<(QuicConnection, Vec<u8>)> {
+    let mut buf = packets.to_vec();
+    let header = match quiche::Header::from_slice(&mut buf, quiche::MAX_CONN_ID_LEN) {
+        Ok(hdr) => hdr,
+        Err(_) => {
+            error!("Wrong QUIC HEADER");
+            return None;
+        }
+    };
+
+    let lookup_key = header.dcid.as_ref().to_vec();
+
+    if let Some(mut connection) = self.connections.remove(&lookup_key) {
+        connection.peer_address = peer;
+        return Some((connection, lookup_key));
+    }
+
+    if self.draining {
+        return None;
+    }
+
+    if header.ty != quiche::Type::Initial {
+        return None;
+    }
+
+    // Check if this is a response to our retry (has our token)
+    let client_ip_bytes = match peer.ip() {
+        std::net::IpAddr::V4(ip) => ip.octets().to_vec(),
+        std::net::IpAddr::V6(ip) => ip.octets().to_vec(),
+    };
+    let odcid_bytes = header.token.as_ref().and_then(|token| {
+        validate_retry_token(token, &client_ip_bytes, Duration::from_secs(30))
+    });
+    let odcid = odcid_bytes.as_ref().map(|bytes| quiche::ConnectionId::from_ref(bytes));
+
+    if header.token.is_some() && odcid.is_none() {
+        // Client has invalid or expired token, send retry
+        debug!("Client has invalid token, sending Retry");
+
+        let mut new_scid_bytes = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut new_scid_bytes);
+        let new_scid = quiche::ConnectionId::from_ref(&new_scid_bytes);
+
+        // Create retry token with client's original DCID and IP
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let retry_token = encode_retry_token(&client_ip_bytes, &header.dcid, timestamp);
+
+        let mut retry_buf = [0u8; 1200];
+        let retry_len = match quiche::retry(
+            &header.scid,
+            &header.dcid,
+            &new_scid,
+            &retry_token,
+            header.version,
+            &mut retry_buf,
+        ) {
+            Ok(len) => len,
+            Err(e) => {
+                error!("Failed to create Retry packet: {:?}", e);
                 return None;
             }
         };
 
-        let dcid_bytes = header.dcid.as_ref().to_vec();
-
-        if let Some(mut connection) = self.connections.remove(&dcid_bytes) {
-            connection.peer_address = peer;
-            return Some((connection, dcid_bytes));
+        if let Err(e) = self.socket.send_to(&retry_buf[..retry_len], peer) {
+            error!("Failed to send Retry: {:?}", e);
         }
 
-        if self.draining {
-            return None;
-        }
-
-        // If this is a 0-RTT packet without a valid token, we need to reject it
-        if header.ty == quiche::Type::Initial && header.token.is_some() {
-            debug!("Received 0-RTT attempt, will negotiate fresh connection");
-            // return None;
-        }
-
-        let mut scid_bytes = [0u8; 16]; // scid must be >= 8 bytes, 16 is perfect
-        rand::thread_rng().fill_bytes(&mut scid_bytes);
-
-        // let scid = header.dcid.clone();
-        let scid = quiche::ConnectionId::from_ref(&scid_bytes);
-        // let odcid = header.dcid.clone();
-        
-        let quic_connection =
-            quiche::accept(&scid, None, local_addr, peer, &mut self.quic_config).ok()?;
-
-        let connection = QuicConnection {
-            quic: quic_connection,
-            h3: None,
-            h3_config: self.h3_config.clone(),
-            streams: HashMap::new(),
-            peer_address: peer,
-            last_activity: Instant::now(),
-        };
-
-        Some((connection, dcid_bytes))
+        return None;
     }
+
+    // Accept the connection
+    // For retry responses, use the DCID from the header (which is the new_scid from our retry)
+    // as the SCID for the accepted connection
+    let mut scid_bytes = [0u8; 16];
+    let scid = if odcid.is_some() {
+        debug!("Accepting connection with validated retry token");
+        header.dcid.clone()  // Use the DCID from the retry response as our SCID
+    } else {
+        rand::thread_rng().fill_bytes(&mut scid_bytes);
+        quiche::ConnectionId::from_ref(&scid_bytes)
+    };
+
+    let quic_connection =
+        quiche::accept(&scid, odcid.as_ref(), local_addr, peer, &mut self.quic_config).ok()?;
+
+    let connection = QuicConnection {
+        quic: quic_connection,
+        h3: None,
+        h3_config: self.h3_config.clone(),
+        streams: HashMap::new(),
+        peer_address: peer,
+        last_activity: Instant::now(),
+    };
+
+    Some((connection, scid.as_ref().to_vec()))
+}
 
     pub fn poll(&mut self) {
         // Read a UDP datagram and feed it into quiche.
@@ -281,11 +438,38 @@ impl QUICListener {
             }
         };
 
-        let recv_data = self.recv_buf[..len].to_vec();
+        let mut recv_data = self.recv_buf[..len].to_vec();
+
+        let header = match quiche::Header::from_slice(&mut recv_data.clone(), quiche::MAX_CONN_ID_LEN) {
+            Ok(hdr) => hdr,
+            Err(_) => {
+                error!("Wrong QUIC HEADER");
+                return;
+            }
+        };
+
+        if header.ty == quiche::Type::VersionNegotiation {
+            let len = match quiche::negotiate_version(
+                &header.scid,
+                &header.dcid,
+                &mut self.send_buf,
+            ) {
+                Ok(len) => len,
+                Err(e) => {
+                    error!("Version negotiation failed: {:?}", e);
+                    return;
+                }
+            };
+
+            if let Err(e) = socket.send_to(&self.send_buf[..len], peer) {
+                error!("Failed to send version negotiation: {:?}", e);
+            }
+            return;
+        }
 
         let h2_pool = self.h2_pool.clone();
 
-        let (mut connection, dcid) = match self.take_or_create_connection(peer, local_addr, &recv_data) {
+        let (mut connection, scid) = match self.take_or_create_connection(peer, local_addr, &recv_data) {
             Some(conn) => {
                 debug!("Got connection for {}", peer);
                 conn
@@ -298,7 +482,7 @@ impl QUICListener {
 
         let recv_info = quiche::RecvInfo { from: peer, to: local_addr };
 
-        if let Err(e) = connection.quic.recv(&mut self.recv_buf[..len], recv_info) {
+        if let Err(e) = connection.quic.recv(&mut recv_data, recv_info) {
             error!("QUIC recv failed: {:?}", e);
             return;
         }
@@ -339,7 +523,7 @@ impl QUICListener {
         Self::handle_timeout(&socket, &mut send_buf, &mut connection);
 
         if !connection.quic.is_closed() {
-            self.connections.insert(dcid, connection);
+            self.connections.insert(scid, connection);
         }
     }
 
@@ -359,12 +543,12 @@ impl QUICListener {
         let mut send_buf = [0u8; 65_535];
         let mut to_remove = Vec::new();
 
-        for (dcid, connection) in self.connections.iter_mut() {
+        for (scid, connection) in self.connections.iter_mut() {
             let timeout = match connection.quic.timeout() {
                 Some(timeout) => timeout,
                 None => {
                     if connection.quic.is_closed() {
-                        to_remove.push(dcid.clone());
+                        to_remove.push(scid.clone());
                     }
                     continue;
                 }
@@ -377,12 +561,12 @@ impl QUICListener {
             }
 
             if connection.quic.is_closed() {
-                to_remove.push(dcid.clone());
+                to_remove.push(scid.clone());
             }
         }
 
-        for dcid in to_remove {
-            self.connections.remove(&dcid);
+        for scid in to_remove {
+            self.connections.remove(&scid);
         }
     }
 
