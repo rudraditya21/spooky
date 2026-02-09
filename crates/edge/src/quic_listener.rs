@@ -319,13 +319,6 @@ impl QUICListener {
         }
     };
 
-    let lookup_key = header.dcid.as_ref().to_vec();
-
-    if let Some(mut connection) = self.connections.remove(&lookup_key) {
-        connection.peer_address = peer;
-        return Some((connection, lookup_key));
-    }
-
     if self.draining {
         return None;
     }
@@ -469,15 +462,24 @@ impl QUICListener {
 
         let h2_pool = self.h2_pool.clone();
 
-        let (mut connection, scid) = match self.take_or_create_connection(peer, local_addr, &recv_data) {
-            Some(conn) => {
-                debug!("Got connection for {}", peer);
-                conn
-            },
-            None => {
-                error!("Failed to create connection for {}", peer);
-                return;
-            }
+        // First, try to find existing connection by DCID
+        let lookup_key = header.dcid.as_ref().to_vec();
+        let (mut connection, scid) = if let Some(mut conn) = self.connections.remove(&lookup_key) {
+            conn.peer_address = peer;
+            debug!("Found existing connection for {}", peer);
+            (conn, lookup_key)
+        } else {
+            // No existing connection found, try to create new one
+                match self.take_or_create_connection(peer, local_addr, &recv_data) {
+                    Some(conn) => {
+                        debug!("Created new connection for {}", peer);
+                        conn
+                    },
+                    None => {
+                        debug!("Dropping packet for unknown connection from {}", peer);
+                        return;
+                    }
+                }
         };
 
         let recv_info = quiche::RecvInfo { from: peer, to: local_addr };
