@@ -14,7 +14,7 @@ use quiche::Config;
 use quiche::h3::NameValue;
 use rand::RngCore;
 use spooky_bridge::h3_to_h2::{build_h2_request, BridgeError};
-use spooky_lb::{BackendPool, HealthTransition, LoadBalancing};
+use spooky_lb::{UpstreamPool, HealthTransition, LoadBalancing};
 use spooky_transport::h2_pool::{H2Pool, PoolError};
 use tokio::runtime::Handle;
 
@@ -62,6 +62,17 @@ fn request_hash_key(req: &RequestEnvelope) -> String {
     }
 
     req.method.clone()
+}
+
+fn find_upstream_for_request<'a>(routes: &'a [spooky_config::config::Route], path: &str) -> Option<&'a str> {
+    // Find the most specific route that matches the path
+    // Routes are checked in order, so more specific routes should come first
+    for route in routes {
+        if path.starts_with(&route.path) {
+            return Some(&route.upstream);
+        }
+    }
+    None
 }
 
 const BACKEND_TIMEOUT: Duration = Duration::from_secs(2);
@@ -123,25 +134,35 @@ impl QUICListener {
         let h3_config =
             Arc::new(quiche::h3::Config::new().expect("Failed to create HTTP/3 config"));
         let backend_addresses = config
-            .backends
-            .iter()
-            .map(|backend| backend.address.clone())
+            .upstreams
+            .values()
+            .flat_map(|upstream| upstream.servers.iter().map(|server| match server {
+                spooky_config::config::Server::Simple(addr) => addr.clone(),
+                spooky_config::config::Server::Full { address, .. } => address.clone(),
+            }))
             .collect::<Vec<_>>();
         let h2_pool = Arc::new(H2Pool::new(backend_addresses, MAX_INFLIGHT_PER_BACKEND));
-        let backend_pool = Arc::new(Mutex::new(BackendPool::new(config.backends.clone())));
+
+        let mut upstream_pools = HashMap::new();
+        for (name, upstream) in &config.upstreams {
+            let upstream_pool = UpstreamPool::from_upstream(upstream)
+                .expect("Failed to create upstream pool");
+            upstream_pools.insert(name.clone(), Arc::new(Mutex::new(upstream_pool)));
+        }
+
         let load_balancer = LoadBalancing::from_config(&config.load_balancing.lb_type)
             .expect("Invalid load balancing configuration");
         let metrics = Metrics::default();
 
-        Self::spawn_health_checks(backend_pool.clone(), h2_pool.clone());
+        Self::spawn_health_checks(upstream_pools.clone(), h2_pool.clone());
 
-        Ok(Self { 
-            socket, 
-            config, 
+        Ok(Self {
+            socket,
+            config,
             quic_config,
             h3_config,
             h2_pool,
-            backend_pool,
+            upstream_pools,
             load_balancer,
             metrics,
             draining: false,
@@ -325,7 +346,8 @@ impl QUICListener {
             if let Err(e) = Self::handle_h3(
                 &mut connection,
                 &h2_pool,
-                &self.backend_pool,
+                &self.upstream_pools,
+                &self.config.routes,
                 &mut self.load_balancer,
                 &self.metrics,
             ) {
@@ -406,7 +428,8 @@ impl QUICListener {
     fn handle_h3(
         connection: &mut QuicConnection,
         h2_pool: &H2Pool,
-        backend_pool: &Arc<Mutex<BackendPool>>,
+        upstream_pools: &HashMap<String, Arc<Mutex<UpstreamPool>>>,
+        routes: &[spooky_config::config::Route],
         load_balancer: &mut LoadBalancing,
         metrics: &Metrics,
     ) -> Result<(), quiche::h3::Error> {
@@ -481,7 +504,8 @@ impl QUICListener {
                             stream_id,
                             req,
                             h2_pool,
-                            backend_pool,
+                            upstream_pools,
+                            routes,
                             load_balancer,
                             metrics,
                         )?;
@@ -506,7 +530,8 @@ impl QUICListener {
         stream_id: u64,
         req: RequestEnvelope,
         h2_pool: &H2Pool,
-        backend_pool: &Arc<Mutex<BackendPool>>,
+        upstream_pools: &HashMap<String, Arc<Mutex<UpstreamPool>>>,
+        routes: &[spooky_config::config::Route],
         load_balancer: &mut LoadBalancing,
         metrics: &Metrics,
     ) -> Result<(), quiche::h3::Error> {
@@ -521,23 +546,36 @@ impl QUICListener {
             );
         }
 
-        let backend_len = backend_pool
+        // Find the upstream for this request
+        let upstream_name = find_upstream_for_request(routes, &req.path)
+            .ok_or_else(|| {
+                error!("No route found for path: {}", req.path);
+                quiche::h3::Error::InternalError
+            })?;
+
+        let upstream_pool = upstream_pools.get(upstream_name)
+            .ok_or_else(|| {
+                error!("Upstream pool not found for: {}", upstream_name);
+                quiche::h3::Error::InternalError
+            })?;
+
+        let upstream_len = upstream_pool
             .lock()
-            .map(|pool| pool.len())
+            .map(|pool| pool.pool.len())
             .unwrap_or(0);
-        if backend_len == 0 {
+        if upstream_len == 0 {
             return Self::send_simple_response(
                 h3,
                 quic,
                 stream_id,
                 http::StatusCode::SERVICE_UNAVAILABLE,
-                b"no backend configured\n",
+                b"no servers configured for upstream\n",
             );
         }
 
         let key = request_hash_key(&req);
         let backend_index = {
-            let pool = backend_pool.lock().expect("backend pool lock");
+            let pool = upstream_pool.lock().expect("upstream pool lock");
             load_balancer.pick(&key, &pool)
         };
         let backend_index = match backend_index {
@@ -548,14 +586,14 @@ impl QUICListener {
                     quic,
                     stream_id,
                     http::StatusCode::SERVICE_UNAVAILABLE,
-                    b"no healthy backends\n",
+                    b"no healthy servers\n",
                 );
             }
         };
 
         let backend_addr = {
-            let pool = backend_pool.lock().expect("backend pool lock");
-            pool.address(backend_index).map(|addr| addr.to_string())
+            let pool = upstream_pool.lock().expect("upstream pool lock");
+            pool.pool.address(backend_index).map(|addr| addr.to_string())
         };
         let backend_addr = match backend_addr {
             Some(addr) => addr,
@@ -565,7 +603,7 @@ impl QUICListener {
                     quic,
                     stream_id,
                     http::StatusCode::SERVICE_UNAVAILABLE,
-                    b"invalid backend\n",
+                    b"invalid server\n",
                 );
             }
         };
@@ -578,14 +616,14 @@ impl QUICListener {
 
         match Self::forward_request(&backend_addr, h2_pool, req) {
             Ok((status, headers, body)) => {
-                let transition = backend_pool
+                let transition = upstream_pool
                     .lock()
                     .ok()
                     .and_then(|mut pool| {
                         if status.is_server_error() {
-                            pool.mark_failure(backend_index)
+                            pool.pool.mark_failure(backend_index)
                         } else {
-                            pool.mark_success(backend_index)
+                            pool.pool.mark_success(backend_index)
                         }
                     });
                 if let Some(transition) = transition {
@@ -601,10 +639,10 @@ impl QUICListener {
             }
             Err(ProxyError::Bridge(err)) => {
                 error!("Bridge error: {:?}", err);
-                let transition = backend_pool
+                let transition = upstream_pool
                     .lock()
                     .ok()
-                    .and_then(|mut pool| pool.mark_failure(backend_index));
+                    .and_then(|mut pool| pool.pool.mark_failure(backend_index));
                 if let Some(transition) = transition {
                     Self::log_health_transition(&backend_addr, transition);
                 }
@@ -621,10 +659,10 @@ impl QUICListener {
             }
             Err(ProxyError::Transport(err)) => {
                 error!("Transport error: {}", err);
-                let transition = backend_pool
+                let transition = upstream_pool
                     .lock()
                     .ok()
-                    .and_then(|mut pool| pool.mark_failure(backend_index));
+                    .and_then(|mut pool| pool.pool.mark_failure(backend_index));
                 if let Some(transition) = transition {
                     Self::log_health_transition(&backend_addr, transition);
                 }
@@ -641,11 +679,11 @@ impl QUICListener {
                 )
             }
             Err(ProxyError::Timeout) => {
-                error!("Backend timeout");
-                let transition = backend_pool
+                error!("Server timeout");
+                let transition = upstream_pool
                     .lock()
                     .ok()
-                    .and_then(|mut pool| pool.mark_failure(backend_index));
+                    .and_then(|mut pool| pool.pool.mark_failure(backend_index));
                 if let Some(transition) = transition {
                     Self::log_health_transition(&backend_addr, transition);
                 }
@@ -815,20 +853,24 @@ impl QUICListener {
         }
     }
 
-    fn spawn_health_checks(backend_pool: Arc<Mutex<BackendPool>>, h2_pool: Arc<H2Pool>) {
+    fn spawn_health_checks(upstream_pools: HashMap<String, Arc<Mutex<UpstreamPool>>>, h2_pool: Arc<H2Pool>) {
         let entries = {
-            let pool = match backend_pool.lock() {
-                Ok(pool) => pool,
-                Err(_) => return,
-            };
-            pool.all_indices()
-                .into_iter()
-                .filter_map(|index| {
-                    let address = pool.address(index)?.to_string();
-                    let health = pool.health_check(index)?;
-                    Some((index, address, health))
-                })
-                .collect::<Vec<_>>()
+            let mut all_entries = Vec::new();
+            for (upstream_name, upstream_pool) in upstream_pools.iter() {
+                let pool = match upstream_pool.lock() {
+                    Ok(pool) => pool,
+                    Err(_) => continue,
+                };
+                for index in pool.pool.all_indices() {
+                    if let (Some(address), Some(health)) = (
+                        pool.pool.address(index),
+                        pool.pool.health_check(index)
+                    ) {
+                        all_entries.push((upstream_name.clone(), upstream_pool.clone(), index, address.to_string(), health));
+                    }
+                }
+            }
+            all_entries
         };
 
         let handle = match Handle::try_current() {
@@ -839,8 +881,7 @@ impl QUICListener {
             }
         };
 
-        for (index, address, health) in entries {
-            let backend_pool = backend_pool.clone();
+        for (_upstream_name, upstream_pool, index, address, health) in entries {
             let h2_pool = h2_pool.clone();
             let handle = handle.clone();
             handle.spawn(async move {
@@ -872,12 +913,12 @@ impl QUICListener {
                         _ => false,
                     };
 
-                    let transition = match backend_pool.lock() {
+                    let transition = match upstream_pool.lock() {
                         Ok(mut pool) => {
                             if healthy {
-                                pool.mark_success(index)
+                                pool.pool.mark_success(index)
                             } else {
-                                pool.mark_failure(index)
+                                pool.pool.mark_failure(index)
                             }
                         }
                         Err(_) => None,

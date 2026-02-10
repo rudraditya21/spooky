@@ -11,7 +11,7 @@ use core::net::SocketAddr;
 
 use spooky_config::config::Config;
 use spooky_transport::h2_pool::H2Pool;
-use spooky_lb::{BackendPool, LoadBalancing};
+use spooky_lb::{UpstreamPool, LoadBalancing};
 
 pub mod quic_listener;
 
@@ -21,7 +21,7 @@ pub struct QUICListener {
     pub quic_config: quiche::Config,
     pub h3_config: Arc<quiche::h3::Config>,
     pub h2_pool: Arc<H2Pool>,
-    pub backend_pool: Arc<Mutex<BackendPool>>,
+    pub upstream_pools: HashMap<String, Arc<Mutex<UpstreamPool>>>,
     pub load_balancer: LoadBalancing,
     pub metrics: Metrics,
     pub draining: bool,
@@ -30,7 +30,7 @@ pub struct QUICListener {
     pub recv_buf: [u8; 65535], // array initialization, let arr [<data type>, <no of elements>] = [<value of all>, <no of elements>]
     pub send_buf: [u8; 65535],
 
-    pub connections: HashMap<Vec<u8>, QuicConnection>, // KEY: DCID (destination connection id)
+    pub connections: HashMap<Vec<u8>, QuicConnection>, // KEY: SCID(server connection id)
 }
 
 pub struct QuicConnection {
