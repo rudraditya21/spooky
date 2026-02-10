@@ -20,6 +20,12 @@ pub const VALID_LB_TYPES: &[&str] = &[
 pub fn validate(config: &Config) -> bool {
     info!("Starting configuration validation...");
 
+    // --- Validate version ---
+    if config.version != 1 {
+        error!("Invalid version: expected '1', found '{}'", config.version);
+        return false;
+    }
+
     // --- Validate protocol ---
     if config.listen.protocol != "http3" {
         error!(
@@ -87,69 +93,90 @@ pub fn validate(config: &Config) -> bool {
         return false;
     }
 
-    // --- Validate backends ---
-    if config.backends.is_empty() {
-        error!("No backends configured");
+    // --- Validate routes ---
+    for route in &config.routes {
+        if route.path.is_empty() {
+            error!("Route path is empty");
+            return false;
+        }
+
+        if !config.upstreams.contains_key(&route.upstream) {
+            error!("Route '{}' references unknown upstream '{}'", route.path, route.upstream);
+            return false;
+        }
+    }
+
+    // --- Validate upstreams ---
+    if config.upstreams.is_empty() {
+        error!("No upstreams configured");
         return false;
     }
 
-    for backend in &config.backends {
-        if backend.id.is_empty() {
-            error!("Backend id is missing");
+    for (upstream_name, upstream) in &config.upstreams {
+        if upstream_name.is_empty() {
+            error!("Upstream name is empty");
             return false;
         }
 
-        if backend.address.is_empty() {
-            error!("Backend address is missing for backend id '{}'", backend.id);
+        if upstream.servers.is_empty() {
+            error!("Upstream '{}' has no servers configured", upstream_name);
             return false;
         }
 
-        if backend.weight == 0 {
-            error!(
-                "Backend weight is invalid (0) for backend id '{}'",
-                backend.id
-            );
+        // Validate strategy
+        if upstream.strategy.is_empty() {
+            error!("Upstream '{}' has empty strategy", upstream_name);
             return false;
         }
 
-        if backend.health_check.interval == 0 {
-            error!(
-                "Health check interval is invalid (0) for backend id '{}'",
-                backend.id
-            );
-            return false;
+        // Validate servers
+        for server in &upstream.servers {
+            match server {
+                crate::config::Server::Simple(address) => {
+                    if address.is_empty() {
+                        error!("Server address is empty in upstream '{}'", upstream_name);
+                        return false;
+                    }
+                }
+                crate::config::Server::Full { address, weight, max_conns: _ } => {
+                    if address.is_empty() {
+                        error!("Server address is empty in upstream '{}'", upstream_name);
+                        return false;
+                    }
+                    if *weight == 0 {
+                        error!("Server weight is invalid (0) for address '{}' in upstream '{}'", address, upstream_name);
+                        return false;
+                    }
+                }
+            }
         }
 
-        if backend.health_check.timeout_ms == 0 {
-            error!(
-                "Health check timeout is invalid (0) for backend id '{}'",
-                backend.id
-            );
-            return false;
-        }
+        // Validate health check if present
+        if let Some(health_check) = &upstream.health_check {
+            if health_check.interval == 0 {
+                error!("Health check interval is invalid (0) for upstream '{}'", upstream_name);
+                return false;
+            }
 
-        if backend.health_check.failure_threshold == 0 {
-            error!(
-                "Health check failure threshold is invalid (0) for backend id '{}'",
-                backend.id
-            );
-            return false;
-        }
+            if health_check.timeout_ms == 0 {
+                error!("Health check timeout is invalid (0) for upstream '{}'", upstream_name);
+                return false;
+            }
 
-        if backend.health_check.success_threshold == 0 {
-            error!(
-                "Health check success threshold is invalid (0) for backend id '{}'",
-                backend.id
-            );
-            return false;
-        }
+            if health_check.failure_threshold == 0 {
+                error!("Health check failure threshold is invalid (0) for upstream '{}'", upstream_name);
+                return false;
+            }
 
-        if backend.health_check.cooldown_ms == 0 {
-            error!(
-                "Health check cooldown is invalid (0) for backend id '{}'",
-                backend.id
-            );
-            return false;
+            if health_check.success_threshold == 0 {
+                error!("Health check success threshold is invalid (0) for upstream '{}'", upstream_name);
+                return false;
+            }
+
+            if health_check.cooldown_ms == 0 {
+                error!("Health check cooldown is invalid (0) for upstream '{}'", upstream_name);
+                return false;
+            }
         }
     }
 

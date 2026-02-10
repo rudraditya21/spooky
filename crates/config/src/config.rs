@@ -1,4 +1,6 @@
-use serde::Deserialize;
+use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
 
 use crate::default::{
     get_default_address, get_default_cooldown_ms, get_default_failure_threshold,
@@ -7,10 +9,16 @@ use crate::default::{
     get_default_protocol, get_default_success_threshold, get_default_weight,
 };
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct Config {
+    pub version: u32,
+
     pub listen: Listen,
-    pub backends: Vec<Backend>,
+
+    // key = upstream name
+    pub upstreams: HashMap<String, Upstream>,
+
+    pub routes: Vec<Route>,
 
     #[serde(default = "get_default_load_balancing")]
     pub load_balancing: LoadBalancing,
@@ -19,7 +27,7 @@ pub struct Config {
     pub log: Log,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct Listen {
     #[serde(default = "get_default_protocol")]
     pub protocol: String, // "http3"
@@ -32,23 +40,44 @@ pub struct Listen {
     pub tls: Tls,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct Tls {
     pub cert: String, // "/path/to/cert"
     pub key: String,  // "/path/to/key"
 }
 
-#[derive(Debug, Deserialize, Clone)]
-pub struct Backend {
-    pub id: String,      // "backend1"
-    pub address: String, // "10.0.1.100:8080"
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct Upstream {
+    #[serde(default)]
+    pub strategy: String, // random | round-robin | consistent-hash
 
-    #[serde(default = "get_default_weight")]
-    pub weight: u32, // 100
-    pub health_check: HealthCheck,
+    pub servers: Vec<Server>,
+
+    pub health_check: Option<HealthCheck>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct Route {
+    pub path: String,        // "/api"
+    pub upstream: String,    // "api_pool"
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(untagged)]
+pub enum Server {
+    Simple(String),
+    Full {
+        address: String,
+
+        #[serde(default = "get_default_weight")]
+        weight: u32,
+
+        #[serde(default)]
+        max_conns: Option<u32>,
+    },
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct HealthCheck {
     #[serde(default = "get_default_path")]
     pub path: String, // "/health"
@@ -69,13 +98,13 @@ pub struct HealthCheck {
     pub cooldown_ms: u64,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct LoadBalancing {
     #[serde(rename = "type")]
     pub lb_type: String, // "weight-based", "least_connection", etc.
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct Log {
     // whisper -> trace
     // haunt -> debug
@@ -86,10 +115,4 @@ pub struct Log {
 
     #[serde(default = "get_default_log_level")]
     pub level: String, // "info, warn, error"
-}
-
-impl Backend {
-    pub fn is_healthy(&self) -> bool {
-        true
-    }
 }
