@@ -247,7 +247,7 @@ fn round_robin_across_backends() {
     ];
 
     let config = make_config(0, backends, "round-robin", cert, key);
-    let mut listener = QUICListener::new(config);
+    let mut listener = QUICListener::new(config).unwrap();
     let listen_addr = listener.socket.local_addr().unwrap();
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -314,7 +314,7 @@ fn consistent_hash_is_stable_per_authority() {
     ];
 
     let config = make_config(0, backends, "consistent-hash", cert, key);
-    let mut listener = QUICListener::new(config);
+    let mut listener = QUICListener::new(config).unwrap();
     let listen_addr = listener.socket.local_addr().unwrap();
 
     let stop = Arc::new(AtomicBool::new(false));

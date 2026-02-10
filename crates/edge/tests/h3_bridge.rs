@@ -224,7 +224,7 @@ fn http3_to_http2_roundtrip() {
     let rt = tokio::runtime::Runtime::new().expect("runtime");
     let backend_addr = rt.block_on(start_h2_backend());
     let config = make_config(0, backend_addr.to_string(), cert, key);
-    let mut listener = QUICListener::new(config);
+    let mut listener = QUICListener::new(config).unwrap();
     let listen_addr = listener.socket.local_addr().unwrap();
 
     let stop = Arc::new(AtomicBool::new(false));
