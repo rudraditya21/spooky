@@ -21,16 +21,18 @@ HTTP/3 is real, but most backends still speak HTTP/2. Spooky lets you deploy HTT
 
 ## Current Status
 
-**Work in progress.** Core architecture is complete (QUIC termination, stream conversion, modular routing). Request forwarding and load balancing are being wired up.
+**Functional HTTP/3 load balancer.** Core functionality is complete and tested. QUIC termination, HTTP/3 to HTTP/2 bridging, request forwarding, and load balancing are all working.
 
 ## Features (Implemented)
 
 - CLI with YAML configuration
 - TLS 1.3 with custom certificates
-- QUIC listener (quiche-based) (quiche uses BoringSSL and builds it via cmake)
+- QUIC listener with retry mechanism (quiche-based)
+- HTTP/3 to HTTP/2 protocol bridging
+- Request forwarding to backend servers
+- Random load balancing with backend health checks
 - Modular architecture (edge/bridge/transport)
-- Random load balancing (placeholder)
-- Health check scaffolding
+- End-to-end HTTP/3 client to HTTP/2 backend proxying
 
 ## Dependencies
 
@@ -47,8 +49,12 @@ sudo apt install -y cmake build-essential pkg-config
 # Build
 cargo build
 
-# Run spooky with config (QUIC listener starts but forwarding is stubbed)
+# Run spooky with config (starts HTTP/3 load balancer)
 cargo run -p spooky -- --config ./config/config.yaml
+
+# Test with HTTP/3 client (requires backend servers running)
+curl --http3-only -k --resolve proxy.spooky.local:9889:127.0.0.1 \
+     https://proxy.spooky.local:9889
 ```
 
 ## Configuration

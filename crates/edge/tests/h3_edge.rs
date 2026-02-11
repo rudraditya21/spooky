@@ -194,7 +194,7 @@ fn http3_request_is_accepted_and_parsed() {
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
     let config = make_config(0, cert, key);
-    let mut listener = QUICListener::new(config);
+    let mut listener = QUICListener::new(config).unwrap();
     let addr = listener.socket.local_addr().unwrap();
 
     let stop = Arc::new(AtomicBool::new(false));
