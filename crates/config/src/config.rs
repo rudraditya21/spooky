@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+
 
 use serde::{Deserialize, Serialize};
 
@@ -9,19 +9,13 @@ use crate::default::{
     get_default_protocol, get_default_success_threshold, get_default_weight,
 };
 
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub version: u32,
 
     pub listen: Listen,
-
-    // key = upstream name
-    pub upstreams: HashMap<String, Upstream>,
-
-    pub routes: Vec<Route>,
-
-    #[serde(default = "get_default_load_balancing")]
-    pub load_balancing: LoadBalancing,
+    pub upstreams: Vec<Upstream>, // we can use HashMap<Route, pool>
+    pub routing: Routing,
 
     #[serde(default = "get_default_log")]
     pub log: Log,
@@ -46,38 +40,52 @@ pub struct Tls {
     pub key: String,  // "/path/to/key"
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Upstream {
+    pub name: String,
+
+    #[serde(default = "get_default_load_balancing")]
+    pub load_balancing: LoadBalancing,
+
+    pub backends: Vec<Backend>
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct Backend {
+    pub id: String,      // "backend1"
+    pub address: String, // "10.0.1.100:8080"
+
+    #[serde(default = "get_default_weight")]
+    pub weight: u32, // 100
+    pub health_check: HealthCheck,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct Routing {
+    pub rules: Vec<RouteRule>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct RouteRule {
+    #[serde(rename = "match")]
+    pub matcher: RouteMatch,
+
+    pub upstream: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct RouteMatch {
     #[serde(default)]
-    pub strategy: String, // random | round-robin | consistent-hash
+    pub host: Option<String>,
 
-    pub servers: Vec<Server>,
+    #[serde(default)]
+    pub path_prefix: Option<String>,
 
-    pub health_check: Option<HealthCheck>,
+    #[serde(default)]
+    pub method: Option<String>, // future-safe
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
-pub struct Route {
-    pub path: String,        // "/api"
-    pub upstream: String,    // "api_pool"
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-#[serde(untagged)]
-pub enum Server {
-    Simple(String),
-    Full {
-        address: String,
-
-        #[serde(default = "get_default_weight")]
-        weight: u32,
-
-        #[serde(default)]
-        max_conns: Option<u32>,
-    },
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct HealthCheck {
     #[serde(default = "get_default_path")]
     pub path: String, // "/health"

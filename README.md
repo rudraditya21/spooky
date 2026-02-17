@@ -15,6 +15,13 @@ Spooky bridges HTTP/3 clients to HTTP/2 backends. It terminates QUIC connections
 
 ## Why Spooky?
 
+“Your SaaS API runs behind HTTP/2.
+You want HTTP/3 for mobile performance.
+Rewriting backend fleet is risky.
+Deploy Spooky at edge.
+Done.”
+
+
 HTTP/3 is real, but most backends still speak HTTP/2. Spooky lets you deploy HTTP/3 at the edge without rewriting your entire infrastructure. Built in Rust for performance, safety, and async-first design.
 
 ---
