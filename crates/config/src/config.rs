@@ -1,21 +1,28 @@
 
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::default::{
     get_default_address, get_default_cooldown_ms, get_default_failure_threshold,
     get_default_health_timeout, get_default_interval, get_default_load_balancing,
     get_default_log, get_default_log_level, get_default_path, get_default_port,
-    get_default_protocol, get_default_success_threshold, get_default_weight,
+    get_default_protocol, get_default_success_threshold, get_default_weight, get_default_version
 };
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
+    #[serde(default = "get_default_version")]  // Make version optional with default
     pub version: u32,
 
     pub listen: Listen,
-    pub upstreams: Vec<Upstream>, // we can use HashMap<Route, pool>
+
+    pub upstream: HashMap<String, Upstream>,
     pub routing: Routing,
+
+    #[serde(default)]
+    pub load_balancing: Option<LoadBalancing>,
 
     #[serde(default = "get_default_log")]
     pub log: Log,
@@ -42,8 +49,6 @@ pub struct Tls {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Upstream {
-    pub name: String,
-
     #[serde(default = "get_default_load_balancing")]
     pub load_balancing: LoadBalancing,
 
@@ -73,7 +78,7 @@ pub struct RouteRule {
     pub upstream: String,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct RouteMatch {
     #[serde(default)]
     pub host: Option<String>,
@@ -109,7 +114,11 @@ pub struct HealthCheck {
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct LoadBalancing {
     #[serde(rename = "type")]
-    pub lb_type: String, // "weight-based", "least_connection", etc.
+    pub lb_type: String, // "random","round_robin","consistent_hash"
+
+    // Add support for consistent hash configuration
+    #[serde(default)]
+    pub key: Option<String>, // For consistent hashing (header, cookie, etc.)
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]

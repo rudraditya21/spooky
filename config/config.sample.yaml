@@ -1,25 +1,61 @@
-listen:
-    protocol: http3
-    port: 9889
-    address: "0.0.0.0"
-    tls:
-        cert: "/path/to/cert" # --> use .pem
-        key: "/path/to/key" # --> use .pem
+version: 1
 
-backends:
-    -   id: "backend1"
-        address: "10.0.1.100:8080"
-        weight: 100  # server can have /metric route for weight-based balancing
+listen:
+    protocol: http3         
+    address: "0.0.0.0"
+    port: 9889
+    tls:
+        cert: certs/proxy-fullchain.pem
+        key: certs/proxy-key-pkcs8.pem
+
+upstream:
+  - name: api_pool
+    load_balancing:
+        type: "consistent-hash"
+
+    backends:
+      - id: "backend1"
+        address: "127.0.0.1:7001"
+        weight: 100
         health_check:
-            path: "/health"
-            interval: 5000
-            timeout_ms: 1000
-            failure_threshold: 3
-            success_threshold: 2
-            cooldown_ms: 5000
+          path: "/health"
+          interval: 5000
+
+      - id: "backend2"
+        address: "127.0.0.1:7002"
+        weight: 50
+        health_check:
+          path: "/status"
+          interval: 10000
+
+  - name: auth_pool
+    load_balancing:
+      type: round-robin
+
+    backends:
+      - id: "auth1"
+        address: "127.0.0.1:8001"
+        weight: 100
+        health_check:
+          path: "/health"
+          interval: 5000    
+
+routing:
+  rules:
+    - match:
+        path_prefix: "/api"
+        upstream: api_pool
+
+    - match:
+        path_prefix: "/auth"
+        upstream: auth_pool
+
+    - match:
+        host: "admin.example.com"
+        upstream: auth_pool
 
 load_balancing:
-    type: random  # random, round-robin, consistent-hash
+    type: "consistent-hash"   # options: random, consistent-hash, round-robin
 
 log:
-  level: info
+    level: info

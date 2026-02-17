@@ -16,7 +16,6 @@ pub const VALID_LB_TYPES: &[&str] = &[
     "ch",
 ];
 
-
 pub fn validate(config: &Config) -> bool {
     info!("Starting configuration validation...");
 
@@ -35,25 +34,27 @@ pub fn validate(config: &Config) -> bool {
         return false;
     }
 
-    // --- Validate Log level ---
+    // --- Validate log level ---
     if !VALID_LOG_LEVELS.iter().any(|lvl| lvl.eq_ignore_ascii_case(&config.log.level)) {
         error!(
-            "Invalid Log Leve: {}",
+            "Invalid log level: {}",
             config.log.level
         );
         return false;
     }
 
-    // --- Validate load balancing type ---
-    if !VALID_LB_TYPES
-        .iter()
-        .any(|lb| lb.eq_ignore_ascii_case(&config.load_balancing.lb_type))
-    {
-        error!(
-            "Invalid load balancing type: {}",
-            config.load_balancing.lb_type
-        );
-        return false;
+    // --- Validate global load balancing type (if present) ---
+    if let Some(ref lb) = config.load_balancing {
+        if !VALID_LB_TYPES
+            .iter()
+            .any(|lb_type| lb_type.eq_ignore_ascii_case(&lb.lb_type))
+        {
+            error!(
+                "Invalid global load balancing type: {}",
+                lb.lb_type
+            );
+            return false;
+        }
     }
 
     // --- Validate listen address ---
@@ -76,111 +77,146 @@ pub fn validate(config: &Config) -> bool {
         error!("TLS certificate file does not exist: {}", config.listen.tls.cert);
         return false;
     }
-    
+
     if !std::path::Path::new(&config.listen.tls.key).exists() {
         error!("TLS private key file does not exist: {}", config.listen.tls.key);
         return false;
     }
-    
+
     // Optional: Try to read the files to ensure they're accessible
     if let Err(e) = std::fs::read(&config.listen.tls.cert) {
         error!("Cannot read TLS certificate file '{}': {}", config.listen.tls.cert, e);
         return false;
     }
-    
+
     if let Err(e) = std::fs::read(&config.listen.tls.key) {
         error!("Cannot read TLS private key file '{}': {}", config.listen.tls.key, e);
         return false;
     }
 
-    // --- Validate routes ---
-    for route in &config.routes {
-        if route.path.is_empty() {
-            error!("Route path is empty");
+    // --- Validate routing rules ---
+    for route in &config.routing.rules {
+        // Check if upstream reference exists
+        if !config.upstream.contains_key(&route.upstream) {
+            error!("Route rule references unknown upstream '{}'", route.upstream);
             return false;
         }
 
-        if !config.upstreams.contains_key(&route.upstream) {
-            error!("Route '{}' references unknown upstream '{}'", route.path, route.upstream);
+        // Validate route matcher has at least one condition
+        let has_host = route.matcher.host.is_some();
+        let has_path = route.matcher.path_prefix.is_some();
+
+        if !has_host && !has_path {
+            error!("Route rule must have either 'host' or 'path_prefix' matcher");
             return false;
+        }
+
+        // Validate path_prefix is not empty if present
+        if let Some(ref path) = route.matcher.path_prefix {
+            if path.is_empty() {
+                error!("Route path_prefix cannot be empty");
+                return false;
+            }
+            if !path.starts_with('/') {
+                error!("Route path_prefix must start with '/': {}", path);
+                return false;
+            }
         }
     }
 
     // --- Validate upstreams ---
-    if config.upstreams.is_empty() {
+    if config.upstream.is_empty() {
         error!("No upstreams configured");
         return false;
     }
 
-    for (upstream_name, upstream) in &config.upstreams {
+    for (upstream_name, upstream) in &config.upstream {
         if upstream_name.is_empty() {
             error!("Upstream name is empty");
             return false;
         }
 
-        if upstream.servers.is_empty() {
-            error!("Upstream '{}' has no servers configured", upstream_name);
+        // Validate load balancing type for this upstream
+        if !VALID_LB_TYPES
+            .iter()
+            .any(|lb_type| lb_type.eq_ignore_ascii_case(&upstream.load_balancing.lb_type))
+        {
+            error!(
+                "Invalid load balancing type '{}' for upstream '{}'",
+                upstream.load_balancing.lb_type, upstream_name
+            );
             return false;
         }
 
-        // Validate strategy
-        if upstream.strategy.is_empty() {
-            error!("Upstream '{}' has empty strategy", upstream_name);
+        // Validate backends
+        if upstream.backends.is_empty() {
+            error!("Upstream '{}' has no backends configured", upstream_name);
             return false;
         }
 
-        // Validate servers
-        for server in &upstream.servers {
-            match server {
-                crate::config::Server::Simple(address) => {
-                    if address.is_empty() {
-                        error!("Server address is empty in upstream '{}'", upstream_name);
-                        return false;
-                    }
-                }
-                crate::config::Server::Full { address, weight, max_conns: _ } => {
-                    if address.is_empty() {
-                        error!("Server address is empty in upstream '{}'", upstream_name);
-                        return false;
-                    }
-                    if *weight == 0 {
-                        error!("Server weight is invalid (0) for address '{}' in upstream '{}'", address, upstream_name);
-                        return false;
-                    }
-                }
-            }
-        }
-
-        // Validate health check if present
-        if let Some(health_check) = &upstream.health_check {
-            if health_check.interval == 0 {
-                error!("Health check interval is invalid (0) for upstream '{}'", upstream_name);
+        for backend in &upstream.backends {
+            // Validate backend ID
+            if backend.id.is_empty() {
+                error!("Backend ID is empty in upstream '{}'", upstream_name);
                 return false;
             }
 
-            if health_check.timeout_ms == 0 {
-                error!("Health check timeout is invalid (0) for upstream '{}'", upstream_name);
+            // Validate backend address
+            if backend.address.is_empty() {
+                error!("Backend address is empty for backend '{}' in upstream '{}'",
+                       backend.id, upstream_name);
                 return false;
             }
 
-            if health_check.failure_threshold == 0 {
-                error!("Health check failure threshold is invalid (0) for upstream '{}'", upstream_name);
+            // Basic address format validation (host:port)
+            if !backend.address.contains(':') {
+                error!("Backend address '{}' in upstream '{}' must be in host:port format",
+                       backend.address, upstream_name);
                 return false;
             }
 
-            if health_check.success_threshold == 0 {
-                error!("Health check success threshold is invalid (0) for upstream '{}'", upstream_name);
+            // Validate weight
+            if backend.weight == 0 {
+                error!("Backend '{}' in upstream '{}' has invalid weight (0)",
+                       backend.id, upstream_name);
                 return false;
             }
 
-            if health_check.cooldown_ms == 0 {
-                error!("Health check cooldown is invalid (0) for upstream '{}'", upstream_name);
+            // Validate health check
+            let hc = &backend.health_check;
+
+            if hc.interval == 0 {
+                error!("Health check interval is invalid (0) for backend '{}' in upstream '{}'",
+                       backend.id, upstream_name);
+                return false;
+            }
+
+            if hc.timeout_ms == 0 {
+                error!("Health check timeout is invalid (0) for backend '{}' in upstream '{}'",
+                       backend.id, upstream_name);
+                return false;
+            }
+
+            if hc.failure_threshold == 0 {
+                error!("Health check failure threshold is invalid (0) for backend '{}' in upstream '{}'",
+                       backend.id, upstream_name);
+                return false;
+            }
+
+            if hc.success_threshold == 0 {
+                error!("Health check success threshold is invalid (0) for backend '{}' in upstream '{}'",
+                       backend.id, upstream_name);
+                return false;
+            }
+
+            if hc.cooldown_ms == 0 {
+                error!("Health check cooldown is invalid (0) for backend '{}' in upstream '{}'",
+                       backend.id, upstream_name);
                 return false;
             }
         }
     }
 
     info!("Configuration validation passed successfully\n");
-
     true
 }
