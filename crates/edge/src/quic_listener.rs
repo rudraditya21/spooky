@@ -9,12 +9,10 @@ use core::net::SocketAddr;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
-use hmac::{Hmac, Mac};
 use log::{debug, error, info};
 use quiche::Config;
 use quiche::h3::NameValue;
 use rand::RngCore;
-use sha2::Sha256;
 use spooky_bridge::h3_to_h2::{build_h2_request, BridgeError};
 use spooky_lb::{UpstreamPool, HealthTransition, LoadBalancing};
 use spooky_transport::h2_pool::{H2Pool, PoolError};
@@ -68,7 +66,9 @@ fn request_hash_key(req: &RequestEnvelope) -> String {
 
 fn find_upstream_for_request<'a>(upstreams: &'a std::collections::HashMap<String, spooky_config::config::Upstream>, path: &str, host: Option<&str>) -> Option<&'a str> {
     // Find the most specific route that matches the path and/or host
-    // Routes are checked in order, so more specific routes should come first
+    // We need to find the longest matching path prefix
+    let mut best_match: Option<(&str, usize)> = None;
+
     for (upstream_name, upstream) in upstreams {
         let has_host_match = match (&upstream.route.host, host) {
             (Some(route_host), Some(request_host)) => route_host == request_host,
@@ -76,25 +76,27 @@ fn find_upstream_for_request<'a>(upstreams: &'a std::collections::HashMap<String
             (Some(_), None) => false, // Host constraint but no host in request
         };
 
-        let has_path_match = match &upstream.route.path_prefix {
-            Some(path_prefix) => path.starts_with(path_prefix),
-            None => true, // No path constraint
+        let path_match_len = match &upstream.route.path_prefix {
+            Some(path_prefix) if path.starts_with(path_prefix) => path_prefix.len(),
+            None => 0, // No path constraint, matches but with lowest priority
+            _ => continue, // No match
         };
 
-        if has_host_match && has_path_match {
-            return Some(upstream_name);
+        if has_host_match {
+            // Keep the match with the longest path prefix
+            if best_match.is_none() || path_match_len > best_match.unwrap().1 {
+                best_match = Some((upstream_name.as_str(), path_match_len));
+            }
         }
     }
-    None
+
+    best_match.map(|(name, _)| name)
 }
 
 const BACKEND_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_INFLIGHT_PER_BACKEND: usize = 64;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
-// Retry token HMAC key (should be randomly generated in production)
-const RETRY_TOKEN_KEY: &[u8] = b"spooky-retry-key-2026";
-const RETRY_TOKEN_MAGIC: &[u8] = b"spooky";
 
 fn lb_name(lb: &LoadBalancing) -> &'static str {
     match lb {
@@ -282,7 +284,6 @@ impl QUICListener {
         if self.draining {
             return None;
         }
-    };
 
         // Only create new connections for Initial packets
         if header.ty != quiche::Type::Initial {
@@ -296,13 +297,10 @@ impl QUICListener {
             // return None;
         }
 
-    if header.ty != quiche::Type::Initial {
-        return None;
-    }
+        let mut scid_bytes = [0u8; 16]; // scid must be >= 8 bytes, 16 is perfect
+        rand::thread_rng().fill_bytes(&mut scid_bytes);
 
-        // let scid = header.dcid.clone();
         let scid = quiche::ConnectionId::from_ref(&scid_bytes);
-        // let odcid = header.dcid.clone();
 
         let quic_connection =
             quiche::accept(&scid, None, local_addr, peer, &mut self.quic_config).ok()?;
@@ -320,33 +318,6 @@ impl QUICListener {
         // After handshake, client will use server's SCID as DCID in subsequent packets
         debug!("Creating new connection with server SCID: {:02x?}", &scid_bytes);
         Some((connection, scid_bytes.to_vec()))
-    }
-
-    // Accept the connection
-    // For retry responses, use the DCID from the header (which is the new_scid from our retry)
-    // as the SCID for the accepted connection
-    let mut scid_bytes = [0u8; 16];
-    let scid = if odcid.is_some() {
-        debug!("Accepting connection with validated retry token");
-        header.dcid.clone()  // Use the DCID from the retry response as our SCID
-    } else {
-        rand::thread_rng().fill_bytes(&mut scid_bytes);
-        quiche::ConnectionId::from_ref(&scid_bytes)
-    };
-
-    let quic_connection =
-        quiche::accept(&scid, odcid.as_ref(), local_addr, peer, &mut self.quic_config).ok()?;
-
-    let connection = QuicConnection {
-        quic: quic_connection,
-        h3: None,
-        h3_config: self.h3_config.clone(),
-        streams: HashMap::new(),
-        peer_address: peer,
-        last_activity: Instant::now(),
-    };
-
-    Some((connection, scid.as_ref().to_vec()))
 }
 
     pub fn poll(&mut self) {
@@ -514,8 +485,8 @@ impl QUICListener {
         Self::handle_timeout(&socket, &mut send_buf, &mut connection);
 
         if !connection.quic.is_closed() {
-            debug!("Storing connection with key: {:02x?}", &dcid);
-            self.connections.insert(dcid, connection);
+            debug!("Storing connection with key: {:02x?}", &scid);
+            self.connections.insert(scid, connection);
         } else {
             debug!("Connection closed, not storing");
         }
