@@ -94,31 +94,25 @@ pub fn validate(config: &Config) -> bool {
         return false;
     }
 
-    // --- Validate routing rules ---
-    for route in &config.routing.rules {
-        // Check if upstream reference exists
-        if !config.upstream.contains_key(&route.upstream) {
-            error!("Route rule references unknown upstream '{}'", route.upstream);
-            return false;
-        }
-
+    // --- Validate upstream routes ---
+    for (upstream_name, upstream) in &config.upstream {
         // Validate route matcher has at least one condition
-        let has_host = route.matcher.host.is_some();
-        let has_path = route.matcher.path_prefix.is_some();
+        let has_host = upstream.route.host.is_some();
+        let has_path = upstream.route.path_prefix.is_some();
 
         if !has_host && !has_path {
-            error!("Route rule must have either 'host' or 'path_prefix' matcher");
+            error!("Upstream '{}' must have either 'host' or 'path_prefix' route matcher", upstream_name);
             return false;
         }
 
         // Validate path_prefix is not empty if present
-        if let Some(ref path) = route.matcher.path_prefix {
+        if let Some(ref path) = upstream.route.path_prefix {
             if path.is_empty() {
-                error!("Route path_prefix cannot be empty");
+                error!("Route path_prefix cannot be empty for upstream '{}'", upstream_name);
                 return false;
             }
             if !path.starts_with('/') {
-                error!("Route path_prefix must start with '/': {}", path);
+                error!("Route path_prefix must start with '/' for upstream '{}': {}", upstream_name, path);
                 return false;
             }
         }

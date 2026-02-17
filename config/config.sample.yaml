@@ -9,7 +9,7 @@ listen:
         key: certs/proxy-key-pkcs8.pem
 
 upstream:
-  - name: api_pool
+  api_pool:
     load_balancing:
         type: "consistent-hash"
 
@@ -28,7 +28,7 @@ upstream:
           path: "/status"
           interval: 10000
 
-  - name: auth_pool
+  auth_pool:
     load_balancing:
       type: round-robin
 
@@ -44,15 +44,15 @@ routing:
   rules:
     - match:
         path_prefix: "/api"
-        upstream: api_pool
+      upstream: api_pool
 
     - match:
         path_prefix: "/auth"
-        upstream: auth_pool
+      upstream: auth_pool
 
     - match:
         host: "admin.example.com"
-        upstream: auth_pool
+      upstream: auth_pool
 
 load_balancing:
     type: "consistent-hash"   # options: random, consistent-hash, round-robin

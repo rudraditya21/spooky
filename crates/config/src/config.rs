@@ -19,10 +19,9 @@ pub struct Config {
     pub listen: Listen,
 
     pub upstream: HashMap<String, Upstream>,
-    pub routing: Routing,
 
     #[serde(default)]
-    pub load_balancing: Option<LoadBalancing>,
+    pub load_balancing: Option<LoadBalancing>, // Global fallback load balancing
 
     #[serde(default = "get_default_log")]
     pub log: Log,
@@ -52,6 +51,8 @@ pub struct Upstream {
     #[serde(default = "get_default_load_balancing")]
     pub load_balancing: LoadBalancing,
 
+    pub route: RouteMatch,  // Route matching criteria for this upstream
+
     pub backends: Vec<Backend>
 }
 
@@ -65,18 +66,6 @@ pub struct Backend {
     pub health_check: HealthCheck,
 }
 
-#[derive(Debug, Deserialize, Clone)]
-pub struct Routing {
-    pub rules: Vec<RouteRule>,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct RouteRule {
-    #[serde(rename = "match")]
-    pub matcher: RouteMatch,
-
-    pub upstream: String,
-}
 
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct RouteMatch {
