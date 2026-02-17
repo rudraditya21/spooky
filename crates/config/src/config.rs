@@ -70,13 +70,13 @@ pub struct Backend {
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct RouteMatch {
     #[serde(default)]
-    pub host: Option<String>,
+    pub host: Option<String>, // host-based routing (e.g., "api.example.com")
 
     #[serde(default)]
-    pub path_prefix: Option<String>,
+    pub path_prefix: Option<String>, // path prefix matching (e.g., "/api")
 
     #[serde(default)]
-    pub method: Option<String>, // future-safe
+    pub method: Option<String>, // 🔮 FUTURE: HTTP method filtering (GET, POST, etc.)
 }
 
 #[derive(Debug, Deserialize, Clone)]

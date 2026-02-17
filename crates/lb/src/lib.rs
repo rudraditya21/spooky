@@ -4,7 +4,7 @@ use std::{
 };
 
 use rand::Rng;
-use spooky_config::config::{Server as Backend, HealthCheck};
+use spooky_config::config::{Backend, HealthCheck};
 
 const DEFAULT_REPLICAS: u32 = 64;
 
@@ -29,16 +29,11 @@ pub enum HealthTransition {
 }
 
 impl BackendState {
-    pub fn new(backend: Backend, health_check: HealthCheck) -> Self {
-        let (address, weight) = match backend {
-            Backend::Simple(addr) => (addr, 100), // default weight
-            Backend::Full { address, weight, .. } => (address, weight),
-        };
-
+    pub fn new(backend: &Backend) -> Self {
         Self {
-            address,
-            weight: weight.max(1),
-            health_check,
+            address: backend.address.clone(),
+            weight: backend.weight.max(1),
+            health_check: backend.health_check.clone(),
             consecutive_failures: 0,
             health_state: HealthState::Healthy,
         }
@@ -110,23 +105,14 @@ pub struct UpstreamPool {
 
 impl UpstreamPool {
     pub fn from_upstream(upstream: &spooky_config::config::Upstream) -> Result<Self, String> {
-        let health_check = upstream.health_check.clone().unwrap_or_else(|| HealthCheck {
-            path: "/health".to_string(),
-            interval: 5000,
-            timeout_ms: 1000,
-            failure_threshold: 3,
-            success_threshold: 2,
-            cooldown_ms: 5000,
-        });
-
-        let backends = upstream.servers
+        let backends = upstream.backends
             .iter()
-            .map(|server| BackendState::new(server.clone(), health_check.clone()))
+            .map(|backend| BackendState::new(backend))
             .collect();
 
         Ok(Self {
             pool: BackendPool::new_from_states(backends),
-            strategy: upstream.strategy.clone(),
+            strategy: upstream.load_balancing.lb_type.clone(),
         })
     }
 }
@@ -316,23 +302,25 @@ fn hash64(data: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use spooky_config::config::RouteMatch;
+
     use super::*;
 
     fn create_backend_state(address: &str, weight: u32) -> BackendState {
-        let server = Backend::Full {
+        let backend = Backend {
+            id: format!("backend-{}", address),
             address: address.to_string(),
             weight,
-            max_conns: None,
+            health_check: HealthCheck {
+                path: "/health".to_string(),
+                interval: 1000,
+                timeout_ms: 1000,
+                failure_threshold: 3,
+                success_threshold: 1,
+                cooldown_ms: 0,
+            },
         };
-        let health_check = HealthCheck {
-            path: "/health".to_string(),
-            interval: 1000,
-            timeout_ms: 1000,
-            failure_threshold: 3,
-            success_threshold: 1,
-            cooldown_ms: 0,
-        };
-        BackendState::new(server, health_check)
+        BackendState::new(&backend)
     }
 
     #[test]
@@ -412,23 +400,42 @@ mod tests {
     #[test]
     fn upstream_pool_from_config() {
         let upstream = spooky_config::config::Upstream {
-            strategy: "round-robin".to_string(),
-            servers: vec![
-                spooky_config::config::Server::Simple("127.0.0.1:8001".to_string()),
-                spooky_config::config::Server::Full {
+            load_balancing: spooky_config::config::LoadBalancing {
+                lb_type: "round-robin".to_string(),
+                key: None,
+            },
+            route: RouteMatch {
+                path_prefix: Some("/".to_string()),
+                ..Default::default()
+            },
+            backends: vec![
+                Backend {
+                    id: "backend1".to_string(),
+                    address: "127.0.0.1:8001".to_string(),
+                    weight: 100,
+                    health_check: HealthCheck {
+                        path: "/health".to_string(),
+                        interval: 5000,
+                        timeout_ms: 2000,
+                        failure_threshold: 3,
+                        success_threshold: 2,
+                        cooldown_ms: 10000,
+                    },
+                },
+                Backend {
+                    id: "backend2".to_string(),
                     address: "127.0.0.1:8002".to_string(),
                     weight: 200,
-                    max_conns: Some(100),
+                    health_check: HealthCheck {
+                        path: "/health".to_string(),
+                        interval: 5000,
+                        timeout_ms: 2000,
+                        failure_threshold: 3,
+                        success_threshold: 2,
+                        cooldown_ms: 10000,
+                    },
                 },
             ],
-            health_check: Some(HealthCheck {
-                path: "/health".to_string(),
-                interval: 5000,
-                timeout_ms: 2000,
-                failure_threshold: 3,
-                success_threshold: 2,
-                cooldown_ms: 10000,
-            }),
         };
 
         let upstream_pool = UpstreamPool::from_upstream(&upstream).unwrap();

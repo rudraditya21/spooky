@@ -1,17 +1,20 @@
 version: 1
 
 listen:
-    protocol: http3         
+    protocol: http3
     address: "0.0.0.0"
     port: 9889
     tls:
-        cert: certs/proxy-fullchain.pem
-        key: certs/proxy-key-pkcs8.pem
+        cert: certs/proxy-fullchain.pem # path to cert
+        key: certs/proxy-key-pkcs8.pem # path to key
 
 upstream:
   api_pool:
     load_balancing:
         type: "consistent-hash"
+
+    route:
+      path_prefix: "/api"
 
     backends:
       - id: "backend1"
@@ -32,30 +35,19 @@ upstream:
     load_balancing:
       type: round-robin
 
+    route:
+      path_prefix: "/auth"
+
     backends:
       - id: "auth1"
         address: "127.0.0.1:8001"
         weight: 100
         health_check:
           path: "/health"
-          interval: 5000    
-
-routing:
-  rules:
-    - match:
-        path_prefix: "/api"
-      upstream: api_pool
-
-    - match:
-        path_prefix: "/auth"
-      upstream: auth_pool
-
-    - match:
-        host: "admin.example.com"
-      upstream: auth_pool
+          interval: 5000
 
 load_balancing:
-    type: "consistent-hash"   # options: random, consistent-hash, round-robin
+    type: "random"   # global fallback: random, consistent-hash, round-robin
 
 log:
     level: info
