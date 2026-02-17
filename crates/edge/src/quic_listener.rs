@@ -245,18 +245,45 @@ impl QUICListener {
         };
 
         let dcid_bytes = header.dcid.as_ref().to_vec();
+        debug!("Packet DCID (len={}): {:02x?}, type: {:?}, active connections: {}",
+            dcid_bytes.len(), &dcid_bytes, header.ty, self.connections.len());
 
+        // Try exact match first
         if let Some(mut connection) = self.connections.remove(&dcid_bytes) {
+            debug!("Found existing connection for DCID: {:02x?}", &dcid_bytes);
             connection.peer_address = peer;
             return Some((connection, dcid_bytes));
+        }
+
+        // For Short packets, try prefix match (client may append bytes to our SCID)
+        // This handles cases where client uses longer DCIDs based on server's SCID
+        if header.ty == quiche::Type::Short && dcid_bytes.len() > 8 {
+            for stored_cid in self.connections.keys() {
+                if dcid_bytes.starts_with(stored_cid) {
+                    debug!("Found connection via prefix match. Stored CID: {:02x?}, Packet DCID: {:02x?}",
+                        stored_cid, &dcid_bytes);
+                    let stored_cid_copy = stored_cid.clone();
+                    if let Some(mut connection) = self.connections.remove(&stored_cid_copy) {
+                        connection.peer_address = peer;
+                        return Some((connection, stored_cid_copy));
+                    }
+                    break;
+                }
+            }
         }
 
         if self.draining {
             return None;
         }
 
+        // Only create new connections for Initial packets
+        if header.ty != quiche::Type::Initial {
+            debug!("Non-Initial packet for unknown connection, ignoring");
+            return None;
+        }
+
         // If this is a 0-RTT packet without a valid token, we need to reject it
-        if header.ty == quiche::Type::Initial && header.token.is_some() {
+        if header.token.is_some() {
             debug!("Received 0-RTT attempt, will negotiate fresh connection");
             // return None;
         }
@@ -267,7 +294,7 @@ impl QUICListener {
         // let scid = header.dcid.clone();
         let scid = quiche::ConnectionId::from_ref(&scid_bytes);
         // let odcid = header.dcid.clone();
-        
+
         let quic_connection =
             quiche::accept(&scid, None, local_addr, peer, &mut self.quic_config).ok()?;
 
@@ -280,7 +307,10 @@ impl QUICListener {
             last_activity: Instant::now(),
         };
 
-        Some((connection, dcid_bytes))
+        // Store connection using server's SCID (not client's DCID)
+        // After handshake, client will use server's SCID as DCID in subsequent packets
+        debug!("Creating new connection with server SCID: {:02x?}", &scid_bytes);
+        Some((connection, scid_bytes.to_vec()))
     }
 
     pub fn poll(&mut self) {
@@ -371,7 +401,10 @@ impl QUICListener {
         Self::handle_timeout(&socket, &mut send_buf, &mut connection);
 
         if !connection.quic.is_closed() {
+            debug!("Storing connection with key: {:02x?}", &dcid);
             self.connections.insert(dcid, connection);
+        } else {
+            debug!("Connection closed, not storing");
         }
     }
 
