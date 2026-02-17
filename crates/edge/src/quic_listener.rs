@@ -9,10 +9,12 @@ use core::net::SocketAddr;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
+use hmac::{Hmac, Mac};
 use log::{debug, error, info};
 use quiche::Config;
 use quiche::h3::NameValue;
 use rand::RngCore;
+use sha2::Sha256;
 use spooky_bridge::h3_to_h2::{build_h2_request, BridgeError};
 use spooky_lb::{UpstreamPool, HealthTransition, LoadBalancing};
 use spooky_transport::h2_pool::{H2Pool, PoolError};
@@ -90,6 +92,10 @@ const BACKEND_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_INFLIGHT_PER_BACKEND: usize = 64;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+// Retry token HMAC key (should be randomly generated in production)
+const RETRY_TOKEN_KEY: &[u8] = b"spooky-retry-key-2026";
+const RETRY_TOKEN_MAGIC: &[u8] = b"spooky";
+
 fn lb_name(lb: &LoadBalancing) -> &'static str {
     match lb {
         LoadBalancing::RoundRobin(_) => "round-robin",
@@ -136,9 +142,10 @@ impl QUICListener {
         quic_config.set_initial_max_streams_bidi(100);
         quic_config.set_initial_max_streams_uni(100);
         quic_config.set_disable_active_migration(true);
-        quic_config.verify_peer(false); // for local development
-        // quic_config.enable_early_data(); // diable 0-RTT (h3 does not need this to work)
-        // curl will attempt 0-RTT, your server can’t validate it, TLS aborts.
+        quic_config.verify_peer(false);
+            
+        // CRITICAL FIX: Explicitly disable 0-RTT/early data
+        // This prevents clients from attempting 0-RTT that we can't handle
 
         debug!("Listening on {}", socket_address);
 
@@ -275,6 +282,7 @@ impl QUICListener {
         if self.draining {
             return None;
         }
+    };
 
         // Only create new connections for Initial packets
         if header.ty != quiche::Type::Initial {
@@ -288,8 +296,9 @@ impl QUICListener {
             // return None;
         }
 
-        let mut scid_bytes = [0u8; 16]; // scid must be >= 8 bytes, 16 is perfect
-        rand::thread_rng().fill_bytes(&mut scid_bytes);
+    if header.ty != quiche::Type::Initial {
+        return None;
+    }
 
         // let scid = header.dcid.clone();
         let scid = quiche::ConnectionId::from_ref(&scid_bytes);
@@ -312,6 +321,33 @@ impl QUICListener {
         debug!("Creating new connection with server SCID: {:02x?}", &scid_bytes);
         Some((connection, scid_bytes.to_vec()))
     }
+
+    // Accept the connection
+    // For retry responses, use the DCID from the header (which is the new_scid from our retry)
+    // as the SCID for the accepted connection
+    let mut scid_bytes = [0u8; 16];
+    let scid = if odcid.is_some() {
+        debug!("Accepting connection with validated retry token");
+        header.dcid.clone()  // Use the DCID from the retry response as our SCID
+    } else {
+        rand::thread_rng().fill_bytes(&mut scid_bytes);
+        quiche::ConnectionId::from_ref(&scid_bytes)
+    };
+
+    let quic_connection =
+        quiche::accept(&scid, odcid.as_ref(), local_addr, peer, &mut self.quic_config).ok()?;
+
+    let connection = QuicConnection {
+        quic: quic_connection,
+        h3: None,
+        h3_config: self.h3_config.clone(),
+        streams: HashMap::new(),
+        peer_address: peer,
+        last_activity: Instant::now(),
+    };
+
+    Some((connection, scid.as_ref().to_vec()))
+}
 
     pub fn poll(&mut self) {
         // Read a UDP datagram and feed it into quiche.
@@ -342,24 +378,101 @@ impl QUICListener {
             }
         };
 
-        let recv_data = self.recv_buf[..len].to_vec();
+        let mut recv_data = self.recv_buf[..len].to_vec();
+
+        let header = match quiche::Header::from_slice(&mut recv_data.clone(), quiche::MAX_CONN_ID_LEN) {
+            Ok(hdr) => hdr,
+            Err(_) => {
+                error!("Wrong QUIC HEADER");
+                return;
+            }
+        };
+
+        if header.ty == quiche::Type::VersionNegotiation {
+            let len = match quiche::negotiate_version(
+                &header.scid,
+                &header.dcid,
+                &mut self.send_buf,
+            ) {
+                Ok(len) => len,
+                Err(e) => {
+                    error!("Version negotiation failed: {:?}", e);
+                    return;
+                }
+            };
+
+            if let Err(e) = socket.send_to(&self.send_buf[..len], peer) {
+                error!("Failed to send version negotiation: {:?}", e);
+            }
+            return;
+        }
 
         let h2_pool = self.h2_pool.clone();
 
-        let (mut connection, dcid) = match self.take_or_create_connection(peer, local_addr, &recv_data) {
-            Some(conn) => {
-                debug!("Got connection for {}", peer);
-                conn
-            },
-            None => {
-                error!("Failed to create connection for {}", peer);
-                return;
+        // First, try to find existing connection by DCID
+        let lookup_key = header.dcid.as_ref().to_vec();
+        debug!("Looking up connection with DCID: {:?}", hex::encode(&lookup_key));
+        let (mut connection, scid) = if let Some(mut conn) = self.connections.remove(&lookup_key) {
+            conn.peer_address = peer;
+            debug!("Found existing connection for {}", peer);
+            (conn, lookup_key)
+        } else {
+            // Check if there's an existing connection from the same peer
+            // This handles cases where the client uses different DCIDs for the same connection
+            let mut found_peer_connection = None;
+            for (key, conn) in &self.connections {
+                if conn.peer_address == peer {
+                    found_peer_connection = Some(key.clone());
+                    break;
+                }
+            }
+
+            if let Some(peer_key) = found_peer_connection {
+                debug!("Found existing connection from same peer {}, trying with key: {:?}",
+                       peer, hex::encode(&peer_key));
+                if let Some(mut conn) = self.connections.remove(&peer_key) {
+                    conn.peer_address = peer;
+                    debug!("Using existing peer connection for {}", peer);
+                    (conn, peer_key)
+                } else {
+                    // This shouldn't happen, but fallback to creating new connection
+                    match self.take_or_create_connection(peer, local_addr, &recv_data) {
+                        Some(conn) => {
+                            debug!("Created new connection for {}", peer);
+                            conn
+                        },
+                        None => {
+                            debug!("Dropping packet for unknown connection from {} (DCID: {:?})",
+                                   peer, hex::encode(&lookup_key));
+                            return;
+                        }
+                    }
+                }
+            } else {
+                debug!("No existing connection found for DCID or peer, checking all connections...");
+                // Debug: check what connections we have
+                for (key, conn) in &self.connections {
+                    debug!("Existing connection DCID: {:?}, peer: {}", hex::encode(key), conn.peer_address);
+                }
+
+                // No existing connection found, try to create new one
+                match self.take_or_create_connection(peer, local_addr, &recv_data) {
+                    Some(conn) => {
+                        debug!("Created new connection for {}", peer);
+                        conn
+                    },
+                    None => {
+                        debug!("Dropping packet for unknown connection from {} (DCID: {:?})",
+                               peer, hex::encode(&lookup_key));
+                        return;
+                    }
+                }
             }
         };
 
         let recv_info = quiche::RecvInfo { from: peer, to: local_addr };
 
-        if let Err(e) = connection.quic.recv(&mut self.recv_buf[..len], recv_info) {
+        if let Err(e) = connection.quic.recv(&mut recv_data, recv_info) {
             error!("QUIC recv failed: {:?}", e);
             return;
         }
@@ -424,12 +537,12 @@ impl QUICListener {
         let mut send_buf = [0u8; 65_535];
         let mut to_remove = Vec::new();
 
-        for (dcid, connection) in self.connections.iter_mut() {
+        for (scid, connection) in self.connections.iter_mut() {
             let timeout = match connection.quic.timeout() {
                 Some(timeout) => timeout,
                 None => {
                     if connection.quic.is_closed() {
-                        to_remove.push(dcid.clone());
+                        to_remove.push(scid.clone());
                     }
                     continue;
                 }
@@ -442,12 +555,12 @@ impl QUICListener {
             }
 
             if connection.quic.is_closed() {
-                to_remove.push(dcid.clone());
+                to_remove.push(scid.clone());
             }
         }
 
-        for dcid in to_remove {
-            self.connections.remove(&dcid);
+        for scid in to_remove {
+            self.connections.remove(&scid);
         }
     }
 
