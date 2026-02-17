@@ -16,7 +16,7 @@ use rcgen::{Certificate, CertificateParams, SanType};
 use tempfile::{tempdir, TempDir};
 use tokio::net::TcpListener;
 
-use spooky_config::config::{Backend, Config, HealthCheck, Listen, LoadBalancing, Log, Tls};
+use spooky_config::config::{Backend, Config, HealthCheck, Listen, LoadBalancing, Log, RouteMatch, Tls, Upstream};
 use spooky_edge::QUICListener;
 
 fn write_test_certs(dir: &TempDir) -> (String, String) {
@@ -65,17 +65,37 @@ async fn start_h2_backend(body: &'static str) -> SocketAddr {
 }
 
 fn make_config(port: u32, backends: Vec<Backend>, lb_type: &str, cert: String, key: String) -> Config {
+    use std::collections::HashMap;
+
+    let mut upstream = HashMap::new();
+    upstream.insert(
+        "test_pool".to_string(),
+        Upstream {
+            load_balancing: LoadBalancing {
+                lb_type: lb_type.to_string(),
+                key: None,
+            },
+            route: RouteMatch {
+                path_prefix: Some("/".to_string()),
+                ..Default::default()
+            },
+            backends,
+        },
+    );
+
     Config {
+        version: 1,
         listen: Listen {
             protocol: "http3".to_string(),
             port,
             address: "127.0.0.1".to_string(),
             tls: Tls { cert, key },
         },
-        backends,
-        load_balancing: LoadBalancing {
+        upstream,
+        load_balancing: Some(LoadBalancing {
             lb_type: lb_type.to_string(),
-        },
+            key: None,
+        }),
         log: Log {
             level: "info".to_string(),
         },
@@ -247,7 +267,7 @@ fn round_robin_across_backends() {
     ];
 
     let config = make_config(0, backends, "round-robin", cert, key);
-    let mut listener = QUICListener::new(config);
+    let mut listener = QUICListener::new(config).expect("failed to create listener");
     let listen_addr = listener.socket.local_addr().unwrap();
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -314,7 +334,7 @@ fn consistent_hash_is_stable_per_authority() {
     ];
 
     let config = make_config(0, backends, "consistent-hash", cert, key);
-    let mut listener = QUICListener::new(config);
+    let mut listener = QUICListener::new(config).expect("failed to create listener");
     let listen_addr = listener.socket.local_addr().unwrap();
 
     let stop = Arc::new(AtomicBool::new(false));

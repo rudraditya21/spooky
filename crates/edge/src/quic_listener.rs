@@ -64,12 +64,23 @@ fn request_hash_key(req: &RequestEnvelope) -> String {
     req.method.clone()
 }
 
-fn find_upstream_for_request<'a>(routes: &'a [spooky_config::config::Route], path: &str) -> Option<&'a str> {
-    // Find the most specific route that matches the path
+fn find_upstream_for_request<'a>(upstreams: &'a std::collections::HashMap<String, spooky_config::config::Upstream>, path: &str, host: Option<&str>) -> Option<&'a str> {
+    // Find the most specific route that matches the path and/or host
     // Routes are checked in order, so more specific routes should come first
-    for route in routes {
-        if path.starts_with(&route.path) {
-            return Some(&route.upstream);
+    for (upstream_name, upstream) in upstreams {
+        let has_host_match = match (&upstream.route.host, host) {
+            (Some(route_host), Some(request_host)) => route_host == request_host,
+            (None, _) => true, // No host constraint
+            (Some(_), None) => false, // Host constraint but no host in request
+        };
+
+        let has_path_match = match &upstream.route.path_prefix {
+            Some(path_prefix) => path.starts_with(path_prefix),
+            None => true, // No path constraint
+        };
+
+        if has_host_match && has_path_match {
+            return Some(upstream_name);
         }
     }
     None
@@ -134,24 +145,23 @@ impl QUICListener {
         let h3_config =
             Arc::new(quiche::h3::Config::new().expect("Failed to create HTTP/3 config"));
         let backend_addresses = config
-            .upstreams
+            .upstream
             .values()
-            .flat_map(|upstream| upstream.servers.iter().map(|server| match server {
-                spooky_config::config::Server::Simple(addr) => addr.clone(),
-                spooky_config::config::Server::Full { address, .. } => address.clone(),
-            }))
+            .flat_map(|upstream| upstream.backends.iter().map(|backend| backend.address.clone()))
             .collect::<Vec<_>>();
         let h2_pool = Arc::new(H2Pool::new(backend_addresses, MAX_INFLIGHT_PER_BACKEND));
 
         let mut upstream_pools = HashMap::new();
-        for (name, upstream) in &config.upstreams {
+        for (name, upstream) in &config.upstream {
             let upstream_pool = UpstreamPool::from_upstream(upstream)
                 .expect("Failed to create upstream pool");
             upstream_pools.insert(name.clone(), Arc::new(Mutex::new(upstream_pool)));
         }
 
-        let load_balancer = LoadBalancing::from_config(&config.load_balancing.lb_type)
-            .expect("Invalid load balancing configuration");
+        let load_balancer = match &config.load_balancing {
+            Some(lb) => LoadBalancing::from_config(&lb.lb_type),
+            None => LoadBalancing::from_config("round-robin"), // default fallback
+        }.expect("Invalid load balancing configuration");
         let metrics = Metrics::default();
 
         Self::spawn_health_checks(upstream_pools.clone(), h2_pool.clone());
@@ -347,7 +357,7 @@ impl QUICListener {
                 &mut connection,
                 &h2_pool,
                 &self.upstream_pools,
-                &self.config.routes,
+                &self.config.upstream,
                 &mut self.load_balancer,
                 &self.metrics,
             ) {
@@ -429,7 +439,7 @@ impl QUICListener {
         connection: &mut QuicConnection,
         h2_pool: &H2Pool,
         upstream_pools: &HashMap<String, Arc<Mutex<UpstreamPool>>>,
-        routes: &[spooky_config::config::Route],
+        upstreams: &std::collections::HashMap<String, spooky_config::config::Upstream>,
         load_balancer: &mut LoadBalancing,
         metrics: &Metrics,
     ) -> Result<(), quiche::h3::Error> {
@@ -505,7 +515,7 @@ impl QUICListener {
                             req,
                             h2_pool,
                             upstream_pools,
-                            routes,
+                            upstreams,
                             load_balancer,
                             metrics,
                         )?;
@@ -531,7 +541,7 @@ impl QUICListener {
         req: RequestEnvelope,
         h2_pool: &H2Pool,
         upstream_pools: &HashMap<String, Arc<Mutex<UpstreamPool>>>,
-        routes: &[spooky_config::config::Route],
+        upstreams: &std::collections::HashMap<String, spooky_config::config::Upstream>,
         load_balancer: &mut LoadBalancing,
         metrics: &Metrics,
     ) -> Result<(), quiche::h3::Error> {
@@ -547,9 +557,9 @@ impl QUICListener {
         }
 
         // Find the upstream for this request
-        let upstream_name = find_upstream_for_request(routes, &req.path)
+        let upstream_name = find_upstream_for_request(upstreams, &req.path, req.authority.as_deref())
             .ok_or_else(|| {
-                error!("No route found for path: {}", req.path);
+                error!("No route found for path: {} (host: {:?})", req.path, req.authority);
                 quiche::h3::Error::InternalError
             })?;
 
