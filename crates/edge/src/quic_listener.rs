@@ -14,7 +14,7 @@ use quiche::Config;
 use quiche::h3::NameValue;
 use rand::RngCore;
 use spooky_bridge::h3_to_h2::{build_h2_request, BridgeError};
-use spooky_lb::{UpstreamPool, HealthTransition, LoadBalancing};
+use spooky_lb::{UpstreamPool, HealthTransition};
 use spooky_transport::h2_pool::{H2Pool, PoolError};
 use tokio::runtime::Handle;
 
@@ -98,14 +98,6 @@ const MAX_INFLIGHT_PER_BACKEND: usize = 64;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 
-fn lb_name(lb: &LoadBalancing) -> &'static str {
-    match lb {
-        LoadBalancing::RoundRobin(_) => "round-robin",
-        LoadBalancing::ConsistentHash(_) => "consistent-hash",
-        LoadBalancing::Random(_) => "random",
-    }
-}
-
 
 impl QUICListener {
     pub fn new(config: SpookyConfig) -> Result<Self, ProxyError> {
@@ -167,10 +159,6 @@ impl QUICListener {
             upstream_pools.insert(name.clone(), Arc::new(Mutex::new(upstream_pool)));
         }
 
-        let load_balancer = match &config.load_balancing {
-            Some(lb) => LoadBalancing::from_config(&lb.lb_type),
-            None => LoadBalancing::from_config("round-robin"), // default fallback
-        }.expect("Invalid load balancing configuration");
         let metrics = Metrics::default();
 
         Self::spawn_health_checks(upstream_pools.clone(), h2_pool.clone());
@@ -182,7 +170,6 @@ impl QUICListener {
             h3_config,
             h2_pool,
             upstream_pools,
-            load_balancer,
             metrics,
             draining: false,
             drain_start: None,
@@ -472,7 +459,6 @@ impl QUICListener {
                 &h2_pool,
                 &self.upstream_pools,
                 &self.config.upstream,
-                &mut self.load_balancer,
                 &self.metrics,
             ) {
                 error!("HTTP/3 handling failed: {:?}", e);
@@ -557,7 +543,6 @@ impl QUICListener {
         h2_pool: &H2Pool,
         upstream_pools: &HashMap<String, Arc<Mutex<UpstreamPool>>>,
         upstreams: &std::collections::HashMap<String, spooky_config::config::Upstream>,
-        load_balancer: &mut LoadBalancing,
         metrics: &Metrics,
     ) -> Result<(), quiche::h3::Error> {
         let mut body_buf = [0u8; 65_535];
@@ -633,7 +618,6 @@ impl QUICListener {
                             h2_pool,
                             upstream_pools,
                             upstreams,
-                            load_balancer,
                             metrics,
                         )?;
                     }
@@ -659,7 +643,6 @@ impl QUICListener {
         h2_pool: &H2Pool,
         upstream_pools: &HashMap<String, Arc<Mutex<UpstreamPool>>>,
         upstreams: &std::collections::HashMap<String, spooky_config::config::Upstream>,
-        load_balancer: &mut LoadBalancing,
         metrics: &Metrics,
     ) -> Result<(), quiche::h3::Error> {
         let start = req.start;
@@ -701,9 +684,11 @@ impl QUICListener {
         }
 
         let key = request_hash_key(&req);
-        let backend_index = {
-            let pool = upstream_pool.lock().expect("upstream pool lock");
-            load_balancer.pick(&key, &pool)
+        let (backend_index, lb_type) = {
+            let mut pool = upstream_pool.lock().expect("upstream pool lock");
+            let lb_type = pool.lb_name();
+            let backend_index = pool.pick(&key);
+            (backend_index, lb_type)
         };
         let backend_index = match backend_index {
             Some(index) => index,
@@ -738,7 +723,7 @@ impl QUICListener {
         info!(
             "Selected backend {} via {}",
             backend_addr,
-            lb_name(load_balancer)
+            lb_type
         );
 
         match Self::forward_request(&backend_addr, h2_pool, req) {

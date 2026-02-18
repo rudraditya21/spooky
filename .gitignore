@@ -99,3 +99,6 @@ certs/
 
 # Internal docs
 docs/internal/
+
+# MkDocs build output
+site/
