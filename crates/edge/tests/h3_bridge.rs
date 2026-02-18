@@ -39,29 +39,50 @@ fn write_test_certs(dir: &TempDir) -> (String, String) {
 }
 
 fn make_config(port: u32, backend_addr: String, cert: String, key: String) -> Config {
+    use std::collections::HashMap;
+    use spooky_config::config::{RouteMatch, Upstream};
+
+    let mut upstream = HashMap::new();
+    upstream.insert(
+        "test_pool".to_string(),
+        Upstream {
+            load_balancing: LoadBalancing {
+                lb_type: "random".to_string(),
+                key: None,
+            },
+            route: RouteMatch {
+                path_prefix: Some("/".to_string()),
+                ..Default::default()
+            },
+            backends: vec![Backend {
+                id: "backend1".to_string(),
+                address: backend_addr,
+                weight: 1,
+                health_check: HealthCheck {
+                    path: "/health".to_string(),
+                    interval: 1000,
+                    timeout_ms: 1000,
+                    failure_threshold: 3,
+                    success_threshold: 1,
+                    cooldown_ms: 0,
+                },
+            }],
+        },
+    );
+
     Config {
+        version: 1,
         listen: Listen {
             protocol: "http3".to_string(),
             port,
             address: "127.0.0.1".to_string(),
             tls: Tls { cert, key },
         },
-        backends: vec![Backend {
-            id: "backend1".to_string(),
-            address: backend_addr,
-            weight: 1,
-            health_check: HealthCheck {
-                path: "/health".to_string(),
-                interval: 1000,
-                timeout_ms: 1000,
-                failure_threshold: 3,
-                success_threshold: 1,
-                cooldown_ms: 0,
-            },
-        }],
-        load_balancing: LoadBalancing {
+        upstream,
+        load_balancing: Some(LoadBalancing {
             lb_type: "random".to_string(),
-        },
+            key: None,
+        }),
         log: Log {
             level: "info".to_string(),
         },
@@ -224,7 +245,7 @@ fn http3_to_http2_roundtrip() {
     let rt = tokio::runtime::Runtime::new().expect("runtime");
     let backend_addr = rt.block_on(start_h2_backend());
     let config = make_config(0, backend_addr.to_string(), cert, key);
-    let mut listener = QUICListener::new(config).unwrap();
+    let mut listener = QUICListener::new(config).expect("failed to create listener");
     let listen_addr = listener.socket.local_addr().unwrap();
 
     let stop = Arc::new(AtomicBool::new(false));

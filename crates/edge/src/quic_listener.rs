@@ -9,14 +9,12 @@ use core::net::SocketAddr;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
-use hmac::{Hmac, Mac};
 use log::{debug, error, info};
 use quiche::Config;
 use quiche::h3::NameValue;
 use rand::RngCore;
-use sha2::Sha256;
 use spooky_bridge::h3_to_h2::{build_h2_request, BridgeError};
-use spooky_lb::{BackendPool, HealthTransition, LoadBalancing};
+use spooky_lb::{UpstreamPool, HealthTransition, LoadBalancing};
 use spooky_transport::h2_pool::{H2Pool, PoolError};
 use tokio::runtime::Handle;
 
@@ -66,112 +64,39 @@ fn request_hash_key(req: &RequestEnvelope) -> String {
     req.method.clone()
 }
 
-/// Encode a retry token containing client IP, original DCID, and timestamp
-fn encode_retry_token(client_ip: &[u8], odcid: &quiche::ConnectionId, timestamp: u64) -> Vec<u8> {
-    let mut token = Vec::new();
+fn find_upstream_for_request<'a>(upstreams: &'a std::collections::HashMap<String, spooky_config::config::Upstream>, path: &str, host: Option<&str>) -> Option<&'a str> {
+    // Find the most specific route that matches the path and/or host
+    // We need to find the longest matching path prefix
+    let mut best_match: Option<(&str, usize)> = None;
 
-    // Magic bytes
-    token.extend_from_slice(RETRY_TOKEN_MAGIC);
+    for (upstream_name, upstream) in upstreams {
+        let has_host_match = match (&upstream.route.host, host) {
+            (Some(route_host), Some(request_host)) => route_host == request_host,
+            (None, _) => true, // No host constraint
+            (Some(_), None) => false, // Host constraint but no host in request
+        };
 
-    // Client IP length and data
-    token.push(client_ip.len() as u8);
-    token.extend_from_slice(client_ip);
+        let path_match_len = match &upstream.route.path_prefix {
+            Some(path_prefix) if path.starts_with(path_prefix) => path_prefix.len(),
+            None => 0, // No path constraint, matches but with lowest priority
+            _ => continue, // No match
+        };
 
-    // Original DCID length and data
-    let odcid_bytes = odcid.as_ref();
-    token.push(odcid_bytes.len() as u8);
-    token.extend_from_slice(odcid_bytes);
-
-    // Timestamp (8 bytes)
-    token.extend_from_slice(&timestamp.to_be_bytes());
-
-    // HMAC-SHA256
-    let mut mac = Hmac::<Sha256>::new_from_slice(RETRY_TOKEN_KEY).unwrap();
-    mac.update(&token);
-    token.extend_from_slice(&mac.finalize().into_bytes());
-
-    token
-}
-
-/// Validate a retry token and extract the original DCID bytes
-fn validate_retry_token(token: &[u8], client_ip: &[u8], max_age: Duration) -> Option<Vec<u8>> {
-    if token.len() < RETRY_TOKEN_MAGIC.len() + 1 + 1 + 8 + 32 {
-        return None; // Minimum size check
+        if has_host_match {
+            // Keep the match with the longest path prefix
+            if best_match.is_none() || path_match_len > best_match.unwrap().1 {
+                best_match = Some((upstream_name.as_str(), path_match_len));
+            }
+        }
     }
 
-    // Check magic
-    if &token[..RETRY_TOKEN_MAGIC.len()] != RETRY_TOKEN_MAGIC {
-        return None;
-    }
-
-    let mut pos = RETRY_TOKEN_MAGIC.len();
-
-    // Client IP
-    let ip_len = token[pos] as usize;
-    pos += 1;
-    if pos + ip_len > token.len() {
-        return None;
-    }
-    let stored_ip = &token[pos..pos + ip_len];
-    pos += ip_len;
-
-    // Verify client IP matches
-    if stored_ip != client_ip {
-        return None;
-    }
-
-    // Original DCID
-    let dcid_len = token[pos] as usize;
-    pos += 1;
-    if pos + dcid_len > token.len() {
-        return None;
-    }
-    let odcid_bytes = &token[pos..pos + dcid_len];
-    pos += dcid_len;
-
-    // Timestamp
-    if pos + 8 > token.len() {
-        return None;
-    }
-    let timestamp_bytes = &token[pos..pos + 8];
-    let timestamp = u64::from_be_bytes(timestamp_bytes.try_into().unwrap());
-    pos += 8;
-
-    // Check timestamp is not too old
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    if now.saturating_sub(timestamp) > max_age.as_secs() {
-        return None;
-    }
-
-    // HMAC
-    if pos + 32 != token.len() {
-        return None;
-    }
-    let provided_hmac = &token[pos..pos + 32];
-    let data_to_verify = &token[..pos];
-
-    let mut mac = Hmac::<Sha256>::new_from_slice(RETRY_TOKEN_KEY).unwrap();
-    mac.update(data_to_verify);
-    let computed_hmac = mac.finalize().into_bytes();
-
-    if provided_hmac != computed_hmac.as_slice() {
-        return None;
-    }
-
-    // Success - return the original DCID bytes
-    Some(odcid_bytes.to_vec())
+    best_match.map(|(name, _)| name)
 }
 
 const BACKEND_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_INFLIGHT_PER_BACKEND: usize = 64;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
-// Retry token HMAC key (should be randomly generated in production)
-const RETRY_TOKEN_KEY: &[u8] = b"spooky-retry-key-2026";
-const RETRY_TOKEN_MAGIC: &[u8] = b"spooky";
 
 fn lb_name(lb: &LoadBalancing) -> &'static str {
     match lb {
@@ -229,25 +154,34 @@ impl QUICListener {
         let h3_config =
             Arc::new(quiche::h3::Config::new().expect("Failed to create HTTP/3 config"));
         let backend_addresses = config
-            .backends
-            .iter()
-            .map(|backend| backend.address.clone())
+            .upstream
+            .values()
+            .flat_map(|upstream| upstream.backends.iter().map(|backend| backend.address.clone()))
             .collect::<Vec<_>>();
         let h2_pool = Arc::new(H2Pool::new(backend_addresses, MAX_INFLIGHT_PER_BACKEND));
-        let backend_pool = Arc::new(Mutex::new(BackendPool::new(config.backends.clone())));
-        let load_balancer = LoadBalancing::from_config(&config.load_balancing.lb_type)
-            .expect("Invalid load balancing configuration");
+
+        let mut upstream_pools = HashMap::new();
+        for (name, upstream) in &config.upstream {
+            let upstream_pool = UpstreamPool::from_upstream(upstream)
+                .expect("Failed to create upstream pool");
+            upstream_pools.insert(name.clone(), Arc::new(Mutex::new(upstream_pool)));
+        }
+
+        let load_balancer = match &config.load_balancing {
+            Some(lb) => LoadBalancing::from_config(&lb.lb_type),
+            None => LoadBalancing::from_config("round-robin"), // default fallback
+        }.expect("Invalid load balancing configuration");
         let metrics = Metrics::default();
 
-        Self::spawn_health_checks(backend_pool.clone(), h2_pool.clone());
+        Self::spawn_health_checks(upstream_pools.clone(), h2_pool.clone());
 
-        Ok(Self { 
-            socket, 
-            config, 
+        Ok(Self {
+            socket,
+            config,
             quic_config,
             h3_config,
             h2_pool,
-            backend_pool,
+            upstream_pools,
             load_balancer,
             metrics,
             draining: false,
@@ -305,101 +239,85 @@ impl QUICListener {
     }
 
     fn take_or_create_connection(
-    &mut self,
-    peer: SocketAddr,
-    local_addr: SocketAddr,
-    packets: &[u8],
-) -> Option<(QuicConnection, Vec<u8>)> {
-    let mut buf = packets.to_vec();
-    let header = match quiche::Header::from_slice(&mut buf, quiche::MAX_CONN_ID_LEN) {
-        Ok(hdr) => hdr,
-        Err(_) => {
-            error!("Wrong QUIC HEADER");
-            return None;
-        }
-    };
-
-    if self.draining {
-        return None;
-    }
-
-    if header.ty != quiche::Type::Initial {
-        return None;
-    }
-
-    // Check if this is a response to our retry (has our token)
-    let client_ip_bytes = match peer.ip() {
-        std::net::IpAddr::V4(ip) => ip.octets().to_vec(),
-        std::net::IpAddr::V6(ip) => ip.octets().to_vec(),
-    };
-    let odcid_bytes = header.token.as_ref().and_then(|token| {
-        validate_retry_token(token, &client_ip_bytes, Duration::from_secs(30))
-    });
-    let odcid = odcid_bytes.as_ref().map(|bytes| quiche::ConnectionId::from_ref(bytes));
-
-    if header.token.is_some() && odcid.is_none() {
-        // Client has invalid or expired token, send retry
-        debug!("Client has invalid token, sending Retry");
-
-        let mut new_scid_bytes = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut new_scid_bytes);
-        let new_scid = quiche::ConnectionId::from_ref(&new_scid_bytes);
-
-        // Create retry token with client's original DCID and IP
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let retry_token = encode_retry_token(&client_ip_bytes, &header.dcid, timestamp);
-
-        let mut retry_buf = [0u8; 1200];
-        let retry_len = match quiche::retry(
-            &header.scid,
-            &header.dcid,
-            &new_scid,
-            &retry_token,
-            header.version,
-            &mut retry_buf,
-        ) {
-            Ok(len) => len,
-            Err(e) => {
-                error!("Failed to create Retry packet: {:?}", e);
+        &mut self,
+        peer: SocketAddr,
+        local_addr: SocketAddr,
+        packets: &[u8],
+    ) -> Option<(QuicConnection, Vec<u8>)> {
+        let mut buf = packets.to_vec();
+        let header = match quiche::Header::from_slice(&mut buf, quiche::MAX_CONN_ID_LEN) {
+            Ok(hdr) => hdr,
+            Err(_) => {
+                error!("Wrong QUIC HEADER");
                 return None;
             }
         };
 
-        if let Err(e) = self.socket.send_to(&retry_buf[..retry_len], peer) {
-            error!("Failed to send Retry: {:?}", e);
+        let dcid_bytes = header.dcid.as_ref().to_vec();
+        debug!("Packet DCID (len={}): {:02x?}, type: {:?}, active connections: {}",
+            dcid_bytes.len(), &dcid_bytes, header.ty, self.connections.len());
+
+        // Try exact match first
+        if let Some(mut connection) = self.connections.remove(&dcid_bytes) {
+            debug!("Found existing connection for DCID: {:02x?}", &dcid_bytes);
+            connection.peer_address = peer;
+            return Some((connection, dcid_bytes));
         }
 
-        return None;
-    }
+        // For Short packets, try prefix match (client may append bytes to our SCID)
+        // This handles cases where client uses longer DCIDs based on server's SCID
+        if header.ty == quiche::Type::Short && dcid_bytes.len() > 8 {
+            for stored_cid in self.connections.keys() {
+                if dcid_bytes.starts_with(stored_cid) {
+                    debug!("Found connection via prefix match. Stored CID: {:02x?}, Packet DCID: {:02x?}",
+                        stored_cid, &dcid_bytes);
+                    let stored_cid_copy = stored_cid.clone();
+                    if let Some(mut connection) = self.connections.remove(&stored_cid_copy) {
+                        connection.peer_address = peer;
+                        return Some((connection, stored_cid_copy));
+                    }
+                    break;
+                }
+            }
+        }
 
-    // Accept the connection
-    // For retry responses, use the DCID from the header (which is the new_scid from our retry)
-    // as the SCID for the accepted connection
-    let mut scid_bytes = [0u8; 16];
-    let scid = if odcid.is_some() {
-        debug!("Accepting connection with validated retry token");
-        header.dcid.clone()  // Use the DCID from the retry response as our SCID
-    } else {
+        if self.draining {
+            return None;
+        }
+
+        // Only create new connections for Initial packets
+        if header.ty != quiche::Type::Initial {
+            debug!("Non-Initial packet for unknown connection, ignoring");
+            return None;
+        }
+
+        // If this is a 0-RTT packet without a valid token, we need to reject it
+        if header.token.is_some() {
+            debug!("Received 0-RTT attempt, will negotiate fresh connection");
+            // return None;
+        }
+
+        let mut scid_bytes = [0u8; 16]; // scid must be >= 8 bytes, 16 is perfect
         rand::thread_rng().fill_bytes(&mut scid_bytes);
-        quiche::ConnectionId::from_ref(&scid_bytes)
-    };
 
-    let quic_connection =
-        quiche::accept(&scid, odcid.as_ref(), local_addr, peer, &mut self.quic_config).ok()?;
+        let scid = quiche::ConnectionId::from_ref(&scid_bytes);
 
-    let connection = QuicConnection {
-        quic: quic_connection,
-        h3: None,
-        h3_config: self.h3_config.clone(),
-        streams: HashMap::new(),
-        peer_address: peer,
-        last_activity: Instant::now(),
-    };
+        let quic_connection =
+            quiche::accept(&scid, None, local_addr, peer, &mut self.quic_config).ok()?;
 
-    Some((connection, scid.as_ref().to_vec()))
+        let connection = QuicConnection {
+            quic: quic_connection,
+            h3: None,
+            h3_config: self.h3_config.clone(),
+            streams: HashMap::new(),
+            peer_address: peer,
+            last_activity: Instant::now(),
+        };
+
+        // Store connection using server's SCID (not client's DCID)
+        // After handshake, client will use server's SCID as DCID in subsequent packets
+        debug!("Creating new connection with server SCID: {:02x?}", &scid_bytes);
+        Some((connection, scid_bytes.to_vec()))
 }
 
     pub fn poll(&mut self) {
@@ -552,7 +470,8 @@ impl QUICListener {
             if let Err(e) = Self::handle_h3(
                 &mut connection,
                 &h2_pool,
-                &self.backend_pool,
+                &self.upstream_pools,
+                &self.config.upstream,
                 &mut self.load_balancer,
                 &self.metrics,
             ) {
@@ -566,7 +485,10 @@ impl QUICListener {
         Self::handle_timeout(&socket, &mut send_buf, &mut connection);
 
         if !connection.quic.is_closed() {
+            debug!("Storing connection with key: {:02x?}", &scid);
             self.connections.insert(scid, connection);
+        } else {
+            debug!("Connection closed, not storing");
         }
     }
 
@@ -633,7 +555,8 @@ impl QUICListener {
     fn handle_h3(
         connection: &mut QuicConnection,
         h2_pool: &H2Pool,
-        backend_pool: &Arc<Mutex<BackendPool>>,
+        upstream_pools: &HashMap<String, Arc<Mutex<UpstreamPool>>>,
+        upstreams: &std::collections::HashMap<String, spooky_config::config::Upstream>,
         load_balancer: &mut LoadBalancing,
         metrics: &Metrics,
     ) -> Result<(), quiche::h3::Error> {
@@ -708,7 +631,8 @@ impl QUICListener {
                             stream_id,
                             req,
                             h2_pool,
-                            backend_pool,
+                            upstream_pools,
+                            upstreams,
                             load_balancer,
                             metrics,
                         )?;
@@ -733,7 +657,8 @@ impl QUICListener {
         stream_id: u64,
         req: RequestEnvelope,
         h2_pool: &H2Pool,
-        backend_pool: &Arc<Mutex<BackendPool>>,
+        upstream_pools: &HashMap<String, Arc<Mutex<UpstreamPool>>>,
+        upstreams: &std::collections::HashMap<String, spooky_config::config::Upstream>,
         load_balancer: &mut LoadBalancing,
         metrics: &Metrics,
     ) -> Result<(), quiche::h3::Error> {
@@ -748,23 +673,36 @@ impl QUICListener {
             );
         }
 
-        let backend_len = backend_pool
+        // Find the upstream for this request
+        let upstream_name = find_upstream_for_request(upstreams, &req.path, req.authority.as_deref())
+            .ok_or_else(|| {
+                error!("No route found for path: {} (host: {:?})", req.path, req.authority);
+                quiche::h3::Error::InternalError
+            })?;
+
+        let upstream_pool = upstream_pools.get(upstream_name)
+            .ok_or_else(|| {
+                error!("Upstream pool not found for: {}", upstream_name);
+                quiche::h3::Error::InternalError
+            })?;
+
+        let upstream_len = upstream_pool
             .lock()
-            .map(|pool| pool.len())
+            .map(|pool| pool.pool.len())
             .unwrap_or(0);
-        if backend_len == 0 {
+        if upstream_len == 0 {
             return Self::send_simple_response(
                 h3,
                 quic,
                 stream_id,
                 http::StatusCode::SERVICE_UNAVAILABLE,
-                b"no backend configured\n",
+                b"no servers configured for upstream\n",
             );
         }
 
         let key = request_hash_key(&req);
         let backend_index = {
-            let pool = backend_pool.lock().expect("backend pool lock");
+            let pool = upstream_pool.lock().expect("upstream pool lock");
             load_balancer.pick(&key, &pool)
         };
         let backend_index = match backend_index {
@@ -775,14 +713,14 @@ impl QUICListener {
                     quic,
                     stream_id,
                     http::StatusCode::SERVICE_UNAVAILABLE,
-                    b"no healthy backends\n",
+                    b"no healthy servers\n",
                 );
             }
         };
 
         let backend_addr = {
-            let pool = backend_pool.lock().expect("backend pool lock");
-            pool.address(backend_index).map(|addr| addr.to_string())
+            let pool = upstream_pool.lock().expect("upstream pool lock");
+            pool.pool.address(backend_index).map(|addr| addr.to_string())
         };
         let backend_addr = match backend_addr {
             Some(addr) => addr,
@@ -792,7 +730,7 @@ impl QUICListener {
                     quic,
                     stream_id,
                     http::StatusCode::SERVICE_UNAVAILABLE,
-                    b"invalid backend\n",
+                    b"invalid server\n",
                 );
             }
         };
@@ -805,14 +743,14 @@ impl QUICListener {
 
         match Self::forward_request(&backend_addr, h2_pool, req) {
             Ok((status, headers, body)) => {
-                let transition = backend_pool
+                let transition = upstream_pool
                     .lock()
                     .ok()
                     .and_then(|mut pool| {
                         if status.is_server_error() {
-                            pool.mark_failure(backend_index)
+                            pool.pool.mark_failure(backend_index)
                         } else {
-                            pool.mark_success(backend_index)
+                            pool.pool.mark_success(backend_index)
                         }
                     });
                 if let Some(transition) = transition {
@@ -828,10 +766,10 @@ impl QUICListener {
             }
             Err(ProxyError::Bridge(err)) => {
                 error!("Bridge error: {:?}", err);
-                let transition = backend_pool
+                let transition = upstream_pool
                     .lock()
                     .ok()
-                    .and_then(|mut pool| pool.mark_failure(backend_index));
+                    .and_then(|mut pool| pool.pool.mark_failure(backend_index));
                 if let Some(transition) = transition {
                     Self::log_health_transition(&backend_addr, transition);
                 }
@@ -848,10 +786,10 @@ impl QUICListener {
             }
             Err(ProxyError::Transport(err)) => {
                 error!("Transport error: {}", err);
-                let transition = backend_pool
+                let transition = upstream_pool
                     .lock()
                     .ok()
-                    .and_then(|mut pool| pool.mark_failure(backend_index));
+                    .and_then(|mut pool| pool.pool.mark_failure(backend_index));
                 if let Some(transition) = transition {
                     Self::log_health_transition(&backend_addr, transition);
                 }
@@ -868,11 +806,11 @@ impl QUICListener {
                 )
             }
             Err(ProxyError::Timeout) => {
-                error!("Backend timeout");
-                let transition = backend_pool
+                error!("Server timeout");
+                let transition = upstream_pool
                     .lock()
                     .ok()
-                    .and_then(|mut pool| pool.mark_failure(backend_index));
+                    .and_then(|mut pool| pool.pool.mark_failure(backend_index));
                 if let Some(transition) = transition {
                     Self::log_health_transition(&backend_addr, transition);
                 }
@@ -1042,20 +980,24 @@ impl QUICListener {
         }
     }
 
-    fn spawn_health_checks(backend_pool: Arc<Mutex<BackendPool>>, h2_pool: Arc<H2Pool>) {
+    fn spawn_health_checks(upstream_pools: HashMap<String, Arc<Mutex<UpstreamPool>>>, h2_pool: Arc<H2Pool>) {
         let entries = {
-            let pool = match backend_pool.lock() {
-                Ok(pool) => pool,
-                Err(_) => return,
-            };
-            pool.all_indices()
-                .into_iter()
-                .filter_map(|index| {
-                    let address = pool.address(index)?.to_string();
-                    let health = pool.health_check(index)?;
-                    Some((index, address, health))
-                })
-                .collect::<Vec<_>>()
+            let mut all_entries = Vec::new();
+            for (upstream_name, upstream_pool) in upstream_pools.iter() {
+                let pool = match upstream_pool.lock() {
+                    Ok(pool) => pool,
+                    Err(_) => continue,
+                };
+                for index in pool.pool.all_indices() {
+                    if let (Some(address), Some(health)) = (
+                        pool.pool.address(index),
+                        pool.pool.health_check(index)
+                    ) {
+                        all_entries.push((upstream_name.clone(), upstream_pool.clone(), index, address.to_string(), health));
+                    }
+                }
+            }
+            all_entries
         };
 
         let handle = match Handle::try_current() {
@@ -1066,8 +1008,7 @@ impl QUICListener {
             }
         };
 
-        for (index, address, health) in entries {
-            let backend_pool = backend_pool.clone();
+        for (_upstream_name, upstream_pool, index, address, health) in entries {
             let h2_pool = h2_pool.clone();
             let handle = handle.clone();
             handle.spawn(async move {
@@ -1099,12 +1040,12 @@ impl QUICListener {
                         _ => false,
                     };
 
-                    let transition = match backend_pool.lock() {
+                    let transition = match upstream_pool.lock() {
                         Ok(mut pool) => {
                             if healthy {
-                                pool.mark_success(index)
+                                pool.pool.mark_success(index)
                             } else {
-                                pool.mark_failure(index)
+                                pool.pool.mark_failure(index)
                             }
                         }
                         Err(_) => None,

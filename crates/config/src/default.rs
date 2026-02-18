@@ -1,6 +1,10 @@
 use crate::config::{LoadBalancing, Log};
 
 // default values
+pub fn get_default_version() -> u32 {
+    1
+}
+
 pub fn get_default_protocol() -> String {
     String::from("http3")
 }
@@ -47,7 +51,8 @@ pub fn get_default_log_level() -> String {
 
 pub fn get_default_load_balancing() -> LoadBalancing {
     LoadBalancing {
-        lb_type: String::from("random"),
+        lb_type: String::from("round_robin"),
+        key: None,
     }
 }
 

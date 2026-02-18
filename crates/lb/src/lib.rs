@@ -4,13 +4,15 @@ use std::{
 };
 
 use rand::Rng;
-use spooky_config::config::Backend;
+use spooky_config::config::{Backend, HealthCheck};
 
 const DEFAULT_REPLICAS: u32 = 64;
 
 #[derive(Clone)]
 pub struct BackendState {
-    backend: Backend,
+    address: String,
+    weight: u32,
+    health_check: HealthCheck,
     consecutive_failures: u32,
     health_state: HealthState,
 }
@@ -27,9 +29,11 @@ pub enum HealthTransition {
 }
 
 impl BackendState {
-    pub fn new(backend: Backend) -> Self {
+    pub fn new(backend: &Backend) -> Self {
         Self {
-            backend,
+            address: backend.address.clone(),
+            weight: backend.weight.max(1),
+            health_check: backend.health_check.clone(),
             consecutive_failures: 0,
             health_state: HealthState::Healthy,
         }
@@ -40,15 +44,15 @@ impl BackendState {
     }
 
     pub fn address(&self) -> &str {
-        &self.backend.address
+        &self.address
     }
 
-    pub fn health_check(&self) -> &spooky_config::config::HealthCheck {
-        &self.backend.health_check
+    pub fn health_check(&self) -> &HealthCheck {
+        &self.health_check
     }
 
     pub fn weight(&self) -> u32 {
-        self.backend.weight.max(1)
+        self.weight
     }
 
     pub fn record_success(&mut self) -> Option<HealthTransition> {
@@ -63,7 +67,7 @@ impl BackendState {
                 }
 
                 *successes += 1;
-                if *successes >= self.backend.health_check.success_threshold {
+                if *successes >= self.health_check.success_threshold {
                     self.consecutive_failures = 0;
                     self.health_state = HealthState::Healthy;
                     return Some(HealthTransition::BecameHealthy);
@@ -75,13 +79,13 @@ impl BackendState {
 
     pub fn record_failure(&mut self) -> Option<HealthTransition> {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-        let threshold = self.backend.health_check.failure_threshold;
+        let threshold = self.health_check.failure_threshold;
         if self.consecutive_failures < threshold {
             return None;
         }
 
         self.consecutive_failures = 0;
-        let cooldown = Duration::from_millis(self.backend.health_check.cooldown_ms);
+        let cooldown = Duration::from_millis(self.health_check.cooldown_ms);
         self.health_state = HealthState::Unhealthy {
             until: Instant::now() + cooldown,
             successes: 0,
@@ -94,9 +98,27 @@ pub struct BackendPool {
     backends: Vec<BackendState>,
 }
 
+pub struct UpstreamPool {
+    pub pool: BackendPool,
+    pub strategy: String,
+}
+
+impl UpstreamPool {
+    pub fn from_upstream(upstream: &spooky_config::config::Upstream) -> Result<Self, String> {
+        let backends = upstream.backends
+            .iter()
+            .map(|backend| BackendState::new(backend))
+            .collect();
+
+        Ok(Self {
+            pool: BackendPool::new_from_states(backends),
+            strategy: upstream.load_balancing.lb_type.clone(),
+        })
+    }
+}
+
 impl BackendPool {
-    pub fn new(backends: Vec<Backend>) -> Self {
-        let backends = backends.into_iter().map(BackendState::new).collect();
+    pub fn new_from_states(backends: Vec<BackendState>) -> Self {
         Self { backends }
     }
 
@@ -126,7 +148,7 @@ impl BackendPool {
         None
     }
 
-    pub fn health_check(&self, index: usize) -> Option<spooky_config::config::HealthCheck> {
+    pub fn health_check(&self, index: usize) -> Option<HealthCheck> {
         self.backends.get(index).map(|b| b.health_check().clone())
     }
 
@@ -166,11 +188,11 @@ impl LoadBalancing {
         }
     }
 
-    pub fn pick(&mut self, key: &str, pool: &BackendPool) -> Option<usize> {
+    pub fn pick(&mut self, key: &str, pool: &UpstreamPool) -> Option<usize> {
         match self {
-            LoadBalancing::RoundRobin(rr) => rr.pick(pool),
-            LoadBalancing::ConsistentHash(ch) => ch.pick(key, pool),
-            LoadBalancing::Random(rand) => rand.pick(pool),
+            LoadBalancing::RoundRobin(rr) => rr.pick(&pool.pool),
+            LoadBalancing::ConsistentHash(ch) => ch.pick(key, &pool.pool),
+            LoadBalancing::Random(rand) => rand.pick(&pool.pool),
         }
     }
 }
@@ -280,14 +302,16 @@ fn hash64(data: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use spooky_config::config::RouteMatch;
+
     use super::*;
 
-    fn backend(id: &str, address: &str, weight: u32) -> Backend {
-        Backend {
-            id: id.to_string(),
+    fn create_backend_state(address: &str, weight: u32) -> BackendState {
+        let backend = Backend {
+            id: format!("backend-{}", address),
             address: address.to_string(),
             weight,
-            health_check: spooky_config::config::HealthCheck {
+            health_check: HealthCheck {
                 path: "/health".to_string(),
                 interval: 1000,
                 timeout_ms: 1000,
@@ -295,15 +319,16 @@ mod tests {
                 success_threshold: 1,
                 cooldown_ms: 0,
             },
-        }
+        };
+        BackendState::new(&backend)
     }
 
     #[test]
     fn round_robin_cycles() {
-        let pool = BackendPool::new(vec![
-            backend("a", "127.0.0.1:1", 1),
-            backend("b", "127.0.0.1:2", 1),
-            backend("c", "127.0.0.1:3", 1),
+        let pool = BackendPool::new_from_states(vec![
+            create_backend_state("127.0.0.1:1", 1),
+            create_backend_state("127.0.0.1:2", 1),
+            create_backend_state("127.0.0.1:3", 1),
         ]);
         let mut rr = RoundRobin::new();
 
@@ -313,10 +338,10 @@ mod tests {
 
     #[test]
     fn consistent_hash_is_stable() {
-        let pool = BackendPool::new(vec![
-            backend("a", "10.0.0.1:1", 1),
-            backend("b", "10.0.0.2:1", 1),
-            backend("c", "10.0.0.3:1", 1),
+        let pool = BackendPool::new_from_states(vec![
+            create_backend_state("10.0.0.1:1", 1),
+            create_backend_state("10.0.0.2:1", 1),
+            create_backend_state("10.0.0.3:1", 1),
         ]);
 
         let ch = ConsistentHash::new(16);
@@ -327,9 +352,9 @@ mod tests {
 
     #[test]
     fn unhealthy_backends_are_skipped() {
-        let mut pool = BackendPool::new(vec![
-            backend("a", "10.0.0.1:1", 1),
-            backend("b", "10.0.0.2:1", 1),
+        let mut pool = BackendPool::new_from_states(vec![
+            create_backend_state("10.0.0.1:1", 1),
+            create_backend_state("10.0.0.2:1", 1),
         ]);
 
         pool.mark_failure(0);
@@ -351,7 +376,7 @@ mod tests {
 
     #[test]
     fn no_healthy_backends_returns_none() {
-        let mut pool = BackendPool::new(vec![backend("a", "10.0.0.1:1", 1)]);
+        let mut pool = BackendPool::new_from_states(vec![create_backend_state("10.0.0.1:1", 1)]);
         pool.mark_failure(0);
         pool.mark_failure(0);
         pool.mark_failure(0);
@@ -362,7 +387,7 @@ mod tests {
 
     #[test]
     fn backend_recovers_after_success_threshold() {
-        let mut pool = BackendPool::new(vec![backend("a", "10.0.0.1:1", 1)]);
+        let mut pool = BackendPool::new_from_states(vec![create_backend_state("10.0.0.1:1", 1)]);
         pool.mark_failure(0);
         pool.mark_failure(0);
         pool.mark_failure(0);
@@ -370,5 +395,53 @@ mod tests {
         assert!(pool.healthy_indices().is_empty());
         pool.mark_success(0);
         assert_eq!(pool.healthy_indices(), vec![0]);
+    }
+
+    #[test]
+    fn upstream_pool_from_config() {
+        let upstream = spooky_config::config::Upstream {
+            load_balancing: spooky_config::config::LoadBalancing {
+                lb_type: "round-robin".to_string(),
+                key: None,
+            },
+            route: RouteMatch {
+                path_prefix: Some("/".to_string()),
+                ..Default::default()
+            },
+            backends: vec![
+                Backend {
+                    id: "backend1".to_string(),
+                    address: "127.0.0.1:8001".to_string(),
+                    weight: 100,
+                    health_check: HealthCheck {
+                        path: "/health".to_string(),
+                        interval: 5000,
+                        timeout_ms: 2000,
+                        failure_threshold: 3,
+                        success_threshold: 2,
+                        cooldown_ms: 10000,
+                    },
+                },
+                Backend {
+                    id: "backend2".to_string(),
+                    address: "127.0.0.1:8002".to_string(),
+                    weight: 200,
+                    health_check: HealthCheck {
+                        path: "/health".to_string(),
+                        interval: 5000,
+                        timeout_ms: 2000,
+                        failure_threshold: 3,
+                        success_threshold: 2,
+                        cooldown_ms: 10000,
+                    },
+                },
+            ],
+        };
+
+        let upstream_pool = UpstreamPool::from_upstream(&upstream).unwrap();
+        assert_eq!(upstream_pool.strategy, "round-robin");
+        assert_eq!(upstream_pool.pool.len(), 2);
+        assert_eq!(upstream_pool.pool.address(0), Some("127.0.0.1:8001"));
+        assert_eq!(upstream_pool.pool.address(1), Some("127.0.0.1:8002"));
     }
 }

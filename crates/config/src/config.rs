@@ -1,25 +1,33 @@
-use serde::Deserialize;
+
+
+use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
 
 use crate::default::{
     get_default_address, get_default_cooldown_ms, get_default_failure_threshold,
     get_default_health_timeout, get_default_interval, get_default_load_balancing,
     get_default_log, get_default_log_level, get_default_path, get_default_port,
-    get_default_protocol, get_default_success_threshold, get_default_weight,
+    get_default_protocol, get_default_success_threshold, get_default_weight, get_default_version
 };
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
-    pub listen: Listen,
-    pub backends: Vec<Backend>,
+    #[serde(default = "get_default_version")]  // Make version optional with default
+    pub version: u32,
 
-    #[serde(default = "get_default_load_balancing")]
-    pub load_balancing: LoadBalancing,
+    pub listen: Listen,
+
+    pub upstream: HashMap<String, Upstream>,
+
+    #[serde(default)]
+    pub load_balancing: Option<LoadBalancing>, // Global fallback load balancing
 
     #[serde(default = "get_default_log")]
     pub log: Log,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct Listen {
     #[serde(default = "get_default_protocol")]
     pub protocol: String, // "http3"
@@ -32,10 +40,20 @@ pub struct Listen {
     pub tls: Tls,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct Tls {
     pub cert: String, // "/path/to/cert"
     pub key: String,  // "/path/to/key"
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct Upstream {
+    #[serde(default = "get_default_load_balancing")]
+    pub load_balancing: LoadBalancing,
+
+    pub route: RouteMatch,  // Route matching criteria for this upstream
+
+    pub backends: Vec<Backend>
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -46,6 +64,19 @@ pub struct Backend {
     #[serde(default = "get_default_weight")]
     pub weight: u32, // 100
     pub health_check: HealthCheck,
+}
+
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct RouteMatch {
+    #[serde(default)]
+    pub host: Option<String>, // host-based routing (e.g., "api.example.com")
+
+    #[serde(default)]
+    pub path_prefix: Option<String>, // path prefix matching (e.g., "/api")
+
+    #[serde(default)]
+    pub method: Option<String>, // 🔮 FUTURE: HTTP method filtering (GET, POST, etc.)
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -69,13 +100,17 @@ pub struct HealthCheck {
     pub cooldown_ms: u64,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct LoadBalancing {
     #[serde(rename = "type")]
-    pub lb_type: String, // "weight-based", "least_connection", etc.
+    pub lb_type: String, // "random","round_robin","consistent_hash"
+
+    // Add support for consistent hash configuration
+    #[serde(default)]
+    pub key: Option<String>, // For consistent hashing (header, cookie, etc.)
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct Log {
     // whisper -> trace
     // haunt -> debug
@@ -86,10 +121,4 @@ pub struct Log {
 
     #[serde(default = "get_default_log_level")]
     pub level: String, // "info, warn, error"
-}
-
-impl Backend {
-    pub fn is_healthy(&self) -> bool {
-        true
-    }
 }
