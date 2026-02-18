@@ -1,179 +1,207 @@
-# 🚀 Roadmap for Spooky (Rust HTTP/3 Load Balancer)
+# Roadmap
 
-## **Current Status: ~15-20% Complete**
+## Current Status
 
-*✅ Implemented: Basic HTTP/3 server, TLS config, logging, project structure*
-*🔄 In Progress: Core load balancing implementation*
-*📋 Planned: Production-ready features*
+**Experimental. Core features functional and tested.** Spooky can terminate HTTP/3 connections, forward to HTTP/2 backends, and perform load balancing with health checks. It is not production-ready — significant known limitations exist (see Technical Debt below).
 
----
+### Completed
 
-## **Phase 1 — Core Load Balancing (Weeks 1–4)**
+- HTTP/3 termination via quiche
+- HTTP/2 backend connectivity
+- Path and host-based routing
+- Multiple load balancing algorithms (random, round-robin, consistent hash)
+- Active health checking with automatic backend management
+- Per-upstream configuration and routing
+- Connection ID management and QUIC packet routing
+- TLS 1.3 with certificate chain loading
+- Structured logging with multiple levels
+- Configuration validation at startup
+- Graceful shutdown with connection draining
 
-🔹 *Goal: Functional HTTP/3 load balancer (MVP).*
+## Phase 1: Operational Hardening
 
-* [x] **Foundation (✅ Complete)**
-  * Rust workspace with proper module structure
-  * HTTP/3 server using quiche
-  * TLS certificate handling
-  * YAML configuration system
-  * Structured logging
+**Goal**: Expand operational and scalability capabilities for production deployments.
 
-* [ ] **Basic Load Balancing**
-  * Implement random backend selection strategy
-  * Add backend server management and configuration
-  * Implement request forwarding to backends
-  * Add basic error handling and response streaming
+### Performance
 
-* [ ] **Backend Health Checking**
-  * Simple HTTP health checks for backends
-  * Backend status tracking (healthy/unhealthy)
-  * Automatic backend removal/addition
+- **Async data plane**: Move backend forwarding off the main poll thread
+- **Streaming bodies**: Implement incremental request/response streaming instead of full buffering
+- **Multi-threading**: Support multi-threaded QUIC packet processing
+- **Connection pooling optimizations**: Reduce allocation overhead in HTTP/2 pool
 
-* [ ] **Configuration**
-  * Backend server configuration via YAML
-  * Load balancing strategy selection
-  * Basic CLI arguments (--port, --config)
+### Observability
 
-✅ **Deliverable**: `spooky` binary that load balances HTTP/3 requests across multiple backend servers.
+- **Metrics export**: Prometheus endpoint for scraping metrics
+- **Distributed tracing**: OpenTelemetry integration
+- **Request logging**: Per-request structured logs with correlation IDs
+- **Connection metrics**: Track QUIC RTT, packet loss, stream count
 
----
+### Operational
 
-## **Phase 2 — Multiple Strategies & Observability (Weeks 4–8)**
+- **Configuration hot reload**: Reload config on SIGHUP without dropping connections
+- **Health check improvements**: Separate client pool for probes to avoid contention
+- **TLS certificate reload**: Automatic reload on certificate rotation
+- **Admin API**: HTTP endpoint for runtime statistics and control
 
-🔹 *Goal: Production-ready load balancing with multiple algorithms.*
+### Reliability
 
-* [ ] **Load Balancing Algorithms**
-  * Round-robin strategy implementation
-  * Least connections strategy
-  * Weighted round-robin (configurable weights)
-  * IP hash strategy for session affinity
+- **Circuit breaker**: Per-backend circuit breakers to prevent cascading failures
+- **Retry logic**: Configurable request retry with exponential backoff
+- **Request timeouts**: Per-route timeout configuration
+- **Rate limiting**: Per-IP and per-route rate limits
 
-* [ ] **Advanced Health Checks**
-  * Configurable health check intervals
-  * Multiple health check endpoints per backend
-  * Health check timeout and retry logic
+## Phase 2: Advanced Features
 
-* [ ] **Observability**
-  * Prometheus metrics endpoint (`/metrics`)
-  * Request/response logging with tracing
-  * Backend performance metrics
-  * Error rate tracking
+**Goal**: Add advanced traffic management and operational capabilities.
 
-* [ ] **Configuration Hot-Reload**
-  * SIGHUP signal handling for config reload
-  * Zero-downtime configuration updates
-  * Configuration validation and error reporting
+### Traffic Management
 
-✅ **Deliverable**: Configurable load balancer with multiple algorithms, health checks, and metrics.
+- **Weighted routing**: Route percentage of traffic to different upstreams
+- **Header-based routing**: Route by arbitrary request headers
+- **Request rewriting**: URL rewriting and header manipulation
+- **Compression**: Automatic response compression
 
----
+### Load Balancing
 
-## **Phase 3 — Production Hardening (Weeks 8–12)**
+- **Least connections**: Track active connections per backend
+- **Response time**: Route based on backend latency
+- **Weighted least connection**: Combine weights with connection count
+- **Cached consistent hash**: Cache hash ring to avoid rebuilds
 
-🔹 *Goal: Production-ready stability and operations.*
+### Security
 
-* [ ] **Graceful Operations**
-  * Graceful shutdown (SIGTERM/SIGINT handling)
-  * Connection draining during shutdown
-  * Startup health checks and readiness probes
+- **TLS peer verification**: Enable certificate verification for production
+- **mTLS support**: Client certificate authentication
+- **Request validation**: Size limits, header validation
+- **IP allowlist/blocklist**: Simple access control
 
-* [ ] **Error Handling & Resilience**
-  * Circuit breaker pattern for failing backends
-  * Request retry logic with exponential backoff
-  * Connection pooling and reuse
-  * Timeout handling for backend requests
+### Deployment
 
-* [ ] **Security Enhancements**
-  * Automatic TLS certificate reload
-  * Request size limits and DDoS protection
-  * Access logging and audit trails
+- **Dynamic backend discovery**: Service discovery integration (DNS SRV, Consul, etcd)
+- **Backend metadata**: Tags and labels for flexible routing
+- **A/B testing support**: Route subset of traffic to experimental backends
+- **Canary deployments**: Gradually shift traffic to new backend versions
 
-* [ ] **Performance Optimization**
-  * Connection pooling for backend servers
-  * Request/response buffering strategies
-  * Memory usage optimization
-  * CPU profiling and optimization
+## Phase 3: Enterprise Features
 
-✅ **Deliverable**: Production-hardened load balancer ready for deployment.
+**Goal**: Support large-scale deployments with advanced requirements.
 
----
+### Multi-Tenancy
 
-## **Phase 4 — Advanced Features (Weeks 12–16)**
+- **Namespace isolation**: Separate routing tables per tenant
+- **Resource limits**: Per-tenant connection and request limits
+- **Tenant routing**: Route by tenant ID or subdomain
 
-🔹 *Goal: Feature parity with established load balancers.*
+### Advanced Observability
 
-* [ ] **Layer 7 Routing**
-  * Path-based request routing (`/api/*` → backend A)
-  * Header-based routing (Host, User-Agent, etc.)
-  * Query parameter routing
+- **APM integration**: Datadog, New Relic, etc.
+- **Custom metrics**: User-defined metric collection
+- **Traffic replay**: Record and replay production traffic
+- **Query logs**: SQL-like queries over request logs
 
-* [ ] **Rate Limiting**
-  * Per-IP rate limiting
-  * Token bucket algorithm implementation
-  * Configurable rate limiting rules
+### Extensions
 
-* [ ] **Advanced Observability**
-  * Distributed tracing support (OpenTelemetry)
-  * Custom metrics for business logic
-  * Alerting integration (webhook notifications)
-  * Request/response body sampling
+- **WebAssembly plugins**: Custom routing logic via WASM
+- **Lua scripting**: Dynamic request/response transformation
+- **gRPC support**: Native gRPC proxying
+- **WebSocket support**: WebSocket over HTTP/3
 
-* [ ] **High Availability**
-  * Configuration sharing between instances
-  * Health check coordination
-  * Consistent hashing for stateful backends
+### High Availability
 
-✅ **Deliverable**: Feature-rich load balancer with advanced routing and HA capabilities.
+- **Connection migration**: Support QUIC connection migration
+- **State replication**: Share connection state across instances
+- **Zero-downtime updates**: Binary updates without connection loss
+- **Multi-region support**: Geographic routing and failover
 
----
+## Phase 4: Protocol Extensions
 
-## **Phase 5 — Ecosystem & Scale (Months 4–6)**
+**Goal**: Support emerging protocols and optimizations.
 
-🔹 *Goal: Kubernetes-native, cloud-ready load balancer.*
+### HTTP/3 Features
 
-* [ ] **Kubernetes Integration**
-  * Ingress controller implementation
-  * Service mesh sidecar deployment
-  * Kubernetes API integration
+- **0-RTT support**: Enable 0-RTT with proper anti-replay measures
+- **QUIC multipath**: Support multiple network paths
+- **Datagram support**: QUIC DATAGRAM frames for low-latency data
+- **Priority trees**: HTTP/3 priority and scheduling
 
-* [ ] **Cloud Native Features**
-  * Helm charts for easy deployment
-  * Docker multi-stage builds
-  * Configuration via ConfigMaps/Secrets
+### Additional Protocols
 
-* [ ] **Developer Experience**
-  * Comprehensive documentation
-  * Example configurations for common use cases
-  * CLI tools for configuration validation
-  * Integration testing framework
+- **HTTP/1.1 support**: Serve HTTP/1.1 clients
+- **TCP proxy mode**: Layer 4 TCP proxying
+- **UDP proxy**: Forward UDP traffic
+- **MQTT support**: IoT protocol support
 
-* [ ] **Performance & Scale**
-  * Performance benchmarks vs nginx/envoy
-  * Horizontal scaling capabilities
-  * Memory and CPU optimization
-  * Load testing and stress testing
+### Optimizations
 
-✅ **Deliverable**: `v1.0.0` - Production-grade, Kubernetes-native load balancer.
+- **Zero-copy**: Eliminate unnecessary data copies
+- **Kernel bypass**: AF_XDP or DPDK integration
+- **Hardware offload**: TLS offload to NICs
+- **eBPF**: Use eBPF for packet filtering and routing
 
----
+## Implementation Priorities
 
-## **Success Metrics**
+### High Priority (Next 3 months)
 
-Rather than 10k stars, focus on:
+1. Async data plane - unblock main thread
+2. Metrics export - essential for production
+3. Configuration hot reload - reduce operational friction
+4. Streaming bodies - reduce memory usage
+5. TLS peer verification - production security
 
-1. **Functionality**: Successfully load balance HTTP/3 traffic
-2. **Performance**: Outperform nginx for HTTP/3 workloads
-3. **Reliability**: 99.9% uptime in production deployments
-4. **Usability**: Easy configuration and deployment
-5. **Community**: Helpful documentation and responsive maintenance
+### Medium Priority (3-6 months)
 
----
+1. Circuit breakers - improve reliability
+2. Distributed tracing - debugging complex issues
+3. Rate limiting - protect backends
+4. Health check improvements - reduce contention
+5. Admin API - operational visibility
 
-## **Technical Architecture Evolution**
+### Low Priority (6+ months)
 
-* **Phase 1**: Single-process load balancer
-* **Phase 2**: Multi-strategy load balancer with monitoring
-* **Phase 3**: Production-hardened with resilience features
-* **Phase 4**: Feature-rich with advanced routing
-* **Phase 5**: Cloud-native with K8s integration
+1. Dynamic backend discovery - integration complexity
+2. Advanced load balancing - diminishing returns
+3. WebAssembly plugins - adds complexity
+4. Protocol extensions - limited immediate value
+5. Multi-tenancy - niche use case
+
+## Technical Debt
+
+### Current Known Issues
+
+1. **Blocking backend calls**: Main thread blocks during HTTP/2 requests
+2. **Full body buffering**: High memory usage for large requests/responses
+3. **Consistent hash rebuilds**: Ring rebuilt on every request
+4. **No metrics export**: Metrics collected but not exposed
+5. **Health check contention**: Shares connection pool with production traffic
+6. **Single-threaded**: QUIC processing limited to one thread
+7. **No TLS verification**: Development-only security posture
+
+### Refactoring Needs
+
+1. **Error handling**: Unify error types across crates
+2. **Configuration**: Type-safe config builders
+3. **Testing**: Expand integration test coverage
+4. **Documentation**: API documentation and examples
+5. **Logging**: Reduce debug log verbosity in hot path
+
+## Non-Goals
+
+Features explicitly not planned:
+
+- **Full service mesh**: Focus remains on edge proxying
+- **Content caching**: Use CDN or dedicated cache
+- **WAF capabilities**: Use dedicated security tools
+- **Database proxying**: Use specialized database proxies
+- **Custom protocols**: Stick to HTTP family
+
+## Contributing
+
+Contributions are welcome. See [contributing guide](development/contributing.md) for development setup and guidelines.
+
+Priority areas for contributions:
+
+1. Metrics export (Prometheus)
+2. Streaming request/response bodies
+3. Configuration hot reload
+4. Integration tests
+5. Documentation and examples

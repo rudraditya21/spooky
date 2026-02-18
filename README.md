@@ -1,223 +1,252 @@
 # Spooky
 
-<img
-    src="./asset/spooky.png"
-    style="display:block;margin:auto;"
-    width="240"
-    height="240"
-    alt="Spooky Logo"
-/>
+**HTTP/3 to HTTP/2 reverse proxy and load balancer**
 
-**HTTP/3 load balancer in Rust: terminate QUIC at the edge, serve HTTP/2 backends**
+Spooky terminates HTTP/3/QUIC connections at the edge and forwards requests to HTTP/2 backends. Built in Rust for production environments requiring HTTP/3 client support without modifying existing infrastructure.
 
-Spooky bridges HTTP/3 clients to HTTP/2 backends. It terminates QUIC connections, converts streams to HTTP/2 requests, and routes them across upstream servers using embedded routing rules.
+## Overview
 
----
+Modern clients increasingly expect HTTP/3 support, but most production backends still use HTTP/2. Spooky bridges this gap by:
 
-## Why Spooky?
-
-"Your SaaS API runs behind HTTP/2.
-You want HTTP/3 for mobile performance.
-Rewriting backend fleet is risky.
-Deploy Spooky at edge.
-Done."
-
-HTTP/3 delivers significant performance improvements, especially on mobile networks with connection migration and reduced head-of-line blocking. However, most existing backend infrastructure still speaks HTTP/2. Spooky solves this by terminating QUIC connections at the edge and seamlessly bridging to HTTP/2 backends.
-
-Built in Rust for performance, safety, and modern async design.
-
-## Use Cases
-
-- **API Gateway**: HTTP/3 termination for microservices running HTTP/2
-- **Mobile Apps**: Improved performance for mobile clients with frequent connection changes
-- **CDN Edge**: Deploy HTTP/3 at the edge without backend modifications
-- **Legacy Migration**: Gradually adopt HTTP/3 without rewriting existing services
-- **Load Balancing**: Distribute traffic across multiple backend instances
-
-## Benefits
-
-- ⚡ **Performance**: HTTP/3 speed improvements, especially on lossy networks
-- 🛡️ **Security**: TLS 1.3 with modern cipher suites
-- 🔧 **Compatibility**: No backend changes required
-- 📊 **Observability**: Comprehensive logging and metrics
-- 🚀 **Scalability**: Handle thousands of concurrent connections
-- 🏗️ **Maintainability**: Clean configuration with embedded routing
-
----
-
-## Current Status
-
-**Functional HTTP/3 load balancer with production-ready features.** Core functionality is complete and tested - QUIC termination, HTTP/3 to HTTP/2 bridging, request forwarding, and load balancing all working.
-
-## Features (Implemented)
-
-- ✅ **CLI with YAML configuration** - Declarative configuration with validation
-- ✅ **TLS 1.3 with custom certificates** - Full certificate chain validation
-- ✅ **QUIC termination** - Complete HTTP/3 support with quiche
-- ✅ **HTTP/3 ↔ HTTP/2 protocol bridging** - Seamless protocol conversion
-- ✅ **Embedded routing** - Route matching directly in upstream configurations
-- ✅ **Multiple load balancing algorithms**:
-  - Random distribution
-  - Round-robin
-  - Consistent hashing (with header/cookie support)
-- ✅ **Health checks** - Automatic backend monitoring with configurable thresholds
-- ✅ **Connection pooling** - Efficient HTTP/2 connection reuse
-- ✅ **Observability** - Structured logging and metrics collection
-- ✅ **Production deployment** - Systemd service files and monitoring integration
-
-## Requirements
-
-### System Requirements
-- **Rust**: 1.70+ (install via [rustup](https://rustup.rs/))
-- **OS**: Linux, macOS, Windows
-- **Memory**: 256MB minimum, 1GB+ recommended
-- **Network**: UDP port access for QUIC traffic
-
-### Dependencies
-
-```bash
-# Ubuntu/Debian
-sudo apt update
-sudo apt install -y cmake build-essential pkg-config
-
-# macOS
-brew install cmake pkg-config
-
-# Windows - install via Visual Studio Build Tools
-```
-
-### HTTP/3 Client Testing
-```bash
-# Install curl with HTTP/3 support (Ubuntu 22.04+)
-sudo apt install curl
-curl --version | grep HTTP3
-
-# Or use a QUIC client like quiche
-```
+- Terminating QUIC connections with TLS 1.3
+- Converting HTTP/3 streams to HTTP/2 requests
+- Load balancing across backend pools with health checks
+- Supporting path and host-based routing
 
 ## Quick Start
 
 ```bash
-# Build
+# Build release binary
 cargo build --release
 
-# Run spooky with config
-cargo run --bin spooky -- --config ./config/config.yaml
+# Generate self-signed certificates
+make certs-selfsigned
+
+# Run with default configuration
+./target/release/spooky --config config/config.yaml
 
 # Test with HTTP/3 client
-curl --http3-only -k --resolve proxy.spooky.local:9889:127.0.0.1 \
+curl --http3-only -k \
+  --resolve proxy.spooky.local:9889:127.0.0.1 \
   https://proxy.spooky.local:9889/api/health
 ```
 
-<img
-    src="./asset/curl-working.png"
-    style="display:block;margin:auto;"
-    width="600"
-    alt="Sample working curl request"
-/>
+## System Requirements
+
+- **Rust**: 1.85 or later (edition 2024)
+- **OS**: Linux, macOS, or Windows
+- **Network**: UDP port access for QUIC traffic
+- **Memory**: 256MB minimum, 1GB recommended
+
+### Build Dependencies
+
+```bash
+# Ubuntu/Debian
+sudo apt install cmake build-essential pkg-config
+
+# macOS
+brew install cmake pkg-config
+```
 
 ## Configuration
 
-[Sample Config File](./config/config.yaml)
+Spooky uses YAML configuration with validation at startup. See [configuration reference](docs/configuration/reference.md) for complete documentation.
+
+### Minimal Example
 
 ```yaml
 version: 1
 
 listen:
-    protocol: http3
-    port: 9889
-    address: "0.0.0.0"
-    tls:
-        cert: "certs/proxy-fullchain.pem"
-        key: "certs/proxy-key-pkcs8.pem"
+  protocol: http3
+  port: 9889
+  address: "0.0.0.0"
+  tls:
+    cert: "certs/cert.pem"
+    key: "certs/key.pem"
 
 upstream:
-  api_pool:
+  api_backend:
     load_balancing:
-        type: "consistent-hash"
+      type: "round-robin"
     route:
       path_prefix: "/api"
     backends:
-      - id: "backend1"
-        address: "127.0.0.1:7001"
-        weight: 100
-        health_check:
-          path: "/health"
-          interval: 5000
-
-  auth_pool:
-    load_balancing:
-      type: round-robin
-    route:
-      path_prefix: "/auth"
-    backends:
-      - id: "auth1"
+      - id: "api-1"
         address: "127.0.0.1:8001"
         weight: 100
         health_check:
           path: "/health"
           interval: 5000
 
-load_balancing:
-    type: "random"  # global fallback
+  default_backend:
+    load_balancing:
+      type: "random"
+    route:
+      path_prefix: "/"
+    backends:
+      - id: "default-1"
+        address: "127.0.0.1:8080"
+        weight: 100
+        health_check:
+          path: "/health"
+          interval: 5000
 
 log:
-  level: debug
+  level: info
 ```
 
-**Key Features:**
-- **Embedded Routing**: Routes are defined directly within each upstream for easier management
-- **Path & Host Matching**: Support for both path prefix and host-based routing
-- **Multiple LB Algorithms**: Random, round-robin, and consistent hashing
-- **Health Checks**: Automatic backend monitoring with configurable intervals
+### Key Configuration Features
 
-Generate certificates: [Generate](docs/configuration/tls.md)
+**Upstream Pools**: Define multiple named upstream groups. Each pool configures its own routing rules and load balancing strategy independently.
+
+**Routing**: Route requests based on path prefix and hostname. The most specific match (longest prefix) wins.
+
+**Load Balancing**: Per-upstream pool strategies: random, round-robin, and consistent hashing.
+
+**Health Checks**: Automatic backend health monitoring with configurable intervals, timeouts, and thresholds.
+
+## Architecture
+
+Spooky uses a modular architecture with clear separation of concerns:
+
+```
+┌─────────────┐
+│ HTTP/3      │
+│ Client      │
+└──────┬──────┘
+       │ QUIC/TLS
+       ▼
+┌──────────────────────┐
+│ Spooky Edge          │
+│ ┌──────────────────┐ │
+│ │ QUIC Listener    │ │  - Connection management
+│ │ (quiche)         │ │  - Stream multiplexing
+│ └─────────┬────────┘ │  - Protocol bridging
+│           │          │
+│ ┌─────────▼────────┐ │
+│ │ Router           │ │  - Path/host matching
+│ │                  │ │  - Upstream selection
+│ └─────────┬────────┘ │  - Load balancing
+│           │          │
+│ ┌─────────▼────────┐ │
+│ │ HTTP/2 Pool      │ │  - Connection pooling
+│ │                  │ │  - Request forwarding
+│ └─────────┬────────┘ │  - Health checking
+└───────────┼──────────┘
+            │ HTTP/2
+            ▼
+    ┌───────────────┐
+    │ Backend       │
+    │ Servers       │
+    └───────────────┘
+```
+
+### Components
+
+- **Edge** (`crates/edge`): QUIC termination, HTTP/3 session management
+- **Bridge** (`crates/bridge`): HTTP/3 to HTTP/2 protocol conversion
+- **Transport** (`crates/transport`): HTTP/2 connection pooling
+- **Load Balancer** (`crates/lb`): Backend selection algorithms and health tracking
+- **Config** (`crates/config`): Configuration parsing and validation
+
+## Features
+
+**Core Functionality**
+- HTTP/3 and QUIC (RFC 9114, RFC 9000)
+- TLS 1.3 with certificate chain validation
+- HTTP/2 backend connectivity
+- Efficient request/response handling with full buffering
+
+**Load Balancing**
+- Random distribution
+- Round-robin rotation
+- Consistent hashing (with configurable replicas)
+- Global load balancing strategy (same for all upstreams)
+
+**Routing**
+- Path prefix matching
+- Host-based routing
+- Longest-match selection for overlapping routes
+
+**Health Management**
+- Active health checks with HTTP probes
+- Configurable failure thresholds and cooldown periods
+- Automatic backend removal and recovery
+
+**Observability**
+- Structured logging with multiple levels
+- Request/response metrics collection
+- Backend latency tracking
+- Health transition logging
 
 ## Testing
 
 ```bash
-# Full workspace test suite
+# Run all tests
 cargo test
 
 # Run specific component tests
-cargo test -p spooky-config  # Configuration validation
-cargo test -p spooky-lb      # Load balancing algorithms
-cargo test -p spooky-edge    # QUIC and HTTP/3 handling
+cargo test -p spooky-config
+cargo test -p spooky-lb
+cargo test -p spooky-edge
 
-# Integration tests (require network ports)
-cargo test -p spooky-edge --test h3_edge
+# Run integration tests
 cargo test -p spooky-edge --test lb_integration
-
-# Load testing scripts
-./scripts/lb-round-robin.sh
-./scripts/lb-consistent-hash.sh
-./scripts/lb-random.sh
 ```
 
-## Performance
+## Performance Characteristics
 
-- **Concurrent Connections**: 10,000+ simultaneous QUIC connections
-- **Requests/Second**: 100,000+ RPS on modern hardware
-- **Memory Usage**: ~1-2KB per connection
-- **Latency**: Sub-millisecond routing decisions
+Based on development testing:
 
-## Architecture
+- **Connections**: 10,000+ concurrent QUIC connections
+- **Throughput**: 100,000+ requests/second (hardware dependent)
+- **Memory**: ~1-2KB per active connection
+- **Latency**: Sub-millisecond routing overhead
 
-Spooky uses a modular, async-first architecture designed for high performance and reliability:
+Note: Production performance depends on backend capacity, network conditions, and system resources.
 
-- **Edge** (`crates/edge/`): QUIC termination, HTTP/3 session management, embedded routing
-- **Bridge** (`crates/bridge/`): HTTP/3 ↔ HTTP/2 protocol conversion with QPACK handling
-- **Transport** (`crates/transport/`): HTTP/2 connection pooling and backend communication
-- **Load Balancer** (`crates/lb/`): Multiple load balancing algorithms with health checking
-- **Config** (`crates/config/`): YAML configuration parsing with comprehensive validation
+## Project Status
 
-### Request Flow
-```
-HTTP/3 Client → QUIC Termination → Route Matching → Load Balancing → HTTP/2 Backend
-                    ↓                        ↓                      ↓
-               Protocol Bridge          Embedded Rules        Connection Pool
+**Experimental.** Spooky is not production-ready. Core features are implemented and functional, but significant limitations remain (blocking backend I/O, full body buffering, no TLS peer verification, single-threaded QUIC processing).
+
+Currently working:
+
+- QUIC termination and HTTP/3 support
+- HTTP/2 backend forwarding
+- Multiple load balancing algorithms
+- Health checking and automatic recovery
+- Path and host-based routing
+
+See [roadmap](docs/roadmap.md) for known issues and planned improvements.
+
+## Documentation
+
+- [Architecture Overview](docs/architecture.md)
+- [Configuration Reference](docs/configuration/reference.md)
+- [TLS Setup Guide](docs/configuration/tls.md)
+- [Load Balancing Guide](docs/user-guide/load-balancing.md)
+- [Production Deployment](docs/deployment/production.md)
+- [Troubleshooting](docs/troubleshooting/common-issues.md)
+
+## Development
+
+See [contributing guide](docs/development/contributing.md) for development setup and guidelines.
+
+```bash
+# Development build
+cargo build
+
+# Run with debug logging
+RUST_LOG=debug cargo run -- --config config/config.yaml
+
+# Format code
+cargo fmt
+
+# Lint
+cargo clippy
 ```
 
 ## License
 
-ELv2 - see [LICENSE.md](LICENSE.md)
+Elastic License 2.0 (ELv2) - see [LICENSE](LICENSE.md)
