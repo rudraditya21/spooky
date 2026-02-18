@@ -1,0 +1,124 @@
+site_name: Spooky
+site_description: HTTP/3 to HTTP/2 reverse proxy and load balancer
+site_url: https://spooky.dev
+repo_url: https://github.com/nishujangra/spooky
+repo_name: nishujangra/spooky
+edit_uri: edit/master/docs/
+
+docs_dir: docs
+exclude_docs: |
+  internal/
+
+theme:
+  name: material
+  palette:
+    - scheme: slate
+      primary: deep purple
+      accent: purple
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+    - scheme: default
+      primary: deep purple
+      accent: purple
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+  font:
+    text: Inter
+    code: JetBrains Mono
+  icon:
+    logo: material/ghost
+    repo: fontawesome/brands/github
+  features:
+    - navigation.instant
+    - navigation.instant.progress
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - navigation.footer
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - search.share
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets:
+      base_path: ["."]
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.critic
+  - pymdownx.caret
+  - pymdownx.keys
+  - pymdownx.mark
+  - pymdownx.tilde
+  - attr_list
+  - md_in_html
+  - def_list
+  - footnotes
+  - tables
+  - toc:
+      permalink: true
+      title: On this page
+
+plugins:
+  - search:
+      lang: en
+  - glightbox
+
+nav:
+  - Home: README.md
+  - Getting Started:
+    - Overview: getting-started/overview.md
+    - Installation: getting-started/installation.md
+    - Quick Start: tutorials/quickstart.md
+  - Configuration:
+    - Reference: configuration/reference.md
+    - TLS Setup: configuration/tls.md
+  - User Guide:
+    - Basics: user-guide/basics.md
+    - Load Balancing: user-guide/load-balancing.md
+  - Architecture:
+    - Overview: architecture.md
+    - High-Level Design: architecture/overview.md
+    - Components: architecture/components.md
+  - Deployment:
+    - Production: deployment/production.md
+    - Troubleshooting: troubleshooting/common-issues.md
+  - Development:
+    - Contributing: development/contributing.md
+    - Changelog: changelog.md
+  - Protocols:
+    - HTTP/3: protocols/http3.md
+    - QUIC: protocols/quic.md
+  - API:
+    - Overview: api/overview.md
+  - References: references.md
+  - Roadmap: roadmap.md
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/nishujangra/spooky
+  version:
+    provider: mike
+
+extra_css:
+  - stylesheets/extra.css
