@@ -100,7 +100,7 @@ pub struct BackendPool {
 
 pub struct UpstreamPool {
     pub pool: BackendPool,
-    pub strategy: String,
+    pub load_balancer: LoadBalancing,
 }
 
 impl UpstreamPool {
@@ -110,10 +110,20 @@ impl UpstreamPool {
             .map(|backend| BackendState::new(backend))
             .collect();
 
+        let load_balancer = LoadBalancing::from_config(&upstream.load_balancing.lb_type)?;
+
         Ok(Self {
             pool: BackendPool::new_from_states(backends),
-            strategy: upstream.load_balancing.lb_type.clone(),
+            load_balancer,
         })
+    }
+
+    pub fn pick(&mut self, key: &str) -> Option<usize> {
+        self.load_balancer.pick(key, &self.pool)
+    }
+
+    pub fn lb_name(&self) -> &'static str {
+        self.load_balancer.name()
     }
 }
 
@@ -188,11 +198,19 @@ impl LoadBalancing {
         }
     }
 
-    pub fn pick(&mut self, key: &str, pool: &UpstreamPool) -> Option<usize> {
+    pub fn pick(&mut self, key: &str, pool: &BackendPool) -> Option<usize> {
         match self {
-            LoadBalancing::RoundRobin(rr) => rr.pick(&pool.pool),
-            LoadBalancing::ConsistentHash(ch) => ch.pick(key, &pool.pool),
-            LoadBalancing::Random(rand) => rand.pick(&pool.pool),
+            LoadBalancing::RoundRobin(rr) => rr.pick(pool),
+            LoadBalancing::ConsistentHash(ch) => ch.pick(key, pool),
+            LoadBalancing::Random(rand) => rand.pick(pool),
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            LoadBalancing::RoundRobin(_) => "round-robin",
+            LoadBalancing::ConsistentHash(_) => "consistent-hash",
+            LoadBalancing::Random(_) => "random",
         }
     }
 }
@@ -439,7 +457,7 @@ mod tests {
         };
 
         let upstream_pool = UpstreamPool::from_upstream(&upstream).unwrap();
-        assert_eq!(upstream_pool.strategy, "round-robin");
+        assert!(matches!(upstream_pool.load_balancer, LoadBalancing::RoundRobin(_)));
         assert_eq!(upstream_pool.pool.len(), 2);
         assert_eq!(upstream_pool.pool.address(0), Some("127.0.0.1:8001"));
         assert_eq!(upstream_pool.pool.address(1), Some("127.0.0.1:8002"));

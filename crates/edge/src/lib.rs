@@ -11,7 +11,7 @@ use core::net::SocketAddr;
 
 use spooky_config::config::Config;
 use spooky_transport::h2_pool::H2Pool;
-use spooky_lb::{UpstreamPool, LoadBalancing};
+use spooky_lb::UpstreamPool;
 
 pub mod quic_listener;
 
@@ -22,7 +22,6 @@ pub struct QUICListener {
     pub h3_config: Arc<quiche::h3::Config>,
     pub h2_pool: Arc<H2Pool>,
     pub upstream_pools: HashMap<String, Arc<Mutex<UpstreamPool>>>,
-    pub load_balancer: LoadBalancing,
     pub metrics: Metrics,
     pub draining: bool,
     pub drain_start: Option<Instant>,
