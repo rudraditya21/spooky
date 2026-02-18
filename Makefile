@@ -74,3 +74,13 @@ certs-clean:
 
 clean:
 	rm -f target/release/spooky
+
+docs-serve:
+	mkdocs serve
+
+docs-build:
+	mkdocs build
+
+docs-setup:
+	pip install -r docs-requirements.txt --break-system-packages
+	mkdocs build
