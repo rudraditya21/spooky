@@ -53,7 +53,8 @@ pub fn build_h2_request(
             continue;
         }
 
-        let header_value = HeaderValue::from_bytes(value).map_err(|_| BridgeError::InvalidHeader)?;
+        let header_value =
+            HeaderValue::from_bytes(value).map_err(|_| BridgeError::InvalidHeader)?;
         builder = builder.header(header_name, header_value);
     }
 

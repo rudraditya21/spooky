@@ -105,9 +105,10 @@ pub struct UpstreamPool {
 
 impl UpstreamPool {
     pub fn from_upstream(upstream: &spooky_config::config::Upstream) -> Result<Self, String> {
-        let backends = upstream.backends
+        let backends = upstream
+            .backends
             .iter()
-            .map(|backend| BackendState::new(backend))
+            .map(BackendState::new)
             .collect();
 
         let load_balancer = LoadBalancing::from_config(&upstream.load_balancing.lb_type)?;
@@ -236,13 +237,21 @@ impl RoundRobin {
     }
 }
 
+impl Default for RoundRobin {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct ConsistentHash {
     replicas: u32,
 }
 
 impl ConsistentHash {
     pub fn new(replicas: u32) -> Self {
-        Self { replicas: replicas.max(1) }
+        Self {
+            replicas: replicas.max(1),
+        }
     }
 
     pub fn pick(&self, key: &str, pool: &BackendPool) -> Option<usize> {
@@ -283,6 +292,12 @@ impl Random {
         let mut rng = rand::thread_rng();
         let idx = rng.gen_range(0..candidates.len());
         Some(candidates[idx])
+    }
+}
+
+impl Default for Random {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -457,7 +472,10 @@ mod tests {
         };
 
         let upstream_pool = UpstreamPool::from_upstream(&upstream).unwrap();
-        assert!(matches!(upstream_pool.load_balancer, LoadBalancing::RoundRobin(_)));
+        assert!(matches!(
+            upstream_pool.load_balancer,
+            LoadBalancing::RoundRobin(_)
+        ));
         assert_eq!(upstream_pool.pool.len(), 2);
         assert_eq!(upstream_pool.pool.address(0), Some("127.0.0.1:8001"));
         assert_eq!(upstream_pool.pool.address(1), Some("127.0.0.1:8002"));

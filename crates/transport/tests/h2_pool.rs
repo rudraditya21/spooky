@@ -1,14 +1,14 @@
 use std::{
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
 use bytes::Bytes;
 use http_body_util::Full;
-use hyper::{body::Incoming, service::service_fn, Request, Response};
+use hyper::{Request, Response, body::Incoming, service::service_fn};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
 

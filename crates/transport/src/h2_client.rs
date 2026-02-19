@@ -1,7 +1,7 @@
-use hyper::{Request, rt::Executor};
-use hyper_util::client::legacy::{Client, connect::HttpConnector};
 use http_body_util::Full;
 use hyper::body::Bytes;
+use hyper::{Request, rt::Executor};
+use hyper_util::client::legacy::{Client, connect::HttpConnector};
 
 pub struct H2Client {
     client: Client<HttpConnector, Full<Bytes>>,
@@ -21,15 +21,12 @@ where
     }
 }
 
-
 impl H2Client {
     pub fn new() -> Self {
         let mut http = HttpConnector::new();
         http.enforce_http(false);
 
-        let client = Client::builder(TokioExecutor)
-            .http2_only(true)
-            .build(http);
+        let client = Client::builder(TokioExecutor).http2_only(true).build(http);
 
         Self { client }
     }
@@ -39,5 +36,11 @@ impl H2Client {
         req: Request<Full<Bytes>>,
     ) -> Result<hyper::Response<hyper::body::Incoming>, hyper_util::client::legacy::Error> {
         self.client.request(req).await
+    }
+}
+
+impl Default for H2Client {
+    fn default() -> Self {
+        Self::new()
     }
 }

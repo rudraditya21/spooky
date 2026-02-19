@@ -101,7 +101,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if conn.is_established() && h3_conn.is_none() {
             let h3_config = quiche::h3::Config::new()?;
-            h3_conn = Some(quiche::h3::Connection::with_transport(&mut conn, &h3_config)?);
+            h3_conn = Some(quiche::h3::Connection::with_transport(
+                &mut conn, &h3_config,
+            )?);
         }
 
         if let Some(h3) = h3_conn.as_mut() {
@@ -127,15 +129,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         println!();
                     }
-                    Ok((stream_id, quiche::h3::Event::Data)) => {
-                        loop {
-                            match h3.recv_body(&mut conn, stream_id, &mut buf) {
-                                Ok(read) => response_body.extend_from_slice(&buf[..read]),
-                                Err(quiche::h3::Error::Done) => break,
-                                Err(e) => return Err(format!("recv_body failed: {e:?}").into()),
-                            }
+                    Ok((stream_id, quiche::h3::Event::Data)) => loop {
+                        match h3.recv_body(&mut conn, stream_id, &mut buf) {
+                            Ok(read) => response_body.extend_from_slice(&buf[..read]),
+                            Err(quiche::h3::Error::Done) => break,
+                            Err(e) => return Err(format!("recv_body failed: {e:?}").into()),
                         }
-                    }
+                    },
                     Ok((_stream_id, quiche::h3::Event::Finished)) => {
                         response_done = true;
                         break;

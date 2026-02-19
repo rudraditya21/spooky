@@ -2,7 +2,8 @@ use std::{
     collections::HashMap,
     net::UdpSocket,
     sync::{
-        Arc, Mutex, atomic::{AtomicU64, Ordering}
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
     },
     time::Instant,
 };
@@ -10,8 +11,8 @@ use std::{
 use core::net::SocketAddr;
 
 use spooky_config::config::Config;
-use spooky_transport::h2_pool::H2Pool;
 use spooky_lb::UpstreamPool;
+use spooky_transport::h2_pool::H2Pool;
 
 pub mod quic_listener;
 

@@ -1,19 +1,17 @@
-
-
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
 use crate::default::{
     get_default_address, get_default_cooldown_ms, get_default_failure_threshold,
-    get_default_health_timeout, get_default_interval, get_default_load_balancing,
-    get_default_log, get_default_log_level, get_default_path, get_default_port,
-    get_default_protocol, get_default_success_threshold, get_default_weight, get_default_version
+    get_default_health_timeout, get_default_interval, get_default_load_balancing, get_default_log,
+    get_default_log_level, get_default_path, get_default_port, get_default_protocol,
+    get_default_success_threshold, get_default_version, get_default_weight,
 };
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
-    #[serde(default = "get_default_version")]  // Make version optional with default
+    #[serde(default = "get_default_version")] // Make version optional with default
     pub version: u32,
 
     pub listen: Listen,
@@ -51,9 +49,9 @@ pub struct Upstream {
     #[serde(default = "get_default_load_balancing")]
     pub load_balancing: LoadBalancing,
 
-    pub route: RouteMatch,  // Route matching criteria for this upstream
+    pub route: RouteMatch, // Route matching criteria for this upstream
 
-    pub backends: Vec<Backend>
+    pub backends: Vec<Backend>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -65,7 +63,6 @@ pub struct Backend {
     pub weight: u32, // 100
     pub health_check: HealthCheck,
 }
-
 
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct RouteMatch {
@@ -118,7 +115,6 @@ pub struct Log {
     // scream -> warn
     // poltergeist -> error
     // silence -> off
-
     #[serde(default = "get_default_log_level")]
     pub level: String, // "info, warn, error"
 }

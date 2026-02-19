@@ -1,2 +1,2 @@
-pub mod tls;
 pub mod logger;
+pub mod tls;

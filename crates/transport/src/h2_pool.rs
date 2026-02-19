@@ -1,8 +1,8 @@
 use std::{collections::HashMap, sync::Arc};
 
 use http_body_util::Full;
-use hyper::body::{Bytes, Incoming};
 use hyper::Request;
+use hyper::body::{Bytes, Incoming};
 use tokio::sync::Semaphore;
 
 use crate::h2_client::H2Client;

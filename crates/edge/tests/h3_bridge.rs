@@ -1,29 +1,29 @@
 use std::{
     net::SocketAddr,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use bytes::Bytes;
 use http_body_util::Full;
-use hyper::{body::Incoming, service::service_fn, Request, Response};
+use hyper::{Request, Response, body::Incoming, service::service_fn};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rand::RngCore;
 use rcgen::{Certificate, CertificateParams, SanType};
-use tempfile::{tempdir, TempDir};
+use tempfile::{TempDir, tempdir};
 use tokio::net::TcpListener;
 
-use spooky_config::config::{
-    Backend, Config, HealthCheck, Listen, LoadBalancing, Log, Tls,
-};
+use spooky_config::config::{Backend, Config, HealthCheck, Listen, LoadBalancing, Log, Tls};
 use spooky_edge::QUICListener;
 
 fn write_test_certs(dir: &TempDir) -> (String, String) {
     let mut params = CertificateParams::new(vec!["localhost".into()]);
-    params.subject_alt_names.push(SanType::IpAddress("127.0.0.1".parse().unwrap()));
+    params
+        .subject_alt_names
+        .push(SanType::IpAddress("127.0.0.1".parse().unwrap()));
     let cert = Certificate::from_params(params).expect("failed to build cert");
 
     let cert_path = dir.path().join("cert.pem");
@@ -39,8 +39,8 @@ fn write_test_certs(dir: &TempDir) -> (String, String) {
 }
 
 fn make_config(port: u32, backend_addr: String, cert: String, key: String) -> Config {
-    use std::collections::HashMap;
     use spooky_config::config::{RouteMatch, Upstream};
+    use std::collections::HashMap;
 
     let mut upstream = HashMap::new();
     upstream.insert(
@@ -97,9 +97,7 @@ async fn start_h2_backend() -> SocketAddr {
         if let Ok((stream, _)) = listener.accept().await {
             let io = TokioIo::new(stream);
             let service = service_fn(|_req: Request<Incoming>| async move {
-                Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from(
-                    "backend ok\n",
-                ))))
+                Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from("backend ok\n"))))
             });
 
             let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
@@ -115,8 +113,8 @@ fn run_h3_client(addr: SocketAddr) -> Result<String, String> {
     let socket = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
     let local_addr = socket.local_addr().map_err(|e| e.to_string())?;
 
-    let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)
-        .map_err(|e| format!("config: {e:?}"))?;
+    let mut config =
+        quiche::Config::new(quiche::PROTOCOL_VERSION).map_err(|e| format!("config: {e:?}"))?;
     config.verify_peer(false);
     config
         .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
@@ -172,7 +170,10 @@ fn run_h3_client(addr: SocketAddr) -> Result<String, String> {
 
         match socket.recv_from(&mut buf) {
             Ok((len, from)) => {
-                let recv_info = quiche::RecvInfo { from, to: local_addr };
+                let recv_info = quiche::RecvInfo {
+                    from,
+                    to: local_addr,
+                };
                 conn.recv(&mut buf[..len], recv_info)
                     .map_err(|e| format!("recv: {e:?}"))?;
             }

@@ -1,22 +1,24 @@
 use std::{
     net::SocketAddr,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use bytes::Bytes;
 use http_body_util::Full;
-use hyper::{body::Incoming, service::service_fn, Request, Response};
+use hyper::{Request, Response, body::Incoming, service::service_fn};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rand::RngCore;
 use rcgen::{Certificate, CertificateParams, SanType};
-use tempfile::{tempdir, TempDir};
+use tempfile::{TempDir, tempdir};
 use tokio::net::TcpListener;
 
-use spooky_config::config::{Backend, Config, HealthCheck, Listen, LoadBalancing, Log, RouteMatch, Tls, Upstream};
+use spooky_config::config::{
+    Backend, Config, HealthCheck, Listen, LoadBalancing, Log, RouteMatch, Tls, Upstream,
+};
 use spooky_edge::QUICListener;
 
 fn write_test_certs(dir: &TempDir) -> (String, String) {
@@ -64,7 +66,13 @@ async fn start_h2_backend(body: &'static str) -> SocketAddr {
     addr
 }
 
-fn make_config(port: u32, backends: Vec<Backend>, lb_type: &str, cert: String, key: String) -> Config {
+fn make_config(
+    port: u32,
+    backends: Vec<Backend>,
+    lb_type: &str,
+    cert: String,
+    key: String,
+) -> Config {
     use std::collections::HashMap;
 
     let mut upstream = HashMap::new();
@@ -106,8 +114,8 @@ fn run_h3_client(addr: SocketAddr, authority: &str) -> Result<String, String> {
     let socket = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
     let local_addr = socket.local_addr().map_err(|e| e.to_string())?;
 
-    let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)
-        .map_err(|e| format!("config: {e:?}"))?;
+    let mut config =
+        quiche::Config::new(quiche::PROTOCOL_VERSION).map_err(|e| format!("config: {e:?}"))?;
     config.verify_peer(false);
     config
         .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
@@ -163,7 +171,10 @@ fn run_h3_client(addr: SocketAddr, authority: &str) -> Result<String, String> {
 
         match socket.recv_from(&mut buf) {
             Ok((len, from)) => {
-                let recv_info = quiche::RecvInfo { from, to: local_addr };
+                let recv_info = quiche::RecvInfo {
+                    from,
+                    to: local_addr,
+                };
                 conn.recv(&mut buf[..len], recv_info)
                     .map_err(|e| format!("recv: {e:?}"))?;
             }
@@ -292,7 +303,10 @@ fn round_robin_across_backends() {
         .map(|body| body.trim().to_string())
         .collect::<Vec<_>>();
 
-    assert_eq!(sequence, vec!["backend-a", "backend-b", "backend-a", "backend-b"]);
+    assert_eq!(
+        sequence,
+        vec!["backend-a", "backend-b", "backend-a", "backend-b"]
+    );
 }
 
 #[test]

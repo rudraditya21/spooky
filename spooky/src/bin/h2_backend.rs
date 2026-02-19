@@ -3,7 +3,7 @@ use std::{convert::Infallible, net::SocketAddr};
 use bytes::Bytes;
 use clap::Parser;
 use http_body_util::Full;
-use hyper::{body::Incoming, service::service_fn, Request, Response};
+use hyper::{Request, Response, body::Incoming, service::service_fn};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
 
@@ -14,9 +14,7 @@ struct Cli {
     port: u16,
 }
 
-async fn handle_request(
-    _req: Request<Incoming>,
-) -> Result<Response<Full<Bytes>>, Infallible> {
+async fn handle_request(_req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
     Ok(Response::new(Full::new(Bytes::from("backend ok\n"))))
 }
 

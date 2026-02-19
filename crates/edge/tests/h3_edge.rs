@@ -1,24 +1,24 @@
 use std::{
     net::UdpSocket,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use rand::RngCore;
 use rcgen::{Certificate, CertificateParams, SanType};
-use tempfile::{tempdir, TempDir};
+use tempfile::{TempDir, tempdir};
 
-use spooky_config::config::{
-    Backend, Config, HealthCheck, Listen, LoadBalancing, Log, Tls,
-};
+use spooky_config::config::{Backend, Config, HealthCheck, Listen, LoadBalancing, Log, Tls};
 use spooky_edge::QUICListener;
 
 fn write_test_certs(dir: &TempDir) -> (String, String) {
     let mut params = CertificateParams::new(vec!["localhost".into()]);
-    params.subject_alt_names.push(SanType::IpAddress("127.0.0.1".parse().unwrap()));
+    params
+        .subject_alt_names
+        .push(SanType::IpAddress("127.0.0.1".parse().unwrap()));
     let cert = Certificate::from_params(params).expect("failed to build cert");
 
     let cert_path = dir.path().join("cert.pem");
@@ -34,8 +34,8 @@ fn write_test_certs(dir: &TempDir) -> (String, String) {
 }
 
 fn make_config(port: u32, cert: String, key: String) -> Config {
-    use std::collections::HashMap;
     use spooky_config::config::{RouteMatch, Upstream};
+    use std::collections::HashMap;
 
     let mut upstream = HashMap::new();
     upstream.insert(
@@ -88,8 +88,8 @@ fn run_h3_client(addr: std::net::SocketAddr) -> Result<String, String> {
     let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
     let local_addr = socket.local_addr().map_err(|e| e.to_string())?;
 
-    let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)
-        .map_err(|e| format!("config: {e:?}"))?;
+    let mut config =
+        quiche::Config::new(quiche::PROTOCOL_VERSION).map_err(|e| format!("config: {e:?}"))?;
     config.verify_peer(false);
     config
         .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
@@ -145,7 +145,10 @@ fn run_h3_client(addr: std::net::SocketAddr) -> Result<String, String> {
 
         match socket.recv_from(&mut buf) {
             Ok((len, from)) => {
-                let recv_info = quiche::RecvInfo { from, to: local_addr };
+                let recv_info = quiche::RecvInfo {
+                    from,
+                    to: local_addr,
+                };
                 conn.recv(&mut buf[..len], recv_info)
                     .map_err(|e| format!("recv: {e:?}"))?;
             }

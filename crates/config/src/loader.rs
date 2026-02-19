@@ -1,5 +1,5 @@
-use std::fs;
 use crate::config::Config;
+use std::fs;
 
 pub fn read_config(filename: &str) -> Result<Config, String> {
     let text = fs::read_to_string(filename)

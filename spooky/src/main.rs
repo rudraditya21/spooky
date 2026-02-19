@@ -1,8 +1,8 @@
 //! Spooky HTTP/3 Load Balancer - Main Entry Point
 
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 
 use clap::Parser;
@@ -40,7 +40,7 @@ async fn main() {
     spooky_utils::logger::init_logger(&config_yaml.log.level);
 
     // Validate Configurations
-    if validate_config(&config_yaml) == false {
+    if !validate_config(&config_yaml) {
         error!("Configuration validation failed. Exiting...");
         std::process::exit(1);
     }

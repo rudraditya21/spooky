@@ -13,21 +13,21 @@ use log::{debug, error, info};
 use quiche::Config;
 use quiche::h3::NameValue;
 use rand::RngCore;
-use spooky_bridge::h3_to_h2::{build_h2_request, BridgeError};
-use spooky_lb::{UpstreamPool, HealthTransition};
+use spooky_bridge::h3_to_h2::{BridgeError, build_h2_request};
+use spooky_lb::{HealthTransition, UpstreamPool};
 use spooky_transport::h2_pool::{H2Pool, PoolError};
 use tokio::runtime::Handle;
 
 use spooky_config::config::Config as SpookyConfig;
 
-use crate::{Metrics, QuicConnection, QUICListener, RequestEnvelope};
+use crate::{Metrics, QUICListener, QuicConnection, RequestEnvelope};
 
 #[derive(Debug)]
 pub enum ProxyError {
     Bridge(BridgeError),
     Transport(String),
     Timeout,
-    Tls(String) // For TLS cred loading failure
+    Tls(String), // For TLS cred loading failure
 }
 
 impl std::fmt::Display for ProxyError {
@@ -44,11 +44,7 @@ impl std::fmt::Display for ProxyError {
 fn is_hop_header(name: &str) -> bool {
     matches!(
         name,
-        "connection"
-            | "keep-alive"
-            | "proxy-connection"
-            | "transfer-encoding"
-            | "upgrade"
+        "connection" | "keep-alive" | "proxy-connection" | "transfer-encoding" | "upgrade"
     )
 }
 
@@ -64,7 +60,11 @@ fn request_hash_key(req: &RequestEnvelope) -> String {
     req.method.clone()
 }
 
-fn find_upstream_for_request<'a>(upstreams: &'a std::collections::HashMap<String, spooky_config::config::Upstream>, path: &str, host: Option<&str>) -> Option<&'a str> {
+fn find_upstream_for_request<'a>(
+    upstreams: &'a std::collections::HashMap<String, spooky_config::config::Upstream>,
+    path: &str,
+    host: Option<&str>,
+) -> Option<&'a str> {
     // Find the most specific route that matches the path and/or host
     // We need to find the longest matching path prefix
     let mut best_match: Option<(&str, usize)> = None;
@@ -72,13 +72,13 @@ fn find_upstream_for_request<'a>(upstreams: &'a std::collections::HashMap<String
     for (upstream_name, upstream) in upstreams {
         let has_host_match = match (&upstream.route.host, host) {
             (Some(route_host), Some(request_host)) => route_host == request_host,
-            (None, _) => true, // No host constraint
+            (None, _) => true,        // No host constraint
             (Some(_), None) => false, // Host constraint but no host in request
         };
 
         let path_match_len = match &upstream.route.path_prefix {
             Some(path_prefix) if path.starts_with(path_prefix) => path_prefix.len(),
-            None => 0, // No path constraint, matches but with lowest priority
+            None => 0,     // No path constraint, matches but with lowest priority
             _ => continue, // No match
         };
 
@@ -97,35 +97,40 @@ const BACKEND_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_INFLIGHT_PER_BACKEND: usize = 64;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
-
-
 impl QUICListener {
     pub fn new(config: SpookyConfig) -> Result<Self, ProxyError> {
         let socket_address = format!("{}:{}", &config.listen.address, &config.listen.port);
-        
-        let socket = UdpSocket::bind(socket_address.as_str())
-            .expect("Failed to bind UDP socker");
+
+        let socket = UdpSocket::bind(socket_address.as_str()).expect("Failed to bind UDP socker");
         socket
             .set_read_timeout(Some(Duration::from_millis(50)))
             .expect("Failed to set UDP read timeout");
 
         let mut quic_config = Config::new(quiche::PROTOCOL_VERSION).expect("REASON");
-        
+
         match quic_config.load_cert_chain_from_pem_file(&config.listen.tls.cert) {
             Ok(_) => debug!("Certificate loaded successfully"),
-            Err(e) => return Err(ProxyError::Tls(format!(
-                 "Failed to load certificate '{}': {}", config.listen.tls.cert, e
-            )))
+            Err(e) => {
+                return Err(ProxyError::Tls(format!(
+                    "Failed to load certificate '{}': {}",
+                    config.listen.tls.cert, e
+                )));
+            }
         }
 
         match quic_config.load_priv_key_from_pem_file(&config.listen.tls.key) {
             Ok(_) => debug!("Private key loaded successfully"),
-            Err(e) => return Err(ProxyError::Tls(format!(
-                "Failed to load key '{}': {}", config.listen.tls.key, e
-            ))),
+            Err(e) => {
+                return Err(ProxyError::Tls(format!(
+                    "Failed to load key '{}': {}",
+                    config.listen.tls.key, e
+                )));
+            }
         }
 
-        quic_config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL).unwrap();
+        quic_config
+            .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+            .unwrap();
         quic_config.set_max_idle_timeout(5000);
         quic_config.set_max_recv_udp_payload_size(1350);
         quic_config.set_max_send_udp_payload_size(1350);
@@ -137,7 +142,7 @@ impl QUICListener {
         quic_config.set_initial_max_streams_uni(100);
         quic_config.set_disable_active_migration(true);
         quic_config.verify_peer(false);
-            
+
         // CRITICAL FIX: Explicitly disable 0-RTT/early data
         // This prevents clients from attempting 0-RTT that we can't handle
 
@@ -148,14 +153,19 @@ impl QUICListener {
         let backend_addresses = config
             .upstream
             .values()
-            .flat_map(|upstream| upstream.backends.iter().map(|backend| backend.address.clone()))
+            .flat_map(|upstream| {
+                upstream
+                    .backends
+                    .iter()
+                    .map(|backend| backend.address.clone())
+            })
             .collect::<Vec<_>>();
         let h2_pool = Arc::new(H2Pool::new(backend_addresses, MAX_INFLIGHT_PER_BACKEND));
 
         let mut upstream_pools = HashMap::new();
         for (name, upstream) in &config.upstream {
-            let upstream_pool = UpstreamPool::from_upstream(upstream)
-                .expect("Failed to create upstream pool");
+            let upstream_pool =
+                UpstreamPool::from_upstream(upstream).expect("Failed to create upstream pool");
             upstream_pools.insert(name.clone(), Arc::new(Mutex::new(upstream_pool)));
         }
 
@@ -175,7 +185,7 @@ impl QUICListener {
             drain_start: None,
             recv_buf: [0; 65535],
             send_buf: [0; 65535],
-            connections: HashMap::new()
+            connections: HashMap::new(),
         })
     }
 
@@ -197,12 +207,11 @@ impl QUICListener {
             return true;
         }
 
-        if let Some(start) = self.drain_start {
-            if start.elapsed() >= DRAIN_TIMEOUT {
-                self.close_all();
-                return true;
-            }
+        if let Some(start) = self.drain_start && start.elapsed() >= DRAIN_TIMEOUT {
+            self.close_all();
+            return true;
         }
+
 
         false
     }
@@ -241,8 +250,13 @@ impl QUICListener {
         };
 
         let dcid_bytes = header.dcid.as_ref().to_vec();
-        debug!("Packet DCID (len={}): {:02x?}, type: {:?}, active connections: {}",
-            dcid_bytes.len(), &dcid_bytes, header.ty, self.connections.len());
+        debug!(
+            "Packet DCID (len={}): {:02x?}, type: {:?}, active connections: {}",
+            dcid_bytes.len(),
+            &dcid_bytes,
+            header.ty,
+            self.connections.len()
+        );
 
         // Try exact match first
         if let Some(mut connection) = self.connections.remove(&dcid_bytes) {
@@ -256,8 +270,10 @@ impl QUICListener {
         if header.ty == quiche::Type::Short && dcid_bytes.len() > 8 {
             for stored_cid in self.connections.keys() {
                 if dcid_bytes.starts_with(stored_cid) {
-                    debug!("Found connection via prefix match. Stored CID: {:02x?}, Packet DCID: {:02x?}",
-                        stored_cid, &dcid_bytes);
+                    debug!(
+                        "Found connection via prefix match. Stored CID: {:02x?}, Packet DCID: {:02x?}",
+                        stored_cid, &dcid_bytes
+                    );
                     let stored_cid_copy = stored_cid.clone();
                     if let Some(mut connection) = self.connections.remove(&stored_cid_copy) {
                         connection.peer_address = peer;
@@ -303,9 +319,12 @@ impl QUICListener {
 
         // Store connection using server's SCID (not client's DCID)
         // After handshake, client will use server's SCID as DCID in subsequent packets
-        debug!("Creating new connection with server SCID: {:02x?}", &scid_bytes);
+        debug!(
+            "Creating new connection with server SCID: {:02x?}",
+            &scid_bytes
+        );
         Some((connection, scid_bytes.to_vec()))
-}
+    }
 
     pub fn poll(&mut self) {
         // Read a UDP datagram and feed it into quiche.
@@ -338,26 +357,24 @@ impl QUICListener {
 
         let mut recv_data = self.recv_buf[..len].to_vec();
 
-        let header = match quiche::Header::from_slice(&mut recv_data.clone(), quiche::MAX_CONN_ID_LEN) {
-            Ok(hdr) => hdr,
-            Err(_) => {
-                error!("Wrong QUIC HEADER");
-                return;
-            }
-        };
-
-        if header.ty == quiche::Type::VersionNegotiation {
-            let len = match quiche::negotiate_version(
-                &header.scid,
-                &header.dcid,
-                &mut self.send_buf,
-            ) {
-                Ok(len) => len,
-                Err(e) => {
-                    error!("Version negotiation failed: {:?}", e);
+        let header =
+            match quiche::Header::from_slice(&mut recv_data.clone(), quiche::MAX_CONN_ID_LEN) {
+                Ok(hdr) => hdr,
+                Err(_) => {
+                    error!("Wrong QUIC HEADER");
                     return;
                 }
             };
+
+        if header.ty == quiche::Type::VersionNegotiation {
+            let len =
+                match quiche::negotiate_version(&header.scid, &header.dcid, &mut self.send_buf) {
+                    Ok(len) => len,
+                    Err(e) => {
+                        error!("Version negotiation failed: {:?}", e);
+                        return;
+                    }
+                };
 
             if let Err(e) = socket.send_to(&self.send_buf[..len], peer) {
                 error!("Failed to send version negotiation: {:?}", e);
@@ -369,7 +386,10 @@ impl QUICListener {
 
         // First, try to find existing connection by DCID
         let lookup_key = header.dcid.as_ref().to_vec();
-        debug!("Looking up connection with DCID: {:?}", hex::encode(&lookup_key));
+        debug!(
+            "Looking up connection with DCID: {:?}",
+            hex::encode(&lookup_key)
+        );
         let (mut connection, scid) = if let Some(mut conn) = self.connections.remove(&lookup_key) {
             conn.peer_address = peer;
             debug!("Found existing connection for {}", peer);
@@ -386,8 +406,11 @@ impl QUICListener {
             }
 
             if let Some(peer_key) = found_peer_connection {
-                debug!("Found existing connection from same peer {}, trying with key: {:?}",
-                       peer, hex::encode(&peer_key));
+                debug!(
+                    "Found existing connection from same peer {}, trying with key: {:?}",
+                    peer,
+                    hex::encode(&peer_key)
+                );
                 if let Some(mut conn) = self.connections.remove(&peer_key) {
                     conn.peer_address = peer;
                     debug!("Using existing peer connection for {}", peer);
@@ -398,19 +421,28 @@ impl QUICListener {
                         Some(conn) => {
                             debug!("Created new connection for {}", peer);
                             conn
-                        },
+                        }
                         None => {
-                            debug!("Dropping packet for unknown connection from {} (DCID: {:?})",
-                                   peer, hex::encode(&lookup_key));
+                            debug!(
+                                "Dropping packet for unknown connection from {} (DCID: {:?})",
+                                peer,
+                                hex::encode(&lookup_key)
+                            );
                             return;
                         }
                     }
                 }
             } else {
-                debug!("No existing connection found for DCID or peer, checking all connections...");
+                debug!(
+                    "No existing connection found for DCID or peer, checking all connections..."
+                );
                 // Debug: check what connections we have
                 for (key, conn) in &self.connections {
-                    debug!("Existing connection DCID: {:?}, peer: {}", hex::encode(key), conn.peer_address);
+                    debug!(
+                        "Existing connection DCID: {:?}, peer: {}",
+                        hex::encode(key),
+                        conn.peer_address
+                    );
                 }
 
                 // No existing connection found, try to create new one
@@ -418,17 +450,23 @@ impl QUICListener {
                     Some(conn) => {
                         debug!("Created new connection for {}", peer);
                         conn
-                    },
+                    }
                     None => {
-                        debug!("Dropping packet for unknown connection from {} (DCID: {:?})",
-                               peer, hex::encode(&lookup_key));
+                        debug!(
+                            "Dropping packet for unknown connection from {} (DCID: {:?})",
+                            peer,
+                            hex::encode(&lookup_key)
+                        );
                         return;
                     }
                 }
             }
         };
 
-        let recv_info = quiche::RecvInfo { from: peer, to: local_addr };
+        let recv_info = quiche::RecvInfo {
+            from: peer,
+            to: local_addr,
+        };
 
         if let Err(e) = connection.quic.recv(&mut recv_data, recv_info) {
             error!("QUIC recv failed: {:?}", e);
@@ -443,18 +481,18 @@ impl QUICListener {
             error!("🔴 Local error: {:?}", err);
         }
 
-
         connection.last_activity = Instant::now();
 
         // Debug logs
-        debug!("QUIC connection state - established: {}, in_early_data: {}, closed: {}", 
+        debug!(
+            "QUIC connection state - established: {}, in_early_data: {}, closed: {}",
             connection.quic.is_established(),
-            connection.quic.is_in_early_data(), 
+            connection.quic.is_in_early_data(),
             connection.quic.is_closed()
         );
 
-        if connection.quic.is_established() || connection.quic.is_in_early_data() {
-            if let Err(e) = Self::handle_h3(
+        if (connection.quic.is_established() || connection.quic.is_in_early_data())
+            && let Err(e) = Self::handle_h3(
                 &mut connection,
                 &h2_pool,
                 &self.upstream_pools,
@@ -462,7 +500,6 @@ impl QUICListener {
                 &self.metrics,
             ) {
                 error!("HTTP/3 handling failed: {:?}", e);
-            }
         }
 
         let mut send_buf = [0u8; 65_535];
@@ -521,11 +558,7 @@ impl QUICListener {
         }
     }
 
-    fn handle_timeout(
-        socket: &UdpSocket,
-        send_buf: &mut [u8],
-        connection: &mut QuicConnection,
-    ) {
+    fn handle_timeout(socket: &UdpSocket, send_buf: &mut [u8], connection: &mut QuicConnection) {
         let timeout = match connection.quic.timeout() {
             Some(timeout) => timeout,
             None => return,
@@ -570,10 +603,13 @@ impl QUICListener {
                     for header in list {
                         headers.push((header.name().to_vec(), header.value().to_vec()));
                         match header.name() {
-                            b":method" => method = String::from_utf8_lossy(header.value()).to_string(),
+                            b":method" => {
+                                method = String::from_utf8_lossy(header.value()).to_string()
+                            }
                             b":path" => path = String::from_utf8_lossy(header.value()).to_string(),
                             b":authority" | b"host" => {
-                                authority = Some(String::from_utf8_lossy(header.value()).to_string())
+                                authority =
+                                    Some(String::from_utf8_lossy(header.value()).to_string())
                             }
                             _ => {}
                         }
@@ -595,19 +631,17 @@ impl QUICListener {
                         info!("HTTP/3 request {} {}", method, path);
                     }
                 }
-                Ok((stream_id, quiche::h3::Event::Data)) => {
-                    loop {
-                        match h3.recv_body(&mut connection.quic, stream_id, &mut body_buf) {
-                            Ok(read) => {
-                                if let Some(req) = connection.streams.get_mut(&stream_id) {
-                                    req.body.extend_from_slice(&body_buf[..read]);
-                                }
+                Ok((stream_id, quiche::h3::Event::Data)) => loop {
+                    match h3.recv_body(&mut connection.quic, stream_id, &mut body_buf) {
+                        Ok(read) => {
+                            if let Some(req) = connection.streams.get_mut(&stream_id) {
+                                req.body.extend_from_slice(&body_buf[..read]);
                             }
-                            Err(quiche::h3::Error::Done) => break,
-                            Err(e) => return Err(e),
                         }
+                        Err(quiche::h3::Error::Done) => break,
+                        Err(e) => return Err(e),
                     }
-                }
+                },
                 Ok((stream_id, quiche::h3::Event::Finished)) => {
                     if let Some(req) = connection.streams.remove(&stream_id) {
                         Self::handle_request_finish(
@@ -635,6 +669,7 @@ impl QUICListener {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn handle_request_finish(
         h3: &mut quiche::h3::Connection,
         quic: &mut quiche::Connection,
@@ -657,17 +692,21 @@ impl QUICListener {
         }
 
         // Find the upstream for this request
-        let upstream_name = find_upstream_for_request(upstreams, &req.path, req.authority.as_deref())
-            .ok_or_else(|| {
-                error!("No route found for path: {} (host: {:?})", req.path, req.authority);
-                quiche::h3::Error::InternalError
-            })?;
+        let upstream_name =
+            find_upstream_for_request(upstreams, &req.path, req.authority.as_deref()).ok_or_else(
+                || {
+                    error!(
+                        "No route found for path: {} (host: {:?})",
+                        req.path, req.authority
+                    );
+                    quiche::h3::Error::InternalError
+                },
+            )?;
 
-        let upstream_pool = upstream_pools.get(upstream_name)
-            .ok_or_else(|| {
-                error!("Upstream pool not found for: {}", upstream_name);
-                quiche::h3::Error::InternalError
-            })?;
+        let upstream_pool = upstream_pools.get(upstream_name).ok_or_else(|| {
+            error!("Upstream pool not found for: {}", upstream_name);
+            quiche::h3::Error::InternalError
+        })?;
 
         let upstream_len = upstream_pool
             .lock()
@@ -705,7 +744,9 @@ impl QUICListener {
 
         let backend_addr = {
             let pool = upstream_pool.lock().expect("upstream pool lock");
-            pool.pool.address(backend_index).map(|addr| addr.to_string())
+            pool.pool
+                .address(backend_index)
+                .map(|addr| addr.to_string())
         };
         let backend_addr = match backend_addr {
             Some(addr) => addr,
@@ -720,24 +761,17 @@ impl QUICListener {
             }
         };
 
-        info!(
-            "Selected backend {} via {}",
-            backend_addr,
-            lb_type
-        );
+        info!("Selected backend {} via {}", backend_addr, lb_type);
 
         match Self::forward_request(&backend_addr, h2_pool, req) {
             Ok((status, headers, body)) => {
-                let transition = upstream_pool
-                    .lock()
-                    .ok()
-                    .and_then(|mut pool| {
-                        if status.is_server_error() {
-                            pool.pool.mark_failure(backend_index)
-                        } else {
-                            pool.pool.mark_success(backend_index)
-                        }
-                    });
+                let transition = upstream_pool.lock().ok().and_then(|mut pool| {
+                    if status.is_server_error() {
+                        pool.pool.mark_failure(backend_index)
+                    } else {
+                        pool.pool.mark_success(backend_index)
+                    }
+                });
                 if let Some(transition) = transition {
                     Self::log_health_transition(&backend_addr, transition);
                 }
@@ -760,7 +794,10 @@ impl QUICListener {
                 }
                 metrics.inc_failure();
                 let latency = start.elapsed().as_millis();
-                info!("Upstream {} status 400 latency_ms {}", backend_addr, latency);
+                info!(
+                    "Upstream {} status 400 latency_ms {}",
+                    backend_addr, latency
+                );
                 Self::send_simple_response(
                     h3,
                     quic,
@@ -781,7 +818,10 @@ impl QUICListener {
                 metrics.inc_failure();
                 metrics.inc_backend_error();
                 let latency = start.elapsed().as_millis();
-                info!("Upstream {} status 502 latency_ms {}", backend_addr, latency);
+                info!(
+                    "Upstream {} status 502 latency_ms {}",
+                    backend_addr, latency
+                );
                 Self::send_simple_response(
                     h3,
                     quic,
@@ -802,7 +842,10 @@ impl QUICListener {
                 metrics.inc_failure();
                 metrics.inc_timeout();
                 let latency = start.elapsed().as_millis();
-                info!("Upstream {} status 503 latency_ms {}", backend_addr, latency);
+                info!(
+                    "Upstream {} status 503 latency_ms {}",
+                    backend_addr, latency
+                );
                 Self::send_simple_response(
                     h3,
                     quic,
@@ -860,15 +903,14 @@ impl QUICListener {
 
         let (parts, body) = response.into_parts();
 
-        let body_bytes = run_blocking(|| async {
-            tokio::time::timeout(BACKEND_TIMEOUT, body.collect()).await
-        })
-        .map_err(|e| ProxyError::Transport(format!("body: {e}")))?;
+        let body_bytes =
+            run_blocking(|| async { tokio::time::timeout(BACKEND_TIMEOUT, body.collect()).await })
+                .map_err(|e| ProxyError::Transport(format!("body: {e}")))?;
 
         let body_bytes = match body_bytes {
-            Ok(inner) => inner.map(|c| c.to_bytes()).map_err(|e| {
-                ProxyError::Transport(format!("body: {e:?}"))
-            })?,
+            Ok(inner) => inner
+                .map(|c| c.to_bytes())
+                .map_err(|e| ProxyError::Transport(format!("body: {e:?}")))?,
             Err(_) => return Err(ProxyError::Timeout),
         };
 
@@ -965,7 +1007,10 @@ impl QUICListener {
         }
     }
 
-    fn spawn_health_checks(upstream_pools: HashMap<String, Arc<Mutex<UpstreamPool>>>, h2_pool: Arc<H2Pool>) {
+    fn spawn_health_checks(
+        upstream_pools: HashMap<String, Arc<Mutex<UpstreamPool>>>,
+        h2_pool: Arc<H2Pool>,
+    ) {
         let entries = {
             let mut all_entries = Vec::new();
             for (upstream_name, upstream_pool) in upstream_pools.iter() {
@@ -974,11 +1019,16 @@ impl QUICListener {
                     Err(_) => continue,
                 };
                 for index in pool.pool.all_indices() {
-                    if let (Some(address), Some(health)) = (
-                        pool.pool.address(index),
-                        pool.pool.health_check(index)
-                    ) {
-                        all_entries.push((upstream_name.clone(), upstream_pool.clone(), index, address.to_string(), health));
+                    if let (Some(address), Some(health)) =
+                        (pool.pool.address(index), pool.pool.health_check(index))
+                    {
+                        all_entries.push((
+                            upstream_name.clone(),
+                            upstream_pool.clone(),
+                            index,
+                            address.to_string(),
+                            health,
+                        ));
                     }
                 }
             }
@@ -1017,8 +1067,8 @@ impl QUICListener {
                         Err(_) => continue,
                     };
 
-                    let result = tokio::time::timeout(timeout, h2_pool.send(&address, request))
-                        .await;
+                    let result =
+                        tokio::time::timeout(timeout, h2_pool.send(&address, request)).await;
 
                     let healthy = match result {
                         Ok(Ok(response)) => response.status().is_success(),
@@ -1053,8 +1103,7 @@ where
     match Handle::try_current() {
         Ok(handle) => Ok(tokio::task::block_in_place(|| handle.block_on(f()))),
         Err(_) => {
-            let rt = tokio::runtime::Runtime::new()
-                .map_err(|e| format!("runtime: {e}"))?;
+            let rt = tokio::runtime::Runtime::new().map_err(|e| format!("runtime: {e}"))?;
             Ok(rt.block_on(f()))
         }
     }
