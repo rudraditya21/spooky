@@ -162,7 +162,7 @@ Spooky uses a modular architecture with clear separation of concerns:
 - Random distribution
 - Round-robin rotation
 - Consistent hashing (with configurable replicas)
-- Global load balancing strategy (same for all upstreams)
+- Per-upstream strategy configuration
 
 **Routing**
 - Path prefix matching
@@ -195,28 +195,10 @@ cargo test -p spooky-edge
 cargo test -p spooky-edge --test lb_integration
 ```
 
-## Performance Characteristics
-
-Based on development testing:
-
-- **Connections**: 10,000+ concurrent QUIC connections
-- **Throughput**: 100,000+ requests/second (hardware dependent)
-- **Memory**: ~1-2KB per active connection
-- **Latency**: Sub-millisecond routing overhead
-
-Note: Production performance depends on backend capacity, network conditions, and system resources.
 
 ## Project Status
 
 **Experimental.** Spooky is not production-ready. Core features are implemented and functional, but significant limitations remain (blocking backend I/O, full body buffering, no TLS peer verification, single-threaded QUIC processing).
-
-Currently working:
-
-- QUIC termination and HTTP/3 support
-- HTTP/2 backend forwarding
-- Multiple load balancing algorithms
-- Health checking and automatic recovery
-- Path and host-based routing
 
 See [roadmap](docs/roadmap.md) for known issues and planned improvements.
 
