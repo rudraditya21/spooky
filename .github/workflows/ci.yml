@@ -18,4 +18,4 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Run tests
-        run: sudo env "PATH=$PATH" cargo test
+        run: sudo env "PATH=$PATH" "HOME=$HOME" cargo test
