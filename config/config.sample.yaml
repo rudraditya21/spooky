@@ -50,4 +50,7 @@ load_balancing:
     type: "random"   # global fallback: random, consistent-hash, round-robin
 
 log:
-    level: info
+    level: debug
+    file:
+        enabled: true
+        path: /var/log/spooky/spooky.log
