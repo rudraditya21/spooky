@@ -1,7 +1,7 @@
 .PHONY: run build build-spooky clean certs certs-selfsigned certs-ca certs-clean certs-verify
 
 run:
-	cargo run -p spooky --bin spooky
+	./target/release/spooky --config config/config.yaml
 
 build:
 	cargo build --release
@@ -68,9 +68,7 @@ certs-verify:
 
 certs-clean:
 	@echo "🧹 Cleaning certificate files..."
-	rm -f certs/proxy-key.pem certs/proxy-key.der certs/proxy-cert.pem certs/proxy-cert.der
-	rm -f certs/ca-key.pem certs/ca-cert.pem certs/proxy.csr certs/proxy-fullchain.pem
-	rm -f certs/ca-cert.srl
+	rm -f certs/*
 
 clean:
 	rm -f target/release/spooky
