@@ -1,7 +1,8 @@
 .PHONY: run build build-spooky clean certs certs-selfsigned certs-ca certs-clean certs-verify
 
 run:
-	./target/release/spooky --config config/config.yaml
+	make build
+	sudo ./target/release/spooky --config config/config.yaml
 
 build:
 	cargo build --release

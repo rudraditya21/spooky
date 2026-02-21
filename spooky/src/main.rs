@@ -20,6 +20,16 @@ struct Cli {
 
 #[tokio::main]
 async fn main() {
+    // Check user (only root allowed)
+    let uid = unsafe {
+        libc::getuid()
+    };
+
+    if uid != 0 {
+        eprintln!("This program must be run as root.");
+        std::process::exit(1);
+    }
+
     // Parse CLI arguments
     let cli = Cli::parse();
 
@@ -37,7 +47,7 @@ async fn main() {
     };
 
     // Initialize the Logger
-    spooky_utils::logger::init_logger(&config_yaml.log.level);
+    spooky_utils::logger::init_logger(&config_yaml.log.level, config_yaml.log.file.enabled, &config_yaml.log.file.path);
 
     // Validate Configurations
     if !validate_config(&config_yaml) {

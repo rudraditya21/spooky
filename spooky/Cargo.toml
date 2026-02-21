@@ -18,6 +18,7 @@ bytes.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
+libc.workspace = true
 
 spooky-config = { path = "../crates/config" }
 spooky-edge = { path = "../crates/edge" }
