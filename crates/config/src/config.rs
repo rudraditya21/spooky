@@ -118,6 +118,7 @@ pub struct Log {
     #[serde(default = "get_default_log_level")]
     pub level: String, // "info, warn, error"
 
+    #[serde(default)]
     pub file: LogFile
 }
 

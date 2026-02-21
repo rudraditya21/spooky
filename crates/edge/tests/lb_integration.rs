@@ -106,6 +106,7 @@ fn make_config(
         }),
         log: Log {
             level: "info".to_string(),
+            file: Default::default(),
         },
     }
 }

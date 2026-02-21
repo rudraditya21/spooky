@@ -85,6 +85,7 @@ fn make_config(port: u32, backend_addr: String, cert: String, key: String) -> Co
         }),
         log: Log {
             level: "info".to_string(),
+            file: Default::default(),
         },
     }
 }
