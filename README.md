@@ -35,6 +35,7 @@ curl --http3-only -k \
 
 - **Rust**: 1.85 or later (edition 2024)
 - **OS**: Linux, macOS, or Windows
+- **Permissions**: Must run as root (required for QUIC/UDP socket binding)
 - **Network**: UDP port access for QUIC traffic
 - **Memory**: 256MB minimum, 1GB recommended
 
@@ -175,8 +176,8 @@ Spooky uses a modular architecture with clear separation of concerns:
 - Automatic backend removal and recovery
 
 **Observability**
-- Structured logging with multiple levels
-- Request/response metrics collection
+- Structured logging with multiple levels (including Spooky-themed aliases)
+- File-based log output via `log.file.enabled` and `log.file.path`
 - Backend latency tracking
 - Health transition logging
 

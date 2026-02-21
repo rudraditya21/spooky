@@ -13,6 +13,9 @@
 - Operating System: Linux, macOS, or Windows
 - Build tools: CMake, pkg-config, C compiler toolchain
 
+**Permissions:**
+- Spooky must run as root (required for QUIC/UDP socket binding)
+
 ## Installation Methods
 
 ### Pre-built Binaries
@@ -290,7 +293,17 @@ sudo systemctl start spooky.service
 
 ### 5. Log Management
 
-By default, Spooky logs to systemd journald. For file-based logging, redirect stdout/stderr in the service file and configure log rotation:
+By default, Spooky logs to stderr (captured by journald under systemd). To write logs to a file instead, set `log.file.enabled: true` in your config:
+
+```yaml
+log:
+  level: info
+  file:
+    enabled: true
+    path: /var/log/spooky/spooky.log
+```
+
+Configure log rotation for file-based logging:
 
 Create `/etc/logrotate.d/spooky`:
 
