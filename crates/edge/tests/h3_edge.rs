@@ -80,6 +80,7 @@ fn make_config(port: u32, cert: String, key: String) -> Config {
         }),
         log: Log {
             level: "info".to_string(),
+            file: Default::default(),
         },
     }
 }

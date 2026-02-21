@@ -119,6 +119,8 @@ The following table lists all default configuration values used when properties 
 | `upstream[].backends[].health_check.cooldown_ms` | `5000` | Cooldown after failure (ms) |
 | `upstream[].load_balancing.type` | `"round-robin"` | Per-upstream load balancing algorithm |
 | `log.level` | `"info"` | Logging verbosity level |
+| `log.file.enabled` | `false` | Write logs to file instead of stderr |
+| `log.file.path` | `"/var/log/spooky/spooky.log"` | Log file path (used when `log.file.enabled` is true) |
 
 ## Listen Configuration
 
@@ -412,13 +414,15 @@ upstream:
 
 ## Logging Configuration
 
-Controls logging output and verbosity.
+Controls logging output, verbosity, and destination.
 
 ### Properties
 
 | Property | Type | Required | Default | Description |
 |----------|------|----------|---------|-------------|
 | `level` | string | No | `info` | Log level |
+| `file.enabled` | bool | No | `false` | Write logs to a file instead of stderr |
+| `file.path` | string | No | `/var/log/spooky/spooky.log` | Log file path (used when `file.enabled` is `true`) |
 
 ### Log Levels
 
@@ -443,25 +447,27 @@ Standard log level mapping:
 ### Examples
 
 ```yaml
-# Production logging
+# stderr only (default)
 log:
   level: info
 
-# Development logging
+# Write to file
 log:
-  level: debug
+  level: info
+  file:
+    enabled: true
+    path: /var/log/spooky/spooky.log
 
-# Troubleshooting with full trace
-log:
-  level: trace
-
-# Error-only logging
-log:
-  level: error
-
-# Using Spooky-themed levels
+# Development — debug to stderr
 log:
   level: haunt  # debug level
+
+# Troubleshooting — trace to file
+log:
+  level: whisper  # trace level
+  file:
+    enabled: true
+    path: /tmp/spooky-trace.log
 ```
 
 ## Configuration Validation

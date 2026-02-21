@@ -1,4 +1,4 @@
-use crate::config::{LoadBalancing, Log};
+use crate::config::{LoadBalancing, Log, LogFile};
 
 // default values
 pub fn get_default_version() -> u32 {
@@ -49,6 +49,10 @@ pub fn get_default_log_level() -> String {
     String::from("info")
 }
 
+pub fn get_default_log_file_path() -> String {
+    String::from("/var/log/spooky/spooky.log")
+}
+
 pub fn get_default_load_balancing() -> LoadBalancing {
     LoadBalancing {
         lb_type: String::from("round_robin"),
@@ -59,5 +63,9 @@ pub fn get_default_load_balancing() -> LoadBalancing {
 pub fn get_default_log() -> Log {
     Log {
         level: String::from("info"),
+        file: LogFile {
+            enabled: false,
+            path: String::from(""),
+        }
     }
 }

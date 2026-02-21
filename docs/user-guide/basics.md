@@ -72,6 +72,8 @@ log:
 
 **log**: Logging configuration
 - `level`: Log verbosity (trace, debug, info, warn, error)
+- `file.enabled`: Write logs to a file instead of stderr (default: false)
+- `file.path`: Log file path (default: `/var/log/spooky/spooky.log`)
 
 ## Upstream Pools and Routing
 
@@ -316,41 +318,55 @@ grep "backend.*healthy" /var/log/spooky/spooky.log | tail -20
 ### Log Configuration
 
 ```yaml
+# stderr (default)
 log:
   level: info
+
+# write to file
+log:
+  level: info
+  file:
+    enabled: true
+    path: /var/log/spooky/spooky.log
 ```
 
 ### Log Analysis
 
+**systemd (log.file.enabled: false)**
+
 ```bash
-# Follow logs in real-time (systemd)
+# Follow logs in real-time
 sudo journalctl -u spooky.service -f
 
-# Follow logs in real-time (if redirected to file)
-tail -f /var/log/spooky/spooky.log
-
-# Filter by severity (systemd)
+# Filter by severity
 sudo journalctl -u spooky.service | grep ERROR
 
-# Filter by severity (if redirected to file)
-grep ERROR /var/log/spooky/spooky.log
-
-# Search for specific requests (systemd)
+# Search for specific requests
 sudo journalctl -u spooky.service | grep "GET /api/users"
 
-# Search for specific requests (if redirected to file)
-grep "GET /api/users" /var/log/spooky/spooky.log
-
-# Monitor backend selection (systemd)
+# Monitor backend selection
 sudo journalctl -u spooky.service | grep "routing to backend"
 
-# Monitor backend selection (if redirected to file)
+# Track health check failures
+sudo journalctl -u spooky.service | grep "health check failed"
+```
+
+**File (log.file.enabled: true)**
+
+```bash
+# Follow logs in real-time
+tail -f /var/log/spooky/spooky.log
+
+# Filter by severity
+grep ERROR /var/log/spooky/spooky.log
+
+# Search for specific requests
+grep "GET /api/users" /var/log/spooky/spooky.log
+
+# Monitor backend selection
 grep "routing to backend" /var/log/spooky/spooky.log
 
-# Track health check failures (systemd)
-sudo journalctl -u spooky.service | grep "health check failed"
-
-# Track health check failures (if redirected to file)
+# Track health check failures
 grep "health check failed" /var/log/spooky/spooky.log
 ```
 
