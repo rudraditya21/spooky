@@ -34,7 +34,7 @@ curl --http3-only -k \
 ## System Requirements
 
 - **Rust**: 1.85 or later (edition 2024)
-- **OS**: Linux, macOS, or Windows
+- **OS**: Linux
 - **Permissions**: Must run as root (required for QUIC/UDP socket binding)
 - **Network**: UDP port access for QUIC traffic
 - **Memory**: 256MB minimum, 1GB recommended
