@@ -1,32 +1,23 @@
 ---
-name: Issue from docs/internal/issues.md
-about: Create issue from the prioritized issues list
+name: Report Issue
+about: Report a bug, request a feature, or discuss an improvement
 title: ""
 labels: ""
 assignees: ""
 ---
 
-**Use this template to create issues from `docs/internal/issues.md`**
-
-Copy the relevant section from the issues document:
-
-## Title
-[Issue title]
-
-## Labels
-[e.g., p0-critical, blocking, performance, data-plane]
-
-## Severity
-[Critical/High/Medium/Low]
-
 ## Description
-[From the issue's Description section]
+
+What is the issue?
+
+## Steps / Context
+
+How to reproduce or additional context.
+
+## Expected vs Actual
+
+What should happen vs what actually happens.
 
 ## Impact
-[From the issue's Impact section]
 
-## Mitigation Path
-[From the issue's Mitigation Path section]
-
-## Related Issues
-[Link any related issues]
+Why does this matter?
