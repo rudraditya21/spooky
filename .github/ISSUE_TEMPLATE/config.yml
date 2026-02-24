@@ -3,6 +3,9 @@ contact_links:
   - name: Discussions
     url: https://github.com/nishujangra/spooky/discussions
     about: Ask questions and share ideas
-  - name: Spooky Documentation
+  - name: Known Issues List
+    url: https://github.com/nishujangra/spooky/blob/master/docs/internal/issues.md
+    about: See prioritized issues to create
+  - name: Documentation
     url: https://nishujangra.github.io/spooky/
     about: Read the docs for troubleshooting and guides
