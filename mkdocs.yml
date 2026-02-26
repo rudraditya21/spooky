@@ -10,78 +10,22 @@ exclude_docs: |
   internal/
 
 theme:
-  name: material
-  palette:
-    - scheme: slate
-      primary: deep purple
-      accent: purple
-      toggle:
-        icon: material/brightness-4
-        name: Switch to light mode
-    - scheme: default
-      primary: deep purple
-      accent: purple
-      toggle:
-        icon: material/brightness-7
-        name: Switch to dark mode
-  font:
-    text: Inter
-    code: JetBrains Mono
-  icon:
-    logo: material/ghost
-    repo: fontawesome/brands/github
-  features:
-    - navigation.instant
-    - navigation.instant.progress
-    - navigation.tabs
-    - navigation.tabs.sticky
-    - navigation.sections
-    - navigation.expand
-    - navigation.top
-    - navigation.footer
-    - toc.follow
-    - search.suggest
-    - search.highlight
-    - search.share
-    - content.code.copy
-    - content.code.annotate
-    - content.tabs.link
+  name: shadcn
+  show_title: true
+  pygments_style: github-dark
 
 markdown_extensions:
   - admonition
-  - pymdownx.details
-  - pymdownx.superfences:
-      custom_fences:
-        - name: mermaid
-          class: mermaid
-          format: !!python/name:pymdownx.superfences.fence_code_format
-  - pymdownx.highlight:
-      anchor_linenums: true
-      line_spans: __span
-      pygments_lang_class: true
-  - pymdownx.inlinehilite
-  - pymdownx.snippets:
-      base_path: ["."]
-  - pymdownx.tabbed:
-      alternate_style: true
-  - pymdownx.critic
-  - pymdownx.caret
-  - pymdownx.keys
-  - pymdownx.mark
-  - pymdownx.tilde
   - attr_list
-  - md_in_html
   - def_list
   - footnotes
+  - md_in_html
   - tables
   - toc:
-      permalink: true
-      title: On this page
+      permalink: false
 
 plugins:
-  - search:
-      lang: en
-  - glightbox
+  - search
 
 nav:
   - Home: README.md
