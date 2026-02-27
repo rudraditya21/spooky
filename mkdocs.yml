@@ -1,6 +1,6 @@
 site_name: Spooky
 site_description: HTTP/3 to HTTP/2 reverse proxy and load balancer
-site_url: https://spooky.dev
+site_url: https://nishujangra.github.io/spooky/
 repo_url: https://github.com/nishujangra/spooky
 repo_name: nishujangra/spooky
 edit_uri: edit/master/docs/
