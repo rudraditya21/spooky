@@ -31,7 +31,7 @@
 
 ### Observability
 
-- **Metrics export**: Prometheus endpoint for scraping metrics
+- **Metrics export**: Prometheus endpoint live — per-route counters, latency percentiles, active-connection and queue-size gauges, full drop counter coverage across all ingress paths
 - **Distributed tracing**: OpenTelemetry integration
 - **Request logging**: Per-request structured logs with correlation IDs
 - **Connection metrics**: Track QUIC RTT, packet loss, stream count
@@ -99,10 +99,8 @@
 - **Traffic replay**: Record and replay production traffic
 - **Query logs**: SQL-like queries over request logs
 
-### Extensions
+### Protocol Features
 
-- **WebAssembly plugins**: Custom routing logic via WASM
-- **Lua scripting**: Dynamic request/response transformation
 - **gRPC support**: Native gRPC proxying
 - **WebSocket support**: WebSocket over HTTP/3
 
@@ -143,16 +141,15 @@
 ### High Priority (Next 3 months)
 
 1. Async data plane - unblock main thread
-2. Metrics export - essential for production
-3. Configuration hot reload - reduce operational friction
-4. Streaming bodies - reduce memory usage
-5. TLS peer verification - production security
+2. Configuration hot reload - reduce operational friction
+3. Streaming bodies - reduce memory usage
+4. TLS peer verification - production security
 
 ### Medium Priority (3-6 months)
 
 1. Circuit breakers - improve reliability
 2. Distributed tracing - debugging complex issues
-3. Rate limiting - protect backends
+3. Rate limiting - protect backends 
 4. Health check improvements - reduce contention
 5. Admin API - operational visibility
 
@@ -160,7 +157,7 @@
 
 1. Dynamic backend discovery - integration complexity
 2. Advanced load balancing - diminishing returns
-3. WebAssembly plugins - adds complexity
+3. Advanced protocol features - adds complexity
 4. Protocol extensions - limited immediate value
 5. Multi-tenancy - niche use case
 
@@ -171,10 +168,9 @@
 1. **Blocking backend calls**: Main thread blocks during HTTP/2 requests
 2. **Full body buffering**: High memory usage for large requests/responses
 3. **Consistent hash rebuilds**: Ring rebuilt on every request
-4. **No metrics export**: Metrics collected but not exposed
-5. **Health check contention**: Shares connection pool with production traffic
-6. **Single-threaded**: QUIC processing limited to one thread
-7. **No TLS verification**: Development-only security posture
+4. **Health check contention**: Shares connection pool with production traffic
+5. **Single-threaded**: QUIC processing limited to one thread
+6. **No TLS verification**: Development-only security posture
 
 ### Refactoring Needs
 
@@ -193,6 +189,7 @@ Features explicitly not planned:
 - **WAF capabilities**: Use dedicated security tools
 - **Database proxying**: Use specialized database proxies
 - **Custom protocols**: Stick to HTTP family
+- **In-process plugin/extension ABI**: No WASM/eBPF/Lua middleware model until a safe isolation and lifecycle model is defined
 
 ## Contributing
 
@@ -200,8 +197,8 @@ Contributions are welcome. See [contributing guide](development/contributing.md)
 
 Priority areas for contributions:
 
-1. Metrics export (Prometheus)
-2. Streaming request/response bodies
-3. Configuration hot reload
+1. Streaming request/response bodies
+2. Configuration hot reload
+3. Distributed tracing (OpenTelemetry)
 4. Integration tests
 5. Documentation and examples

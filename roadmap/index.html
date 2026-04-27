@@ -888,7 +888,7 @@
 </ul>
 <h3 id="observability">Observability</h3>
 <ul>
-<li><strong>Metrics export</strong>: Prometheus endpoint for scraping metrics</li>
+<li><strong>Metrics export</strong>: Prometheus endpoint live — per-route counters, latency percentiles, active-connection and queue-size gauges, full drop counter coverage across all ingress paths</li>
 <li><strong>Distributed tracing</strong>: OpenTelemetry integration</li>
 <li><strong>Request logging</strong>: Per-request structured logs with correlation IDs</li>
 <li><strong>Connection metrics</strong>: Track QUIC RTT, packet loss, stream count</li>
@@ -952,10 +952,8 @@
 <li><strong>Traffic replay</strong>: Record and replay production traffic</li>
 <li><strong>Query logs</strong>: SQL-like queries over request logs</li>
 </ul>
-<h3 id="extensions">Extensions</h3>
+<h3 id="protocol-features">Protocol Features</h3>
 <ul>
-<li><strong>WebAssembly plugins</strong>: Custom routing logic via WASM</li>
-<li><strong>Lua scripting</strong>: Dynamic request/response transformation</li>
 <li><strong>gRPC support</strong>: Native gRPC proxying</li>
 <li><strong>WebSocket support</strong>: WebSocket over HTTP/3</li>
 </ul>
@@ -993,7 +991,6 @@
 <h3 id="high-priority-next-3-months">High Priority (Next 3 months)</h3>
 <ol>
 <li>Async data plane - unblock main thread</li>
-<li>Metrics export - essential for production</li>
 <li>Configuration hot reload - reduce operational friction</li>
 <li>Streaming bodies - reduce memory usage</li>
 <li>TLS peer verification - production security</li>
@@ -1002,7 +999,7 @@
 <ol>
 <li>Circuit breakers - improve reliability</li>
 <li>Distributed tracing - debugging complex issues</li>
-<li>Rate limiting - protect backends</li>
+<li>Rate limiting - protect backends </li>
 <li>Health check improvements - reduce contention</li>
 <li>Admin API - operational visibility</li>
 </ol>
@@ -1010,7 +1007,7 @@
 <ol>
 <li>Dynamic backend discovery - integration complexity</li>
 <li>Advanced load balancing - diminishing returns</li>
-<li>WebAssembly plugins - adds complexity</li>
+<li>Advanced protocol features - adds complexity</li>
 <li>Protocol extensions - limited immediate value</li>
 <li>Multi-tenancy - niche use case</li>
 </ol>
@@ -1020,7 +1017,6 @@
 <li><strong>Blocking backend calls</strong>: Main thread blocks during HTTP/2 requests</li>
 <li><strong>Full body buffering</strong>: High memory usage for large requests/responses</li>
 <li><strong>Consistent hash rebuilds</strong>: Ring rebuilt on every request</li>
-<li><strong>No metrics export</strong>: Metrics collected but not exposed</li>
 <li><strong>Health check contention</strong>: Shares connection pool with production traffic</li>
 <li><strong>Single-threaded</strong>: QUIC processing limited to one thread</li>
 <li><strong>No TLS verification</strong>: Development-only security posture</li>
@@ -1041,14 +1037,15 @@
 <li><strong>WAF capabilities</strong>: Use dedicated security tools</li>
 <li><strong>Database proxying</strong>: Use specialized database proxies</li>
 <li><strong>Custom protocols</strong>: Stick to HTTP family</li>
+<li><strong>In-process plugin/extension ABI</strong>: No WASM/eBPF/Lua middleware model until a safe isolation and lifecycle model is defined</li>
 </ul>
 <h2 id="contributing">Contributing</h2>
 <p>Contributions are welcome. See <a href="development/contributing.md">contributing guide</a> for development setup and guidelines.</p>
 <p>Priority areas for contributions:</p>
 <ol>
-<li>Metrics export (Prometheus)</li>
 <li>Streaming request/response bodies</li>
 <li>Configuration hot reload</li>
+<li>Distributed tracing (OpenTelemetry)</li>
 <li>Integration tests</li>
 <li>Documentation and examples</li>
 </ol>
@@ -1413,10 +1410,10 @@
             Advanced Observability
         </a>
         
-        <a href="#extensions"
+        <a href="#protocol-features"
             class="text-muted-foreground hover:text-foreground data-[active=true]:text-foreground text-[0.8rem] no-underline transition-colors data-[depth=3]:pl-4 data-[depth=4]:pl-6"
-            data-active="false" data-depth="3" onClick="deferSetActiveTocLink('#extensions');">
-            Extensions
+            data-active="false" data-depth="3" onClick="deferSetActiveTocLink('#protocol-features');">
+            Protocol Features
         </a>
         
         <a href="#high-availability"
