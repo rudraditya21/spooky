@@ -289,7 +289,7 @@ Each backend represents an upstream server that can handle requests.
 
 **Address format notes:**
 - `host:port` — shorthand, treated as `https://host:port`
-- `https://host:port` — TLS connection; certificate verification is currently skipped (self-signed certs are accepted)
+- `https://host:port` — TLS connection with certificate verification enabled by default (`upstream_tls.verify_certificates=true`)
 - `http://host:port` — plain HTTP/1.1 only; HTTP/2 over cleartext (h2c) is not supported
 
 #### Health Check Configuration
@@ -369,7 +369,7 @@ Load balancing determines how requests are distributed across healthy backends w
 | Property | Type | Required | Default | Description |
 |----------|------|----------|---------|-------------|
 | `type` | string | Yes | - | Load balancing algorithm |
-| `key` | string | No | - | Hash key source for consistent hashing (planned feature) |
+| `key` | string | No | - | Reserved for future pluggable key extraction (currently ignored) |
 
 ### Supported Algorithms
 
@@ -399,14 +399,44 @@ upstream:
 
 Routes requests using consistent hashing based on a fixed key derived from the request. Currently uses request authority (if present), otherwise request path, otherwise HTTP method.
 
-**Note**: Configurable key sources (headers, cookies, query parameters) are planned for future implementation.
-
 ```yaml
 upstream:
   my_pool:
     load_balancing:
       type: "consistent-hash"
-      # key: "header:x-user-id"  # Planned feature, not currently supported
+```
+
+#### least-connections
+
+Selects the healthy backend with the fewest active requests. Ties are deterministic by backend index order.
+
+```yaml
+upstream:
+  my_pool:
+    load_balancing:
+      type: "least-connections"
+```
+
+#### latency-aware
+
+Selects healthy backends using a latency score built from EWMA backend latency and active request pressure. Unsampled backends are probed first to avoid cold-start bias.
+
+```yaml
+upstream:
+  my_pool:
+    load_balancing:
+      type: "latency-aware"
+```
+
+#### sticky-cid
+
+Uses consistent hashing keyed by QUIC connection ID for connection-level stickiness. The same CID is routed to the same backend while healthy membership is stable.
+
+```yaml
+upstream:
+  my_pool:
+    load_balancing:
+      type: "sticky-cid"
 ```
 
 ### Algorithm Selection
@@ -414,6 +444,9 @@ upstream:
 - Use `random` for simple stateless load distribution
 - Use `round-robin` for even distribution across backends
 - Use `consistent-hash` when session affinity or request consistency is required
+- Use `least-connections` when backend load varies significantly across requests
+- Use `latency-aware` when you want faster backends to absorb more traffic
+- Use `sticky-cid` for QUIC-connection affinity without application-level stickiness keys
 
 ### Examples
 
@@ -763,6 +796,46 @@ resilience:
       - "auth_pool"
       - "payments_pool"
 ```
+
+## Observability Endpoint Hardening
+
+When enabling `observability.metrics` or `observability.control_api`, keep endpoints on loopback unless you intentionally expose them behind network controls.
+
+### Metrics Endpoint
+
+Key fields:
+
+- `observability.metrics.max_connections` (default: `512`): concurrent connection cap.
+- `observability.metrics.connection_timeout_ms` (default: `30000`): per-connection lifetime timeout.
+
+### Control API Endpoint
+
+Key fields:
+
+- `observability.control_api.auth_token`: bearer token required for runtime and restart endpoints (`Authorization: Bearer <token>`).
+- `observability.control_api.max_connections` (default: `256`): concurrent connection cap.
+- `observability.control_api.connection_timeout_ms` (default: `30000`): per-connection lifetime timeout.
+
+If `observability.control_api.address` is non-loopback, `observability.control_api.auth_token` is required.
+
+### Routing Transparency
+
+`observability.routing` enables explicit route-decision logging.
+
+| Property | Type | Required | Default | Description |
+|----------|------|----------|---------|-------------|
+| `enabled` | boolean | No | `false` | Emit route-decision transparency logs |
+| `include_reason` | boolean | No | `true` | Include deterministic tie-break reason in route-decision logs |
+| `expose_header` | boolean | No | `false` | Reserved toggle for downstream route-decision response headers |
+| `header_name` | string | No | `"x-spooky-route-decision"` | Reserved header name; must be non-empty when `expose_header=true` |
+
+### Watchdog Restart Hook
+
+Use structured command execution:
+
+- `resilience.watchdog.restart_command`: array, where index `0` is executable and remaining entries are arguments.
+
+Legacy `resilience.watchdog.restart_hook` is deprecated and rejected by validation.
 
 ## Configuration Validation
 
