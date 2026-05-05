@@ -13,13 +13,13 @@ use std::{
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tracing::Span;
 
+use crate::Metrics;
+use crate::RetryReason;
 use crate::cid_radix::CidRadix;
 use crate::constants::MAX_DATAGRAM_SIZE_BYTES;
 use crate::resilience::{AdaptivePermit, RouteQueuePermit, RuntimeResilience};
 use crate::route_index;
 use crate::watchdog::WatchdogCoordinator;
-use crate::Metrics;
-use crate::RetryReason;
 
 pub struct SharedRuntimeState {
     pub(crate) h2_pool: Arc<H2Pool>,

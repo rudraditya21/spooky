@@ -40,7 +40,11 @@ pub(crate) fn abort_stream(req: &mut RequestEnvelope, metrics: &Metrics) -> Stre
         if let (Some(pool), Some(index)) = (&req.upstream_pool, req.backend_index)
             && let Ok(mut guard) = pool.write()
         {
-            guard.finish_request(index, req.start.elapsed(), req.response_status.or(Some(503)));
+            guard.finish_request(
+                index,
+                req.start.elapsed(),
+                req.response_status.or(Some(503)),
+            );
         }
         req.backend_request_finished = true;
     }
@@ -407,7 +411,11 @@ impl QUICListener {
         Ok(())
     }
 
-    pub(super) fn flush_send(socket: &UdpSocket, send_buf: &mut [u8], connection: &mut QuicConnection) {
+    pub(super) fn flush_send(
+        socket: &UdpSocket,
+        send_buf: &mut [u8],
+        connection: &mut QuicConnection,
+    ) {
         let mut packet_count = 0;
 
         loop {

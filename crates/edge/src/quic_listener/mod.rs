@@ -67,12 +67,12 @@ mod health_check;
 mod token_bucket;
 mod validation;
 
+use connection::resolve_primary_from_radix_prefix;
 pub(crate) use connection::{ConnectionRoutes, purge_connection_routes, sweep_closed_connections};
-pub(crate) use token_bucket::TokenBucket;
+use forwarding::{ForwardRequestMeta, abort_stream};
 #[cfg(test)]
 use health_check::classify_active_health_check_response;
-use connection::resolve_primary_from_radix_prefix;
-use forwarding::{ForwardRequestMeta, abort_stream};
+pub(crate) use token_bucket::TokenBucket;
 use validation::{
     RequestBufferError, extract_header_value, generated_span_id, generated_trace_id,
     parse_traceparent, request_content_length, validate_request_headers,

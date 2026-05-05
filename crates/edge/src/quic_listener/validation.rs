@@ -56,36 +56,60 @@ pub(super) fn validate_request_headers(
         match header.name() {
             b":method" => {
                 if method.is_some() {
-                    return Err((http::StatusCode::BAD_REQUEST, b"duplicate :method header\n", false));
+                    return Err((
+                        http::StatusCode::BAD_REQUEST,
+                        b"duplicate :method header\n",
+                        false,
+                    ));
                 }
                 method = Some(String::from_utf8_lossy(header.value()).to_string());
             }
             b":path" => {
                 if path.is_some() {
-                    return Err((http::StatusCode::BAD_REQUEST, b"duplicate :path header\n", false));
+                    return Err((
+                        http::StatusCode::BAD_REQUEST,
+                        b"duplicate :path header\n",
+                        false,
+                    ));
                 }
                 path = Some(String::from_utf8_lossy(header.value()).to_string());
             }
             b":authority" => {
                 if authority.is_some() {
-                    return Err((http::StatusCode::BAD_REQUEST, b"duplicate :authority header\n", false));
+                    return Err((
+                        http::StatusCode::BAD_REQUEST,
+                        b"duplicate :authority header\n",
+                        false,
+                    ));
                 }
                 authority = Some(String::from_utf8_lossy(header.value()).to_string());
             }
             b"host" => {
                 if host.is_some() {
-                    return Err((http::StatusCode::BAD_REQUEST, b"duplicate host header\n", false));
+                    return Err((
+                        http::StatusCode::BAD_REQUEST,
+                        b"duplicate host header\n",
+                        false,
+                    ));
                 }
                 host = Some(String::from_utf8_lossy(header.value()).to_string());
             }
             b":scheme" => {
                 if scheme_seen {
-                    return Err((http::StatusCode::BAD_REQUEST, b"duplicate :scheme header\n", false));
+                    return Err((
+                        http::StatusCode::BAD_REQUEST,
+                        b"duplicate :scheme header\n",
+                        false,
+                    ));
                 }
                 scheme_seen = true;
             }
             name if name.starts_with(b":") => {
-                return Err((http::StatusCode::BAD_REQUEST, b"unsupported pseudo-header\n", false));
+                return Err((
+                    http::StatusCode::BAD_REQUEST,
+                    b"unsupported pseudo-header\n",
+                    false,
+                ));
             }
             _ => {}
         }
@@ -93,19 +117,39 @@ pub(super) fn validate_request_headers(
 
     let method = match method {
         Some(method) => method,
-        None => return Err((http::StatusCode::BAD_REQUEST, b"missing :method header\n", false)),
+        None => {
+            return Err((
+                http::StatusCode::BAD_REQUEST,
+                b"missing :method header\n",
+                false,
+            ));
+        }
     };
     let path = match path {
         Some(path) => path,
-        None => return Err((http::StatusCode::BAD_REQUEST, b"missing :path header\n", false)),
+        None => {
+            return Err((
+                http::StatusCode::BAD_REQUEST,
+                b"missing :path header\n",
+                false,
+            ));
+        }
     };
 
     if method.trim().is_empty() || method.as_bytes().iter().any(|b| b.is_ascii_whitespace()) {
-        return Err((http::StatusCode::BAD_REQUEST, b"invalid :method header\n", false));
+        return Err((
+            http::StatusCode::BAD_REQUEST,
+            b"invalid :method header\n",
+            false,
+        ));
     }
 
     if path.is_empty() || !path.starts_with('/') {
-        return Err((http::StatusCode::BAD_REQUEST, b"invalid :path header\n", false));
+        return Err((
+            http::StatusCode::BAD_REQUEST,
+            b"invalid :path header\n",
+            false,
+        ));
     }
 
     if resilience.enforce_authority_host_match
@@ -113,8 +157,8 @@ pub(super) fn validate_request_headers(
     {
         let normalized_authority = normalize_host_for_routing(authority_value)
             .unwrap_or_else(|| authority_value.to_ascii_lowercase());
-        let normalized_host =
-            normalize_host_for_routing(host_value).unwrap_or_else(|| host_value.to_ascii_lowercase());
+        let normalized_host = normalize_host_for_routing(host_value)
+            .unwrap_or_else(|| host_value.to_ascii_lowercase());
         if normalized_authority != normalized_host {
             return Err((
                 http::StatusCode::BAD_REQUEST,
@@ -125,11 +169,19 @@ pub(super) fn validate_request_headers(
     }
 
     if !resilience.method_allowed(&method) {
-        return Err((http::StatusCode::METHOD_NOT_ALLOWED, b"request method blocked by policy\n", true));
+        return Err((
+            http::StatusCode::METHOD_NOT_ALLOWED,
+            b"request method blocked by policy\n",
+            true,
+        ));
     }
 
     if resilience.path_denied(&path) {
-        return Err((http::StatusCode::FORBIDDEN, b"request path blocked by policy\n", true));
+        return Err((
+            http::StatusCode::FORBIDDEN,
+            b"request path blocked by policy\n",
+            true,
+        ));
     }
 
     Ok(RequestValidationResult {

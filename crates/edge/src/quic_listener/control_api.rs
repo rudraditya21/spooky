@@ -181,7 +181,10 @@ impl QUICListener {
         Ok(())
     }
 
-    pub(super) fn json_response(status: StatusCode, value: serde_json::Value) -> Response<Full<Bytes>> {
+    pub(super) fn json_response(
+        status: StatusCode,
+        value: serde_json::Value,
+    ) -> Response<Full<Bytes>> {
         match Response::builder()
             .status(status)
             .header("content-type", "application/json")
@@ -323,7 +326,10 @@ impl QUICListener {
         }
     }
 
-    pub(super) fn control_api_is_authorized(req: &Request<Incoming>, state: &ControlApiState) -> bool {
+    pub(super) fn control_api_is_authorized(
+        req: &Request<Incoming>,
+        state: &ControlApiState,
+    ) -> bool {
         let Some(token) = state.auth_token.as_ref() else {
             return true;
         };
@@ -514,5 +520,4 @@ impl QUICListener {
             },
         );
     }
-
 }
