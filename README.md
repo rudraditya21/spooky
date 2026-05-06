@@ -73,10 +73,11 @@ Repository config templates:
 
 ### Ingress Compatibility Posture
 
-Spooky currently accepts **HTTP/3 over QUIC only** on the ingress listener.
+Spooky uses **HTTP/3 over QUIC** as its native ingress data plane and also runs a **TLS bootstrap ingress** for HTTP/1.1 and HTTP/2 clients.
 
-- HTTP/1.1 and HTTP/2 clients are not accepted directly.
-- If legacy client compatibility is required, deploy an external frontend (CDN/LB/reverse proxy) that terminates HTTP/1.1 or HTTP/2 and forwards to a Spooky HTTP/3 ingress.
+- Native path: HTTP/3 over QUIC on UDP.
+- Compatibility path: HTTP/1.1 + HTTP/2 over TLS on TCP for modern browser compatibility and `Alt-Svc` discovery/upgrade to HTTP/3.
+- External frontends (CDN/LB/reverse proxy) are still supported when you want additional edge policy, WAF, or protocol mediation.
 
 ### Minimal Example
 
