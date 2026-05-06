@@ -74,7 +74,7 @@ upstream:
       path_prefix: "/"
     backends:
       - id: "local-backend"
-        address: "127.0.0.1:8080"
+        address: "http://127.0.0.1:8080"
         weight: 100
         # health_check is optional — omit to disable active health polling
 
@@ -83,10 +83,9 @@ log:
 ```
 
 This configuration:
-- Listens for HTTP/3 (QUIC) on UDP port 9889 and HTTP/1.1+HTTP/2 (TLS) on TCP port 9889
+- Listens for HTTP/3 (QUIC) on UDP port 9889
 - Uses the generated self-signed certificates
-- Forwards all requests to `127.0.0.1:8080` using random load balancing
-- Advertises `Alt-Svc` on every response so browsers upgrade to HTTP/3 automatically
+- Forwards all requests to `http://127.0.0.1:8080` using random load balancing
 
 ## Step 5: Start Spooky
 
@@ -102,7 +101,7 @@ Expected output:
 [INFO] Loading configuration from config.yaml
 [INFO] Starting Spooky HTTP/3 proxy
 [INFO] Listening on 0.0.0.0:9889 (HTTP/3)
-[INFO] Backend local-backend (127.0.0.1:8080) marked healthy
+[INFO] Backend local-backend (http://127.0.0.1:8080) marked healthy
 [INFO] Proxy started successfully
 ```
 
@@ -122,23 +121,15 @@ curl --http3-only -k https://localhost:9889/
 
 The `-k` flag bypasses certificate validation for self-signed certificates. You should see the response from your backend server.
 
-### Using curl with Alt-Svc Discovery
-
-For a more realistic test that mimics browser behavior:
-
-```bash
-curl -k \
-  --resolve localhost:9889:127.0.0.1 \
-  https://localhost:9889/
-```
+### Verify Alt-Svc Header
 
 Verify HTTP/3 connectivity by forcing HTTP/3-only requests:
 
 ```bash
-curl -k --http3-only https://localhost:9889/
+curl -k --http3-only -i https://localhost:9889/
 ```
 
-If successful, you should receive a response from your backend. Spooky advertises `Alt-Svc: h3=":PORT"; ma=86400` on every response, so browsers automatically upgrade to HTTP/3 on subsequent visits. HTTP/3 connectivity is confirmed when the response contains the `alt-svc` header or when you force `--http3-only` and the request succeeds.
+If successful, you should receive a response from your backend and an `alt-svc` header in the response.
 
 ### Using a Custom HTTP/3 Client
 
@@ -167,7 +158,7 @@ Check that requests are being forwarded to the backend. In the terminal running 
 ```
 [INFO] QUIC connection established from 127.0.0.1:55420
 [INFO] HTTP/3 stream 0: GET /
-[INFO] Forwarding to backend local-backend (127.0.0.1:8080)
+[INFO] Forwarding to backend local-backend (http://127.0.0.1:8080)
 [INFO] Response 200 OK forwarded to client
 ```
 
@@ -186,7 +177,7 @@ upstream:
       path_prefix: "/api"
     backends:
       - id: "api-server"
-        address: "127.0.0.1:8001"
+        address: "http://127.0.0.1:8001"
         weight: 100
 
   default_backend:
@@ -196,7 +187,7 @@ upstream:
       path_prefix: "/"
     backends:
       - id: "default-server"
-        address: "127.0.0.1:8080"
+        address: "http://127.0.0.1:8080"
         weight: 100
 ```
 

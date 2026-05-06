@@ -78,7 +78,7 @@ cargo build --release
 make certs-selfsigned
 
 # Start proxy
-./target/release/spooky --config config/config.yaml
+./target/release/spooky --config config/config.development.yaml
 ```
 
 ## Configuration Example
@@ -93,8 +93,8 @@ listen:
   port: 9889
   address: "0.0.0.0"
   tls:
-    cert: "certs/cert.pem"
-    key: "certs/key.pem"
+    cert: "certs/proxy-fullchain.pem"
+    key: "certs/proxy-key-pkcs8.pem"
 
 upstream:
   api_backend:
@@ -117,7 +117,7 @@ upstream:
       path_prefix: "/"
     backends:
       - id: "default-1"
-        address: "127.0.0.1:8080"
+        address: "http://127.0.0.1:8080"
         weight: 100
 
 log:

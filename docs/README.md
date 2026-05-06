@@ -70,7 +70,7 @@ upstream:
       path_prefix: "/"
     backends:
       - id: "backend-1"
-        address: "127.0.0.1:8080"
+        address: "http://127.0.0.1:8080"
         weight: 100
         health_check:
           path: "/health"

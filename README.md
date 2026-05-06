@@ -99,7 +99,7 @@ upstream:
       path_prefix: "/api"
     backends:
       - id: "api-1"
-        address: "127.0.0.1:8001"
+        address: "http://127.0.0.1:8001"
         weight: 100
         health_check:
           path: "/health"
@@ -112,7 +112,7 @@ upstream:
       path_prefix: "/"
     backends:
       - id: "default-1"
-        address: "127.0.0.1:8080"
+        address: "http://127.0.0.1:8080"
         weight: 100
         health_check:
           path: "/health"
