@@ -6,7 +6,7 @@ CA_CONF := $(CERTS_DIR)/ca.conf
 
 run:
 	make build
-	./target/release/spooky --config config/config.yaml
+	./target/release/spooky --config config/config.development.yaml
 
 build:
 	cargo build --release
@@ -99,12 +99,14 @@ certs-selfsigned: $(SAN_CONF)
 	openssl req -new -key certs/proxy-key-pkcs8.pem -out certs/proxy.csr -config certs/san.conf -extensions v3_req
 	@echo "🏛️ Creating self-signed certificate..."
 	openssl x509 -req -in certs/proxy.csr -signkey certs/proxy-key-pkcs8.pem -out certs/proxy-cert.pem -days 365 -extensions v3_req -extfile certs/san.conf -sha256
+	@echo "📦 Creating full chain..."
+	cat certs/proxy-cert.pem > certs/proxy-fullchain.pem
 	@echo "🔄 Converting to DER format..."
 	openssl pkcs8 -in certs/proxy-key-pkcs8.pem -topk8 -nocrypt -outform DER -out certs/proxy-key.der
 	openssl x509 -in certs/proxy-cert.pem -outform DER -out certs/proxy-cert.der
 	@echo "🔒 Setting secure permissions..."
 	chmod 600 certs/proxy-key.pem certs/proxy-key-pkcs8.pem certs/proxy-key.der
-	chmod 644 certs/proxy-cert.pem certs/proxy-cert.der
+	chmod 644 certs/proxy-cert.pem certs/proxy-cert.der certs/proxy-fullchain.pem
 	@echo "✅ Self-signed certificates created successfully!"
 
 certs-ca: $(SAN_CONF) $(CA_CONF)
