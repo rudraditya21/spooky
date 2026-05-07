@@ -110,6 +110,13 @@ fn should_strip_bootstrap_request_header(name: &http::header::HeaderName) -> boo
     false
 }
 
+fn bootstrap_forwarded_for_value(ip: std::net::IpAddr) -> String {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.to_string(),
+        std::net::IpAddr::V6(v6) => format!("\"[{}]\"", v6),
+    }
+}
+
 type BootstrapServiceFuture = std::pin::Pin<
     Box<
         dyn std::future::Future<
@@ -3815,8 +3822,13 @@ impl QUICListener {
                                 http::header::HOST,
                                 authority.as_deref().unwrap_or(endpoint.authority()),
                             );
-                            upstream_req = upstream_req
-                                .header("forwarded", format!("for={};proto=https", peer.ip()));
+                            upstream_req = upstream_req.header(
+                                "forwarded",
+                                format!(
+                                    "for={};proto=https",
+                                    bootstrap_forwarded_for_value(peer.ip())
+                                ),
+                            );
 
                             let body_bytes = match req.into_body().collect().await {
                                 Ok(collected) => collected.to_bytes(),
