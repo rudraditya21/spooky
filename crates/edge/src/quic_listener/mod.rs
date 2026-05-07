@@ -75,7 +75,7 @@ use health_check::classify_active_health_check_response;
 pub(crate) use token_bucket::TokenBucket;
 use validation::{
     RequestBufferError, extract_header_value, generated_span_id, generated_trace_id,
-    parse_traceparent, request_content_length, validate_request_headers,
+    parse_traceparent, request_content_length, validate_http_request, validate_request_headers,
 };
 
 fn is_hop_header(name: &str) -> bool {
@@ -3566,6 +3566,8 @@ impl QUICListener {
 
         let h2_pool = Arc::clone(&shared_state.h2_pool);
         let backend_endpoints = Arc::clone(&shared_state.backend_endpoints);
+        let metrics = Arc::clone(&shared_state.metrics);
+        let resilience = Arc::clone(&shared_state.resilience);
         let upstream_pools = shared_state.upstream_pools.clone();
         let routing_index = RouteIndex::from_upstreams(&config.upstream);
 
@@ -3626,6 +3628,8 @@ impl QUICListener {
                 let alt_svc = alt_svc_value.clone();
                 let h2_pool = Arc::clone(&h2_pool);
                 let backend_endpoints = Arc::clone(&backend_endpoints);
+                let metrics = Arc::clone(&metrics);
+                let resilience = Arc::clone(&resilience);
                 let upstream_pools = upstream_pools.clone();
                 let routing_index = Arc::clone(&routing_index);
 
@@ -3648,26 +3652,35 @@ impl QUICListener {
                         let alt = alt_svc_conn.clone();
                         let h2_pool = Arc::clone(&h2_pool);
                         let backend_endpoints = Arc::clone(&backend_endpoints);
+                        let metrics = Arc::clone(&metrics);
+                        let resilience = Arc::clone(&resilience);
                         let upstream_pools = upstream_pools.clone();
                         let routing_index = Arc::clone(&routing_index);
 
                         Box::pin(async move {
-                            let _method = req.method().to_string();
-                            let path = req
-                                .uri()
-                                .path_and_query()
-                                .map(|pq| pq.as_str().to_owned())
-                                .unwrap_or_else(|| "/".to_string());
-                            let authority = req
-                                .uri()
-                                .authority()
-                                .map(|a| a.as_str().to_owned())
-                                .or_else(|| {
-                                    req.headers()
-                                        .get(http::header::HOST)
-                                        .and_then(|v| v.to_str().ok())
-                                        .map(str::to_owned)
-                                });
+                            let request = match validate_http_request(&req, &resilience) {
+                                Ok(request) => request,
+                                Err((status, body, is_policy)) => {
+                                    metrics.inc_failure();
+                                    metrics.inc_request_validation_reject();
+                                    if is_policy {
+                                        metrics.inc_policy_denied();
+                                    }
+                                    metrics.record_route(
+                                        "unrouted",
+                                        Duration::from_millis(0),
+                                        RouteOutcome::Failure,
+                                    );
+                                    return Ok(Response::builder()
+                                        .status(status)
+                                        .header("alt-svc", &alt)
+                                        .body(Full::new(Bytes::copy_from_slice(body)))
+                                        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()))));
+                                }
+                            };
+                            let method = request.method;
+                            let path = request.path;
+                            let authority = request.authority;
 
                             // Route lookup
                             let upstream_name = routing_index.lookup(&path, authority.as_deref());
@@ -3762,7 +3775,7 @@ impl QUICListener {
                                 };
 
                             let mut upstream_req = Request::builder()
-                                .method(req.method().clone())
+                                .method(method.as_str())
                                 .uri(upstream_uri);
 
                             for (name, value) in req.headers() {
