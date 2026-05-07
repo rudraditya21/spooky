@@ -3566,11 +3566,9 @@ impl QUICListener {
             RustlsServerConfig::builder().with_no_client_auth()
         };
 
-        let mut tls_config = builder
-            .with_single_cert(server_certs, key)
-            .map_err(|err| {
-                ProxyError::Tls(format!("failed to build rustls ServerConfig: {}", err))
-            })?;
+        let mut tls_config = builder.with_single_cert(server_certs, key).map_err(|err| {
+            ProxyError::Tls(format!("failed to build rustls ServerConfig: {}", err))
+        })?;
 
         tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
@@ -3707,7 +3705,9 @@ impl QUICListener {
                                         .status(status)
                                         .header("alt-svc", &alt)
                                         .body(Full::new(Bytes::copy_from_slice(body)))
-                                        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()))));
+                                        .unwrap_or_else(|_| {
+                                            Response::new(Full::new(Bytes::new()))
+                                        }));
                                 }
                             };
                             let method = request.method;
@@ -3806,9 +3806,8 @@ impl QUICListener {
                                     }
                                 };
 
-                            let mut upstream_req = Request::builder()
-                                .method(method.as_str())
-                                .uri(upstream_uri);
+                            let mut upstream_req =
+                                Request::builder().method(method.as_str()).uri(upstream_uri);
 
                             for (name, value) in req.headers() {
                                 if name == http::header::HOST

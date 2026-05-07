@@ -142,9 +142,11 @@ pub(super) fn validate_request_headers(
         authority,
         host,
         resilience,
-        b"invalid :method header\n",
-        b"invalid :path header\n",
-        b":authority and host headers must match\n",
+        RequestPartErrors {
+            invalid_method: b"invalid :method header\n",
+            invalid_path: b"invalid :path header\n",
+            authority_mismatch: b":authority and host headers must match\n",
+        },
     )
 }
 
@@ -173,7 +175,8 @@ pub(super) fn validate_http_request(
         header_bytes = header_bytes.saturating_add(authority_value.len());
     }
     if let Some(host_value) = host.as_deref() {
-        header_bytes = header_bytes.saturating_add(http::header::HOST.as_str().len() + host_value.len());
+        header_bytes =
+            header_bytes.saturating_add(http::header::HOST.as_str().len() + host_value.len());
     }
 
     for (name, value) in req.headers() {
@@ -199,10 +202,18 @@ pub(super) fn validate_http_request(
         authority,
         host,
         resilience,
-        b"invalid method header\n",
-        b"invalid path header\n",
-        b"authority and host headers must match\n",
+        RequestPartErrors {
+            invalid_method: b"invalid method header\n",
+            invalid_path: b"invalid path header\n",
+            authority_mismatch: b"authority and host headers must match\n",
+        },
     )
+}
+
+struct RequestPartErrors {
+    invalid_method: &'static [u8],
+    invalid_path: &'static [u8],
+    authority_mismatch: &'static [u8],
 }
 
 fn validate_request_parts(
@@ -211,16 +222,14 @@ fn validate_request_parts(
     authority: Option<String>,
     host: Option<String>,
     resilience: &RuntimeResilience,
-    invalid_method_body: &'static [u8],
-    invalid_path_body: &'static [u8],
-    authority_mismatch_body: &'static [u8],
+    errors: RequestPartErrors,
 ) -> Result<RequestValidationResult, (http::StatusCode, &'static [u8], bool)> {
     if method.trim().is_empty() || method.as_bytes().iter().any(|b| b.is_ascii_whitespace()) {
-        return Err((http::StatusCode::BAD_REQUEST, invalid_method_body, false));
+        return Err((http::StatusCode::BAD_REQUEST, errors.invalid_method, false));
     }
 
     if path.is_empty() || !path.starts_with('/') {
-        return Err((http::StatusCode::BAD_REQUEST, invalid_path_body, false));
+        return Err((http::StatusCode::BAD_REQUEST, errors.invalid_path, false));
     }
 
     if resilience.enforce_authority_host_match
@@ -231,7 +240,11 @@ fn validate_request_parts(
         let normalized_host = normalize_host_for_routing(host_value)
             .unwrap_or_else(|| host_value.to_ascii_lowercase());
         if normalized_authority != normalized_host {
-            return Err((http::StatusCode::BAD_REQUEST, authority_mismatch_body, false));
+            return Err((
+                http::StatusCode::BAD_REQUEST,
+                errors.authority_mismatch,
+                false,
+            ));
         }
     }
 
