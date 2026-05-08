@@ -134,7 +134,10 @@ fn bootstrap_resolution_error_response(reason: &str) -> (StatusCode, &'static [u
         return (StatusCode::SERVICE_UNAVAILABLE, b"no healthy backends\n");
     }
 
-    (StatusCode::BAD_GATEWAY, b"route/backend resolution failed\n")
+    (
+        StatusCode::BAD_GATEWAY,
+        b"route/backend resolution failed\n",
+    )
 }
 
 type BootstrapServiceFuture = std::pin::Pin<
@@ -4128,13 +4131,13 @@ mod tests {
         }
     }
 
-    fn test_routing_context(
-        lb_type: &str,
-    ) -> (
+    type TestRoutingContext = (
         HashMap<String, Arc<RwLock<super::UpstreamPool>>>,
         super::RouteIndex,
         Arc<RwLock<super::UpstreamPool>>,
-    ) {
+    );
+
+    fn test_routing_context(lb_type: &str) -> TestRoutingContext {
         let mut upstreams = HashMap::new();
         upstreams.insert("api_pool".to_string(), test_upstream(lb_type));
         let routing_index = super::RouteIndex::from_upstreams(&upstreams);
