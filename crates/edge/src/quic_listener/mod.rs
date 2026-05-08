@@ -3744,6 +3744,8 @@ impl QUICListener {
                                     }))
                             };
 
+                            // Preserve the same route-lookup + tie-break semantics as the QUIC
+                            // data plane by delegating bootstrap backend resolution here.
                             let resolved = Self::resolve_backend(
                                 &method,
                                 &path,
