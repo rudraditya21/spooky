@@ -294,6 +294,7 @@ pub struct Performance {
     #[serde(default = "perf_default_worker_threads")]
     pub worker_threads: usize,
 
+    /// Tokio worker threads used by the control-plane runtime.
     #[serde(default = "perf_default_control_plane_threads")]
     pub control_plane_threads: usize,
 

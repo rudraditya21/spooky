@@ -5,6 +5,7 @@ use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
 mod privilege_drop;
 mod runtime_guard;
 
+use spooky_config::config::Config;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -59,8 +60,7 @@ async fn wait_for_shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     // Parse CLI arguments
     let cli = Cli::parse();
 
@@ -109,8 +109,29 @@ Use a port >= 1024 for unprivileged startup.",
         std::process::exit(1);
     }
 
-    configure_async_runtime(config_yaml.performance.control_plane_threads.max(1));
+    let control_plane_threads = config_yaml.performance.control_plane_threads.max(1);
+    configure_async_runtime(control_plane_threads);
 
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(control_plane_threads)
+        .thread_name("spooky-control-plane")
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            error!(
+                "Failed to initialize Tokio control-plane runtime (threads={}): {}",
+                control_plane_threads, err
+            );
+            std::process::exit(1);
+        }
+    };
+
+    runtime.block_on(run(config_yaml, uid));
+}
+
+async fn run(config_yaml: Config, uid: libc::uid_t) {
     let shared_state = match QUICListener::build_shared_state(&config_yaml) {
         Ok(shared_state) => Arc::new(shared_state),
         Err(e) => {
