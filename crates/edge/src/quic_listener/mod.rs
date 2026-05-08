@@ -3714,98 +3714,73 @@ impl QUICListener {
                             let path = request.path;
                             let authority = request.authority;
 
-                            // Route lookup
-                            let upstream_name = routing_index.lookup(&path, authority.as_deref());
-                            let upstream_name = match upstream_name {
-                                Some(name) => name.to_string(),
-                                None => {
-                                    return Ok(Response::builder()
-                                        .status(StatusCode::BAD_GATEWAY)
-                                        .header("alt-svc", &alt)
-                                        .body(Full::new(Bytes::from_static(b"no route\n")))
-                                        .unwrap_or_else(|_| {
-                                            Response::new(Full::new(Bytes::from_static(b"error\n")))
-                                        }));
-                                }
+                            let bootstrap_error = |status: StatusCode, body: &'static [u8]| {
+                                Ok(Response::builder()
+                                    .status(status)
+                                    .header("alt-svc", &alt)
+                                    .body(Full::new(Bytes::from_static(body)))
+                                    .unwrap_or_else(|_| {
+                                        Response::new(Full::new(Bytes::from_static(b"error\n")))
+                                    }))
                             };
 
-                            // Pick backend using configured LB strategy and current health state.
-                            let backend_addr = {
-                                let pool_lock = match upstream_pools.get(&upstream_name) {
-                                    Some(p) => p,
-                                    None => {
-                                        return Ok(Response::builder()
-                                            .status(StatusCode::BAD_GATEWAY)
-                                            .header("alt-svc", &alt)
-                                            .body(Full::new(Bytes::from_static(b"no pool\n")))
-                                            .unwrap_or_else(|_| {
-                                                Response::new(Full::new(Bytes::from_static(
-                                                    b"error\n",
-                                                )))
-                                            }));
-                                    }
-                                };
-                                let mut pool = match pool_lock.write() {
-                                    Ok(p) => p,
-                                    Err(_) => {
-                                        return Ok(Response::builder()
-                                            .status(StatusCode::BAD_GATEWAY)
-                                            .header("alt-svc", &alt)
-                                            .body(Full::new(Bytes::from_static(b"pool error\n")))
-                                            .unwrap_or_else(|_| {
-                                                Response::new(Full::new(Bytes::from_static(
-                                                    b"error\n",
-                                                )))
-                                            }));
-                                    }
-                                };
-                                if pool.pool.is_empty() {
-                                    return Ok(Response::builder()
-                                        .status(StatusCode::SERVICE_UNAVAILABLE)
-                                        .header("alt-svc", &alt)
-                                        .body(Full::new(Bytes::from_static(b"no backends\n")))
-                                        .unwrap_or_else(|_| {
-                                            Response::new(Full::new(Bytes::from_static(
-                                                b"error\n",
-                                            )))
-                                        }));
-                                }
+                            let resolved = Self::resolve_backend(
+                                &method,
+                                &path,
+                                authority.as_deref(),
+                                None,
+                                &upstream_pools,
+                                &routing_index,
+                            );
+                            let (_upstream_name, backend_addr, _backend_index, _pool, _lb, _, _, _) =
+                                match resolved {
+                                    Ok(value) => value,
+                                    Err(ProxyError::Transport(reason)) => {
+                                        if reason.starts_with("no route for ") {
+                                            return bootstrap_error(
+                                                StatusCode::BAD_GATEWAY,
+                                                b"no route\n",
+                                            );
+                                        }
+                                        if reason == "pool not found" || reason.starts_with("pool not found:") {
+                                            return bootstrap_error(
+                                                StatusCode::BAD_GATEWAY,
+                                                b"no pool\n",
+                                            );
+                                        }
+                                        if reason == "upstream pool lock poisoned" {
+                                            return bootstrap_error(
+                                                StatusCode::BAD_GATEWAY,
+                                                b"pool error\n",
+                                            );
+                                        }
+                                        if reason == "no servers in upstream"
+                                            || reason == "no healthy servers"
+                                            || reason == "invalid server address"
+                                        {
+                                            return bootstrap_error(
+                                                StatusCode::SERVICE_UNAVAILABLE,
+                                                b"no backends\n",
+                                            );
+                                        }
 
-                                let request_key =
-                                    authority.as_deref().unwrap_or(if !path.is_empty() {
-                                        path.as_str()
-                                    } else {
-                                        method.as_str()
-                                    });
-                                let Some(backend_index) = pool.pick(request_key) else {
-                                    return Ok(Response::builder()
-                                        .status(StatusCode::SERVICE_UNAVAILABLE)
-                                        .header("alt-svc", &alt)
-                                        .body(Full::new(Bytes::from_static(
-                                            b"no healthy backends\n",
-                                        )))
-                                        .unwrap_or_else(|_| {
-                                            Response::new(Full::new(Bytes::from_static(
-                                                b"error\n",
-                                            )))
-                                        }));
-                                };
-
-                                match pool.pool.address(backend_index).map(str::to_owned) {
-                                    Some(addr) => addr,
-                                    None => {
-                                        return Ok(Response::builder()
-                                            .status(StatusCode::SERVICE_UNAVAILABLE)
-                                            .header("alt-svc", &alt)
-                                            .body(Full::new(Bytes::from_static(b"no backends\n")))
-                                            .unwrap_or_else(|_| {
-                                                Response::new(Full::new(Bytes::from_static(
-                                                    b"error\n",
-                                                )))
-                                            }));
+                                        warn!(
+                                            "Bootstrap route/backend resolution failed: {}",
+                                            reason
+                                        );
+                                        return bootstrap_error(
+                                            StatusCode::BAD_GATEWAY,
+                                            b"route/backend resolution failed\n",
+                                        );
                                     }
-                                }
-                            };
+                                    Err(err) => {
+                                        warn!("Bootstrap route/backend resolution failed: {}", err);
+                                        return bootstrap_error(
+                                            StatusCode::BAD_GATEWAY,
+                                            b"route/backend resolution failed\n",
+                                        );
+                                    }
+                                };
 
                             let endpoint = match backend_endpoints.get(&backend_addr) {
                                 Some(ep) => ep.clone(),
