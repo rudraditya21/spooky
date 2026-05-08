@@ -68,7 +68,7 @@ log:
 
 performance:
     worker_threads: 1
-    control_plane_threads: 2
+    control_plane_threads: 2  # Tokio worker threads for control-plane async tasks (startup, health checks, metrics)
     packet_shards_per_worker: 1
     packet_shard_queue_capacity: 2048
     packet_shard_queue_max_bytes: 67108864    # max queued UDP datagram bytes per shard dispatch queue (64 MiB)
