@@ -3729,7 +3729,7 @@ impl QUICListener {
                                 }
                             };
 
-                            // Pick backend
+                            // Pick backend using configured LB strategy and current health state.
                             let backend_addr = {
                                 let pool_lock = match upstream_pools.get(&upstream_name) {
                                     Some(p) => p,
@@ -3745,7 +3745,7 @@ impl QUICListener {
                                             }));
                                     }
                                 };
-                                let pool = match pool_lock.read() {
+                                let mut pool = match pool_lock.write() {
                                     Ok(p) => p,
                                     Err(_) => {
                                         return Ok(Response::builder()
@@ -3759,7 +3759,39 @@ impl QUICListener {
                                             }));
                                     }
                                 };
-                                match pool.pool.address(0).map(str::to_owned) {
+                                if pool.pool.is_empty() {
+                                    return Ok(Response::builder()
+                                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                                        .header("alt-svc", &alt)
+                                        .body(Full::new(Bytes::from_static(b"no backends\n")))
+                                        .unwrap_or_else(|_| {
+                                            Response::new(Full::new(Bytes::from_static(
+                                                b"error\n",
+                                            )))
+                                        }));
+                                }
+
+                                let request_key =
+                                    authority.as_deref().unwrap_or(if !path.is_empty() {
+                                        path.as_str()
+                                    } else {
+                                        method.as_str()
+                                    });
+                                let Some(backend_index) = pool.pick(request_key) else {
+                                    return Ok(Response::builder()
+                                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                                        .header("alt-svc", &alt)
+                                        .body(Full::new(Bytes::from_static(
+                                            b"no healthy backends\n",
+                                        )))
+                                        .unwrap_or_else(|_| {
+                                            Response::new(Full::new(Bytes::from_static(
+                                                b"error\n",
+                                            )))
+                                        }));
+                                };
+
+                                match pool.pool.address(backend_index).map(str::to_owned) {
                                     Some(addr) => addr,
                                     None => {
                                         return Ok(Response::builder()
