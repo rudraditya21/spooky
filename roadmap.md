@@ -14,6 +14,7 @@
 - Per-upstream configuration and routing
 - Connection ID management and QUIC packet routing
 - TLS 1.3 with certificate chain loading
+- Downstream mTLS (client certificate authentication) via `listen.tls.client_auth.enabled`, `listen.tls.client_auth.require_client_cert`, and `listen.tls.client_auth.ca_file`
 - Structured logging with multiple levels
 - Configuration validation at startup
 - Graceful shutdown with connection draining
@@ -70,7 +71,7 @@
 ### Security
 
 - **TLS peer verification**: Enable certificate verification for production
-- **mTLS support**: Client certificate authentication
+- **mTLS operational tooling**: Certificate rotation/revocation workflows and deployment guidance
 - **Request validation**: Size limits, header validation
 - **IP allowlist/blocklist**: Simple access control
 
@@ -167,7 +168,7 @@
 1. **Blocking backend calls**: Main thread blocks during HTTP/2 requests
 2. **Full body buffering**: High memory usage for large requests/responses
 3. **Configuration hot reload missing**: Runtime config updates still require restart
-4. **HTTP/3-only ingress**: No native HTTP/1.1 or HTTP/2 client ingress support
+4. **Dual-ingress operational complexity**: Runtime serves HTTP/3 (native) plus HTTP/1.1/2 TLS bootstrap, so operators must secure and observe both paths consistently
 5. **Method-based route matching unimplemented**: `route.method` remains reserved for future use
 6. **Control/metrics endpoint hardening is operator-dependent**: endpoints should remain network-isolated unless explicitly protected
 

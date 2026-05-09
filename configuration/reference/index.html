@@ -5,32 +5,7 @@
     <script>
         const base_url = "https://supernova-labs-org.github.io/spooky/"; /* for search plugin notably */
     </script>
-    <script>
-    const darkTheme = window.matchMedia("(prefers-color-scheme: dark)");
-    darkTheme.onchange = (e) => {
-        if (e.matches) {
-            document.documentElement.classList.add("dark")
-            localStorage.theme = 'dark';
-        } else {
-            document.documentElement.classList.remove("dark")
-            localStorage.removeItem("theme")
-        }
-    };
-
-    // On page load. Priotiry to lcaolStorage
-    if (localStorage.theme === "dark") {
-        document.documentElement.classList.add("dark")
-    } else if (localStorage.theme === "light") {
-        document.documentElement.classList.remove("dark")
-    } else if (darkTheme.matches) {
-        document.documentElement.classList.add("dark")
-    } else {
-        document.documentElement.classList.remove("dark")
-    }
-
-    // set the layout based on localStorage
-    document.documentElement.classList.add(localStorage.getItem("html-layout") || "layout-fixed");
-</script>
+    <script integrity="sha384-m6cZ+Whl1ci89lidlu8DH4C+sZLNOYBvImtjUIhUK+iaNffXhqtbYgBVuuPfRsa0" src="../../js/dark.js"></script>
 
 
     <meta charset="UTF-8">
@@ -86,6 +61,11 @@
     <link href="../../css/geist.css" rel="stylesheet">
 
     
+    <style>
+        :root {
+            --theme-accent: oklch(62.3% 0.214 259.815);
+        }
+    </style>
     <link href="../../stylesheets/extra.css" rel="stylesheet">
 
     
@@ -824,8 +804,7 @@
         </h1>
 
         <div class="flex items-center gap-2 pt-1.5">
-          
-<button
+          <button
     onclick="fetch(`https://supernova-labs-org.github.io/spooky/configuration/reference.md`).then((r) => r.blob()).then((blob) => navigator.clipboard.write([new ClipboardItem({ 'text/plain': blob })]))"
     data-slot="button" class="secondary cursor-pointer">
     <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -993,7 +972,7 @@ log:
 <tr>
 <td><code>listen.protocol</code></td>
 <td><code>"http3"</code></td>
-<td>Ingress protocol (HTTP/3 over QUIC only)</td>
+<td>Native ingress protocol (HTTP/3 over QUIC); TLS bootstrap ingress for HTTP/1.1/2 compatibility is also active</td>
 </tr>
 <tr>
 <td><code>listen.port</code></td>
@@ -1146,7 +1125,7 @@ log:
 <td>string</td>
 <td>No</td>
 <td><code>http3</code></td>
-<td>Protocol to listen on (HTTP/3 over QUIC only)</td>
+<td>Native ingress protocol for the data plane (HTTP/3 over QUIC)</td>
 </tr>
 <tr>
 <td><code>address</code></td>
@@ -1175,7 +1154,7 @@ log:
 <ul>
 <li><code>http3</code>: HTTP/3 over QUIC (recommended)</li>
 </ul>
-<p>HTTP/1.1 and HTTP/2 ingress are not currently supported directly. If those clients must be supported, place an external frontend that terminates legacy protocols and forwards to Spooky over HTTP/3.</p>
+<p>Spooky also exposes a TLS bootstrap ingress for HTTP/1.1 and HTTP/2 clients. This compatibility path is primarily used for browser interoperability and advertising <code>Alt-Svc</code> so clients can upgrade to HTTP/3. Backend selection on the bootstrap path uses the same route-resolution, load-balancing strategy, and health-aware eligibility rules as the native QUIC ingress.</p>
 <h3 id="tls-configuration">TLS Configuration</h3>
 <div class="table-wrapper"><table>
 <thead>
@@ -1734,7 +1713,7 @@ log:
 <td>integer</td>
 <td>No</td>
 <td><code>2</code></td>
-<td>Threads for background tasks (health checks, metrics)</td>
+<td>Tokio worker threads for the control-plane runtime (startup, health checks, metrics, and other async control tasks)</td>
 </tr>
 <tr>
 <td><code>reuseport</code></td>
