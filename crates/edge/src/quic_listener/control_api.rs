@@ -117,10 +117,11 @@ impl QUICListener {
             error!("{}", msg);
             return Ok(());
         }
-        let listener = match {
+        let from_std_result = {
             let _guard = handle.enter();
             tokio::net::TcpListener::from_std(std_listener)
-        } {
+        };
+        let listener = match from_std_result {
             Ok(listener) => listener,
             Err(err) => {
                 let msg = format!(
