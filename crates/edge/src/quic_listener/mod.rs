@@ -3485,7 +3485,11 @@ impl QUICListener {
         Ok(())
     }
 
-    fn build_bootstrap_tls_acceptor(config: &SpookyConfig) -> Result<TlsAcceptor, ProxyError> {
+    fn build_server_tls_acceptor(
+        config: &SpookyConfig,
+        enforce_client_auth: bool,
+        alpn_protocols: Vec<Vec<u8>>,
+    ) -> Result<TlsAcceptor, ProxyError> {
         use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
         use std::io::BufReader;
 
@@ -3533,7 +3537,7 @@ impl QUICListener {
             }
         };
 
-        let builder = if config.listen.tls.client_auth.enabled {
+        let builder = if enforce_client_auth && config.listen.tls.client_auth.enabled {
             let ca_file = config
                 .listen
                 .tls
@@ -3593,9 +3597,17 @@ impl QUICListener {
             ProxyError::Tls(format!("failed to build rustls ServerConfig: {}", err))
         })?;
 
-        tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        tls_config.alpn_protocols = alpn_protocols;
 
         Ok(TlsAcceptor::from(Arc::new(tls_config)))
+    }
+
+    fn build_bootstrap_tls_acceptor(config: &SpookyConfig) -> Result<TlsAcceptor, ProxyError> {
+        Self::build_server_tls_acceptor(
+            config,
+            true,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+        )
     }
 
     fn spawn_bootstrap_tls_listener(

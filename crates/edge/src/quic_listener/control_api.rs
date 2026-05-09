@@ -51,6 +51,21 @@ impl QUICListener {
         let bind = format!("{}:{}", endpoint.address, endpoint.port);
         let max_connections = endpoint.max_connections.max(1);
         let connection_timeout = Duration::from_millis(endpoint.connection_timeout_ms.max(1));
+        let acceptor = match Self::build_server_tls_acceptor(
+            config,
+            false,
+            vec![b"http/1.1".to_vec()],
+        ) {
+            Ok(acceptor) => acceptor,
+            Err(err) => {
+                let msg = format!("failed to initialize control API TLS config: {err}");
+                if required {
+                    return Err(ProxyError::Tls(msg));
+                }
+                error!("{}", msg);
+                return Ok(());
+            }
+        };
         let paths = ControlApiPaths {
             health_path: endpoint.health_path.clone(),
             ready_path: endpoint.ready_path.clone(),
@@ -101,7 +116,10 @@ impl QUICListener {
             error!("{}", msg);
             return Ok(());
         }
-        let listener = match tokio::net::TcpListener::from_std(std_listener) {
+        let listener = match {
+            let _guard = handle.enter();
+            tokio::net::TcpListener::from_std(std_listener)
+        } {
             Ok(listener) => listener,
             Err(err) => {
                 let msg = format!(
@@ -122,7 +140,7 @@ impl QUICListener {
             Some(Arc::clone(&shared_state.metrics)),
             async move {
                 info!(
-                    "Control API endpoint listening on http://{}{} (ready={}, runtime={}, max_connections={}, connection_timeout_ms={})",
+                    "Control API endpoint listening on https://{}{} (ready={}, runtime={}, max_connections={}, connection_timeout_ms={})",
                     bind,
                     paths.health_path,
                     paths.ready_path,
@@ -133,7 +151,7 @@ impl QUICListener {
                 let connection_limiter = Arc::new(Semaphore::new(max_connections));
 
                 loop {
-                    let (stream, _peer) = match listener.accept().await {
+                    let (stream, peer) = match listener.accept().await {
                         Ok(v) => v,
                         Err(err) => {
                             error!("Control API endpoint accept failed: {}", err);
@@ -147,13 +165,24 @@ impl QUICListener {
                         }
                     };
 
-                    let io = TokioIo::new(stream);
+                    let acceptor = acceptor.clone();
                     let paths = paths.clone();
                     let state = state.clone();
                     let timeout = connection_timeout;
 
                     tokio::spawn(async move {
                         let _permit = permit;
+                        let tls_stream = match acceptor.accept(stream).await {
+                            Ok(stream) => stream,
+                            Err(err) => {
+                                error!(
+                                    "Control API endpoint TLS handshake failed from {}: {}",
+                                    peer, err
+                                );
+                                return;
+                            }
+                        };
+                        let io = TokioIo::new(tls_stream);
                         let service = service_fn(move |req: Request<Incoming>| {
                             let paths = paths.clone();
                             let state = state.clone();
@@ -331,7 +360,7 @@ impl QUICListener {
         state: &ControlApiState,
     ) -> bool {
         let Some(token) = state.auth_token.as_ref() else {
-            return true;
+            return false;
         };
         let Some(header) = req.headers().get(http::header::AUTHORIZATION) else {
             return false;

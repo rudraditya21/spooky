@@ -720,12 +720,9 @@ pub fn validate(config: &Config) -> bool {
             return false;
         }
 
-        if !is_loopback_bind_address(&config.observability.control_api.address)
-            && config.observability.control_api.auth_token.is_none()
-        {
+        if config.observability.control_api.auth_token.is_none() {
             error!(
-                "observability.control_api.auth_token is required when control_api.address is non-loopback ({})",
-                config.observability.control_api.address
+                "observability.control_api.auth_token is required when control_api.enabled=true"
             );
             return false;
         }
@@ -1613,6 +1610,17 @@ upstream:
         let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.observability.control_api.enabled = true;
         cfg.observability.control_api.address = "0.0.0.0".to_string();
+        cfg.observability.control_api.auth_token = None;
+        assert!(!validate(&cfg));
+    }
+
+    #[test]
+    fn rejects_loopback_control_api_without_auth_token() {
+        let dir = tempdir().expect("tempdir");
+        let (cert, key) = write_test_certs(dir.path());
+        let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        cfg.observability.control_api.enabled = true;
+        cfg.observability.control_api.address = "127.0.0.1".to_string();
         cfg.observability.control_api.auth_token = None;
         assert!(!validate(&cfg));
     }
