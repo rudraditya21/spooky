@@ -3616,6 +3616,9 @@ impl QUICListener {
         let bind = format!("{}:{}", config.listen.address, config.listen.port);
         let alt_svc_value = format!("h3=\":{}\"; ma=86400", config.listen.port);
         let backend_timeout = Duration::from_millis(config.performance.backend_timeout_ms);
+        let max_connections = config.performance.max_active_connections.max(1);
+        let connection_timeout =
+            Duration::from_millis(config.performance.client_body_idle_timeout_ms.max(1));
 
         let h2_pool = Arc::clone(&shared_state.h2_pool);
         let backend_endpoints = Arc::clone(&shared_state.backend_endpoints);
@@ -3665,14 +3668,29 @@ impl QUICListener {
                 }
             };
             info!(
-                "Bootstrap TLS listener on https://{} (TCP+TLS) — advertising Alt-Svc: {}",
-                bind, alt_svc_value
+                "Bootstrap TLS listener on https://{} (TCP+TLS) — advertising Alt-Svc: {} (max_connections={}, connection_timeout_ms={})",
+                bind,
+                alt_svc_value,
+                max_connections,
+                connection_timeout.as_millis()
             );
+            let connection_limiter = Arc::new(Semaphore::new(max_connections));
             loop {
                 let (stream, peer) = match listener.accept().await {
                     Ok(v) => v,
                     Err(err) => {
                         error!("Bootstrap TLS listener accept failed: {}", err);
+                        continue;
+                    }
+                };
+                let permit = match Arc::clone(&connection_limiter).try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        metrics.inc_connection_cap_reject();
+                        debug!(
+                            "Bootstrap TLS listener dropped connection from {}: max_connections reached",
+                            peer
+                        );
                         continue;
                     }
                 };
@@ -3685,8 +3703,10 @@ impl QUICListener {
                 let resilience = Arc::clone(&resilience);
                 let upstream_pools = upstream_pools.clone();
                 let routing_index = Arc::clone(&routing_index);
+                let timeout = connection_timeout;
 
                 tokio::spawn(async move {
+                    let _permit = permit;
                     let tls_stream = match acceptor.accept(stream).await {
                         Ok(s) => s,
                         Err(err) => {
@@ -3944,14 +3964,27 @@ impl QUICListener {
 
                     if use_h2 {
                         let executor = hyper_util::rt::TokioExecutor::new();
-                        if let Err(err) = http2::Builder::new(executor)
-                            .serve_connection(io, svc)
-                            .await
-                        {
-                            debug!("Bootstrap h2 connection from {} closed: {}", peer, err);
+                        let serve = http2::Builder::new(executor).serve_connection(io, svc);
+                        match tokio::time::timeout(timeout, serve).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(err)) => {
+                                debug!("Bootstrap h2 connection from {} closed: {}", peer, err);
+                            }
+                            Err(_) => {
+                                debug!("Bootstrap h2 connection from {} timed out", peer);
+                            }
                         }
-                    } else if let Err(err) = http1::Builder::new().serve_connection(io, svc).await {
-                        debug!("Bootstrap h1 connection from {} closed: {}", peer, err);
+                    } else {
+                        let serve = http1::Builder::new().serve_connection(io, svc);
+                        match tokio::time::timeout(timeout, serve).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(err)) => {
+                                debug!("Bootstrap h1 connection from {} closed: {}", peer, err);
+                            }
+                            Err(_) => {
+                                debug!("Bootstrap h1 connection from {} timed out", peer);
+                            }
+                        }
                     }
                 });
             }
