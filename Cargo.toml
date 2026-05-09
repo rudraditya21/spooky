@@ -36,6 +36,7 @@ thiserror = "1"
 tokio = { version = "1", features = ["full"] }
 libc = "0.2"
 smallvec = "1"
+subtle = "2"
 socket2 = { version = "0.5", features = ["all"] }
 core_affinity = "0.8"
 tracing = "0.1.41"

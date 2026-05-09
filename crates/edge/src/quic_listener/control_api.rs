@@ -1,4 +1,5 @@
 use super::*;
+use subtle::ConstantTimeEq;
 
 #[derive(Clone)]
 pub(super) struct ControlApiPaths {
@@ -371,7 +372,7 @@ impl QUICListener {
         let Some(provided) = raw.strip_prefix("Bearer ") else {
             return false;
         };
-        provided == token
+        bool::from(provided.as_bytes().ct_eq(token.as_bytes()))
     }
 
     pub(super) fn spawn_watchdog(
