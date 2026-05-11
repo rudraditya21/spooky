@@ -43,7 +43,8 @@ pub(crate) fn normalize_host_for_routing(raw: &str) -> Option<String> {
 /// Route precedence (deterministic):
 /// 1) Longest matching path_prefix wins.
 /// 2) On equal path length, host-specific routes win over host-agnostic routes.
-/// 3) On remaining ties, lexicographically smaller upstream name wins.
+/// 3) On equal host/path match, method-specific routes win over method-agnostic routes.
+/// 4) On remaining ties, lexicographically smaller upstream name wins.
 ///
 /// `order` stores the lexicographic rank of upstream name (smaller rank = smaller name),
 /// so trie updates are independent of HashMap insertion order.
@@ -52,6 +53,7 @@ pub struct IndexedRoute {
     upstream_idx: usize,
     path_len: usize,
     host_specific: bool,
+    method_specific: bool,
     order: usize,
 }
 
@@ -60,6 +62,7 @@ enum RoutePreference {
     KeepCurrent,
     TakeCandidatePathLen,
     TakeCandidateHostSpecific,
+    TakeCandidateMethodSpecific,
     TakeCandidateLexicalOrder,
 }
 
@@ -69,6 +72,7 @@ pub(crate) enum RouteDecisionReason {
     HostPathLongerOrEqual,
     DefaultPathLonger,
     HostSpecificTieBreak,
+    MethodSpecificTieBreak,
     LexicalTieBreak,
 }
 
@@ -82,7 +86,7 @@ pub(crate) struct RouteDecision<'a> {
 
 #[derive(Default)]
 pub struct TrieNode {
-    pub route: Option<IndexedRoute>,
+    pub routes: Vec<IndexedRoute>,
     children: Vec<TrieEdge>,
 }
 
@@ -94,7 +98,15 @@ struct TrieEdge {
 
 impl TrieNode {
     fn update_route(&mut self, candidate: IndexedRoute) {
-        self.route = prefer_route(self.route, Some(candidate));
+        if let Some(existing) = self
+            .routes
+            .iter_mut()
+            .find(|route| route.upstream_idx == candidate.upstream_idx)
+        {
+            *existing = candidate;
+            return;
+        }
+        self.routes.push(candidate);
     }
 
     #[inline(always)]
@@ -145,25 +157,62 @@ impl RouteTrie {
         node.update_route(route);
     }
 
-    fn longest_prefix(&self, path: &str) -> Option<IndexedRoute> {
+    fn longest_prefix(
+        &self,
+        path: &str,
+        method: Option<&str>,
+        upstream_methods: &[Option<String>],
+    ) -> Option<IndexedRoute> {
         let mut node = &self.root;
-        let mut best = node
-            .route
-            .filter(|route| prefix_boundary_matches(path, route.path_len));
+        let mut best = best_matching_route(&node.routes, path, method, upstream_methods, None);
 
         for byte in path.as_bytes() {
             let Some(next) = node.child(*byte) else {
                 break;
             };
             node = next;
-            let candidate = node
-                .route
-                .filter(|route| prefix_boundary_matches(path, route.path_len));
-            best = prefer_route(best, candidate);
+            best = best_matching_route(&node.routes, path, method, upstream_methods, best);
         }
 
         best
     }
+}
+
+fn route_matches_method(
+    route: IndexedRoute,
+    method: Option<&str>,
+    upstream_methods: &[Option<String>],
+) -> bool {
+    let Some(method) = method else {
+        return true;
+    };
+    match upstream_methods
+        .get(route.upstream_idx)
+        .and_then(|value| value.as_deref())
+    {
+        Some(expected) => expected.eq_ignore_ascii_case(method),
+        None => true,
+    }
+}
+
+fn best_matching_route(
+    routes: &[IndexedRoute],
+    path: &str,
+    method: Option<&str>,
+    upstream_methods: &[Option<String>],
+    current: Option<IndexedRoute>,
+) -> Option<IndexedRoute> {
+    let mut best = current;
+    for route in routes.iter().copied() {
+        if !prefix_boundary_matches(path, route.path_len) {
+            continue;
+        }
+        if !route_matches_method(route, method, upstream_methods) {
+            continue;
+        }
+        best = prefer_route(best, Some(route));
+    }
+    best
 }
 
 #[inline(always)]
@@ -182,6 +231,7 @@ pub(crate) struct RouteIndex {
     default_trie: RouteTrie,
     default_max_path_len: usize,
     upstream_names: Vec<String>,
+    upstream_methods: Vec<Option<String>>,
 }
 
 impl RouteIndex {
@@ -190,6 +240,7 @@ impl RouteIndex {
         let mut default_trie = RouteTrie::default();
         let mut default_max_path_len = 0usize;
         let mut upstream_names = Vec::with_capacity(upstreams.len());
+        let mut upstream_methods = Vec::with_capacity(upstreams.len());
         // Build a stable route list first. This keeps tie-breaking deterministic even if
         // upstreams came from a map with non-deterministic iteration order.
         let mut ordered: Vec<(&String, &Upstream)> = upstreams.iter().collect();
@@ -198,6 +249,15 @@ impl RouteIndex {
         for (order, (name, upstream)) in ordered.into_iter().enumerate() {
             let upstream_idx = upstream_names.len();
             upstream_names.push(name.clone());
+            upstream_methods.push(
+                upstream
+                    .route
+                    .method
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.to_ascii_uppercase()),
+            );
             let path_len = upstream
                 .route
                 .path_prefix
@@ -209,6 +269,7 @@ impl RouteIndex {
                 upstream_idx,
                 path_len,
                 host_specific: upstream.route.host.is_some(),
+                method_specific: upstream.route.method.is_some(),
                 order,
             };
 
@@ -240,10 +301,20 @@ impl RouteIndex {
             default_trie,
             default_max_path_len,
             upstream_names,
+            upstream_methods,
         }
     }
 
     pub(crate) fn lookup<'a>(&'a self, path: &str, host: Option<&str>) -> Option<&'a str> {
+        self.lookup_for_method(path, host, None)
+    }
+
+    pub(crate) fn lookup_for_method<'a>(
+        &'a self,
+        path: &str,
+        host: Option<&str>,
+        method: Option<&str>,
+    ) -> Option<&'a str> {
         let host_best = host.and_then(|raw_host| {
             let parsed_host = parsed_host_for_routing(raw_host)?;
             let host_trie = if host_has_uppercase_ascii(parsed_host) {
@@ -252,7 +323,7 @@ impl RouteIndex {
             } else {
                 self.host_tries.get(parsed_host)
             }?;
-            host_trie.longest_prefix(path)
+            host_trie.longest_prefix(path, method, &self.upstream_methods)
         });
 
         if let Some(best) = host_best
@@ -261,14 +332,28 @@ impl RouteIndex {
             return Some(self.upstream_names[best.upstream_idx].as_str());
         }
 
-        let best = prefer_route(self.default_trie.longest_prefix(path), host_best);
+        let best = prefer_route(
+            self.default_trie
+                .longest_prefix(path, method, &self.upstream_methods),
+            host_best,
+        );
         best.map(|route| self.upstream_names[route.upstream_idx].as_str())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn lookup_with_decision<'a>(
         &'a self,
         path: &str,
         host: Option<&str>,
+    ) -> Option<RouteDecision<'a>> {
+        self.lookup_with_decision_for_method(path, host, None)
+    }
+
+    pub(crate) fn lookup_with_decision_for_method<'a>(
+        &'a self,
+        path: &str,
+        host: Option<&str>,
+        method: Option<&str>,
     ) -> Option<RouteDecision<'a>> {
         let host_best = host.and_then(|raw_host| {
             let parsed_host = parsed_host_for_routing(raw_host)?;
@@ -278,10 +363,12 @@ impl RouteIndex {
             } else {
                 self.host_tries.get(parsed_host)
             }?;
-            host_trie.longest_prefix(path)
+            host_trie.longest_prefix(path, method, &self.upstream_methods)
         });
 
-        let default_best = self.default_trie.longest_prefix(path);
+        let default_best = self
+            .default_trie
+            .longest_prefix(path, method, &self.upstream_methods);
         if let Some(best) = host_best
             && best.path_len >= self.default_max_path_len
         {
@@ -290,6 +377,9 @@ impl RouteIndex {
                 Some(default_route) => match compare_route(default_route, best) {
                     RoutePreference::TakeCandidateHostSpecific => {
                         RouteDecisionReason::HostSpecificTieBreak
+                    }
+                    RoutePreference::TakeCandidateMethodSpecific => {
+                        RouteDecisionReason::MethodSpecificTieBreak
                     }
                     RoutePreference::TakeCandidateLexicalOrder => {
                         RouteDecisionReason::LexicalTieBreak
@@ -326,6 +416,9 @@ impl RouteIndex {
                     RoutePreference::TakeCandidateHostSpecific => {
                         RouteDecisionReason::HostSpecificTieBreak
                     }
+                    RoutePreference::TakeCandidateMethodSpecific => {
+                        RouteDecisionReason::MethodSpecificTieBreak
+                    }
                     RoutePreference::TakeCandidateLexicalOrder => {
                         RouteDecisionReason::LexicalTieBreak
                     }
@@ -359,6 +452,7 @@ fn prefer_route(
             RoutePreference::KeepCurrent => Some(current),
             RoutePreference::TakeCandidatePathLen
             | RoutePreference::TakeCandidateHostSpecific
+            | RoutePreference::TakeCandidateMethodSpecific
             | RoutePreference::TakeCandidateLexicalOrder => Some(candidate),
         },
     }
@@ -375,6 +469,13 @@ fn compare_route(current: IndexedRoute, candidate: IndexedRoute) -> RoutePrefere
         RoutePreference::TakeCandidateHostSpecific
     } else if candidate.path_len == current.path_len
         && candidate.host_specific == current.host_specific
+        && candidate.method_specific
+        && !current.method_specific
+    {
+        RoutePreference::TakeCandidateMethodSpecific
+    } else if candidate.path_len == current.path_len
+        && candidate.host_specific == current.host_specific
+        && candidate.method_specific == current.method_specific
         && candidate.order < current.order
     {
         RoutePreference::TakeCandidateLexicalOrder
@@ -388,11 +489,35 @@ pub(crate) fn scan_lookup<'a>(
     path: &str,
     host: Option<&str>,
 ) -> Option<&'a str> {
+    scan_lookup_for_method(upstreams, path, host, None)
+}
+
+pub(crate) fn scan_lookup_for_method<'a>(
+    upstreams: &'a HashMap<String, Upstream>,
+    path: &str,
+    host: Option<&str>,
+    method: Option<&str>,
+) -> Option<&'a str> {
     let path_bytes = path.as_bytes();
     let normalized_request_host = host.and_then(parsed_host_for_routing);
-    let mut best_match: Option<(&str, usize, bool)> = None;
+    let mut best_match: Option<(&str, usize, bool, bool)> = None;
 
     for (upstream_name, upstream) in upstreams {
+        let has_method_match = match (
+            upstream.route.method.as_deref().map(str::trim),
+            method.map(str::trim),
+        ) {
+            (Some(""), _) => true,
+            (Some(route_method), Some(request_method)) => {
+                route_method.eq_ignore_ascii_case(request_method)
+            }
+            (Some(_), None) => true,
+            (None, _) => true,
+        };
+        if !has_method_match {
+            continue;
+        }
+
         let has_host_match = match (&upstream.route.host, normalized_request_host) {
             (Some(route_host), Some(request_host)) => {
                 if route_host == request_host {
@@ -433,25 +558,45 @@ pub(crate) fn scan_lookup<'a>(
             continue;
         }
         let host_specific = upstream.route.host.is_some();
+        let method_specific = upstream
+            .route
+            .method
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
 
         match best_match {
-            Some((best_name, best_len, best_host_specific)) => {
+            Some((best_name, best_len, best_host_specific, best_method_specific)) => {
                 if path_match_len > best_len
                     || (path_match_len == best_len && host_specific && !best_host_specific)
                     || (path_match_len == best_len
                         && host_specific == best_host_specific
+                        && method_specific
+                        && !best_method_specific)
+                    || (path_match_len == best_len
+                        && host_specific == best_host_specific
+                        && method_specific == best_method_specific
                         && upstream_name.as_str() < best_name)
                 {
-                    best_match = Some((upstream_name.as_str(), path_match_len, host_specific));
+                    best_match = Some((
+                        upstream_name.as_str(),
+                        path_match_len,
+                        host_specific,
+                        method_specific,
+                    ));
                 }
             }
             None => {
-                best_match = Some((upstream_name.as_str(), path_match_len, host_specific));
+                best_match = Some((
+                    upstream_name.as_str(),
+                    path_match_len,
+                    host_specific,
+                    method_specific,
+                ));
             }
         }
     }
 
-    best_match.map(|(name, _, _)| name)
+    best_match.map(|(name, _, _, _)| name)
 }
 
 #[cfg(test)]
@@ -461,6 +606,14 @@ mod tests {
     use std::time::Instant;
 
     fn test_upstream(host: Option<&str>, path_prefix: Option<&str>) -> Upstream {
+        test_upstream_with_method(host, path_prefix, None)
+    }
+
+    fn test_upstream_with_method(
+        host: Option<&str>,
+        path_prefix: Option<&str>,
+        method: Option<&str>,
+    ) -> Upstream {
         Upstream {
             load_balancing: LoadBalancing {
                 lb_type: "random".to_string(),
@@ -469,7 +622,7 @@ mod tests {
             route: RouteMatch {
                 host: host.map(str::to_string),
                 path_prefix: path_prefix.map(str::to_string),
-                method: None,
+                method: method.map(str::to_string),
             },
             backends: vec![],
         }
@@ -625,6 +778,50 @@ mod tests {
             .expect("decision");
         assert_eq!(decision.upstream, "default-api-v2");
         assert_eq!(decision.reason, RouteDecisionReason::DefaultPathLonger);
+    }
+
+    #[test]
+    fn method_specific_route_wins_on_tie() {
+        let mut upstreams = HashMap::new();
+        upstreams.insert(
+            "all-api".to_string(),
+            test_upstream_with_method(None, Some("/api"), None),
+        );
+        upstreams.insert(
+            "post-api".to_string(),
+            test_upstream_with_method(None, Some("/api"), Some("POST")),
+        );
+        let index = RouteIndex::from_upstreams(&upstreams);
+
+        let get = index
+            .lookup_with_decision_for_method("/api/items", None, Some("GET"))
+            .expect("GET route");
+        assert_eq!(get.upstream, "all-api");
+
+        let post = index
+            .lookup_with_decision_for_method("/api/items", None, Some("POST"))
+            .expect("POST route");
+        assert_eq!(post.upstream, "post-api");
+
+        assert_eq!(
+            scan_lookup_for_method(&upstreams, "/api/items", None, Some("POST")),
+            Some("post-api")
+        );
+    }
+
+    #[test]
+    fn method_matching_is_case_insensitive() {
+        let mut upstreams = HashMap::new();
+        upstreams.insert(
+            "post-api".to_string(),
+            test_upstream_with_method(None, Some("/api"), Some("post")),
+        );
+        let index = RouteIndex::from_upstreams(&upstreams);
+
+        assert_eq!(
+            index.lookup_for_method("/api", None, Some("POST")),
+            Some("post-api")
+        );
     }
 
     #[test]

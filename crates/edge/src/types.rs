@@ -108,6 +108,13 @@ pub struct QUICListener {
     pub(crate) conn_rate_limiter: crate::quic_listener::TokenBucket,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QuicConnectionErrorSnapshot {
+    pub(crate) is_app: bool,
+    pub(crate) error_code: u64,
+    pub(crate) reason: Vec<u8>,
+}
+
 pub struct QuicConnection {
     pub quic: quiche::Connection,
     pub h3: Option<quiche::h3::Connection>,
@@ -120,6 +127,8 @@ pub struct QuicConnection {
     pub routing_scids: HashSet<Arc<[u8]>>,
     pub packets_since_rotation: u64,
     pub last_scid_rotation: Instant,
+    pub(crate) last_peer_error_snapshot: Option<QuicConnectionErrorSnapshot>,
+    pub(crate) last_local_error_snapshot: Option<QuicConnectionErrorSnapshot>,
 }
 
 /// Result type returned by the in-flight H2 forwarding task.
