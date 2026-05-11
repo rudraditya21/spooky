@@ -1,6 +1,7 @@
 //! Spooky HTTP/3 Load Balancer - Main Entry Point
 
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
 mod privilege_drop;
 mod runtime_guard;
@@ -23,7 +24,7 @@ use spooky_edge::{
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
-    // Sets a custom config file
+    // Path to the configuration file.
     #[arg(short, long)]
     config: Option<String>,
 }
@@ -64,9 +65,18 @@ fn main() {
     // Parse CLI arguments
     let cli = Cli::parse();
 
-    let config_path = cli
-        .config
-        .unwrap_or_else(|| "./config/config.development.yaml".to_string());
+    const DEFAULT_CONFIG_PATH: &str = "/etc/spooky/config.yaml";
+    let config_path = match cli.config {
+        Some(path) => path,
+        None if Path::new(DEFAULT_CONFIG_PATH).exists() => DEFAULT_CONFIG_PATH.to_string(),
+        None => {
+            eprintln!(
+                "Error: no --config provided and default config '{}' was not found.",
+                DEFAULT_CONFIG_PATH
+            );
+            std::process::exit(2);
+        }
+    };
 
     // Read configuration file
     let config_yaml = match spooky_config::loader::read_config(&config_path) {
