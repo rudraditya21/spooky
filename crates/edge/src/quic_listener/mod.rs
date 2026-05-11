@@ -1,11 +1,14 @@
 use std::{
     collections::{HashMap, HashSet},
+    convert::Infallible,
     future::Future,
     net::{ToSocketAddrs, UdpSocket},
+    pin::Pin,
     sync::{
         Arc, OnceLock, RwLock,
         atomic::{AtomicUsize, Ordering},
     },
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
@@ -14,7 +17,7 @@ use core::net::SocketAddr;
 use bytes::Bytes;
 use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
-use hyper::body::Incoming;
+use hyper::body::{Body, Frame, Incoming};
 use hyper::server::conn::http1;
 use hyper::server::conn::http2;
 use hyper::service::service_fn;
@@ -144,12 +147,43 @@ type BootstrapServiceFuture = std::pin::Pin<
     Box<
         dyn std::future::Future<
                 Output = Result<
-                    hyper::Response<http_body_util::Full<hyper::body::Bytes>>,
+                    hyper::Response<http_body_util::combinators::BoxBody<hyper::body::Bytes, Infallible>>,
                     hyper::Error,
                 >,
             > + Send,
     >,
 >;
+
+struct BootstrapStreamingBody {
+    inner: Incoming,
+}
+
+impl BootstrapStreamingBody {
+    fn new(inner: Incoming) -> Self {
+        Self { inner }
+    }
+}
+
+impl Body for BootstrapStreamingBody {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match Pin::new(&mut self.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => Poll::Ready(Some(Ok(frame))),
+            Poll::Ready(Some(Err(_))) => Poll::Ready(None),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+fn boxed_full(body: Bytes) -> http_body_util::combinators::BoxBody<Bytes, Infallible> {
+    Full::new(body).map_err(|never| match never {}).boxed()
+}
 
 type ResolvedBackend = (
     String,
@@ -3620,6 +3654,8 @@ impl QUICListener {
         let bind = format!("{}:{}", config.listen.address, config.listen.port);
         let alt_svc_value = format!("h3=\":{}\"; ma=86400", config.listen.port);
         let backend_timeout = Duration::from_millis(config.performance.backend_timeout_ms);
+        let max_request_body_bytes = config.performance.max_request_body_bytes;
+        let max_response_body_bytes = config.performance.max_response_body_bytes;
         let max_connections = config.performance.max_active_connections.max(1);
         let connection_timeout =
             Duration::from_millis(config.performance.client_body_idle_timeout_ms.max(1));
@@ -3702,6 +3738,8 @@ impl QUICListener {
                 let resilience = Arc::clone(&resilience);
                 let upstream_pools = upstream_pools.clone();
                 let routing_index = Arc::clone(&routing_index);
+                let max_request_body_bytes = max_request_body_bytes;
+                let max_response_body_bytes = max_response_body_bytes;
                 let timeout = connection_timeout;
 
                 tokio::spawn(async move {
@@ -3728,6 +3766,8 @@ impl QUICListener {
                         let resilience = Arc::clone(&resilience);
                         let upstream_pools = upstream_pools.clone();
                         let routing_index = Arc::clone(&routing_index);
+                        let max_request_body_bytes = max_request_body_bytes;
+                        let max_response_body_bytes = max_response_body_bytes;
 
                         Box::pin(async move {
                             let request = match validate_http_request(&req, &resilience) {
@@ -3746,10 +3786,8 @@ impl QUICListener {
                                     return Ok(Response::builder()
                                         .status(status)
                                         .header("alt-svc", &alt)
-                                        .body(Full::new(Bytes::copy_from_slice(body)))
-                                        .unwrap_or_else(|_| {
-                                            Response::new(Full::new(Bytes::new()))
-                                        }));
+                                        .body(boxed_full(Bytes::copy_from_slice(body)))
+                                        .unwrap_or_else(|_| Response::new(boxed_full(Bytes::new()))));
                                 }
                             };
                             let method = request.method;
@@ -3760,9 +3798,9 @@ impl QUICListener {
                                 Ok(Response::builder()
                                     .status(status)
                                     .header("alt-svc", &alt)
-                                    .body(Full::new(Bytes::from_static(body)))
+                                    .body(boxed_full(Bytes::from_static(body)))
                                     .unwrap_or_else(|_| {
-                                        Response::new(Full::new(Bytes::from_static(b"error\n")))
+                                        Response::new(boxed_full(Bytes::from_static(b"error\n")))
                                     }))
                             };
 
@@ -3807,9 +3845,9 @@ impl QUICListener {
                                     return Ok(Response::builder()
                                         .status(StatusCode::BAD_GATEWAY)
                                         .header("alt-svc", &alt)
-                                        .body(Full::new(Bytes::from_static(b"no endpoint\n")))
+                                        .body(boxed_full(Bytes::from_static(b"no endpoint\n")))
                                         .unwrap_or_else(|_| {
-                                            Response::new(Full::new(Bytes::from_static(b"error\n")))
+                                            Response::new(boxed_full(Bytes::from_static(b"error\n")))
                                         }));
                                 }
                             };
@@ -3823,9 +3861,9 @@ impl QUICListener {
                                         return Ok(Response::builder()
                                             .status(StatusCode::BAD_GATEWAY)
                                             .header("alt-svc", &alt)
-                                            .body(Full::new(Bytes::from_static(b"bad uri\n")))
+                                            .body(boxed_full(Bytes::from_static(b"bad uri\n")))
                                             .unwrap_or_else(|_| {
-                                                Response::new(Full::new(Bytes::from_static(
+                                                Response::new(boxed_full(Bytes::from_static(
                                                     b"error\n",
                                                 )))
                                             }));
@@ -3855,87 +3893,87 @@ impl QUICListener {
                                 ),
                             );
 
-                            let body_bytes = match req.into_body().collect().await {
-                                Ok(collected) => collected.to_bytes(),
-                                Err(_) => Bytes::new(),
-                            };
+                            if let Some(content_length) = req
+                                .headers()
+                                .get(http::header::CONTENT_LENGTH)
+                                .and_then(|v| v.to_str().ok())
+                                .and_then(|s| s.parse::<usize>().ok())
+                                && content_length > max_request_body_bytes
+                            {
+                                return Ok(Response::builder()
+                                    .status(StatusCode::PAYLOAD_TOO_LARGE)
+                                    .header("alt-svc", &alt)
+                                    .body(boxed_full(Bytes::from_static(b"request body too large\n")))
+                                    .unwrap_or_else(|_| {
+                                        Response::new(boxed_full(Bytes::from_static(b"error\n")))
+                                    }));
+                            }
 
-                            // Build a template request (no body) then clone per retry attempt
-                            let template = match upstream_req.body(()) {
+                            let upstream_req = match upstream_req.body(
+                                BootstrapStreamingBody::new(req.into_body())
+                                    .map_err(|never| match never {})
+                                    .boxed(),
+                            ) {
                                 Ok(r) => r,
                                 Err(_) => {
                                     return Ok(Response::builder()
                                         .status(StatusCode::BAD_GATEWAY)
                                         .header("alt-svc", &alt)
-                                        .body(Full::new(Bytes::from_static(
+                                        .body(boxed_full(Bytes::from_static(
                                             b"request build error\n",
                                         )))
                                         .unwrap_or_else(|_| {
-                                            Response::new(Full::new(Bytes::from_static(b"error\n")))
+                                            Response::new(boxed_full(Bytes::from_static(b"error\n")))
                                         }));
                                 }
                             };
-                            let (parts, _) = template.into_parts();
-                            let parts = Arc::new(parts);
-
-                            // Forward to backend — retry on connection errors (pool not yet warm)
-                            const MAX_RETRIES: u32 = 3;
-                            let mut last_err = String::new();
-                            let mut upstream_resp_opt = None;
-                            for attempt in 0..=MAX_RETRIES {
-                                if attempt > 0 {
-                                    tokio::time::sleep(Duration::from_millis(150)).await;
-                                }
-                                let retry_body = http_body_util::Full::new(body_bytes.clone())
-                                    .map_err(|e: std::convert::Infallible| e)
-                                    .boxed();
-                                let retry_req = Request::from_parts((*parts).clone(), retry_body);
-                                match tokio::time::timeout(
-                                    backend_timeout,
-                                    h2_pool.send(&backend_addr, retry_req),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(resp)) => {
-                                        upstream_resp_opt = Some(resp);
-                                        break;
-                                    }
-                                    Ok(Err(err)) => {
-                                        last_err = err.to_string();
-                                    }
-                                    Err(_) => {
-                                        return Ok(Response::builder()
-                                            .status(StatusCode::GATEWAY_TIMEOUT)
-                                            .header("alt-svc", &alt)
-                                            .body(Full::new(Bytes::from_static(
-                                                b"upstream timeout\n",
-                                            )))
-                                            .unwrap_or_else(|_| {
-                                                Response::new(Full::new(Bytes::from_static(
-                                                    b"error\n",
-                                                )))
-                                            }));
-                                    }
-                                }
-                            }
-                            let upstream_resp = match upstream_resp_opt {
-                                Some(r) => r,
-                                None => {
-                                    warn!(
-                                        "Bootstrap proxy upstream error after retries: {}",
-                                        last_err
-                                    );
+                            let upstream_resp = match tokio::time::timeout(
+                                backend_timeout,
+                                h2_pool.send(&backend_addr, upstream_req),
+                            )
+                            .await
+                            {
+                                Ok(Ok(resp)) => resp,
+                                Ok(Err(err)) => {
+                                    warn!("Bootstrap proxy upstream error: {}", err);
                                     return Ok(Response::builder()
                                         .status(StatusCode::BAD_GATEWAY)
                                         .header("alt-svc", &alt)
-                                        .body(Full::new(Bytes::from_static(b"upstream error\n")))
+                                        .body(boxed_full(Bytes::from_static(b"upstream error\n")))
                                         .unwrap_or_else(|_| {
-                                            Response::new(Full::new(Bytes::from_static(b"error\n")))
+                                            Response::new(boxed_full(Bytes::from_static(b"error\n")))
+                                        }));
+                                }
+                                Err(_) => {
+                                    return Ok(Response::builder()
+                                        .status(StatusCode::GATEWAY_TIMEOUT)
+                                        .header("alt-svc", &alt)
+                                        .body(boxed_full(Bytes::from_static(b"upstream timeout\n")))
+                                        .unwrap_or_else(|_| {
+                                            Response::new(boxed_full(Bytes::from_static(b"error\n")))
                                         }));
                                 }
                             };
 
                             // Build downstream response with Alt-Svc injected
+                            if let Some(content_length) = upstream_resp
+                                .headers()
+                                .get(http::header::CONTENT_LENGTH)
+                                .and_then(|v| v.to_str().ok())
+                                .and_then(|s| s.parse::<usize>().ok())
+                                && content_length > max_response_body_bytes
+                            {
+                                return Ok(Response::builder()
+                                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                                    .header("alt-svc", &alt)
+                                    .body(boxed_full(Bytes::from_static(
+                                        b"upstream response body too large\n",
+                                    )))
+                                    .unwrap_or_else(|_| {
+                                        Response::new(boxed_full(Bytes::from_static(b"error\n")))
+                                    }));
+                            }
+
                             let status = upstream_resp.status();
                             let mut resp_builder = Response::builder().status(status);
                             for (name, value) in upstream_resp.headers() {
@@ -3949,15 +3987,13 @@ impl QUICListener {
                                 resp_builder = resp_builder.header(name, value);
                             }
                             resp_builder = resp_builder.header("alt-svc", &alt);
-
-                            let resp_body = match upstream_resp.into_body().collect().await {
-                                Ok(collected) => collected.to_bytes(),
-                                Err(_) => Bytes::new(),
-                            };
+                            let resp_body = BootstrapStreamingBody::new(upstream_resp.into_body())
+                                .map_err(|never| match never {})
+                                .boxed();
 
                             Ok(resp_builder
-                                .body(Full::new(resp_body))
-                                .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()))))
+                                .body(resp_body)
+                                .unwrap_or_else(|_| Response::new(boxed_full(Bytes::new()))))
                         })
                     });
 
