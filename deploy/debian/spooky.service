@@ -1,0 +1,33 @@
+[Unit]
+Description=Spooky QUIC/HTTP3 Reverse Proxy
+Documentation=https://github.com/Supernova-Labs-Org/spooky
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=spooky
+Group=spooky
+ExecStart=/usr/bin/spooky --config /etc/spooky/config.yaml
+Restart=on-failure
+RestartSec=5s
+
+# Logs go to /var/log/spooky/spooky.log via config; also capture stderr to syslog
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=spooky
+
+# Allow binding to privileged ports if needed via capabilities instead of root
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/log/spooky /etc/spooky
+PrivateTmp=yes
+PrivateDevices=yes
+
+[Install]
+WantedBy=multi-user.target
