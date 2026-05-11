@@ -216,7 +216,7 @@ pub struct RouteMatch {
     pub path_prefix: Option<String>, // path prefix matching (e.g., "/api")
 
     #[serde(default)]
-    pub method: Option<String>, // 🔮 FUTURE: HTTP method filtering (GET, POST, etc.)
+    pub method: Option<String>, // Optional HTTP method filtering (GET, POST, etc.)
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -247,9 +247,9 @@ pub struct LoadBalancing {
     #[serde(rename = "type")]
     pub lb_type: String, // "random","round_robin","consistent_hash","least_connections","latency_aware","sticky_cid"
 
-    // Add support for consistent hash configuration
+    // Configurable key source for hash-based/sticky load balancing.
     #[serde(default)]
-    pub key: Option<String>, // For consistent hashing (header, cookie, etc.)
+    pub key: Option<String>, // Examples: header:x-user-id, cookie:session_id, query:user_id
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]

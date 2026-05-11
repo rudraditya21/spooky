@@ -157,6 +157,39 @@ fn bootstrap_forwarded_for_value(ip: std::net::IpAddr) -> String {
     }
 }
 
+fn extract_cookie_value(cookie_header: &str, cookie_name: &str) -> Option<String> {
+    for pair in cookie_header.split(';') {
+        let part = pair.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (name, value) = part.split_once('=')?;
+        if name.trim().eq_ignore_ascii_case(cookie_name) {
+            let value = value.trim();
+            if value.is_empty() {
+                return None;
+            }
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn extract_query_param(path: &str, param: &str) -> Option<String> {
+    let (_, query) = path.split_once('?')?;
+    for pair in query.split('&') {
+        let entry = pair.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let (name, value) = entry.split_once('=')?;
+        if name.eq_ignore_ascii_case(param) && !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
 fn bootstrap_resolution_error_response(reason: &str) -> (StatusCode, &'static [u8]) {
     if reason.starts_with("no route for ") {
         return (StatusCode::BAD_GATEWAY, b"no route\n");
@@ -192,6 +225,8 @@ type BootstrapServiceFuture = std::pin::Pin<
             > + Send,
     >,
 >;
+
+type LbHeaderLookup<'a> = dyn Fn(&str) -> Option<String> + 'a;
 
 struct BootstrapStreamingBody {
     inner: Incoming,
@@ -1632,6 +1667,12 @@ impl QUICListener {
 
                     // Route lookup — needed to start the H2 request immediately.
                     let sticky_cid_key = hex::encode(connection.primary_scid.as_ref());
+                    let lb_header_lookup = |name: &str| {
+                        list.iter()
+                            .find(|header| header.name().eq_ignore_ascii_case(name.as_bytes()))
+                            .and_then(|header| std::str::from_utf8(header.value()).ok())
+                            .map(str::to_string)
+                    };
                     let resolved = Self::resolve_backend(
                         &method,
                         &path,
@@ -1639,6 +1680,7 @@ impl QUICListener {
                         Some(sticky_cid_key.as_str()),
                         upstream_pools,
                         routing_index,
+                        Some(&lb_header_lookup),
                     );
 
                     let (
@@ -3347,13 +3389,14 @@ impl QUICListener {
         cid_key: Option<&str>,
         upstream_pools: &HashMap<String, Arc<RwLock<UpstreamPool>>>,
         routing_index: &RouteIndex,
+        header_lookup: Option<&LbHeaderLookup<'_>>,
     ) -> Result<ResolvedBackend, ProxyError> {
         if method.is_empty() || path.is_empty() {
             return Err(ProxyError::Transport("empty method or path".into()));
         }
 
         let route_decision = routing_index
-            .lookup_with_decision(path, authority)
+            .lookup_with_decision_for_method(path, authority, Some(method))
             .ok_or_else(|| ProxyError::Transport(format!("no route for {path}")))?;
         let upstream_name = route_decision.upstream;
 
@@ -3361,15 +3404,6 @@ impl QUICListener {
             .get(upstream_name)
             .ok_or_else(|| ProxyError::Transport(format!("pool not found: {upstream_name}")))?
             .clone();
-
-        let request_key = authority.unwrap_or(if !path.is_empty() { path } else { method });
-        let key_for_lb = |lb_type: &str| -> &str {
-            if lb_type == "sticky-cid" {
-                cid_key.unwrap_or(request_key)
-            } else {
-                request_key
-            }
-        };
 
         let (backend_index, lb_type, backend_addr) = {
             let (read_lb_type, read_fast_selected) = {
@@ -3380,9 +3414,17 @@ impl QUICListener {
                     return Err(ProxyError::Transport("no servers in upstream".into()));
                 }
                 let lb_type = pool.lb_name();
-                let key = key_for_lb(lb_type);
+                let key = Self::resolve_lb_request_key(
+                    lb_type,
+                    pool.lb_key(),
+                    method,
+                    path,
+                    authority,
+                    cid_key,
+                    header_lookup,
+                );
                 let fast_pick = pool
-                    .pick_readonly(key)
+                    .pick_readonly(key.as_str())
                     .and_then(|idx| pool.pool.address(idx).map(|addr| (idx, addr.to_string())));
                 let fast_selected = fast_pick.and_then(|(idx, addr)| {
                     pool.begin_request_if_healthy(idx).then_some((idx, addr))
@@ -3400,9 +3442,17 @@ impl QUICListener {
                     return Err(ProxyError::Transport("no servers in upstream".into()));
                 }
                 let lb_type = pool.lb_name();
-                let key = key_for_lb(lb_type);
+                let key = Self::resolve_lb_request_key(
+                    lb_type,
+                    pool.lb_key(),
+                    method,
+                    path,
+                    authority,
+                    cid_key,
+                    header_lookup,
+                );
 
-                let idx = pool.pick(key).ok_or_else(|| {
+                let idx = pool.pick(key.as_str()).ok_or_else(|| {
                     let total = pool.pool.len();
                     let healthy = pool.pool.healthy_len();
                     error!(
@@ -3439,6 +3489,96 @@ impl QUICListener {
             route_decision.host_specific,
             route_decision.reason,
         ))
+    }
+
+    fn resolve_lb_key_from_spec(
+        lb_key_spec: &str,
+        method: &str,
+        path: &str,
+        authority: Option<&str>,
+        cid_key: Option<&str>,
+        header_lookup: Option<&LbHeaderLookup<'_>>,
+    ) -> Option<String> {
+        let spec = lb_key_spec.trim();
+        if spec.is_empty() {
+            return None;
+        }
+
+        if spec.eq_ignore_ascii_case("path") {
+            let path_only = path.split_once('?').map(|(p, _)| p).unwrap_or(path);
+            return Some(path_only.to_string());
+        }
+        if spec.eq_ignore_ascii_case("authority") {
+            return authority.map(str::to_string);
+        }
+        if spec.eq_ignore_ascii_case("method") {
+            return Some(method.to_string());
+        }
+        if spec.eq_ignore_ascii_case("cid") || spec.eq_ignore_ascii_case("sticky-cid") {
+            return cid_key.map(str::to_string);
+        }
+
+        let (source, key_name) = spec.split_once(':')?;
+        let key_name = key_name.trim();
+        if key_name.is_empty() {
+            return None;
+        }
+
+        if source.eq_ignore_ascii_case("header") {
+            return header_lookup.and_then(|lookup| lookup(key_name));
+        }
+
+        if source.eq_ignore_ascii_case("cookie") {
+            let cookie_header =
+                header_lookup.and_then(|lookup| lookup(http::header::COOKIE.as_str()))?;
+            return extract_cookie_value(cookie_header.as_str(), key_name);
+        }
+
+        if source.eq_ignore_ascii_case("query") {
+            return extract_query_param(path, key_name);
+        }
+
+        None
+    }
+
+    fn default_lb_request_key(method: &str, path: &str, authority: Option<&str>) -> String {
+        authority
+            .unwrap_or(if !path.is_empty() { path } else { method })
+            .to_string()
+    }
+
+    fn resolve_lb_request_key(
+        lb_type: &str,
+        lb_key_spec: Option<&str>,
+        method: &str,
+        path: &str,
+        authority: Option<&str>,
+        cid_key: Option<&str>,
+        header_lookup: Option<&LbHeaderLookup<'_>>,
+    ) -> String {
+        let default_key = Self::default_lb_request_key(method, path, authority);
+
+        if let Some(spec) = lb_key_spec
+            && let Some(value) = Self::resolve_lb_key_from_spec(
+                spec,
+                method,
+                path,
+                authority,
+                cid_key,
+                header_lookup,
+            )
+            && !value.is_empty()
+        {
+            return value;
+        }
+
+        if lb_type == "sticky-cid"
+            && let Some(cid_key) = cid_key
+        {
+            return cid_key.to_string();
+        }
+
+        default_key
     }
 
     fn spawn_metrics_endpoint(
@@ -3872,6 +4012,12 @@ impl QUICListener {
 
                                 // Preserve the same route-lookup + tie-break semantics as the QUIC
                                 // data plane by delegating bootstrap backend resolution here.
+                                let lb_header_lookup = |name: &str| {
+                                    req.headers()
+                                        .get(name)
+                                        .and_then(|value| value.to_str().ok())
+                                        .map(str::to_string)
+                                };
                                 let resolved = Self::resolve_backend(
                                     &method,
                                     &path,
@@ -3879,6 +4025,7 @@ impl QUICListener {
                                     None,
                                     &upstream_pools,
                                     &routing_index,
+                                    Some(&lb_header_lookup),
                                 );
                                 let (
                                     _upstream_name,
@@ -4537,15 +4684,19 @@ mod tests {
     }
 
     fn test_upstream(lb_type: &str) -> Upstream {
+        test_upstream_with(lb_type, None, None)
+    }
+
+    fn test_upstream_with(lb_type: &str, lb_key: Option<&str>, method: Option<&str>) -> Upstream {
         Upstream {
             load_balancing: LoadBalancing {
                 lb_type: lb_type.to_string(),
-                key: None,
+                key: lb_key.map(str::to_string),
             },
             route: RouteMatch {
                 host: None,
                 path_prefix: Some("/api".to_string()),
-                method: None,
+                method: method.map(str::to_string),
             },
             backends: vec![
                 Backend {
@@ -4595,6 +4746,7 @@ mod tests {
                 None,
                 &upstream_pools,
                 &routing_index,
+                None,
             )
             .expect("resolve backend");
             picks.push(backend);
@@ -4625,6 +4777,7 @@ mod tests {
             None,
             &upstream_pools,
             &routing_index,
+            None,
         )
         .expect("resolve backend");
 
@@ -4650,12 +4803,115 @@ mod tests {
             None,
             &upstream_pools,
             &routing_index,
+            None,
         )
         .expect("resolve backend");
 
         assert_eq!(
             backend, "127.0.0.1:7002",
             "least-connections should prefer lower in-flight backend in bootstrap selection"
+        );
+    }
+
+    #[test]
+    fn resolve_backend_prefers_method_specific_route() {
+        let mut upstreams = HashMap::new();
+        upstreams.insert(
+            "all_methods".to_string(),
+            test_upstream_with("round-robin", None, None),
+        );
+        let mut post_only = test_upstream_with("round-robin", None, Some("POST"));
+        post_only.backends = vec![Backend {
+            id: "post".to_string(),
+            address: "127.0.0.1:7010".to_string(),
+            weight: 1,
+            health_check: None,
+        }];
+        upstreams.insert("post_only".to_string(), post_only);
+
+        let routing_index = super::RouteIndex::from_upstreams(&upstreams);
+        let mut upstream_pools = HashMap::new();
+        for (name, upstream) in &upstreams {
+            let pool = super::UpstreamPool::from_upstream(upstream).expect("pool");
+            upstream_pools.insert(name.clone(), Arc::new(RwLock::new(pool)));
+        }
+
+        let (upstream, _, _, _, _, _, _, _) = super::QUICListener::resolve_backend(
+            "GET",
+            "/api/items",
+            None,
+            None,
+            &upstream_pools,
+            &routing_index,
+            None,
+        )
+        .expect("GET resolve");
+        assert_eq!(upstream, "all_methods");
+
+        let (upstream, backend, _, _, _, _, _, _) = super::QUICListener::resolve_backend(
+            "POST",
+            "/api/items",
+            None,
+            None,
+            &upstream_pools,
+            &routing_index,
+            None,
+        )
+        .expect("POST resolve");
+        assert_eq!(upstream, "post_only");
+        assert_eq!(backend, "127.0.0.1:7010");
+    }
+
+    #[test]
+    fn resolve_backend_uses_configured_header_lb_key() {
+        let (upstream_pools, routing_index, _pool) = {
+            let mut upstreams = HashMap::new();
+            upstreams.insert(
+                "api_pool".to_string(),
+                test_upstream_with("consistent-hash", Some("header:x-user-id"), None),
+            );
+            let routing_index = super::RouteIndex::from_upstreams(&upstreams);
+            let pool =
+                super::UpstreamPool::from_upstream(upstreams.get("api_pool").expect("upstream"))
+                    .expect("pool");
+            let pool = Arc::new(RwLock::new(pool));
+            let mut upstream_pools = HashMap::new();
+            upstream_pools.insert("api_pool".to_string(), Arc::clone(&pool));
+            (upstream_pools, routing_index, pool)
+        };
+
+        let header_lookup = |name: &str| {
+            if name.eq_ignore_ascii_case("x-user-id") {
+                Some("alice".to_string())
+            } else {
+                None
+            }
+        };
+
+        let (_, first_backend, _, _, _, _, _, _) = super::QUICListener::resolve_backend(
+            "GET",
+            "/api/items",
+            None,
+            None,
+            &upstream_pools,
+            &routing_index,
+            Some(&header_lookup),
+        )
+        .expect("first resolve");
+        let (_, second_backend, _, _, _, _, _, _) = super::QUICListener::resolve_backend(
+            "GET",
+            "/api/items",
+            None,
+            None,
+            &upstream_pools,
+            &routing_index,
+            Some(&header_lookup),
+        )
+        .expect("second resolve");
+
+        assert_eq!(
+            first_backend, second_backend,
+            "consistent-hash should remain stable when configured header key is constant"
         );
     }
 

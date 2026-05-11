@@ -162,6 +162,7 @@ pub struct BackendPool {
 pub struct UpstreamPool {
     pub pool: BackendPool,
     pub load_balancer: LoadBalancing,
+    lb_key: Option<String>,
 }
 
 impl UpstreamPool {
@@ -169,10 +170,18 @@ impl UpstreamPool {
         let backends = upstream.backends.iter().map(BackendState::new).collect();
 
         let load_balancer = LoadBalancing::from_config(&upstream.load_balancing.lb_type)?;
+        let lb_key = upstream
+            .load_balancing
+            .key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
 
         Ok(Self {
             pool: BackendPool::new_from_states(backends),
             load_balancer,
+            lb_key,
         })
     }
 
@@ -201,6 +210,10 @@ impl UpstreamPool {
 
     pub fn lb_name(&self) -> &'static str {
         self.load_balancer.name()
+    }
+
+    pub fn lb_key(&self) -> Option<&str> {
+        self.lb_key.as_deref()
     }
 }
 
