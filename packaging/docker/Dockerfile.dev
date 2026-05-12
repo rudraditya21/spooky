@@ -1,0 +1,26 @@
+FROM rust:1-bookworm AS dev
+
+WORKDIR /workspace
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        cmake \
+        ninja-build \
+        pkg-config \
+        perl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY spooky ./spooky
+COPY config ./config
+COPY certs ./certs
+
+RUN cargo build -p spooky --bin spooky
+
+EXPOSE 9889/udp
+EXPOSE 9889/tcp
+EXPOSE 9901/tcp
+EXPOSE 9902/tcp
+
+CMD ["cargo", "run", "-p", "spooky", "--bin", "spooky", "--", "--config", "config/config.development.yaml"]

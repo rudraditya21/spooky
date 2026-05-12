@@ -1,0 +1,121 @@
+version: 1
+
+listen:
+  protocol: http3
+  address: "0.0.0.0"
+  port: 9889
+  tls:
+    cert: /etc/spooky/certs/proxy-cert.pem
+    key: /etc/spooky/certs/proxy-key-pkcs8.pem
+    client_auth:
+      enabled: false
+      require_client_cert: false
+      ca_file: null
+
+upstream:
+  default:
+    route:
+      path_prefix: "/"
+    backends:
+      - id: "default-backend"
+        address: "http://127.0.0.1:8080"
+
+upstream_tls:
+  verify_certificates: true
+  strict_sni: true
+  ca_file: null
+  ca_dir: null
+
+performance:
+  worker_threads: 1
+  control_plane_threads: 2
+  packet_shards_per_worker: 1
+  packet_shard_queue_capacity: 2048
+  packet_shard_queue_max_bytes: 67108864
+  reuseport: true
+  pin_workers: false
+
+observability:
+  metrics:
+    enabled: true
+    required: false
+    address: "0.0.0.0"
+    port: 9901
+    path: "/metrics"
+    max_connections: 256
+    connection_timeout_ms: 30000
+  control_api:
+    enabled: true
+    required: false
+    address: "0.0.0.0"
+    port: 9902
+    health_path: "/health"
+    ready_path: "/ready"
+    runtime_path: "/admin/runtime"
+    restart_path: "/admin/runtime/restart"
+    auth_token: "replace-with-strong-token"
+    max_connections: 128
+    connection_timeout_ms: 30000
+  tracing:
+    enabled: false
+    service_name: "spooky"
+    otlp_endpoint: null
+    sample_ratio: 1.0
+
+resilience:
+  adaptive_admission:
+    enabled: true
+    min_limit: 64
+    max_limit: 1024
+    decrease_step: 16
+    increase_step: 8
+    high_latency_ms: 250
+  route_queue:
+    default_cap: 512
+    global_cap: 2048
+    shed_retry_after_seconds: 1
+    caps: {}
+  protocol:
+    allow_0rtt: false
+    early_data_safe_methods: ["GET", "HEAD"]
+    max_headers_count: 128
+    max_headers_bytes: 16384
+    enforce_authority_host_match: true
+    allowed_methods: []
+    denied_path_prefixes: []
+  circuit_breaker:
+    enabled: true
+    failure_threshold: 5
+    open_ms: 10000
+    half_open_max_probes: 2
+  hedging:
+    enabled: false
+    delay_ms: 75
+    safe_methods: ["GET", "HEAD"]
+    route_allowlist: []
+  retry_budget:
+    enabled: true
+    ratio_percent: 20
+    per_route_ratio_percent: {}
+  brownout:
+    enabled: true
+    trigger_inflight_percent: 90
+    recover_inflight_percent: 60
+    core_routes: []
+  watchdog:
+    enabled: false
+    check_interval_ms: 1000
+    poll_stall_timeout_ms: 5000
+    timeout_error_rate_percent: 60
+    min_requests_per_window: 20
+    overload_inflight_percent: 95
+    unhealthy_consecutive_windows: 3
+    drain_grace_ms: 8000
+    restart_cooldown_ms: 120000
+
+log:
+  level: info
+  format: plain
+  file:
+    enabled: false
+    path: /var/log/spooky/spooky.log

@@ -1,0 +1,17 @@
+services:
+  spooky:
+    build:
+      context: ../..
+      dockerfile: packaging/docker/Dockerfile
+    image: spooky:packaging
+    container_name: spooky-packaging
+    command: ["--config", "/etc/spooky/config.yaml"]
+    volumes:
+      - ./config.docker.yaml:/etc/spooky/config.yaml:ro
+      - ../../certs:/etc/spooky/certs:ro
+    ports:
+      - "9889:9889/udp"
+      - "9889:9889/tcp"
+      - "9901:9901/tcp"
+      - "9902:9902/tcp"
+    restart: unless-stopped
