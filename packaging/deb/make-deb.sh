@@ -13,7 +13,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
 # ---- defaults --------------------------------------------------------------
@@ -76,10 +76,10 @@ mkdir -p \
 install -m 0755 "$BINARY_SRC" "$BUILD_DIR/usr/bin/${PKG_NAME}"
 
 # default config (marked as conffile so dpkg won't clobber on upgrade)
-install -m 0640 "deploy/debian/config.yaml" "$BUILD_DIR/etc/spooky/config.yaml"
+install -m 0640 "packaging/deb/debian/config.yaml" "$BUILD_DIR/etc/spooky/config.yaml"
 
 # systemd unit
-install -m 0644 "deploy/debian/spooky.service" "$BUILD_DIR/lib/systemd/system/spooky.service"
+install -m 0644 "packaging/deb/debian/spooky.service" "$BUILD_DIR/lib/systemd/system/spooky.service"
 
 # ---- DEBIAN/control --------------------------------------------------------
 cat > "$BUILD_DIR/DEBIAN/control" <<EOF
