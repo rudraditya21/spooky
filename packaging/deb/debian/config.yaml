@@ -1,0 +1,60 @@
+version: 1
+
+listen:
+  protocol: http3
+  address: "0.0.0.0"
+  port: 9889
+  tls:
+    cert: "/etc/spooky/certs/fullchain.pem"
+    key: "/etc/spooky/certs/privkey.pem"
+
+upstream_tls:
+  verify_certificates: true
+  strict_sni: true
+
+upstream:
+  default:
+    load_balancing:
+      type: round-robin
+    route:
+      path_prefix: "/"
+    backends:
+      - id: "backend1"
+        address: "backend.internal.example:8443"
+        weight: 100
+        health_check:
+          path: "/health"
+          interval: 5000
+          timeout_ms: 1000
+          failure_threshold: 3
+          success_threshold: 2
+          cooldown_ms: 5000
+
+log:
+  level: info
+  format: json
+  file:
+    enabled: true
+    path: /var/log/spooky/spooky.log
+
+security:
+  privileges:
+    enabled: true
+    user: "spooky"
+    group: "spooky"
+
+observability:
+  metrics:
+    enabled: true
+    required: false
+    address: "127.0.0.1"
+    port: 9901
+    path: "/metrics"
+  control_api:
+    enabled: true
+    required: false
+    address: "127.0.0.1"
+    port: 9902
+    health_path: "/health"
+    ready_path: "/ready"
+    auth_token: "replace-with-strong-token"
