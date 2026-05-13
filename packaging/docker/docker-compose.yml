@@ -4,6 +4,7 @@ services:
       context: ../..
       dockerfile: packaging/docker/Dockerfile
     image: spooky:packaging
+    user: "0"
     container_name: spooky-packaging
     command: ["--config", "/etc/spooky/config.yaml"]
     volumes:
