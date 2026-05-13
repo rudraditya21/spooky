@@ -89,8 +89,8 @@ listen:
   port: 9889
   address: "0.0.0.0"
   tls:
-    cert: "certs/cert.pem"
-    key: "certs/key.pem"
+    cert: "certs/proxy-cert.pem"
+    key: "certs/proxy-key-pkcs8.pem"
 
 upstream:
   api_backend:
@@ -186,7 +186,7 @@ flowchart LR
 **Load Balancing**
 - Random distribution
 - Round-robin rotation
-- Consistent hashing (with configurable replicas)
+- Consistent hashing (weighted virtual nodes)
 - Least-connections routing
 - Latency-aware routing (EWMA + in-flight pressure)
 - Sticky sessions via QUIC CID hashing
