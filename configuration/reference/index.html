@@ -386,6 +386,25 @@
             
             <li data-slot="sidebar-menu-item" data-sidebar="menu-item" class="group/menu-item relative">
     <a data-slot="sidebar-menu-button" data-active="false" data-sidebar="menu-button"
+        data-size="default" href="/spooky/getting-started/docker/"
+        class="peer/menu-button flex items-center gap-2 rounded-md p-2 text-left ring-sidebar-ring outline-hidden transition-[width,height,padding] group-has-data-[sidebar=menu-action]/menu-item:pr-8 group-data-[collapsible=icon]:size-8! group-data-[collapsible=icon]:p-2! focus-visible:ring-2 active:bg-sidebar-accent active:text-sidebar-accent-foreground disabled:pointer-events-none disabled:opacity-50 aria-disabled:pointer-events-none aria-disabled:opacity-50 data-[active=true]:font-medium data-[active=true]:text-sidebar-accent-foreground data-[state=open]:hover:bg-sidebar-accent data-[state=open]:hover:text-sidebar-accent-foreground [&>span:last-child]:truncate [&>svg]:size-4 [&>svg]:shrink-0 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground relative h-[30px] w-fit overflow-visible border border-transparent text-[0.8rem] font-medium after:absolute after:inset-x-0 after:-inset-y-1 after:z-0 after:rounded-md data-[active=true]:border-accent data-[active=true]:bg-accent 3xl:fixed:w-full 3xl:fixed:max-w-48">
+
+        
+        Docker
+        
+
+        
+
+        
+
+        
+    </a>
+</li>
+            
+            
+            
+            <li data-slot="sidebar-menu-item" data-sidebar="menu-item" class="group/menu-item relative">
+    <a data-slot="sidebar-menu-button" data-active="false" data-sidebar="menu-button"
         data-size="default" href="/spooky/tutorials/quickstart/"
         class="peer/menu-button flex items-center gap-2 rounded-md p-2 text-left ring-sidebar-ring outline-hidden transition-[width,height,padding] group-has-data-[sidebar=menu-action]/menu-item:pr-8 group-data-[collapsible=icon]:size-8! group-data-[collapsible=icon]:p-2! focus-visible:ring-2 active:bg-sidebar-accent active:text-sidebar-accent-foreground disabled:pointer-events-none disabled:opacity-50 aria-disabled:pointer-events-none aria-disabled:opacity-50 data-[active=true]:font-medium data-[active=true]:text-sidebar-accent-foreground data-[state=open]:hover:bg-sidebar-accent data-[state=open]:hover:text-sidebar-accent-foreground [&>span:last-child]:truncate [&>svg]:size-4 [&>svg]:shrink-0 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground relative h-[30px] w-fit overflow-visible border border-transparent text-[0.8rem] font-medium after:absolute after:inset-x-0 after:-inset-y-1 after:z-0 after:rounded-md data-[active=true]:border-accent data-[active=true]:bg-accent 3xl:fixed:w-full 3xl:fixed:max-w-48">
 
@@ -873,7 +892,7 @@ upstream:
   api_pool:
     load_balancing:
       type: &quot;consistent-hash&quot;
-      # key: &quot;header:x-user-id&quot;  # Planned feature, not currently supported
+      key: &quot;header:x-user-id&quot;  # Optional key source for consistent-hash/sticky-cid
 
     route:
       host: &quot;api.example.com&quot;
@@ -985,19 +1004,19 @@ log:
 <td>Listening address</td>
 </tr>
 <tr>
-<td><code>listen.tls.cert_file</code></td>
+<td><code>listen.tls.cert</code></td>
 <td>Required</td>
 <td>TLS certificate file path</td>
 </tr>
 <tr>
-<td><code>listen.tls.key_file</code></td>
+<td><code>listen.tls.key</code></td>
 <td>Required</td>
 <td>TLS private key file path</td>
 </tr>
 <tr>
 <td><code>upstream[].route.path_prefix</code></td>
-<td><code>"/"</code></td>
-<td>Path prefix for routing</td>
+<td>none</td>
+<td>Path prefix for routing (set explicitly; use <code>/</code> for catch-all)</td>
 </tr>
 <tr>
 <td><code>upstream[].backends[].weight</code></td>
@@ -1276,7 +1295,7 @@ listen:
 <td>string</td>
 <td>No</td>
 <td>-</td>
-<td>HTTP method to match (reserved for future use)</td>
+<td>HTTP method to match (case-insensitive, e.g. <code>GET</code>, <code>POST</code>)</td>
 </tr>
 </tbody>
 </table></div>
@@ -1520,7 +1539,7 @@ backends:
 <td>string</td>
 <td>No</td>
 <td>-</td>
-<td>Reserved for future pluggable key extraction (currently ignored)</td>
+<td>Optional key source for <code>consistent-hash</code> and <code>sticky-cid</code> (<code>header:&lt;name&gt;</code>, <code>cookie:&lt;name&gt;</code>, <code>query:&lt;name&gt;</code>, <code>path</code>, <code>authority</code>, <code>method</code>, <code>cid</code>)</td>
 </tr>
 </tbody>
 </table></div>
@@ -1540,11 +1559,12 @@ backends:
       type: &quot;round-robin&quot;
 </code></pre>
 <h4 id="consistent-hash">consistent-hash</h4>
-<p>Routes requests using consistent hashing based on a fixed key derived from the request. Currently uses request authority (if present), otherwise request path, otherwise HTTP method.</p>
+<p>Routes requests using consistent hashing. By default it hashes request authority (if present), otherwise request path, otherwise HTTP method. Set <code>load_balancing.key</code> to override key derivation.</p>
 <pre><code class="language-yaml">upstream:
   my_pool:
     load_balancing:
       type: &quot;consistent-hash&quot;
+      key: &quot;header:x-user-id&quot;
 </code></pre>
 <h4 id="least-connections">least-connections</h4>
 <p>Selects the healthy backend with the fewest active requests. Ties are deterministic by backend index order.</p>
@@ -2687,6 +2707,12 @@ log:
                         <a class="text-2xl font-medium" href="../../getting-started/installation/">
                             
                             Installation
+                            
+                        </a>
+                        
+                        <a class="text-2xl font-medium" href="../../getting-started/docker/">
+                            
+                            Docker
                             
                         </a>
                         

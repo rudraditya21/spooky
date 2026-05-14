@@ -27,7 +27,7 @@ upstream:
   api_pool:
     load_balancing:
       type: "consistent-hash"
-      # key: "header:x-user-id"  # Planned feature, not currently supported
+      key: "header:x-user-id"  # Optional key source for consistent-hash/sticky-cid
 
     route:
       host: "api.example.com"
@@ -112,9 +112,9 @@ The following table lists all default configuration values used when properties 
 | `listen.protocol` | `"http3"` | Native ingress protocol (HTTP/3 over QUIC); TLS bootstrap ingress for HTTP/1.1/2 compatibility is also active |
 | `listen.port` | `9889` | Listening port |
 | `listen.address` | `"0.0.0.0"` | Listening address |
-| `listen.tls.cert_file` | Required | TLS certificate file path |
-| `listen.tls.key_file` | Required | TLS private key file path |
-| `upstream[].route.path_prefix` | `"/"` | Path prefix for routing |
+| `listen.tls.cert` | Required | TLS certificate file path |
+| `listen.tls.key` | Required | TLS private key file path |
+| `upstream[].route.path_prefix` | none | Path prefix for routing (set explicitly; use `/` for catch-all) |
 | `upstream[].backends[].weight` | `100` | Backend weight for load balancing |
 | `upstream[].backends[].health_check.path` | `"/health"` | Health check endpoint |
 | `upstream[].backends[].health_check.interval` | `5000` | Health check interval (ms) |
@@ -217,7 +217,7 @@ Route matching determines which upstream pool handles a request. Routes are eval
 |----------|------|----------|---------|-------------|
 | `host` | string | No | - | Host header to match (e.g., `api.example.com`) |
 | `path_prefix` | string | No | - | Path prefix to match (e.g., `/api`) |
-| `method` | string | No | - | HTTP method to match (reserved for future use) |
+| `method` | string | No | - | HTTP method to match (case-insensitive, e.g. `GET`, `POST`) |
 
 Route matching rules:
 
@@ -374,7 +374,7 @@ Load balancing determines how requests are distributed across healthy backends w
 | Property | Type | Required | Default | Description |
 |----------|------|----------|---------|-------------|
 | `type` | string | Yes | - | Load balancing algorithm |
-| `key` | string | No | - | Reserved for future pluggable key extraction (currently ignored) |
+| `key` | string | No | - | Optional key source for `consistent-hash` and `sticky-cid` (`header:<name>`, `cookie:<name>`, `query:<name>`, `path`, `authority`, `method`, `cid`) |
 
 ### Supported Algorithms
 
@@ -402,13 +402,14 @@ upstream:
 
 #### consistent-hash
 
-Routes requests using consistent hashing based on a fixed key derived from the request. Currently uses request authority (if present), otherwise request path, otherwise HTTP method.
+Routes requests using consistent hashing. By default it hashes request authority (if present), otherwise request path, otherwise HTTP method. Set `load_balancing.key` to override key derivation.
 
 ```yaml
 upstream:
   my_pool:
     load_balancing:
       type: "consistent-hash"
+      key: "header:x-user-id"
 ```
 
 #### least-connections

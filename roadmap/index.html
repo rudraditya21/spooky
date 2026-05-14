@@ -386,6 +386,25 @@
             
             <li data-slot="sidebar-menu-item" data-sidebar="menu-item" class="group/menu-item relative">
     <a data-slot="sidebar-menu-button" data-active="false" data-sidebar="menu-button"
+        data-size="default" href="/spooky/getting-started/docker/"
+        class="peer/menu-button flex items-center gap-2 rounded-md p-2 text-left ring-sidebar-ring outline-hidden transition-[width,height,padding] group-has-data-[sidebar=menu-action]/menu-item:pr-8 group-data-[collapsible=icon]:size-8! group-data-[collapsible=icon]:p-2! focus-visible:ring-2 active:bg-sidebar-accent active:text-sidebar-accent-foreground disabled:pointer-events-none disabled:opacity-50 aria-disabled:pointer-events-none aria-disabled:opacity-50 data-[active=true]:font-medium data-[active=true]:text-sidebar-accent-foreground data-[state=open]:hover:bg-sidebar-accent data-[state=open]:hover:text-sidebar-accent-foreground [&>span:last-child]:truncate [&>svg]:size-4 [&>svg]:shrink-0 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground relative h-[30px] w-fit overflow-visible border border-transparent text-[0.8rem] font-medium after:absolute after:inset-x-0 after:-inset-y-1 after:z-0 after:rounded-md data-[active=true]:border-accent data-[active=true]:bg-accent 3xl:fixed:w-full 3xl:fixed:max-w-48">
+
+        
+        Docker
+        
+
+        
+
+        
+
+        
+    </a>
+</li>
+            
+            
+            
+            <li data-slot="sidebar-menu-item" data-sidebar="menu-item" class="group/menu-item relative">
+    <a data-slot="sidebar-menu-button" data-active="false" data-sidebar="menu-button"
         data-size="default" href="/spooky/tutorials/quickstart/"
         class="peer/menu-button flex items-center gap-2 rounded-md p-2 text-left ring-sidebar-ring outline-hidden transition-[width,height,padding] group-has-data-[sidebar=menu-action]/menu-item:pr-8 group-data-[collapsible=icon]:size-8! group-data-[collapsible=icon]:p-2! focus-visible:ring-2 active:bg-sidebar-accent active:text-sidebar-accent-foreground disabled:pointer-events-none disabled:opacity-50 aria-disabled:pointer-events-none aria-disabled:opacity-50 data-[active=true]:font-medium data-[active=true]:text-sidebar-accent-foreground data-[state=open]:hover:bg-sidebar-accent data-[state=open]:hover:text-sidebar-accent-foreground [&>span:last-child]:truncate [&>svg]:size-4 [&>svg]:shrink-0 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground relative h-[30px] w-fit overflow-visible border border-transparent text-[0.8rem] font-medium after:absolute after:inset-x-0 after:-inset-y-1 after:z-0 after:rounded-md data-[active=true]:border-accent data-[active=true]:bg-accent 3xl:fixed:w-full 3xl:fixed:max-w-48">
 
@@ -852,6 +871,7 @@
 <li>Per-upstream configuration and routing</li>
 <li>Connection ID management and QUIC packet routing</li>
 <li>TLS 1.3 with certificate chain loading</li>
+<li>Upstream TLS peer verification enabled by default via <code>upstream_tls.verify_certificates</code></li>
 <li>Downstream mTLS (client certificate authentication) via <code>listen.tls.client_auth.enabled</code>, <code>listen.tls.client_auth.require_client_cert</code>, and <code>listen.tls.client_auth.ca_file</code></li>
 <li>Structured logging with multiple levels</li>
 <li>Configuration validation at startup</li>
@@ -904,7 +924,6 @@
 </ul>
 <h3 id="security">Security</h3>
 <ul>
-<li><strong>TLS peer verification</strong>: Enable certificate verification for production</li>
 <li><strong>mTLS operational tooling</strong>: Certificate rotation/revocation workflows and deployment guidance</li>
 <li><strong>Request validation</strong>: Size limits, header validation</li>
 <li><strong>IP allowlist/blocklist</strong>: Simple access control</li>
@@ -972,7 +991,7 @@
 <li>Async data plane - unblock main thread</li>
 <li>Configuration hot reload - reduce operational friction</li>
 <li>Streaming bodies - reduce memory usage</li>
-<li>TLS peer verification - production security</li>
+<li>mTLS operational tooling - certificate lifecycle automation</li>
 </ol>
 <h3 id="medium-priority-3-6-months">Medium Priority (3-6 months)</h3>
 <ol>
@@ -997,7 +1016,7 @@
 <li><strong>Full body buffering</strong>: High memory usage for large requests/responses</li>
 <li><strong>Configuration hot reload missing</strong>: Runtime config updates still require restart</li>
 <li><strong>Dual-ingress operational complexity</strong>: Runtime serves HTTP/3 (native) plus HTTP/1.1/2 TLS bootstrap, so operators must secure and observe both paths consistently</li>
-<li><strong>Method-based route matching unimplemented</strong>: <code>route.method</code> remains reserved for future use</li>
+<li><strong>Method-based route matching constraints</strong>: keep route precedence and method tie-break semantics covered by integration tests as routing rules evolve</li>
 <li><strong>Control/metrics endpoint hardening is operator-dependent</strong>: endpoints should remain network-isolated unless explicitly protected</li>
 </ol>
 <h3 id="refactoring-needs">Refactoring Needs</h3>
@@ -1108,6 +1127,12 @@
                         <a class="text-2xl font-medium" href="../getting-started/installation/">
                             
                             Installation
+                            
+                        </a>
+                        
+                        <a class="text-2xl font-medium" href="../getting-started/docker/">
+                            
+                            Docker
                             
                         </a>
                         

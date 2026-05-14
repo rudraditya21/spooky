@@ -386,6 +386,25 @@
             
             <li data-slot="sidebar-menu-item" data-sidebar="menu-item" class="group/menu-item relative">
     <a data-slot="sidebar-menu-button" data-active="false" data-sidebar="menu-button"
+        data-size="default" href="/spooky/getting-started/docker/"
+        class="peer/menu-button flex items-center gap-2 rounded-md p-2 text-left ring-sidebar-ring outline-hidden transition-[width,height,padding] group-has-data-[sidebar=menu-action]/menu-item:pr-8 group-data-[collapsible=icon]:size-8! group-data-[collapsible=icon]:p-2! focus-visible:ring-2 active:bg-sidebar-accent active:text-sidebar-accent-foreground disabled:pointer-events-none disabled:opacity-50 aria-disabled:pointer-events-none aria-disabled:opacity-50 data-[active=true]:font-medium data-[active=true]:text-sidebar-accent-foreground data-[state=open]:hover:bg-sidebar-accent data-[state=open]:hover:text-sidebar-accent-foreground [&>span:last-child]:truncate [&>svg]:size-4 [&>svg]:shrink-0 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground relative h-[30px] w-fit overflow-visible border border-transparent text-[0.8rem] font-medium after:absolute after:inset-x-0 after:-inset-y-1 after:z-0 after:rounded-md data-[active=true]:border-accent data-[active=true]:bg-accent 3xl:fixed:w-full 3xl:fixed:max-w-48">
+
+        
+        Docker
+        
+
+        
+
+        
+
+        
+    </a>
+</li>
+            
+            
+            
+            <li data-slot="sidebar-menu-item" data-sidebar="menu-item" class="group/menu-item relative">
+    <a data-slot="sidebar-menu-button" data-active="false" data-sidebar="menu-button"
         data-size="default" href="/spooky/tutorials/quickstart/"
         class="peer/menu-button flex items-center gap-2 rounded-md p-2 text-left ring-sidebar-ring outline-hidden transition-[width,height,padding] group-has-data-[sidebar=menu-action]/menu-item:pr-8 group-data-[collapsible=icon]:size-8! group-data-[collapsible=icon]:p-2! focus-visible:ring-2 active:bg-sidebar-accent active:text-sidebar-accent-foreground disabled:pointer-events-none disabled:opacity-50 aria-disabled:pointer-events-none aria-disabled:opacity-50 data-[active=true]:font-medium data-[active=true]:text-sidebar-accent-foreground data-[state=open]:hover:bg-sidebar-accent data-[state=open]:hover:text-sidebar-accent-foreground [&>span:last-child]:truncate [&>svg]:size-4 [&>svg]:shrink-0 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground relative h-[30px] w-fit overflow-visible border border-transparent text-[0.8rem] font-medium after:absolute after:inset-x-0 after:-inset-y-1 after:z-0 after:rounded-md data-[active=true]:border-accent data-[active=true]:bg-accent 3xl:fixed:w-full 3xl:fixed:max-w-48">
 
@@ -898,7 +917,7 @@
   api_pool:
     load_balancing:
       type: &quot;consistent-hash&quot;  # Accepts: consistent-hash, consistent_hash, ch
-      # key: &quot;header:x-user-id&quot;  # Planned feature: configurable hash key source
+      key: &quot;header:x-user-id&quot;   # Optional key source: header/cookie/query/path/authority/method/cid
     route:
       path_prefix: &quot;/api&quot;
     backends:
@@ -923,16 +942,16 @@
 - FNV-1a hash function for distribution
 - Automatically skips unhealthy backends</p>
 <p><strong>Hash Key Sources</strong>:</p>
-<p>Currently, the key parameter is configured but hash key extraction must be implemented in the proxy layer. The algorithm accepts any string key.</p>
-<pre><code class="language-yaml"># Current behavior: fixed key derivation from request
-load_balancing:
+<pre><code class="language-yaml">load_balancing:
   type: &quot;consistent-hash&quot;
-# Planned configurable key sources (not currently implemented):
-# key: &quot;header:x-user-id&quot;       # User ID from header
+  key: &quot;header:x-user-id&quot;       # User ID from header
 # key: &quot;header:x-session-id&quot;    # Session ID from header
 # key: &quot;cookie:session_id&quot;      # Session cookie
 # key: &quot;query:user_id&quot;          # Query parameter
-# key: &quot;path&quot;                   # Request path
+# key: &quot;path&quot;                   # Request path (without query string)
+# key: &quot;authority&quot;              # Host/authority
+# key: &quot;method&quot;                 # HTTP method
+# key: &quot;cid&quot;                    # QUIC connection ID (same as sticky-cid default)
 </code></pre>
 <p><strong>Use Cases</strong>:
 - Applications requiring session affinity
@@ -1701,6 +1720,12 @@ upstream:
                         <a class="text-2xl font-medium" href="../../getting-started/installation/">
                             
                             Installation
+                            
+                        </a>
+                        
+                        <a class="text-2xl font-medium" href="../../getting-started/docker/">
+                            
+                            Docker
                             
                         </a>
                         
