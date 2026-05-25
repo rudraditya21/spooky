@@ -1,6 +1,6 @@
 # Spooky
 
-Spooky lets HAProxy, NGINX, and Apache environments adopt QUIC/HTTP/3 in days instead of quarters.
+Spooky is an HTTP/3 (QUIC) edge proxy and load balancer for HTTP/2 backends.
 
 ## Overview
 
