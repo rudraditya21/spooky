@@ -62,7 +62,10 @@ pub(super) fn validate_request_headers(
                         false,
                     ));
                 }
-                method = Some(strict_header_value(header.value(), b"invalid :method header\n")?);
+                method = Some(strict_header_value(
+                    header.value(),
+                    b"invalid :method header\n",
+                )?);
             }
             b":path" => {
                 if path.is_some() {
@@ -72,7 +75,10 @@ pub(super) fn validate_request_headers(
                         false,
                     ));
                 }
-                path = Some(strict_header_value(header.value(), b"invalid :path header\n")?);
+                path = Some(strict_header_value(
+                    header.value(),
+                    b"invalid :path header\n",
+                )?);
             }
             b":authority" => {
                 if authority.is_some() {
@@ -95,7 +101,10 @@ pub(super) fn validate_request_headers(
                         false,
                     ));
                 }
-                host = Some(strict_header_value(header.value(), b"invalid host header\n")?);
+                host = Some(strict_header_value(
+                    header.value(),
+                    b"invalid host header\n",
+                )?);
             }
             b":scheme" => {
                 if scheme_seen {
