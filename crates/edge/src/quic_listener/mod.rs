@@ -4995,7 +4995,10 @@ mod tests {
     #[test]
     fn bootstrap_header_filter_keeps_non_nominated_custom_headers() {
         let mut headers = HeaderMap::new();
-        headers.insert(http::header::CONNECTION, HeaderValue::from_static("keep-alive"));
+        headers.insert(
+            http::header::CONNECTION,
+            HeaderValue::from_static("keep-alive"),
+        );
         let tokens = connection_header_tokens(&headers);
 
         let header = http::HeaderName::from_static("x-custom-keep");
