@@ -62,7 +62,7 @@ pub(super) fn validate_request_headers(
                         false,
                     ));
                 }
-                method = Some(String::from_utf8_lossy(header.value()).to_string());
+                method = Some(strict_header_value(header.value(), b"invalid :method header\n")?);
             }
             b":path" => {
                 if path.is_some() {
@@ -72,7 +72,7 @@ pub(super) fn validate_request_headers(
                         false,
                     ));
                 }
-                path = Some(String::from_utf8_lossy(header.value()).to_string());
+                path = Some(strict_header_value(header.value(), b"invalid :path header\n")?);
             }
             b":authority" => {
                 if authority.is_some() {
@@ -82,7 +82,10 @@ pub(super) fn validate_request_headers(
                         false,
                     ));
                 }
-                authority = Some(String::from_utf8_lossy(header.value()).to_string());
+                authority = Some(strict_header_value(
+                    header.value(),
+                    b"invalid :authority header\n",
+                )?);
             }
             b"host" => {
                 if host.is_some() {
@@ -92,7 +95,7 @@ pub(super) fn validate_request_headers(
                         false,
                     ));
                 }
-                host = Some(String::from_utf8_lossy(header.value()).to_string());
+                host = Some(strict_header_value(header.value(), b"invalid host header\n")?);
             }
             b":scheme" => {
                 if scheme_seen {
@@ -168,8 +171,16 @@ pub(super) fn validate_http_request(
     let host = req
         .headers()
         .get(http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
+        .map(|v| {
+            v.to_str().map(str::to_owned).map_err(|_| {
+                (
+                    http::StatusCode::BAD_REQUEST,
+                    b"invalid host header\n",
+                    false,
+                )
+            })
+        })
+        .transpose()?;
 
     if let Some(authority_value) = authority.as_deref() {
         header_bytes = header_bytes.saturating_add(authority_value.len());
@@ -208,6 +219,15 @@ pub(super) fn validate_http_request(
             authority_mismatch: b"authority and host headers must match\n",
         },
     )
+}
+
+fn strict_header_value(
+    value: &[u8],
+    invalid_error: &'static [u8],
+) -> Result<String, (http::StatusCode, &'static [u8], bool)> {
+    std::str::from_utf8(value)
+        .map(str::to_owned)
+        .map_err(|_| (http::StatusCode::BAD_REQUEST, invalid_error, false))
 }
 
 struct RequestPartErrors {
