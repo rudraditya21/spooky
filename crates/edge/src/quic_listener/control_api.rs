@@ -176,6 +176,11 @@ impl QUICListener {
                     let permit = match Arc::clone(&connection_limiter).try_acquire_owned() {
                         Ok(permit) => permit,
                         Err(_) => {
+                            state.metrics.inc_control_api_connection_limit_drop();
+                            warn!(
+                                "Control API endpoint dropped connection from {} due to max connection limit ({})",
+                                peer, max_connections
+                            );
                             continue;
                         }
                     };

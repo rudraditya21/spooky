@@ -55,6 +55,7 @@ pub struct Metrics {
     pub request_buffer_limit_rejects: AtomicU64,
     pub response_prebuffer_limit_rejects: AtomicU64,
     pub scid_rotations: AtomicU64,
+    pub control_api_connection_limit_drops: AtomicU64,
     pub watchdog_restart_requests: AtomicU64,
     pub watchdog_restart_hooks: AtomicU64,
     pub watchdog_degraded_windows: AtomicU64,
@@ -312,6 +313,7 @@ impl Metrics {
             request_buffer_limit_rejects: AtomicU64::new(0),
             response_prebuffer_limit_rejects: AtomicU64::new(0),
             scid_rotations: AtomicU64::new(0),
+            control_api_connection_limit_drops: AtomicU64::new(0),
             watchdog_restart_requests: AtomicU64::new(0),
             watchdog_restart_hooks: AtomicU64::new(0),
             watchdog_degraded_windows: AtomicU64::new(0),
@@ -636,6 +638,11 @@ impl Metrics {
 
     pub fn inc_scid_rotation(&self) {
         self.scid_rotations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_control_api_connection_limit_drop(&self) {
+        self.control_api_connection_limit_drops
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn inc_watchdog_restart_request(&self) {

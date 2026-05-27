@@ -98,6 +98,7 @@ mod tests {
         metrics.inc_hedge_wasted();
         metrics.inc_hedge_primary_won_after_trigger();
         metrics.observe_hedge_primary_late_ms(42);
+        metrics.inc_control_api_connection_limit_drop();
 
         let output = metrics.render_prometheus();
         assert!(
@@ -121,6 +122,7 @@ mod tests {
         assert!(output.contains("spooky_ingress_draining_drops_total 0\n"));
         assert!(output.contains("spooky_ingress_connection_create_failed_total 0\n"));
         assert!(output.contains("spooky_ingress_version_neg_failed_total 0\n"));
+        assert!(output.contains("spooky_control_api_connection_limit_drops 1\n"));
         assert!(output.contains("spooky_circuit_breaker_rejected_total 0\n"));
         assert!(output.contains("spooky_brownout_active 0\n"));
     }

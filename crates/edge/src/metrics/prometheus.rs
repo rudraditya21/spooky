@@ -353,6 +353,16 @@ impl Metrics {
             self.scid_rotations.load(Ordering::Relaxed)
         ));
 
+        out.push_str(
+            "# HELP spooky_control_api_connection_limit_drops Total control API connections dropped due to max-connection limiter.\n",
+        );
+        out.push_str("# TYPE spooky_control_api_connection_limit_drops counter\n");
+        out.push_str(&format!(
+            "spooky_control_api_connection_limit_drops {}\n",
+            self.control_api_connection_limit_drops
+                .load(Ordering::Relaxed)
+        ));
+
         out.push_str("# HELP spooky_watchdog_restart_requests Total watchdog restart requests.\n");
         out.push_str("# TYPE spooky_watchdog_restart_requests counter\n");
         out.push_str(&format!(
