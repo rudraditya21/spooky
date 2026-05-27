@@ -62,7 +62,10 @@ pub(super) fn validate_request_headers(
                         false,
                     ));
                 }
-                method = Some(String::from_utf8_lossy(header.value()).to_string());
+                method = Some(strict_header_value(
+                    header.value(),
+                    b"invalid :method header\n",
+                )?);
             }
             b":path" => {
                 if path.is_some() {
@@ -72,7 +75,10 @@ pub(super) fn validate_request_headers(
                         false,
                     ));
                 }
-                path = Some(String::from_utf8_lossy(header.value()).to_string());
+                path = Some(strict_header_value(
+                    header.value(),
+                    b"invalid :path header\n",
+                )?);
             }
             b":authority" => {
                 if authority.is_some() {
@@ -82,7 +88,10 @@ pub(super) fn validate_request_headers(
                         false,
                     ));
                 }
-                authority = Some(String::from_utf8_lossy(header.value()).to_string());
+                authority = Some(strict_header_value(
+                    header.value(),
+                    b"invalid :authority header\n",
+                )?);
             }
             b"host" => {
                 if host.is_some() {
@@ -92,7 +101,10 @@ pub(super) fn validate_request_headers(
                         false,
                     ));
                 }
-                host = Some(String::from_utf8_lossy(header.value()).to_string());
+                host = Some(strict_header_value(
+                    header.value(),
+                    b"invalid host header\n",
+                )?);
             }
             b":scheme" => {
                 if scheme_seen {
@@ -168,8 +180,16 @@ pub(super) fn validate_http_request(
     let host = req
         .headers()
         .get(http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
+        .map(|v| {
+            v.to_str().map(str::to_owned).map_err(|_| {
+                (
+                    http::StatusCode::BAD_REQUEST,
+                    b"invalid host header\n" as &'static [u8],
+                    false,
+                )
+            })
+        })
+        .transpose()?;
 
     if let Some(authority_value) = authority.as_deref() {
         header_bytes = header_bytes.saturating_add(authority_value.len());
@@ -208,6 +228,15 @@ pub(super) fn validate_http_request(
             authority_mismatch: b"authority and host headers must match\n",
         },
     )
+}
+
+fn strict_header_value(
+    value: &[u8],
+    invalid_error: &'static [u8],
+) -> Result<String, (http::StatusCode, &'static [u8], bool)> {
+    std::str::from_utf8(value)
+        .map(str::to_owned)
+        .map_err(|_| (http::StatusCode::BAD_REQUEST, invalid_error, false))
 }
 
 struct RequestPartErrors {
@@ -321,4 +350,90 @@ pub(super) fn generated_trace_id(conn_trace_id: &str, request_id: u64) -> String
 
 pub(super) fn generated_span_id(request_id: u64) -> String {
     format!("{:016x}", crate::stable_hash64(&request_id.to_be_bytes()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spooky_config::config::Resilience;
+
+    fn runtime_resilience() -> RuntimeResilience {
+        RuntimeResilience::from_config(&Resilience::default(), 1024)
+    }
+
+    fn h3_header(name: &'static [u8], value: &'static [u8]) -> quiche::h3::Header {
+        quiche::h3::Header::new(name, value)
+    }
+
+    #[test]
+    fn rejects_invalid_utf8_method_header() {
+        let resilience = runtime_resilience();
+        let headers = vec![
+            h3_header(b":method", b"GE\xffT"),
+            h3_header(b":path", b"/"),
+            h3_header(b":authority", b"example.com"),
+        ];
+
+        let err = match validate_request_headers(&headers, &resilience) {
+            Ok(_) => panic!("expected invalid utf-8 :method to be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.1, b"invalid :method header\n");
+        assert!(!err.2);
+    }
+
+    #[test]
+    fn rejects_invalid_utf8_path_header() {
+        let resilience = runtime_resilience();
+        let headers = vec![
+            h3_header(b":method", b"GET"),
+            h3_header(b":path", b"/\xff"),
+            h3_header(b":authority", b"example.com"),
+        ];
+
+        let err = match validate_request_headers(&headers, &resilience) {
+            Ok(_) => panic!("expected invalid utf-8 :path to be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.1, b"invalid :path header\n");
+        assert!(!err.2);
+    }
+
+    #[test]
+    fn rejects_invalid_utf8_authority_header() {
+        let resilience = runtime_resilience();
+        let headers = vec![
+            h3_header(b":method", b"GET"),
+            h3_header(b":path", b"/"),
+            h3_header(b":authority", b"exa\xffmple.com"),
+        ];
+
+        let err = match validate_request_headers(&headers, &resilience) {
+            Ok(_) => panic!("expected invalid utf-8 :authority to be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.1, b"invalid :authority header\n");
+        assert!(!err.2);
+    }
+
+    #[test]
+    fn rejects_invalid_utf8_host_header() {
+        let resilience = runtime_resilience();
+        let headers = vec![
+            h3_header(b":method", b"GET"),
+            h3_header(b":path", b"/"),
+            h3_header(b"host", b"exa\xffmple.com"),
+        ];
+
+        let err = match validate_request_headers(&headers, &resilience) {
+            Ok(_) => panic!("expected invalid utf-8 host to be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.1, b"invalid host header\n");
+        assert!(!err.2);
+    }
 }
