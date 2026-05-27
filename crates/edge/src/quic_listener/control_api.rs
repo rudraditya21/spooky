@@ -1,4 +1,5 @@
 use super::*;
+use std::ffi::OsString;
 use subtle::ConstantTimeEq;
 
 #[derive(Clone)]
@@ -38,6 +39,18 @@ impl ControlApiState {
 }
 
 impl QUICListener {
+    fn watchdog_restart_env(path: Option<OsString>, restart_reason: &str) -> Vec<(OsString, OsString)> {
+        let mut env_vars = Vec::with_capacity(2);
+        if let Some(path_value) = path {
+            env_vars.push((OsString::from("PATH"), path_value));
+        }
+        env_vars.push((
+            OsString::from("SPOOKY_WATCHDOG_REASON"),
+            OsString::from(restart_reason),
+        ));
+        env_vars
+    }
+
     pub(super) fn spawn_control_api_endpoint(
         config: &SpookyConfig,
         shared_state: &SharedRuntimeState,
@@ -522,11 +535,14 @@ impl QUICListener {
                         .skip(1)
                         .map(String::as_str)
                         .collect();
-                    let status = tokio::process::Command::new(program)
-                        .args(args)
-                        .env("SPOOKY_WATCHDOG_REASON", &restart_reason)
-                        .status()
-                        .await;
+                    let restart_env =
+                        Self::watchdog_restart_env(std::env::var_os("PATH"), &restart_reason);
+                    let mut command = tokio::process::Command::new(program);
+                    command.args(args).env_clear();
+                    for (key, value) in restart_env {
+                        command.env(key, value);
+                    }
+                    let status = command.status().await;
                     match status {
                         Ok(status) => {
                             info!(
