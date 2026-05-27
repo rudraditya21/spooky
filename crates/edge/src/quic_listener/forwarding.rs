@@ -65,6 +65,13 @@ pub(crate) fn abort_stream(req: &mut RequestEnvelope, metrics: &Metrics) -> Stre
 }
 
 impl QUICListener {
+    fn is_internal_pool_control_error(error: &PoolError) -> bool {
+        matches!(
+            error,
+            PoolError::InflightLimiterClosed | PoolError::UnknownBackend(_)
+        )
+    }
+
     pub(super) fn pick_alternate_backend(
         upstream_pool: &Arc<RwLock<UpstreamPool>>,
         primary_index: usize,
@@ -291,9 +298,7 @@ impl QUICListener {
                     b"upstream error\n",
                 )
             }
-            Err(ProxyError::Transport(_))
-            | Err(ProxyError::Pool(PoolError::InflightLimiterClosed))
-            | Err(ProxyError::Pool(PoolError::UnknownBackend(_))) => {
+            Err(ProxyError::Transport(_)) => {
                 error!("Upstream transport error");
                 metrics.inc_health_failure(HealthFailureReason::Transport);
                 if let Some(pool) = &upstream_pool
@@ -303,6 +308,30 @@ impl QUICListener {
                     })
                 {
                     Self::log_health_transition(backend_addr, t);
+                }
+                metrics.inc_failure();
+                metrics.inc_backend_error();
+                metrics.record_route(route_label, start.elapsed(), RouteOutcome::BackendError);
+                Self::log_access(req, 502);
+                Self::send_simple_response(
+                    h3,
+                    quic,
+                    stream_id,
+                    http::StatusCode::BAD_GATEWAY,
+                    b"upstream error\n",
+                )
+            }
+            Err(ProxyError::Pool(pool_err @ PoolError::InflightLimiterClosed))
+            | Err(ProxyError::Pool(pool_err @ PoolError::UnknownBackend(_))) => {
+                debug_assert!(Self::is_internal_pool_control_error(&pool_err));
+                match &pool_err {
+                    PoolError::InflightLimiterClosed => {
+                        error!("Upstream pool inflight limiter closed");
+                    }
+                    PoolError::UnknownBackend(_) => {
+                        error!("Upstream pool unknown backend");
+                    }
+                    _ => {}
                 }
                 metrics.inc_failure();
                 metrics.inc_backend_error();
@@ -450,5 +479,34 @@ impl QUICListener {
                 error!("Backend {} became unhealthy", addr);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn internal_pool_errors_are_classified_as_control_plane_only() {
+        assert!(QUICListener::is_internal_pool_control_error(
+            &PoolError::InflightLimiterClosed
+        ));
+        assert!(QUICListener::is_internal_pool_control_error(
+            &PoolError::UnknownBackend("missing".to_string())
+        ));
+    }
+
+    #[test]
+    fn backend_overload_is_not_classified_as_internal_pool_error() {
+        assert!(!QUICListener::is_internal_pool_control_error(
+            &PoolError::BackendOverloaded("busy".to_string())
+        ));
+    }
+
+    #[test]
+    fn circuit_open_is_not_classified_as_internal_pool_error() {
+        assert!(!QUICListener::is_internal_pool_control_error(
+            &PoolError::CircuitOpen("open".to_string())
+        ));
     }
 }
