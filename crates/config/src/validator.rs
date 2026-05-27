@@ -815,9 +815,10 @@ pub fn validate(config: &Config) -> bool {
 
     // --- Validate upstream TLS trust-store configuration ---
     if !config.upstream_tls.verify_certificates {
-        warn!(
-            "upstream_tls.verify_certificates=false disables TLS certificate validation for HTTPS upstreams"
+        error!(
+            "upstream_tls.verify_certificates=false is not allowed; certificate verification must remain enabled"
         );
+        return false;
     }
 
     if let Some(ca_file) = config.upstream_tls.ca_file.as_ref() {
@@ -1410,6 +1411,10 @@ upstream:
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.listen.tls.client_auth.enabled = true;
         cfg.listen.tls.client_auth.ca_file = None;
+        assert!(!validate(&cfg));
+
+        cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        cfg.upstream_tls.verify_certificates = false;
         assert!(!validate(&cfg));
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());

@@ -4,7 +4,6 @@ use std::fs::File;
 use std::future::Future;
 use std::io::BufReader;
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Duration;
 
 use http_body_util::combinators::BoxBody;
@@ -12,8 +11,7 @@ use hyper::body::Bytes;
 use hyper::{Request, rt::Executor};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::pki_types::CertificateDer;
 use rustls::{ClientConfig, RootCertStore};
 
 #[derive(Debug, Clone)]
@@ -49,55 +47,6 @@ where
 {
     fn execute(&self, fut: F) {
         tokio::spawn(fut);
-    }
-}
-
-#[derive(Debug)]
-struct NoVerifier;
-
-impl ServerCertVerifier for NoVerifier {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp: &[u8],
-        _now: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::RSA_PKCS1_SHA384,
-            rustls::SignatureScheme::RSA_PKCS1_SHA512,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA384,
-            rustls::SignatureScheme::RSA_PSS_SHA512,
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
-            rustls::SignatureScheme::ED25519,
-        ]
     }
 }
 
@@ -152,12 +101,10 @@ impl Default for H2Client {
 
 fn build_tls_config(tls: &TlsClientConfig) -> Result<ClientConfig, String> {
     if !tls.verify_certificates {
-        let mut cfg = ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoVerifier))
-            .with_no_client_auth();
-        cfg.enable_sni = tls.strict_sni;
-        return Ok(cfg);
+        return Err(
+            "upstream_tls.verify_certificates=false is not allowed; enable certificate verification"
+                .to_string(),
+        );
     }
 
     let mut roots = RootCertStore::empty();
@@ -308,5 +255,21 @@ mod tests {
         assert!(client.is_err());
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn disabling_certificate_verification_is_rejected() {
+        let client = H2Client::new(
+            8,
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+            TlsClientConfig {
+                verify_certificates: false,
+                strict_sni: true,
+                ca_file: None,
+                ca_dir: None,
+            },
+        );
+        assert!(client.is_err());
     }
 }
