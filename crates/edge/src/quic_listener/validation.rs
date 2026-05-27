@@ -175,7 +175,7 @@ pub(super) fn validate_http_request(
             v.to_str().map(str::to_owned).map_err(|_| {
                 (
                     http::StatusCode::BAD_REQUEST,
-                    b"invalid host header\n",
+                    b"invalid host header\n" as &'static [u8],
                     false,
                 )
             })
@@ -365,7 +365,10 @@ mod tests {
             h3_header(b":authority", b"example.com"),
         ];
 
-        let err = validate_request_headers(&headers, &resilience).unwrap_err();
+        let err = match validate_request_headers(&headers, &resilience) {
+            Ok(_) => panic!("expected invalid utf-8 :method to be rejected"),
+            Err(err) => err,
+        };
         assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
         assert_eq!(err.1, b"invalid :method header\n");
         assert!(!err.2);
@@ -380,7 +383,10 @@ mod tests {
             h3_header(b":authority", b"example.com"),
         ];
 
-        let err = validate_request_headers(&headers, &resilience).unwrap_err();
+        let err = match validate_request_headers(&headers, &resilience) {
+            Ok(_) => panic!("expected invalid utf-8 :path to be rejected"),
+            Err(err) => err,
+        };
         assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
         assert_eq!(err.1, b"invalid :path header\n");
         assert!(!err.2);
@@ -395,7 +401,10 @@ mod tests {
             h3_header(b":authority", b"exa\xffmple.com"),
         ];
 
-        let err = validate_request_headers(&headers, &resilience).unwrap_err();
+        let err = match validate_request_headers(&headers, &resilience) {
+            Ok(_) => panic!("expected invalid utf-8 :authority to be rejected"),
+            Err(err) => err,
+        };
         assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
         assert_eq!(err.1, b"invalid :authority header\n");
         assert!(!err.2);
@@ -410,7 +419,10 @@ mod tests {
             h3_header(b"host", b"exa\xffmple.com"),
         ];
 
-        let err = validate_request_headers(&headers, &resilience).unwrap_err();
+        let err = match validate_request_headers(&headers, &resilience) {
+            Ok(_) => panic!("expected invalid utf-8 host to be rejected"),
+            Err(err) => err,
+        };
         assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
         assert_eq!(err.1, b"invalid host header\n");
         assert!(!err.2);
