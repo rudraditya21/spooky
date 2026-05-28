@@ -826,10 +826,9 @@ pub fn validate(config: &Config) -> bool {
 
     // --- Validate upstream TLS trust-store configuration ---
     if !config.upstream_tls.verify_certificates {
-        error!(
-            "upstream_tls.verify_certificates=false is not allowed; certificate verification must remain enabled"
+        warn!(
+            "upstream_tls.verify_certificates=false: upstream TLS certificate verification is disabled; only use in trusted/development environments"
         );
-        return false;
     }
 
     if let Some(ca_file) = config.upstream_tls.ca_file.as_ref() {
