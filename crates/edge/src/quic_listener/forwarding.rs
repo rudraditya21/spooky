@@ -1,4 +1,5 @@
 use super::*;
+use std::error::Error as StdError;
 
 #[derive(Clone)]
 pub(super) struct ForwardRequestMeta {
@@ -67,6 +68,17 @@ pub(crate) fn abort_stream(req: &mut RequestEnvelope, metrics: &Metrics) -> Stre
 impl QUICListener {
     fn send_error_health_failure_reason() -> Option<HealthFailureReason> {
         None
+    }
+
+    fn format_error_chain(err: &(dyn StdError + 'static)) -> String {
+        let mut detail = err.to_string();
+        let mut source = err.source();
+        while let Some(cause) = source {
+            detail.push_str(": ");
+            detail.push_str(&cause.to_string());
+            source = cause.source();
+        }
+        detail
     }
 
     fn is_internal_pool_control_error(error: &PoolError) -> bool {
@@ -285,9 +297,10 @@ impl QUICListener {
                 // that look like transport failures but are actually local config errors.
                 // Do NOT mark backend health as failed: the backend may be fully operational;
                 // this path is usually a local proxy configuration/runtime issue.
+                let send_err_detail = Self::format_error_chain(send_err);
                 error!(
                     "Upstream send failed for {} (possible TLS/cert/SNI misconfiguration): {}",
-                    backend_addr, send_err
+                    backend_addr, send_err_detail
                 );
                 if let Some(reason) = Self::send_error_health_failure_reason() {
                     metrics.inc_health_failure(reason);
@@ -525,5 +538,37 @@ mod tests {
     #[test]
     fn send_error_does_not_map_to_backend_health_failure_reason() {
         assert_eq!(QUICListener::send_error_health_failure_reason(), None);
+    }
+
+    #[derive(Debug)]
+    struct OuterErr(InnerErr);
+
+    #[derive(Debug)]
+    struct InnerErr;
+
+    impl std::fmt::Display for OuterErr {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "outer")
+        }
+    }
+
+    impl std::fmt::Display for InnerErr {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "inner")
+        }
+    }
+
+    impl StdError for OuterErr {
+        fn source(&self) -> Option<&(dyn StdError + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    impl StdError for InnerErr {}
+
+    #[test]
+    fn format_error_chain_includes_nested_causes() {
+        let msg = QUICListener::format_error_chain(&OuterErr(InnerErr));
+        assert_eq!(msg, "outer: inner");
     }
 }

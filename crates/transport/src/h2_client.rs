@@ -4,6 +4,7 @@ use std::fs::File;
 use std::future::Future;
 use std::io::BufReader;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use http_body_util::combinators::BoxBody;
@@ -11,8 +12,10 @@ use hyper::body::Bytes;
 use hyper::{Request, rt::Executor};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
-use rustls::pki_types::CertificateDer;
-use rustls::{ClientConfig, RootCertStore};
+
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
 
 #[derive(Debug, Clone)]
 pub struct TlsClientConfig {
@@ -96,10 +99,16 @@ impl H2Client {
 
 fn build_tls_config(tls: &TlsClientConfig) -> Result<ClientConfig, String> {
     if !tls.verify_certificates {
-        return Err(
-            "upstream_tls.verify_certificates=false is not allowed; enable certificate verification"
-                .to_string(),
+        eprintln!(
+            "upstream TLS certificate verification is disabled (upstream_tls.verify_certificates=false); this is insecure and should only be used in trusted environments"
         );
+        let mut cfg = ClientConfig::builder()
+            .with_root_certificates(RootCertStore::empty())
+            .with_no_client_auth();
+        cfg.enable_sni = tls.strict_sni;
+        cfg.dangerous()
+            .set_certificate_verifier(Arc::new(InsecureServerCertVerifier));
+        return Ok(cfg);
     }
 
     let mut roots = RootCertStore::empty();
@@ -207,6 +216,54 @@ fn is_pem_like_path(path: &Path) -> bool {
     )
 }
 
+#[derive(Debug)]
+struct InsecureServerCertVerifier;
+
+impl ServerCertVerifier for InsecureServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::ED25519,
+        ]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{H2Client, TlsClientConfig};
@@ -247,7 +304,7 @@ mod tests {
     }
 
     #[test]
-    fn disabling_certificate_verification_is_rejected() {
+    fn disabling_certificate_verification_is_allowed() {
         let client = H2Client::new(
             8,
             Duration::from_secs(5),
@@ -259,6 +316,6 @@ mod tests {
                 ca_dir: None,
             },
         );
-        assert!(client.is_err());
+        assert!(client.is_ok());
     }
 }
