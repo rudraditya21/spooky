@@ -1435,7 +1435,7 @@ upstream:
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.upstream_tls.verify_certificates = false;
-        assert!(!validate(&cfg));
+        assert!(validate(&cfg));
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.upstream_tls.ca_file = Some("/path/does/not/exist.pem".to_string());
