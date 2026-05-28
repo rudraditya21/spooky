@@ -5,11 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.1-beta] - 2026-05-28
+
+### Added
+- `upstream_tls.verify_certificates: false` — new config option to disable upstream TLS certificate verification, useful for backends with self-signed certs in development or trusted internal environments. Matches the opt-out behavior of Nginx (`proxy_ssl_verify off`) and Envoy (`ACCEPT_UNTRUSTED`). A warning is logged at startup when disabled.
+
+### Fixed
+- Upstream send errors now log the full error cause chain instead of the opaque `client error (Connect)`, making TLS failures (missing SAN, untrusted root, cert/SNI mismatch) immediately diagnosable from logs without requiring a packet trace.
+- Validator no longer hard-rejects `upstream_tls.verify_certificates=false`; it now emits a warning and allows startup to continue.
+- Debian package and systemd unit: TLS certificate files must be owned `root:spooky` with mode `640` so the `spooky` service user can read them. Documentation and all installation examples corrected accordingly.
 
 ### Changed
 - Packaging layout cleanup: Debian assets moved under `packaging/deb/` (`make-deb.sh`, systemd unit, default config).
 - Installation and Docker docs updated to match current packaging paths and runtime behavior.
+- Debian package version bumped to `0.1.1-beta`.
 
 ## [0.1.0-beta] - 2026-05-12
 
