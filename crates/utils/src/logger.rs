@@ -39,30 +39,12 @@ pub fn init_logger(log_level: &str, log_enabled: bool, log_file: &str, json: boo
     if json {
         builder.format(|buf, record| {
             let message = record.args().to_string();
-            let mut payload = json!({
+            let payload = json!({
                 "ts": buf.timestamp_seconds().to_string(),
                 "level": record.level().as_str().to_ascii_lowercase(),
                 "target": record.target(),
                 "msg": message,
             });
-            if let Some(value) = extract_kv_field(&message, "request_id") {
-                payload["request_id"] = json!(value);
-            }
-            if let Some(value) = extract_kv_field(&message, "trace_id") {
-                payload["trace_id"] = json!(value);
-            }
-            if let Some(value) = extract_kv_field(&message, "span_id") {
-                payload["span_id"] = json!(value);
-            }
-            if let Some(value) = extract_kv_field(&message, "status") {
-                payload["status"] = json!(value);
-            }
-            if let Some(value) = extract_kv_field(&message, "method") {
-                payload["method"] = json!(value);
-            }
-            if let Some(value) = extract_kv_field(&message, "path") {
-                payload["path"] = json!(value);
-            }
 
             writeln!(buf, "{payload}")
         });
@@ -101,17 +83,4 @@ pub fn init_logger(log_level: &str, log_enabled: bool, log_file: &str, json: boo
     // else → default (stderr)
 
     builder.init();
-}
-
-fn extract_kv_field(message: &str, key: &str) -> Option<String> {
-    let pattern = format!("{key}=");
-    let start = message.find(&pattern)?;
-    let value_start = start + pattern.len();
-    let value = &message[value_start..];
-    let end = value.find(char::is_whitespace).unwrap_or(value.len());
-    let candidate = value[..end].trim_matches('"').trim_matches(',');
-    if candidate.is_empty() {
-        return None;
-    }
-    Some(candidate.to_string())
 }
