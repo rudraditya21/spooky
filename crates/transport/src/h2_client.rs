@@ -83,19 +83,14 @@ impl H2Client {
     ) -> Result<hyper::Response<hyper::body::Incoming>, hyper_util::client::legacy::Error> {
         self.client.request(req).await
     }
-}
-
-impl Default for H2Client {
-    fn default() -> Self {
-        match Self::new(
+    
+    pub fn try_default() -> Result<Self, String> {
+        Self::new(
             64,
             Duration::from_secs(30),
             Duration::from_secs(2),
             TlsClientConfig::default(),
-        ) {
-            Ok(client) => client,
-            Err(err) => panic!("default H2 client config must be valid: {err}"),
-        }
+        )
     }
 }
 
@@ -219,13 +214,7 @@ mod tests {
 
     #[test]
     fn default_tls_client_config_builds_h2_client() {
-        let client = H2Client::new(
-            8,
-            Duration::from_secs(5),
-            Duration::from_secs(1),
-            TlsClientConfig::default(),
-        );
-        assert!(client.is_ok());
+        assert!(H2Client::try_default().is_ok());
     }
 
     #[test]
