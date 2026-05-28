@@ -616,13 +616,7 @@ pub fn validate(config: &Config) -> bool {
         return false;
     }
 
-    if config
-        .resilience
-        .watchdog
-        .restart_hook
-        .as_ref()
-        .is_some_and(|value| !value.trim().is_empty())
-    {
+    if config.resilience.watchdog.restart_hook.is_some() {
         error!(
             "resilience.watchdog.restart_hook is deprecated and unsupported; use restart_command instead"
         );
@@ -1633,6 +1627,24 @@ upstream:
         let (cert, key) = write_test_certs(dir.path());
         let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.resilience.watchdog.restart_hook = Some("echo legacy".to_string());
+        assert!(!validate(&cfg));
+    }
+
+    #[test]
+    fn rejects_any_provided_legacy_watchdog_restart_hook_value() {
+        let dir = tempdir().expect("tempdir");
+        let (cert, key) = write_test_certs(dir.path());
+
+        let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        cfg.resilience.watchdog.restart_hook = None;
+        assert!(validate(&cfg));
+
+        cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        cfg.resilience.watchdog.restart_hook = Some(String::new());
+        assert!(!validate(&cfg));
+
+        cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        cfg.resilience.watchdog.restart_hook = Some("   ".to_string());
         assert!(!validate(&cfg));
     }
 
