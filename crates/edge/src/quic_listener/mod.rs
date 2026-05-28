@@ -307,16 +307,16 @@ fn boxed_full(body: Bytes) -> http_body_util::combinators::BoxBody<Bytes, Infall
     Full::new(body).map_err(|never| match never {}).boxed()
 }
 
-type ResolvedBackend = (
-    String,
-    String,
-    usize,
-    Arc<RwLock<UpstreamPool>>,
-    String,
-    usize,
-    bool,
-    RouteDecisionReason,
-);
+struct ResolvedBackend {
+    upstream_name: String,
+    backend_addr: String,
+    backend_index: usize,
+    upstream_pool: Arc<RwLock<UpstreamPool>>,
+    backend_lb: String,
+    route_path_len: usize,
+    route_host_specific: bool,
+    route_reason: RouteDecisionReason,
+}
 
 impl QUICListener {
     pub fn new(config: SpookyConfig) -> Result<Self, ProxyError> {
@@ -1754,16 +1754,16 @@ impl QUICListener {
                         trace_span,
                         request_id,
                     ) = match resolved {
-                        Ok((
+                        Ok(ResolvedBackend {
                             upstream_name,
-                            addr,
-                            idx,
+                            backend_addr: addr,
+                            backend_index: idx,
                             upstream_pool,
                             backend_lb,
                             route_path_len,
                             route_host_specific,
                             route_reason,
-                        )) => {
+                        }) => {
                             resilience.brownout.observe_admission_pressure(
                                 resilience.adaptive_admission.inflight_percent(),
                             );
@@ -3528,16 +3528,16 @@ impl QUICListener {
             route_decision.host_specific,
             route_decision.reason
         );
-        Ok((
-            upstream_name.to_string(),
+        Ok(ResolvedBackend {
+            upstream_name: upstream_name.to_string(),
             backend_addr,
             backend_index,
             upstream_pool,
-            lb_type.to_string(),
-            route_decision.matched_path_len,
-            route_decision.host_specific,
-            route_decision.reason,
-        ))
+            backend_lb: lb_type.to_string(),
+            route_path_len: route_decision.matched_path_len,
+            route_host_specific: route_decision.host_specific,
+            route_reason: route_decision.reason,
+        })
     }
 
     fn resolve_lb_key_from_spec(
@@ -4076,17 +4076,8 @@ impl QUICListener {
                                     &routing_index,
                                     Some(&lb_header_lookup),
                                 );
-                                let (
-                                    _upstream_name,
-                                    backend_addr,
-                                    _backend_index,
-                                    _pool,
-                                    _lb,
-                                    _,
-                                    _,
-                                    _,
-                                ) = match resolved {
-                                    Ok(value) => value,
+                                let backend_addr = match resolved {
+                                    Ok(value) => value.backend_addr,
                                     Err(ProxyError::Transport(reason)) => {
                                         let (status, body) =
                                             bootstrap_resolution_error_response(&reason);
@@ -4795,7 +4786,7 @@ mod tests {
 
         let mut picks = Vec::new();
         for _ in 0..4 {
-            let (_upstream, backend, _, _, _, _, _, _) = super::QUICListener::resolve_backend(
+            let resolved = super::QUICListener::resolve_backend(
                 "GET",
                 "/api/items",
                 None,
@@ -4805,7 +4796,7 @@ mod tests {
                 None,
             )
             .expect("resolve backend");
-            picks.push(backend);
+            picks.push(resolved.backend_addr);
         }
 
         assert!(
@@ -4826,7 +4817,7 @@ mod tests {
             guard.pool.mark_failure(0);
         }
 
-        let (_upstream, backend, _, _, _, _, _, _) = super::QUICListener::resolve_backend(
+        let resolved = super::QUICListener::resolve_backend(
             "GET",
             "/api/items",
             None,
@@ -4838,7 +4829,7 @@ mod tests {
         .expect("resolve backend");
 
         assert_eq!(
-            backend, "127.0.0.1:7002",
+            resolved.backend_addr, "127.0.0.1:7002",
             "unhealthy backend must be excluded from bootstrap backend selection"
         );
     }
@@ -4852,7 +4843,7 @@ mod tests {
             guard.pool.begin_request(0);
         }
 
-        let (_upstream, backend, _, _, _, _, _, _) = super::QUICListener::resolve_backend(
+        let resolved = super::QUICListener::resolve_backend(
             "GET",
             "/api/items",
             None,
@@ -4864,7 +4855,7 @@ mod tests {
         .expect("resolve backend");
 
         assert_eq!(
-            backend, "127.0.0.1:7002",
+            resolved.backend_addr, "127.0.0.1:7002",
             "least-connections should prefer lower in-flight backend in bootstrap selection"
         );
     }
@@ -4892,7 +4883,7 @@ mod tests {
             upstream_pools.insert(name.clone(), Arc::new(RwLock::new(pool)));
         }
 
-        let (upstream, _, _, _, _, _, _, _) = super::QUICListener::resolve_backend(
+        let resolved = super::QUICListener::resolve_backend(
             "GET",
             "/api/items",
             None,
@@ -4902,9 +4893,9 @@ mod tests {
             None,
         )
         .expect("GET resolve");
-        assert_eq!(upstream, "all_methods");
+        assert_eq!(resolved.upstream_name, "all_methods");
 
-        let (upstream, backend, _, _, _, _, _, _) = super::QUICListener::resolve_backend(
+        let resolved = super::QUICListener::resolve_backend(
             "POST",
             "/api/items",
             None,
@@ -4914,8 +4905,8 @@ mod tests {
             None,
         )
         .expect("POST resolve");
-        assert_eq!(upstream, "post_only");
-        assert_eq!(backend, "127.0.0.1:7010");
+        assert_eq!(resolved.upstream_name, "post_only");
+        assert_eq!(resolved.backend_addr, "127.0.0.1:7010");
     }
 
     #[test]
@@ -4944,7 +4935,7 @@ mod tests {
             }
         };
 
-        let (_, first_backend, _, _, _, _, _, _) = super::QUICListener::resolve_backend(
+        let first = super::QUICListener::resolve_backend(
             "GET",
             "/api/items",
             None,
@@ -4954,7 +4945,7 @@ mod tests {
             Some(&header_lookup),
         )
         .expect("first resolve");
-        let (_, second_backend, _, _, _, _, _, _) = super::QUICListener::resolve_backend(
+        let second = super::QUICListener::resolve_backend(
             "GET",
             "/api/items",
             None,
@@ -4966,7 +4957,7 @@ mod tests {
         .expect("second resolve");
 
         assert_eq!(
-            first_backend, second_backend,
+            first.backend_addr, second.backend_addr,
             "consistent-hash should remain stable when configured header key is constant"
         );
     }
