@@ -83,7 +83,7 @@ fn make_config(port: u32, cert: String, key: String, backend_address: String) ->
         version: 1,
         listen: Listen {
             protocol: "http3".to_string(),
-            port,
+            port: port as u16,
             address: "127.0.0.1".to_string(),
             tls: Tls {
                 cert,
@@ -821,7 +821,7 @@ fn make_config_with_rate_limit(
         version: 1,
         listen: Listen {
             protocol: "http3".to_string(),
-            port,
+            port: port as u16,
             address: "127.0.0.1".to_string(),
             tls: Tls {
                 cert,

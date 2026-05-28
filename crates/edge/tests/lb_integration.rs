@@ -107,7 +107,7 @@ fn make_config(
         version: 1,
         listen: Listen {
             protocol: "http3".to_string(),
-            port,
+            port: port as u16,
             address: "127.0.0.1".to_string(),
             tls: Tls {
                 cert,
