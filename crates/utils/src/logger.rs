@@ -2,13 +2,53 @@ use std::{
     fs::{OpenOptions, create_dir_all},
     io::Write,
     path::Path,
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use env_logger::{Builder, Target};
 use log::LevelFilter;
 use serde_json::json;
 
+static LOGGER_INIT_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+static LOGGER_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LoggerInitStatus {
+    Initialized,
+    AlreadyInitialized,
+}
+
 pub fn init_logger(log_level: &str, log_enabled: bool, log_file: &str, json: bool) {
+    let _ = try_init_logger(log_level, log_enabled, log_file, json);
+}
+
+pub fn try_init_logger(
+    log_level: &str,
+    log_enabled: bool,
+    log_file: &str,
+    json: bool,
+) -> LoggerInitStatus {
+    let mutex = LOGGER_INIT_MUTEX.get_or_init(|| Mutex::new(()));
+    let _guard = mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if LOGGER_INITIALIZED.load(Ordering::Acquire) {
+        return LoggerInitStatus::AlreadyInitialized;
+    }
+
+    let status = configure_and_init_logger(log_level, log_enabled, log_file, json);
+    LOGGER_INITIALIZED.store(true, Ordering::Release);
+    status
+}
+
+fn configure_and_init_logger(
+    log_level: &str,
+    log_enabled: bool,
+    log_file: &str,
+    json: bool,
+) -> LoggerInitStatus {
     let level = match log_level.to_lowercase().as_str() {
         "whisper" => LevelFilter::Trace,
         "haunt" => LevelFilter::Debug,
@@ -62,8 +102,7 @@ pub fn init_logger(log_level: &str, log_enabled: bool, log_file: &str, json: boo
                 parent.display(),
                 err
             );
-            builder.init();
-            return;
+            return try_init_builder(builder);
         }
 
         let file = match OpenOptions::new().create(true).append(true).open(log_file) {
@@ -73,8 +112,7 @@ pub fn init_logger(log_level: &str, log_enabled: bool, log_file: &str, json: boo
                     "Failed to open log file '{}': {}. Falling back to stderr logging.",
                     log_file, err
                 );
-                builder.init();
-                return;
+                return try_init_builder(builder);
             }
         };
 
@@ -82,5 +120,25 @@ pub fn init_logger(log_level: &str, log_enabled: bool, log_file: &str, json: boo
     }
     // else → default (stderr)
 
-    builder.init();
+    try_init_builder(builder)
+}
+
+fn try_init_builder(mut builder: Builder) -> LoggerInitStatus {
+    match builder.try_init() {
+        Ok(()) => LoggerInitStatus::Initialized,
+        Err(_) => LoggerInitStatus::AlreadyInitialized,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LoggerInitStatus, try_init_logger};
+
+    #[test]
+    fn logger_init_is_idempotent() {
+        let _first = try_init_logger("info", false, "", false);
+
+        let second = try_init_logger("debug", true, "/tmp/ignored.log", true);
+        assert_eq!(second, LoggerInitStatus::AlreadyInitialized);
+    }
 }
