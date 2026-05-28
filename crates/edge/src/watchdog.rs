@@ -2,7 +2,7 @@ use std::sync::{
     Mutex,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use spooky_config::config::Watchdog as WatchdogConfig;
 
@@ -46,7 +46,8 @@ pub struct WatchdogCoordinator {
     degraded: AtomicBool,
     restart_requested: AtomicBool,
     restart_requested_at_ms: AtomicU64,
-    last_restart_at_ms: AtomicU64,
+    restart_requested_at_instant: Mutex<Option<Instant>>,
+    last_restart_at_instant: Mutex<Option<Instant>>,
     expected_workers: AtomicUsize,
     drained_workers: AtomicUsize,
     restart_reason: Mutex<String>,
@@ -62,7 +63,8 @@ impl WatchdogCoordinator {
             degraded: AtomicBool::new(false),
             restart_requested: AtomicBool::new(false),
             restart_requested_at_ms: AtomicU64::new(0),
-            last_restart_at_ms: AtomicU64::new(0),
+            restart_requested_at_instant: Mutex::new(None),
+            last_restart_at_instant: Mutex::new(None),
             expected_workers: AtomicUsize::new(1),
             drained_workers: AtomicUsize::new(0),
             restart_reason: Mutex::new(String::new()),
@@ -99,9 +101,12 @@ impl WatchdogCoordinator {
         if !self.enabled {
             return false;
         }
-        let now_ms = now_millis();
-        let last_restart = self.last_restart_at_ms.load(Ordering::Relaxed);
-        if last_restart != 0 && now_ms.saturating_sub(last_restart) < self.restart_cooldown_ms {
+        let now_instant = Instant::now();
+        if let Ok(last_restart) = self.last_restart_at_instant.lock()
+            && let Some(last_restart_instant) = *last_restart
+            && now_instant.duration_since(last_restart_instant).as_millis()
+                < self.restart_cooldown_ms as u128
+        {
             return false;
         }
         if self
@@ -113,7 +118,10 @@ impl WatchdogCoordinator {
         }
 
         self.restart_requested_at_ms
-            .store(now_ms, Ordering::Relaxed);
+            .store(now_millis(), Ordering::Relaxed);
+        if let Ok(mut restart_requested_at) = self.restart_requested_at_instant.lock() {
+            *restart_requested_at = Some(now_instant);
+        }
         self.drained_workers.store(0, Ordering::Relaxed);
         if let Ok(mut current) = self.restart_reason.lock() {
             *current = reason.to_string();
@@ -136,6 +144,15 @@ impl WatchdogCoordinator {
         self.restart_requested_at_ms.load(Ordering::Relaxed)
     }
 
+    pub fn restart_requested_elapsed_ms(&self) -> Option<u64> {
+        if !self.restart_requested() {
+            return None;
+        }
+        let guard = self.restart_requested_at_instant.lock().ok()?;
+        let started_at = (*guard)?;
+        Some(Instant::now().duration_since(started_at).as_millis() as u64)
+    }
+
     pub fn mark_worker_drained(&self) {
         if !self.restart_requested() {
             return;
@@ -149,8 +166,12 @@ impl WatchdogCoordinator {
     }
 
     pub fn complete_restart_cycle(&self) {
-        self.last_restart_at_ms
-            .store(now_millis(), Ordering::Relaxed);
+        if let Ok(mut last_restart_at) = self.last_restart_at_instant.lock() {
+            *last_restart_at = Some(Instant::now());
+        }
+        if let Ok(mut restart_requested_at) = self.restart_requested_at_instant.lock() {
+            *restart_requested_at = None;
+        }
         self.restart_requested.store(false, Ordering::Relaxed);
         self.restart_requested_at_ms.store(0, Ordering::Relaxed);
         self.drained_workers.store(0, Ordering::Relaxed);
@@ -211,5 +232,26 @@ mod tests {
         assert!(!watchdog.workers_drained());
         watchdog.mark_worker_drained();
         assert!(watchdog.workers_drained());
+    }
+
+    #[test]
+    fn restart_cooldown_blocks_immediate_retrigger_after_cycle() {
+        let cfg = WatchdogConfig {
+            enabled: true,
+            check_interval_ms: 1000,
+            poll_stall_timeout_ms: 5000,
+            timeout_error_rate_percent: 60,
+            min_requests_per_window: 20,
+            overload_inflight_percent: 90,
+            unhealthy_consecutive_windows: 3,
+            drain_grace_ms: 5_000,
+            restart_cooldown_ms: 60_000,
+            restart_command: Vec::new(),
+            restart_hook: None,
+        };
+        let watchdog = WatchdogCoordinator::new(&cfg);
+        assert!(watchdog.request_restart("overload"));
+        watchdog.complete_restart_cycle();
+        assert!(!watchdog.request_restart("stall"));
     }
 }

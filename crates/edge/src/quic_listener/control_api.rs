@@ -39,6 +39,20 @@ impl ControlApiState {
 }
 
 impl QUICListener {
+    fn bearer_token_from_authorization_header(raw: &str) -> Option<&str> {
+        let raw = raw.trim();
+        let split = raw.find(char::is_whitespace)?;
+        let (scheme, rest) = raw.split_at(split);
+        if !scheme.eq_ignore_ascii_case("bearer") {
+            return None;
+        }
+        let token = rest.trim_start();
+        if token.is_empty() {
+            return None;
+        }
+        Some(token)
+    }
+
     fn watchdog_restart_env(
         path: Option<OsString>,
         restart_reason: &str,
@@ -388,7 +402,7 @@ impl QUICListener {
         let Ok(raw) = header.to_str() else {
             return false;
         };
-        let Some(provided) = raw.strip_prefix("Bearer ") else {
+        let Some(provided) = Self::bearer_token_from_authorization_header(raw) else {
             return false;
         };
         bool::from(provided.as_bytes().ct_eq(token.as_bytes()))
@@ -516,9 +530,9 @@ impl QUICListener {
                         continue;
                     }
 
-                    let requested_at = watchdog.restart_requested_at_ms();
-                    let grace_elapsed = requested_at != 0
-                        && now.saturating_sub(requested_at) >= watchdog_config.drain_grace_ms;
+                    let grace_elapsed = watchdog
+                        .restart_requested_elapsed_ms()
+                        .is_some_and(|elapsed| elapsed >= watchdog_config.drain_grace_ms);
                     if !watchdog.workers_drained() && !grace_elapsed {
                         continue;
                     }
@@ -606,6 +620,38 @@ mod tests {
         assert_eq!(
             map.get(&OsString::from("SPOOKY_WATCHDOG_REASON")),
             Some(&OsString::from("poll_stall"))
+        );
+    }
+
+    #[test]
+    fn bearer_authorization_scheme_is_case_insensitive() {
+        assert_eq!(
+            QUICListener::bearer_token_from_authorization_header("Bearer token-1"),
+            Some("token-1")
+        );
+        assert_eq!(
+            QUICListener::bearer_token_from_authorization_header("bearer token-2"),
+            Some("token-2")
+        );
+        assert_eq!(
+            QUICListener::bearer_token_from_authorization_header("BEARER token-3"),
+            Some("token-3")
+        );
+    }
+
+    #[test]
+    fn bearer_authorization_rejects_malformed_headers() {
+        assert_eq!(
+            QUICListener::bearer_token_from_authorization_header("Basic abc"),
+            None
+        );
+        assert_eq!(
+            QUICListener::bearer_token_from_authorization_header("Bearer"),
+            None
+        );
+        assert_eq!(
+            QUICListener::bearer_token_from_authorization_header("Bearer   "),
+            None
         );
     }
 }

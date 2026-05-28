@@ -304,8 +304,14 @@ impl QUICListener {
                     b"upstream error\n",
                 )
             }
-            Err(ProxyError::Transport(_)) => {
-                error!("Upstream transport error");
+            Err(ProxyError::Transport(err)) => {
+                error!(
+                    "request_id={} upstream={} backend={} Upstream transport error: {}",
+                    req.request_id,
+                    req.upstream_name.as_deref().unwrap_or("-"),
+                    backend_addr,
+                    err
+                );
                 metrics.inc_health_failure(HealthFailureReason::Transport);
                 if let Some(pool) = &upstream_pool
                     && let Some(t) = pool.write().ok().and_then(|mut p| {
