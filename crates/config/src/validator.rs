@@ -113,6 +113,33 @@ fn is_loopback_bind_address(raw: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn is_valid_http_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.as_bytes().iter().all(|byte| {
+            matches!(
+                byte,
+                b'0'..=b'9'
+                    | b'a'..=b'z'
+                    | b'A'..=b'Z'
+                    | b'!'
+                    | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+            )
+        })
+}
+
 pub fn validate(config: &Config) -> bool {
     info!("Starting configuration validation...");
 
@@ -495,6 +522,17 @@ pub fn validate(config: &Config) -> bool {
         .any(|method| method.trim().is_empty())
     {
         error!("resilience.protocol.allowed_methods must not contain empty values");
+        return false;
+    }
+
+    if config
+        .resilience
+        .protocol
+        .allowed_methods
+        .iter()
+        .any(|method| !is_valid_http_token(method))
+    {
+        error!("resilience.protocol.allowed_methods must contain valid HTTP method tokens");
         return false;
     }
 
@@ -1376,6 +1414,18 @@ upstream:
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.resilience.protocol.allowed_methods = vec!["".to_string()];
+        assert!(!validate(&cfg));
+
+        cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        cfg.resilience.protocol.allowed_methods = vec!["GE T".to_string()];
+        assert!(!validate(&cfg));
+
+        cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        cfg.resilience.protocol.allowed_methods = vec!["GET/".to_string()];
+        assert!(!validate(&cfg));
+
+        cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        cfg.resilience.protocol.allowed_methods = vec!["GE\nT".to_string()];
         assert!(!validate(&cfg));
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
