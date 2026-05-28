@@ -83,7 +83,7 @@ impl H2Client {
     ) -> Result<hyper::Response<hyper::body::Incoming>, hyper_util::client::legacy::Error> {
         self.client.request(req).await
     }
-    
+
     pub fn try_default() -> Result<Self, String> {
         Self::new(
             64,

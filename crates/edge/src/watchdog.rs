@@ -104,9 +104,7 @@ impl WatchdogCoordinator {
         let now_instant = Instant::now();
         if let Ok(last_restart) = self.last_restart_at_instant.lock()
             && let Some(last_restart_instant) = *last_restart
-            && now_instant
-                .duration_since(last_restart_instant)
-                .as_millis()
+            && now_instant.duration_since(last_restart_instant).as_millis()
                 < self.restart_cooldown_ms as u128
         {
             return false;
