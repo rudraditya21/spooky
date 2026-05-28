@@ -9,7 +9,7 @@ pub fn get_default_protocol() -> String {
     String::from("http3")
 }
 
-pub fn get_default_port() -> u32 {
+pub fn get_default_port() -> u16 {
     9889
 }
 

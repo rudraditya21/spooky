@@ -128,7 +128,7 @@ pub struct Listen {
     pub protocol: String, // "http3"
 
     #[serde(default = "get_default_port")]
-    pub port: u32, // 9889
+    pub port: u16, // 9889
 
     #[serde(default = "get_default_address")]
     pub address: String, // "0.0.0.0"
