@@ -91,6 +91,7 @@ mod tests {
         let metrics = Metrics::default();
         metrics.inc_overload_shed_reason(OverloadShedReason::GlobalInflight);
         metrics.inc_overload_shed_reason(OverloadShedReason::BackendInflight);
+        metrics.inc_overload_shed_reason(OverloadShedReason::CircuitOpen);
         metrics.set_active_connections(7);
         metrics.inc_connection_cap_reject();
         metrics.inc_hedge_triggered();
@@ -107,6 +108,7 @@ mod tests {
         assert!(
             output.contains("spooky_overload_shed_by_reason_total{reason=\"backend_inflight\"} 1")
         );
+        assert!(output.contains("spooky_overload_shed_by_reason_total{reason=\"circuit_open\"} 1"));
         assert!(output.contains("spooky_active_connections 7"));
         assert!(output.contains("spooky_connection_cap_rejects 1"));
         assert!(output.contains("spooky_hedge_triggered_total 1"));

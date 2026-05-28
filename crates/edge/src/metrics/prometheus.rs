@@ -135,6 +135,10 @@ impl Metrics {
             self.overload_shed_backend_inflight.load(Ordering::Relaxed)
         ));
         out.push_str(&format!(
+            "spooky_overload_shed_by_reason_total{{reason=\"circuit_open\"}} {}\n",
+            self.overload_shed_circuit_open.load(Ordering::Relaxed)
+        ));
+        out.push_str(&format!(
             "spooky_overload_shed_by_reason_total{{reason=\"request_buffer_cap\"}} {}\n",
             self.overload_shed_request_buffer.load(Ordering::Relaxed)
         ));

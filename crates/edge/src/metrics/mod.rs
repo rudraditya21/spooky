@@ -29,6 +29,7 @@ pub struct Metrics {
     pub overload_shed_global_inflight: AtomicU64,
     pub overload_shed_upstream_inflight: AtomicU64,
     pub overload_shed_backend_inflight: AtomicU64,
+    pub overload_shed_circuit_open: AtomicU64,
     pub overload_shed_request_buffer: AtomicU64,
     pub overload_shed_response_prebuffer: AtomicU64,
     pub overload_shed_connection_cap: AtomicU64,
@@ -200,6 +201,7 @@ pub enum OverloadShedReason {
     GlobalInflight,
     UpstreamInflight,
     BackendInflight,
+    CircuitOpen,
     RequestBufferCap,
     ResponsePrebufferCap,
     ConnectionCap,
@@ -287,6 +289,7 @@ impl Metrics {
             overload_shed_global_inflight: AtomicU64::new(0),
             overload_shed_upstream_inflight: AtomicU64::new(0),
             overload_shed_backend_inflight: AtomicU64::new(0),
+            overload_shed_circuit_open: AtomicU64::new(0),
             overload_shed_request_buffer: AtomicU64::new(0),
             overload_shed_response_prebuffer: AtomicU64::new(0),
             overload_shed_connection_cap: AtomicU64::new(0),
@@ -427,6 +430,10 @@ impl Metrics {
             }
             OverloadShedReason::BackendInflight => {
                 self.overload_shed_backend_inflight
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            OverloadShedReason::CircuitOpen => {
+                self.overload_shed_circuit_open
                     .fetch_add(1, Ordering::Relaxed);
             }
             OverloadShedReason::RequestBufferCap => {

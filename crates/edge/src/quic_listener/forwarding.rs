@@ -265,7 +265,7 @@ impl QUICListener {
             Err(ProxyError::Pool(PoolError::CircuitOpen(_))) => {
                 metrics.inc_failure();
                 metrics.inc_circuit_breaker_rejected();
-                metrics.inc_overload_shed_reason(OverloadShedReason::BackendInflight);
+                metrics.inc_overload_shed_reason(OverloadShedReason::CircuitOpen);
                 metrics.record_route(route_label, start.elapsed(), RouteOutcome::OverloadShed);
                 Self::log_access(req, 503);
                 Self::send_overload_response(
