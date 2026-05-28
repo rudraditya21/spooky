@@ -627,8 +627,8 @@ impl QUICListener {
             request_buffer_global_cap_bytes,
             unknown_length_response_prebuffer_bytes,
             require_client_cert,
-            recv_buf: [0; MAX_DATAGRAM_SIZE_BYTES],
-            send_buf: [0; MAX_DATAGRAM_SIZE_BYTES],
+            recv_buf: Box::new([0; MAX_DATAGRAM_SIZE_BYTES]),
+            send_buf: Box::new([0; MAX_DATAGRAM_SIZE_BYTES]),
             connections: HashMap::new(),
             cid_routes: HashMap::new(),
             peer_routes: HashMap::new(),
@@ -1135,7 +1135,7 @@ impl QUICListener {
         }
 
         // Read a UDP datagram and feed it into quiche.
-        let (len, peer) = match self.socket.recv_from(&mut self.recv_buf) {
+        let (len, peer) = match self.socket.recv_from(self.recv_buf.as_mut_slice()) {
             Ok(v) => v,
             Err(ref e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
@@ -1197,7 +1197,11 @@ impl QUICListener {
 
         if packet_type == quiche::Type::VersionNegotiation {
             let len =
-                match quiche::negotiate_version(&header.scid, &header.dcid, &mut self.send_buf) {
+                match quiche::negotiate_version(
+                    &header.scid,
+                    &header.dcid,
+                    self.send_buf.as_mut_slice(),
+                ) {
                     Ok(len) => len,
                     Err(e) => {
                         error!("Version negotiation failed: {:?}", e);

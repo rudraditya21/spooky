@@ -432,7 +432,7 @@ fn run_h3_client_multiple_requests(
 }
 
 fn assert_cid_sync_invariants(listener: &QUICListener) {
-    for (primary_key, connection) in &listener.connections {
+    for (primary_key, connection) in listener.connections() {
         assert_eq!(
             primary_key.as_ref(),
             connection.primary_scid.as_ref(),
@@ -441,7 +441,7 @@ fn assert_cid_sync_invariants(listener: &QUICListener) {
 
         for cid in &connection.routing_scids {
             let matched = listener
-                .cid_radix
+                .cid_radix()
                 .longest_prefix_match(cid.as_ref())
                 .unwrap_or_else(|| panic!("missing CID in radix: {}", hex::encode(cid)));
             assert_eq!(
@@ -452,12 +452,12 @@ fn assert_cid_sync_invariants(listener: &QUICListener) {
 
             if cid.as_ref() == connection.primary_scid.as_ref() {
                 assert!(
-                    !listener.cid_routes.contains_key(cid.as_ref()),
+                    !listener.cid_routes().contains_key(cid.as_ref()),
                     "primary SCID must not be present in alias map"
                 );
             } else {
                 let mapped_primary = listener
-                    .cid_routes
+                    .cid_routes()
                     .get(cid.as_ref())
                     .unwrap_or_else(|| panic!("alias CID missing mapping: {}", hex::encode(cid)));
                 assert_eq!(
@@ -469,13 +469,13 @@ fn assert_cid_sync_invariants(listener: &QUICListener) {
         }
     }
 
-    for (alias, primary) in &listener.cid_routes {
+    for (alias, primary) in listener.cid_routes() {
         assert_ne!(
             alias.as_ref(),
             primary.as_ref(),
             "alias route must not map a primary to itself"
         );
-        let connection = listener.connections.get(primary).unwrap_or_else(|| {
+        let connection = listener.connections().get(primary).unwrap_or_else(|| {
             panic!(
                 "alias points to missing primary connection: alias={} primary={}",
                 hex::encode(alias),
@@ -611,19 +611,19 @@ fn send_udp(to: std::net::SocketAddr, payload: &[u8]) {
 
 fn assert_maps_empty(listener: &QUICListener) {
     assert!(
-        listener.connections.is_empty(),
+        listener.connections().is_empty(),
         "connections map must be empty after malformed traffic, had {} entries",
-        listener.connections.len()
+        listener.connections().len()
     );
     assert!(
-        listener.cid_routes.is_empty(),
+        listener.cid_routes().is_empty(),
         "cid_routes must be empty after malformed traffic, had {} entries",
-        listener.cid_routes.len()
+        listener.cid_routes().len()
     );
     assert!(
-        listener.peer_routes.is_empty(),
+        listener.peer_routes().is_empty(),
         "peer_routes must be empty after malformed traffic, had {} entries",
-        listener.peer_routes.len()
+        listener.peer_routes().len()
     );
 }
 
@@ -915,9 +915,9 @@ fn connection_flood_is_rate_limited() {
     // With burst=1 only the very first packet can create a connection.
     // All subsequent ones are dropped by the rate limiter.
     assert!(
-        listener.connections.len() <= 1,
+        listener.connections().len() <= 1,
         "rate limiter must cap connections at burst=1, got {}",
-        listener.connections.len()
+        listener.connections().len()
     );
 }
 
@@ -941,9 +941,9 @@ fn active_connection_cap_rejects_excess_initial_packets() {
     }
 
     assert!(
-        listener.connections.len() <= 1,
+        listener.connections().len() <= 1,
         "active connection cap must keep at most one connection, got {}",
-        listener.connections.len()
+        listener.connections().len()
     );
     assert!(
         listener
@@ -972,7 +972,7 @@ fn draining_mode_rejects_initial_when_no_connections_exist() {
     listener.poll();
 
     assert_eq!(
-        listener.connections.len(),
+        listener.connections().len(),
         0,
         "no new connection should be admitted after drain starts"
     );
@@ -992,12 +992,12 @@ fn draining_mode_rejects_new_initial_after_existing_connection() {
     send_udp(addr, &first);
     listener.poll();
     assert_eq!(
-        listener.connections.len(),
+        listener.connections().len(),
         1,
         "first Initial should create a baseline connection before drain"
     );
     let known_connection_ids: std::collections::HashSet<Vec<u8>> = listener
-        .connections
+        .connections()
         .keys()
         .map(|cid| cid.to_vec())
         .collect();
@@ -1011,7 +1011,7 @@ fn draining_mode_rejects_new_initial_after_existing_connection() {
     }
 
     let post_drain_ids: std::collections::HashSet<Vec<u8>> = listener
-        .connections
+        .connections()
         .keys()
         .map(|cid| cid.to_vec())
         .collect();
@@ -1040,7 +1040,7 @@ fn normal_traffic_below_rate_limit_is_unaffected() {
     }
 
     assert_eq!(
-        listener.connections.len(),
+        listener.connections().len(),
         REQUEST_COUNT,
         "all {} connections should be accepted when below rate limit",
         REQUEST_COUNT
@@ -1234,18 +1234,18 @@ fn lifecycle_churn_leaves_no_orphaned_state() {
     let guard = listener.lock().expect("listener lock");
     assert_cid_sync_invariants(&guard);
     assert!(
-        guard.connections.is_empty(),
+        guard.connections().is_empty(),
         "connections must be empty after churn, found {} entries",
-        guard.connections.len()
+        guard.connections().len()
     );
     assert!(
-        guard.cid_routes.is_empty(),
+        guard.cid_routes().is_empty(),
         "cid_routes must be empty after churn, found {} entries",
-        guard.cid_routes.len()
+        guard.cid_routes().len()
     );
     assert!(
-        guard.peer_routes.is_empty(),
+        guard.peer_routes().is_empty(),
         "peer_routes must be empty after churn, found {} entries",
-        guard.peer_routes.len()
+        guard.peer_routes().len()
     );
 }

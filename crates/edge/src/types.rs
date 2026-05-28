@@ -98,13 +98,13 @@ pub struct QUICListener {
     pub unknown_length_response_prebuffer_bytes: usize,
     pub require_client_cert: bool,
 
-    pub recv_buf: [u8; MAX_DATAGRAM_SIZE_BYTES],
-    pub send_buf: [u8; MAX_DATAGRAM_SIZE_BYTES],
+    pub(crate) recv_buf: Box<[u8; MAX_DATAGRAM_SIZE_BYTES]>,
+    pub(crate) send_buf: Box<[u8; MAX_DATAGRAM_SIZE_BYTES]>,
 
-    pub connections: HashMap<Arc<[u8]>, QuicConnection>, // KEY: SCID(server connection id)
-    pub cid_routes: HashMap<Arc<[u8]>, Arc<[u8]>>,       // KEY: alias SCID, VALUE: primary SCID
-    pub peer_routes: HashMap<SocketAddr, Arc<[u8]>>,     // KEY: peer address, VALUE: primary SCID
-    pub cid_radix: CidRadix,
+    pub(crate) connections: HashMap<Arc<[u8]>, QuicConnection>, // KEY: SCID(server connection id)
+    pub(crate) cid_routes: HashMap<Arc<[u8]>, Arc<[u8]>>, // KEY: alias SCID, VALUE: primary SCID
+    pub(crate) peer_routes: HashMap<SocketAddr, Arc<[u8]>>, // KEY: peer address, VALUE: primary SCID
+    pub(crate) cid_radix: CidRadix,
     pub(crate) conn_rate_limiter: crate::quic_listener::TokenBucket,
 }
 
@@ -244,6 +244,24 @@ pub struct RequestEnvelope {
 impl RequestEnvelope {
     pub fn request_id(&self) -> u64 {
         self.request_id
+    }
+}
+
+impl QUICListener {
+    pub fn connections(&self) -> &HashMap<Arc<[u8]>, QuicConnection> {
+        &self.connections
+    }
+
+    pub fn cid_routes(&self) -> &HashMap<Arc<[u8]>, Arc<[u8]>> {
+        &self.cid_routes
+    }
+
+    pub fn peer_routes(&self) -> &HashMap<SocketAddr, Arc<[u8]>> {
+        &self.peer_routes
+    }
+
+    pub fn cid_radix(&self) -> &CidRadix {
+        &self.cid_radix
     }
 }
 
