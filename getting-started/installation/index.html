@@ -885,8 +885,8 @@
 <h2 id="installation-methods">Installation Methods</h2>
 <h3 id="debian-package-recommended-for-linux">Debian Package (Recommended for Linux)</h3>
 <p>Download and install the <code>.deb</code> from <a href="https://github.com/Supernova-Labs-Org/spooky/releases">GitHub Releases</a>:</p>
-<pre><code class="language-bash">wget https://github.com/Supernova-Labs-Org/spooky/releases/download/v0.1.0-beta/spooky_0.1.0-beta_amd64.deb
-sudo dpkg -i spooky_0.1.0-beta_amd64.deb
+<pre><code class="language-bash">wget https://github.com/Supernova-Labs-Org/spooky/releases/download/v0.1.1-beta/spooky_0.1.1-beta_amd64.deb
+sudo dpkg -i spooky_0.1.1-beta_amd64.deb
 </code></pre>
 <p>The package installs:
 - Binary: <code>/usr/bin/spooky</code>
@@ -901,7 +901,7 @@ sudo systemctl status spooky
 </code></pre>
 <p>To build a <code>.deb</code> package from source in this repository:</p>
 <pre><code class="language-bash">./packaging/deb/make-deb.sh
-sudo dpkg -i spooky_0.1.0-beta_amd64.deb
+sudo dpkg -i spooky_0.1.1-beta_amd64.deb
 </code></pre>
 <h3 id="build-from-source">Build from Source</h3>
 <p><strong>Install build dependencies</strong> (required — quiche/BoringSSL needs cmake and a C++ compiler):</p>
@@ -935,8 +935,8 @@ cargo test -p spooky-edge --test lb_integration
 sudo cp /path/to/fullchain.pem /etc/spooky/certs/fullchain.pem
 sudo cp /path/to/privkey.pem   /etc/spooky/certs/privkey.pem
 
-# Set ownership and permissions
-sudo chown spooky:spooky /etc/spooky/certs/fullchain.pem /etc/spooky/certs/privkey.pem
+# Set ownership and permissions (root owns, spooky group can read)
+sudo chown root:spooky /etc/spooky/certs/fullchain.pem /etc/spooky/certs/privkey.pem
 sudo chmod 640 /etc/spooky/certs/fullchain.pem /etc/spooky/certs/privkey.pem
 </code></pre>
 <p>Then update <code>/etc/spooky/config.yaml</code> to point to these paths:</p>
@@ -950,7 +950,7 @@ sudo chmod 640 /etc/spooky/certs/fullchain.pem /etc/spooky/certs/privkey.pem
 <pre><code class="language-bash">sudo cp certs/proxy-fullchain.pem /etc/spooky/certs/fullchain.pem
 sudo cp certs/proxy-key-pkcs8.pem /etc/spooky/certs/privkey.pem
 
-sudo chown spooky:spooky /etc/spooky/certs/fullchain.pem /etc/spooky/certs/privkey.pem
+sudo chown root:spooky /etc/spooky/certs/fullchain.pem /etc/spooky/certs/privkey.pem
 sudo chmod 640 /etc/spooky/certs/fullchain.pem /etc/spooky/certs/privkey.pem
 </code></pre>
 <p>Update <code>/etc/spooky/config.yaml</code>:</p>
@@ -972,7 +972,7 @@ sudo chmod 640 /etc/spooky/certs/fullchain.pem /etc/spooky/certs/privkey.pem
 
 sudo mv /tmp/fullchain.pem /etc/spooky/certs/fullchain.pem
 sudo mv /tmp/privkey.pem   /etc/spooky/certs/privkey.pem
-sudo chown spooky:spooky /etc/spooky/certs/fullchain.pem /etc/spooky/certs/privkey.pem
+sudo chown root:spooky /etc/spooky/certs/fullchain.pem /etc/spooky/certs/privkey.pem
 sudo chmod 640 /etc/spooky/certs/fullchain.pem /etc/spooky/certs/privkey.pem
 </code></pre>
 <p>For production certificates, see <a href="../../configuration/tls/">TLS Configuration</a>.</p>
@@ -1121,13 +1121,13 @@ sudo tail -f /var/log/spooky/spooky.log
 <h2 id="troubleshooting">Troubleshooting</h2>
 <p><strong><code>/etc/spooky/config.yaml</code> missing after <code>dpkg -i</code>:</strong>
 The package install may have been interrupted. Reinstall or manually restore the file:</p>
-<pre><code class="language-bash">sudo dpkg -i spooky_0.1.0-beta_amd64.deb
+<pre><code class="language-bash">sudo dpkg -i spooky_0.1.1-beta_amd64.deb
 # or:
 sudo install -m 0640 -o spooky -g spooky packaging/deb/debian/config.yaml /etc/spooky/config.yaml
 </code></pre>
 <p><strong><code>Permission denied</code> on TLS key/cert:</strong>
 The <code>spooky</code> user cannot read the certificate files. Fix ownership and permissions:</p>
-<pre><code class="language-bash">sudo chown spooky:spooky /etc/spooky/certs/fullchain.pem /etc/spooky/certs/privkey.pem
+<pre><code class="language-bash">sudo chown root:spooky /etc/spooky/certs/fullchain.pem /etc/spooky/certs/privkey.pem
 sudo chmod 640 /etc/spooky/certs/fullchain.pem /etc/spooky/certs/privkey.pem
 sudo systemctl restart spooky
 </code></pre>

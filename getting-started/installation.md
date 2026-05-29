@@ -24,8 +24,8 @@
 Download and install the `.deb` from [GitHub Releases](https://github.com/Supernova-Labs-Org/spooky/releases):
 
 ```bash
-wget https://github.com/Supernova-Labs-Org/spooky/releases/download/v0.1.0-beta/spooky_0.1.0-beta_amd64.deb
-sudo dpkg -i spooky_0.1.0-beta_amd64.deb
+wget https://github.com/Supernova-Labs-Org/spooky/releases/download/v0.1.1-beta/spooky_0.1.1-beta_amd64.deb
+sudo dpkg -i spooky_0.1.1-beta_amd64.deb
 ```
 
 The package installs:
@@ -47,7 +47,7 @@ To build a `.deb` package from source in this repository:
 
 ```bash
 ./packaging/deb/make-deb.sh
-sudo dpkg -i spooky_0.1.0-beta_amd64.deb
+sudo dpkg -i spooky_0.1.1-beta_amd64.deb
 ```
 
 ### Build from Source
@@ -98,8 +98,8 @@ Copy your certificate and private key into the certs directory and set correct o
 sudo cp /path/to/fullchain.pem /etc/spooky/certs/fullchain.pem
 sudo cp /path/to/privkey.pem   /etc/spooky/certs/privkey.pem
 
-# Set ownership and permissions
-sudo chown spooky:spooky /etc/spooky/certs/fullchain.pem /etc/spooky/certs/privkey.pem
+# Set ownership and permissions (root owns, spooky group can read)
+sudo chown root:spooky /etc/spooky/certs/fullchain.pem /etc/spooky/certs/privkey.pem
 sudo chmod 640 /etc/spooky/certs/fullchain.pem /etc/spooky/certs/privkey.pem
 ```
 
@@ -120,7 +120,7 @@ If you are building from source and want to use the included development certifi
 sudo cp certs/proxy-fullchain.pem /etc/spooky/certs/fullchain.pem
 sudo cp certs/proxy-key-pkcs8.pem /etc/spooky/certs/privkey.pem
 
-sudo chown spooky:spooky /etc/spooky/certs/fullchain.pem /etc/spooky/certs/privkey.pem
+sudo chown root:spooky /etc/spooky/certs/fullchain.pem /etc/spooky/certs/privkey.pem
 sudo chmod 640 /etc/spooky/certs/fullchain.pem /etc/spooky/certs/privkey.pem
 ```
 
@@ -148,7 +148,7 @@ openssl req -x509 -newkey rsa:4096 -nodes \
 
 sudo mv /tmp/fullchain.pem /etc/spooky/certs/fullchain.pem
 sudo mv /tmp/privkey.pem   /etc/spooky/certs/privkey.pem
-sudo chown spooky:spooky /etc/spooky/certs/fullchain.pem /etc/spooky/certs/privkey.pem
+sudo chown root:spooky /etc/spooky/certs/fullchain.pem /etc/spooky/certs/privkey.pem
 sudo chmod 640 /etc/spooky/certs/fullchain.pem /etc/spooky/certs/privkey.pem
 ```
 
@@ -337,7 +337,7 @@ sudo tail -f /var/log/spooky/spooky.log
 **`/etc/spooky/config.yaml` missing after `dpkg -i`:**
 The package install may have been interrupted. Reinstall or manually restore the file:
 ```bash
-sudo dpkg -i spooky_0.1.0-beta_amd64.deb
+sudo dpkg -i spooky_0.1.1-beta_amd64.deb
 # or:
 sudo install -m 0640 -o spooky -g spooky packaging/deb/debian/config.yaml /etc/spooky/config.yaml
 ```
@@ -345,7 +345,7 @@ sudo install -m 0640 -o spooky -g spooky packaging/deb/debian/config.yaml /etc/s
 **`Permission denied` on TLS key/cert:**
 The `spooky` user cannot read the certificate files. Fix ownership and permissions:
 ```bash
-sudo chown spooky:spooky /etc/spooky/certs/fullchain.pem /etc/spooky/certs/privkey.pem
+sudo chown root:spooky /etc/spooky/certs/fullchain.pem /etc/spooky/certs/privkey.pem
 sudo chmod 640 /etc/spooky/certs/fullchain.pem /etc/spooky/certs/privkey.pem
 sudo systemctl restart spooky
 ```
