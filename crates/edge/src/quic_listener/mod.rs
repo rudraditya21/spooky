@@ -92,6 +92,8 @@ fn is_hop_header(name: &str) -> bool {
         name,
         "connection"
             | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
             | "proxy-connection"
             | "transfer-encoding"
             | "upgrade"
@@ -156,6 +158,15 @@ fn should_strip_h3_response_header(
     connection_tokens.contains(name.as_str())
         || is_hop_header(name.as_str())
         || name == http::header::CONTENT_LENGTH
+}
+
+fn should_strip_bootstrap_response_header(
+    name: &http::header::HeaderName,
+    connection_tokens: &HashSet<String>,
+) -> bool {
+    connection_tokens.contains(name.as_str())
+        || is_hop_header(name.as_str())
+        || name.as_str().eq_ignore_ascii_case("alt-svc")
 }
 
 fn response_size_exceeded_after_chunk(
@@ -4419,12 +4430,13 @@ impl QUICListener {
 
                                 let status = upstream_resp.status();
                                 let mut resp_builder = Response::builder().status(status);
+                                let response_connection_tokens =
+                                    connection_header_tokens(upstream_resp.headers());
                                 for (name, value) in upstream_resp.headers() {
-                                    if name == http::header::CONNECTION
-                                        || name.as_str() == "keep-alive"
-                                        || name.as_str() == "transfer-encoding"
-                                        || name.as_str() == "alt-svc"
-                                    {
+                                    if should_strip_bootstrap_response_header(
+                                        name,
+                                        &response_connection_tokens,
+                                    ) {
                                         continue;
                                     }
                                     resp_builder = resp_builder.header(name, value);
@@ -4718,7 +4730,8 @@ mod tests {
         ConnectionRoutes, TokenBucket, abort_stream, classify_active_health_check_response,
         connection_header_tokens, purge_connection_routes, resolve_primary_from_radix_prefix,
         response_size_exceeded_after_chunk, should_strip_bootstrap_request_header,
-        should_strip_h3_response_header, sweep_closed_connections,
+        should_strip_bootstrap_response_header, should_strip_h3_response_header,
+        sweep_closed_connections,
     };
     type RoutingMaps = (
         HashMap<Arc<[u8]>, Arc<[u8]>>,
@@ -5042,6 +5055,64 @@ mod tests {
         let tokens = connection_header_tokens(&headers);
         let nominated = http::HeaderName::from_static("x-internal-hop");
         assert!(should_strip_h3_response_header(&nominated, &tokens));
+    }
+
+    #[test]
+    fn bootstrap_response_filter_strips_standard_hop_by_hop_headers() {
+        let tokens = HashSet::new();
+        assert!(should_strip_bootstrap_response_header(
+            &http::header::CONNECTION,
+            &tokens
+        ));
+        assert!(should_strip_bootstrap_response_header(
+            &http::header::TE,
+            &tokens
+        ));
+        assert!(should_strip_bootstrap_response_header(
+            &http::header::TRAILER,
+            &tokens
+        ));
+        assert!(should_strip_bootstrap_response_header(
+            &http::header::TRANSFER_ENCODING,
+            &tokens
+        ));
+        assert!(should_strip_bootstrap_response_header(
+            &http::header::UPGRADE,
+            &tokens
+        ));
+        assert!(should_strip_bootstrap_response_header(
+            &http::header::PROXY_AUTHENTICATE,
+            &tokens
+        ));
+        assert!(should_strip_bootstrap_response_header(
+            &http::header::PROXY_AUTHORIZATION,
+            &tokens
+        ));
+        let alt_svc = http::HeaderName::from_static("alt-svc");
+        assert!(should_strip_bootstrap_response_header(&alt_svc, &tokens));
+        let keep_alive = http::HeaderName::from_static("keep-alive");
+        assert!(should_strip_bootstrap_response_header(&keep_alive, &tokens));
+    }
+
+    #[test]
+    fn bootstrap_response_filter_strips_connection_nominated_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONNECTION,
+            HeaderValue::from_static("x-hop-token, x-alt"),
+        );
+        let tokens = connection_header_tokens(&headers);
+        let nominated = http::HeaderName::from_static("x-hop-token");
+        assert!(should_strip_bootstrap_response_header(&nominated, &tokens));
+    }
+
+    #[test]
+    fn bootstrap_response_filter_keeps_end_to_end_headers() {
+        let tokens = HashSet::new();
+        assert!(!should_strip_bootstrap_response_header(
+            &http::header::CACHE_CONTROL,
+            &tokens
+        ));
     }
 
     #[test]
