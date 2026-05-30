@@ -20,6 +20,15 @@ SLOW_PATH="${SLOW_PATH:-/slow}"
 LOSS_PATH="${LOSS_PATH:-/api}"
 NETEM_IFACE="${NETEM_IFACE:-}"
 LOSS_PERCENT="${LOSS_PERCENT:-2}"
+MATRIX_PROFILES="${MATRIX_PROFILES:-}"
+MATRIX_PROFILE_SELECT="${MATRIX_PROFILE_SELECT:-}"
+
+DEFAULT_MATRIX_PROFILES=(
+  "profile_1_s4_c40_20_30:0:4:40:20:30"
+  "profile_2_s8_c80_40_60:0:8:80:40:60"
+  "profile_3_s16_c120_60_90:0:16:120:60:90"
+  "profile_4_s24_c160_80_120:0:24:160:80:120"
+)
 
 usage() {
   cat <<USAGE
@@ -42,6 +51,14 @@ Shared request/path overrides:
 
 Optional Linux loss injection passthrough:
   NETEM_IFACE=eth0 LOSS_PERCENT=2
+
+Profile overrides:
+  MATRIX_PROFILES="name:workers:streams:burst:slow:loss[,name:workers:streams:burst:slow:loss...]"
+  MATRIX_PROFILE_SELECT="name1,name2"
+
+Examples:
+  MATRIX_PROFILES="quick:4:16:120:0:0" scripts/load-matrix.sh
+  MATRIX_PROFILE_SELECT="profile_2_s8_c80_40_60" scripts/load-matrix.sh
 USAGE
 }
 
@@ -65,20 +82,22 @@ mkdir -p "${RUN_DIR}"
 
 run_profile() {
   local profile="$1"
-  local streams="$2"
-  local burst_conc="$3"
-  local slow_conc="$4"
-  local loss_conc="$5"
+  local workers="$2"
+  local streams="$3"
+  local burst_conc="$4"
+  local slow_conc="$5"
+  local loss_conc="$6"
 
   local out_dir="${RUN_DIR}/${profile}"
   mkdir -p "${out_dir}"
 
-  echo "==> Running profile '${profile}' (streams=${streams}, burst=${burst_conc}, slow=${slow_conc}, loss=${loss_conc})"
+  echo "==> Running profile '${profile}' (workers=${workers}, streams=${streams}, burst=${burst_conc}, slow=${slow_conc}, loss=${loss_conc})"
 
   TARGET="${TARGET}" \
   HOST="${HOST}" \
   H3_CLIENT_BIN="${H3_CLIENT_BIN}" \
   OUT_DIR="${out_dir}" \
+  LOAD_WORKERS="${workers}" \
   STREAMS_PER_WORKER="${streams}" \
   BURST_PATH="${BURST_PATH}" \
   BURST_REQUESTS="${BURST_REQUESTS}" \
@@ -94,10 +113,43 @@ run_profile() {
   "${LOAD_SCRIPT}"
 }
 
-run_profile "profile_1_s4_c40_20_30" 4 40 20 30
-run_profile "profile_2_s8_c80_40_60" 8 80 40 60
-run_profile "profile_3_s16_c120_60_90" 16 120 60 90
-run_profile "profile_4_s24_c160_80_120" 24 160 80 120
+declare -a profile_rows=()
+if [[ -n "${MATRIX_PROFILES}" ]]; then
+  IFS=',' read -r -a profile_rows <<<"${MATRIX_PROFILES}"
+else
+  profile_rows=("${DEFAULT_MATRIX_PROFILES[@]}")
+fi
+
+if [[ -n "${MATRIX_PROFILE_SELECT}" ]]; then
+  declare -A selected=()
+  IFS=',' read -r -a selected_names <<<"${MATRIX_PROFILE_SELECT}"
+  for name in "${selected_names[@]}"; do
+    selected["${name}"]=1
+  done
+
+  declare -a filtered_rows=()
+  for row in "${profile_rows[@]}"; do
+    IFS=':' read -r profile_name _ <<<"${row}"
+    if [[ -n "${selected[${profile_name}]:-}" ]]; then
+      filtered_rows+=("${row}")
+    fi
+  done
+  profile_rows=("${filtered_rows[@]}")
+fi
+
+if [[ "${#profile_rows[@]}" -eq 0 ]]; then
+  echo "error: no matrix profiles selected to run" >&2
+  exit 1
+fi
+
+for row in "${profile_rows[@]}"; do
+  IFS=':' read -r profile_name workers streams burst_conc slow_conc loss_conc <<<"${row}"
+  if [[ -z "${profile_name}" || -z "${workers}" || -z "${streams}" || -z "${burst_conc}" || -z "${slow_conc}" || -z "${loss_conc}" ]]; then
+    echo "error: invalid MATRIX_PROFILES entry '${row}'" >&2
+    exit 1
+  fi
+  run_profile "${profile_name}" "${workers}" "${streams}" "${burst_conc}" "${slow_conc}" "${loss_conc}"
+done
 
 summary_tsv="${RUN_DIR}/summary.tsv"
 summary_md="${RUN_DIR}/summary.md"
