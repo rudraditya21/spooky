@@ -6,6 +6,8 @@ HOST="${HOST:-localhost}"
 H3_CLIENT_BIN="${H3_CLIENT_BIN:-./target/release/h3_client}"
 OUT_DIR="${OUT_DIR:-bench/load}"
 STREAMS_PER_WORKER="${STREAMS_PER_WORKER:-8}"
+LOAD_WORKERS="${LOAD_WORKERS:-0}"
+WORKER_SPAWN_INTERVAL_MS="${WORKER_SPAWN_INTERVAL_MS:-0}"
 WARMUP_REQUESTS="${WARMUP_REQUESTS:-200}"
 WARMUP_CONCURRENCY="${WARMUP_CONCURRENCY:-20}"
 WARMUP_PATH="${WARMUP_PATH:-/api}"
@@ -42,6 +44,8 @@ Environment overrides:
   H3_CLIENT_BIN=./target/release/h3_client
   OUT_DIR=bench/load
   STREAMS_PER_WORKER=8
+  LOAD_WORKERS=0
+  WORKER_SPAWN_INTERVAL_MS=0
   WARMUP_REQUESTS=200 WARMUP_CONCURRENCY=20 WARMUP_PATH=/api
   READINESS_TIMEOUT_SEC=20 READINESS_POLL_INTERVAL_SEC=0.5
   BACKEND_READY_URL=http://127.0.0.1:8080/health
@@ -72,6 +76,16 @@ fi
 
 if [[ "${STREAMS_PER_WORKER}" -lt 1 ]]; then
   echo "error: STREAMS_PER_WORKER must be >= 1 (got ${STREAMS_PER_WORKER})" >&2
+  exit 1
+fi
+
+if [[ "${LOAD_WORKERS}" -lt 0 ]]; then
+  echo "error: LOAD_WORKERS must be >= 0 (got ${LOAD_WORKERS})" >&2
+  exit 1
+fi
+
+if [[ "${WORKER_SPAWN_INTERVAL_MS}" -lt 0 ]]; then
+  echo "error: WORKER_SPAWN_INTERVAL_MS must be >= 0 (got ${WORKER_SPAWN_INTERVAL_MS})" >&2
   exit 1
 fi
 
@@ -187,6 +201,13 @@ run_scenario() {
 
   local attempt=0
   while true; do
+    if [[ "${requests}" -le 0 ]]; then
+      printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+        "${name}" "${path}" "${requests}" "${concurrency}" "0" "0" \
+        "0.00" "0" "0" "0" "0" "0" >>"${results_tsv}"
+      return 0
+    fi
+
     local raw
     local lat_ok
     raw="$(mktemp)"
@@ -197,7 +218,19 @@ run_scenario() {
     start_ns="$(now_ns)"
 
     local workers
-    workers="${concurrency}"
+    if [[ "${LOAD_WORKERS}" -gt 0 ]]; then
+      workers="${LOAD_WORKERS}"
+    else
+      if command -v nproc >/dev/null 2>&1; then
+        workers="$(nproc)"
+      else
+        workers=1
+      fi
+    fi
+
+    if [[ "${workers}" -gt "${concurrency}" ]]; then
+      workers="${concurrency}"
+    fi
     if [[ "${workers}" -gt "${requests}" ]]; then
       workers="${requests}"
     fi
@@ -205,9 +238,27 @@ run_scenario() {
       workers=1
     fi
 
+    local target_streams
+    target_streams="${concurrency}"
+    if [[ "${target_streams}" -lt 1 ]]; then
+      target_streams=1
+    fi
+    if [[ "${workers}" -gt "${target_streams}" ]]; then
+      workers="${target_streams}"
+    fi
+
     local batch_base batch_remainder worker_reqs
     batch_base=$((requests / workers))
     batch_remainder=$((requests % workers))
+
+    local stream_base stream_remainder
+    stream_base=$((target_streams / workers))
+    stream_remainder=$((target_streams % workers))
+
+    local spawn_sleep_seconds="0"
+    if [[ "${WORKER_SPAWN_INTERVAL_MS}" -gt 0 ]]; then
+      spawn_sleep_seconds="$(awk -v ms="${WORKER_SPAWN_INTERVAL_MS}" 'BEGIN { printf "%.3f", ms / 1000.0 }')"
+    fi
 
     local tmpdir
     tmpdir="$(mktemp -d)"
@@ -223,7 +274,16 @@ run_scenario() {
       fi
 
       local worker_streams
-      worker_streams="${STREAMS_PER_WORKER}"
+      worker_streams="${stream_base}"
+      if [[ "${i}" -lt "${stream_remainder}" ]]; then
+        worker_streams=$((worker_streams + 1))
+      fi
+      if [[ "${worker_streams}" -lt 1 ]]; then
+        worker_streams=1
+      fi
+      if [[ "${worker_streams}" -gt "${STREAMS_PER_WORKER}" ]]; then
+        worker_streams="${STREAMS_PER_WORKER}"
+      fi
       if [[ "${worker_streams}" -gt "${worker_reqs}" ]]; then
         worker_streams="${worker_reqs}"
       fi
@@ -239,6 +299,10 @@ run_scenario() {
         >"${tmpdir}/worker.${i}.out" \
         2>"${tmpdir}/worker.${i}.err" &
       pids+=("$!")
+
+      if [[ "${WORKER_SPAWN_INTERVAL_MS}" -gt 0 ]]; then
+        sleep "${spawn_sleep_seconds}"
+      fi
     done
 
     local pid
@@ -247,7 +311,14 @@ run_scenario() {
     done
 
     # Aggregate only well-formed "<ok> <latency_ns>" output lines.
-    awk '/^[01] [0-9]+$/ {print $1, $2}' "${tmpdir}"/worker.*.out >"${raw}" || true
+    shopt -s nullglob
+    local worker_out_files=("${tmpdir}"/worker.*.out)
+    shopt -u nullglob
+    if [[ "${#worker_out_files[@]}" -eq 0 ]]; then
+      : >"${raw}"
+    else
+      awk '/^[01] [0-9]+$/ {print $1, $2}' "${worker_out_files[@]}" >"${raw}" || true
+    fi
 
     end_ns="$(now_ns)"
     rm -rf "${tmpdir}"
