@@ -246,6 +246,13 @@ pub fn validate(config: &Config) -> bool {
         return false;
     }
 
+    if config.performance.inflight_acquire_wait_ms > 25 {
+        warn!(
+            "performance.inflight_acquire_wait_ms={} may increase tail latency under sustained load; keep it small (0-25ms) for burst smoothing only",
+            config.performance.inflight_acquire_wait_ms
+        );
+    }
+
     if config.performance.backend_timeout_ms == 0 {
         error!("performance.backend_timeout_ms must be greater than 0");
         return false;

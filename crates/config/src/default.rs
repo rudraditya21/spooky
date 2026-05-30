@@ -119,6 +119,10 @@ pub fn perf_default_per_upstream_inflight_limit() -> usize {
     1024
 }
 
+pub fn perf_default_inflight_acquire_wait_ms() -> u64 {
+    0
+}
+
 pub fn perf_default_backend_timeout_ms() -> u64 {
     2_000
 }

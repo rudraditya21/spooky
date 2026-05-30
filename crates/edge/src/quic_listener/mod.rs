@@ -584,6 +584,8 @@ impl QUICListener {
             Duration::from_millis(config.performance.client_body_idle_timeout_ms);
         let backend_total_request_timeout =
             Duration::from_millis(config.performance.backend_total_request_timeout_ms);
+        let inflight_acquire_wait =
+            Duration::from_millis(config.performance.inflight_acquire_wait_ms);
         let drain_timeout = Duration::from_millis(config.performance.shutdown_drain_timeout_ms);
         let max_active_connections = config.performance.max_active_connections.max(1);
         let max_streams_per_connection =
@@ -625,6 +627,7 @@ impl QUICListener {
             backend_body_total_timeout,
             client_body_idle_timeout,
             backend_total_request_timeout,
+            inflight_acquire_wait,
             max_active_connections,
             max_streams_per_connection,
             max_request_body_bytes,
@@ -1401,6 +1404,7 @@ impl QUICListener {
                 self.request_buffer_global_cap_bytes,
                 self.unknown_length_response_prebuffer_bytes,
                 self.client_body_idle_timeout,
+                self.inflight_acquire_wait,
                 self.config.observability.tracing.enabled,
                 self.config.observability.routing.enabled,
                 self.config.observability.routing.include_reason,
@@ -1627,6 +1631,28 @@ impl QUICListener {
         }
     }
 
+    fn try_acquire_owned_with_micro_wait(
+        semaphore: Arc<Semaphore>,
+        wait_budget: Duration,
+    ) -> Result<(tokio::sync::OwnedSemaphorePermit, bool), tokio::sync::TryAcquireError> {
+        match Arc::clone(&semaphore).try_acquire_owned() {
+            Ok(permit) => return Ok((permit, false)),
+            Err(err) if wait_budget.is_zero() => return Err(err),
+            Err(_) => {}
+        }
+
+        let start = Instant::now();
+        loop {
+            if start.elapsed() >= wait_budget {
+                return Err(tokio::sync::TryAcquireError::NoPermits);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            if let Ok(permit) = Arc::clone(&semaphore).try_acquire_owned() {
+                return Ok((permit, true));
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn handle_h3(
         connection: &mut QuicConnection,
@@ -1647,6 +1673,7 @@ impl QUICListener {
         request_buffer_global_cap_bytes: usize,
         unknown_length_response_prebuffer_bytes: usize,
         client_body_idle_timeout: Duration,
+        inflight_acquire_wait: Duration,
         tracing_enabled: bool,
         routing_transparency_enabled: bool,
         routing_transparency_include_reason: bool,
@@ -1875,37 +1902,51 @@ impl QUICListener {
                                     }
                                 };
 
-                            let global_permit =
-                                match Arc::clone(&global_inflight).try_acquire_owned() {
-                                    Ok(permit) => permit,
-                                    Err(_) => {
-                                        metrics.inc_failure();
-                                        metrics.inc_overload_shed_reason(
-                                            OverloadShedReason::GlobalInflight,
-                                        );
-                                        metrics.record_route(
-                                            &upstream_name,
-                                            request_start.elapsed(),
-                                            RouteOutcome::OverloadShed,
-                                        );
-                                        Self::send_overload_response(
-                                            h3,
-                                            &mut connection.quic,
-                                            stream_id,
-                                            b"overloaded, retry later\n",
-                                            resilience.shed_retry_after_seconds,
-                                        )?;
-                                        resilience
-                                            .adaptive_admission
-                                            .observe(request_start.elapsed(), true);
-                                        continue;
+                            let global_permit = match Self::try_acquire_owned_with_micro_wait(
+                                Arc::clone(&global_inflight),
+                                inflight_acquire_wait,
+                            ) {
+                                Ok((permit, waited)) => {
+                                    if waited {
+                                        metrics.inc_inflight_wait_admit_global();
                                     }
-                                };
+                                    permit
+                                }
+                                Err(_) => {
+                                    metrics.inc_failure();
+                                    metrics
+                                        .inc_overload_shed_reason(OverloadShedReason::GlobalInflight);
+                                    metrics.record_route(
+                                        &upstream_name,
+                                        request_start.elapsed(),
+                                        RouteOutcome::OverloadShed,
+                                    );
+                                    Self::send_overload_response(
+                                        h3,
+                                        &mut connection.quic,
+                                        stream_id,
+                                        b"overloaded, retry later\n",
+                                        resilience.shed_retry_after_seconds,
+                                    )?;
+                                    resilience
+                                        .adaptive_admission
+                                        .observe(request_start.elapsed(), true);
+                                    continue;
+                                }
+                            };
 
                             let upstream_permit =
                                 match upstream_inflight.get(&upstream_name).cloned() {
-                                    Some(semaphore) => match semaphore.try_acquire_owned() {
-                                        Ok(permit) => permit,
+                                    Some(semaphore) => match Self::try_acquire_owned_with_micro_wait(
+                                        semaphore,
+                                        inflight_acquire_wait,
+                                    ) {
+                                        Ok((permit, waited)) => {
+                                            if waited {
+                                                metrics.inc_inflight_wait_admit_upstream();
+                                            }
+                                            permit
+                                        }
                                         Err(_) => {
                                             drop(global_permit);
                                             metrics.inc_failure();

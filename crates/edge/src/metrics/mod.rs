@@ -28,6 +28,8 @@ pub struct Metrics {
     pub overload_shed_route_global_cap: AtomicU64,
     pub overload_shed_global_inflight: AtomicU64,
     pub overload_shed_upstream_inflight: AtomicU64,
+    pub inflight_wait_admit_global: AtomicU64,
+    pub inflight_wait_admit_upstream: AtomicU64,
     pub overload_shed_backend_inflight: AtomicU64,
     pub overload_shed_circuit_open: AtomicU64,
     pub overload_shed_request_buffer: AtomicU64,
@@ -288,6 +290,8 @@ impl Metrics {
             overload_shed_route_global_cap: AtomicU64::new(0),
             overload_shed_global_inflight: AtomicU64::new(0),
             overload_shed_upstream_inflight: AtomicU64::new(0),
+            inflight_wait_admit_global: AtomicU64::new(0),
+            inflight_wait_admit_upstream: AtomicU64::new(0),
             overload_shed_backend_inflight: AtomicU64::new(0),
             overload_shed_circuit_open: AtomicU64::new(0),
             overload_shed_request_buffer: AtomicU64::new(0),
@@ -458,6 +462,16 @@ impl Metrics {
 
     pub fn inc_connection_cap_reject(&self) {
         self.connection_cap_rejects.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_inflight_wait_admit_global(&self) {
+        self.inflight_wait_admit_global
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_inflight_wait_admit_upstream(&self) {
+        self.inflight_wait_admit_upstream
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn inc_hedge_triggered(&self) {

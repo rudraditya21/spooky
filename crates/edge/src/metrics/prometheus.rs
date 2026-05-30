@@ -152,6 +152,19 @@ impl Metrics {
             self.overload_shed_connection_cap.load(Ordering::Relaxed)
         ));
 
+        out.push_str(
+            "# HELP spooky_inflight_wait_admit_total Successful inflight admissions after micro-wait.\n",
+        );
+        out.push_str("# TYPE spooky_inflight_wait_admit_total counter\n");
+        out.push_str(&format!(
+            "spooky_inflight_wait_admit_total{{scope=\"global\"}} {}\n",
+            self.inflight_wait_admit_global.load(Ordering::Relaxed)
+        ));
+        out.push_str(&format!(
+            "spooky_inflight_wait_admit_total{{scope=\"upstream\"}} {}\n",
+            self.inflight_wait_admit_upstream.load(Ordering::Relaxed)
+        ));
+
         out.push_str("# HELP spooky_active_connections Current active QUIC connections.\n");
         out.push_str("# TYPE spooky_active_connections gauge\n");
         out.push_str(&format!(

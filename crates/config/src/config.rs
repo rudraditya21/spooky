@@ -25,6 +25,7 @@ use crate::default::{
     perf_default_h2_pool_max_idle_per_backend, perf_default_max_active_connections,
     perf_default_max_request_body_bytes, perf_default_max_response_body_bytes,
     perf_default_new_connections_burst, perf_default_new_connections_per_sec,
+    perf_default_inflight_acquire_wait_ms,
     perf_default_packet_shard_queue_capacity, perf_default_packet_shard_queue_max_bytes,
     perf_default_packet_shards_per_worker, perf_default_per_backend_inflight_limit,
     perf_default_per_upstream_inflight_limit, perf_default_pin_workers,
@@ -323,6 +324,11 @@ pub struct Performance {
     #[serde(default = "perf_default_per_upstream_inflight_limit")]
     pub per_upstream_inflight_limit: usize,
 
+    /// Optional micro-wait before shedding on global/upstream inflight permit acquisition.
+    /// `0` disables waiting and preserves immediate-shed behavior.
+    #[serde(default = "perf_default_inflight_acquire_wait_ms")]
+    pub inflight_acquire_wait_ms: u64,
+
     #[serde(default = "perf_default_backend_timeout_ms")]
     pub backend_timeout_ms: u64,
 
@@ -430,6 +436,7 @@ impl Default for Performance {
             pin_workers: perf_default_pin_workers(),
             global_inflight_limit: perf_default_global_inflight_limit(),
             per_upstream_inflight_limit: perf_default_per_upstream_inflight_limit(),
+            inflight_acquire_wait_ms: perf_default_inflight_acquire_wait_ms(),
             backend_timeout_ms: perf_default_backend_timeout_ms(),
             backend_connect_timeout_ms: perf_default_backend_connect_timeout_ms(),
             backend_body_idle_timeout_ms: perf_default_backend_body_idle_timeout_ms(),

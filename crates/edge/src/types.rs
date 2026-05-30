@@ -91,6 +91,7 @@ pub struct QUICListener {
     pub backend_body_total_timeout: Duration,
     pub client_body_idle_timeout: Duration,
     pub backend_total_request_timeout: Duration,
+    pub inflight_acquire_wait: Duration,
     pub max_active_connections: usize,
     pub max_streams_per_connection: usize,
     pub max_request_body_bytes: usize,
