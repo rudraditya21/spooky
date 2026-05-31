@@ -49,8 +49,6 @@ nav:
       - Production: deployment/production.md
       - Troubleshooting: troubleshooting/common-issues.md
   - Development:
-      - Benchmarks: benchmarks.md
-      - Load Test Results: benchmarks/load.md
       - Changelog: changelog.md
   - Protocols:
       - HTTP/3: protocols/http3.md
