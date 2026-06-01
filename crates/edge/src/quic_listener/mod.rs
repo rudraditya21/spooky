@@ -29,6 +29,11 @@ use quiche::Config;
 use quiche::h3::NameValue;
 use rand::RngCore;
 use rustls::{RootCertStore, ServerConfig as RustlsServerConfig, server::WebPkiClientVerifier};
+use rustls::{
+    pki_types::{CertificateDer, PrivateKeyDer},
+    server::{ClientHello, ResolvesServerCert, ResolvesServerCertUsingSni},
+    sign::CertifiedKey,
+};
 use serde_json::json;
 use socket2::{Domain, Protocol, Socket, Type};
 use spooky_bridge::h3_to_h2::{ForwardedContext, build_h2_request_for_endpoint};
@@ -86,6 +91,20 @@ use validation::{
     RequestBufferError, extract_header_value, generated_span_id, generated_trace_id,
     parse_traceparent, validate_http_request, validate_request_headers,
 };
+
+#[derive(Debug)]
+struct FallbackServerCertResolver {
+    sni_resolver: ResolvesServerCertUsingSni,
+    fallback: Arc<CertifiedKey>,
+}
+
+impl ResolvesServerCert for FallbackServerCertResolver {
+    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        self.sni_resolver
+            .resolve(client_hello)
+            .or_else(|| Some(Arc::clone(&self.fallback)))
+    }
+}
 
 fn is_hop_header(name: &str) -> bool {
     matches!(
@@ -772,26 +791,63 @@ impl QUICListener {
         Ok(socket.into())
     }
 
+    fn legacy_tls_cert_pair(config: &SpookyConfig) -> Result<Option<(&str, &str)>, ProxyError> {
+        let cert = config.listen.tls.cert.trim();
+        let key = config.listen.tls.key.trim();
+        let has_pair = !cert.is_empty() || !key.is_empty();
+        if !has_pair {
+            return Ok(None);
+        }
+        if cert.is_empty() || key.is_empty() {
+            return Err(ProxyError::Tls(
+                "listen.tls.cert and listen.tls.key must both be set when either is provided"
+                    .to_string(),
+            ));
+        }
+        Ok(Some((cert, key)))
+    }
+
+    fn default_tls_cert_pair(config: &SpookyConfig) -> Result<(&str, &str), ProxyError> {
+        if let Some(pair) = Self::legacy_tls_cert_pair(config)? {
+            return Ok(pair);
+        }
+        let Some(entry) = config.listen.tls.certificates.first() else {
+            return Err(ProxyError::Tls(
+                "listen.tls requires either cert/key or certificates entries".to_string(),
+            ));
+        };
+        let cert = entry.cert.trim();
+        let key = entry.key.trim();
+        if cert.is_empty() || key.is_empty() {
+            return Err(ProxyError::Tls(
+                "listen.tls.certificates entries must include non-empty cert and key".to_string(),
+            ));
+        }
+        Ok((cert, key))
+    }
+
     fn build_quic_config(config: &SpookyConfig) -> Result<Config, ProxyError> {
         let mut quic_config = Config::new(quiche::PROTOCOL_VERSION)
             .map_err(|err| ProxyError::Transport(format!("failed to create QUIC config: {err}")))?;
 
-        match quic_config.load_cert_chain_from_pem_file(&config.listen.tls.cert) {
+        let (default_cert, default_key) = Self::default_tls_cert_pair(config)?;
+
+        match quic_config.load_cert_chain_from_pem_file(default_cert) {
             Ok(_) => debug!("Certificate loaded successfully"),
             Err(e) => {
                 return Err(ProxyError::Tls(format!(
                     "Failed to load certificate '{}': {}",
-                    config.listen.tls.cert, e
+                    default_cert, e
                 )));
             }
         }
 
-        match quic_config.load_priv_key_from_pem_file(&config.listen.tls.key) {
+        match quic_config.load_priv_key_from_pem_file(default_key) {
             Ok(_) => debug!("Private key loaded successfully"),
             Err(e) => {
                 return Err(ProxyError::Tls(format!(
                     "Failed to load key '{}': {}",
-                    config.listen.tls.key, e
+                    default_key, e
                 )));
             }
         }
@@ -3807,57 +3863,86 @@ impl QUICListener {
         Ok(())
     }
 
+    fn load_tls_cert_chain_from_pem_file(
+        path: &str,
+        field_name: &str,
+    ) -> Result<Vec<CertificateDer<'static>>, ProxyError> {
+        use rustls_pemfile::certs;
+        use std::io::BufReader;
+
+        let cert_bytes = std::fs::read(path).map_err(|err| {
+            ProxyError::Tls(format!("failed to read {field_name} '{}': {}", path, err))
+        })?;
+
+        certs(&mut BufReader::new(cert_bytes.as_slice()))
+            .collect::<Result<_, _>>()
+            .map_err(|err| ProxyError::Tls(format!("failed to parse {field_name} PEM: {err}")))
+    }
+
+    fn load_tls_private_key_from_pem_file(
+        path: &str,
+        field_name: &str,
+    ) -> Result<PrivateKeyDer<'static>, ProxyError> {
+        use rustls_pemfile::{pkcs8_private_keys, rsa_private_keys};
+        use std::io::BufReader;
+
+        let key_bytes = std::fs::read(path).map_err(|err| {
+            ProxyError::Tls(format!("failed to read {field_name} '{}': {}", path, err))
+        })?;
+
+        let mut reader = BufReader::new(key_bytes.as_slice());
+        let pkcs8: Vec<PrivateKeyDer<'static>> = pkcs8_private_keys(&mut reader)
+            .map(|r| r.map(PrivateKeyDer::Pkcs8))
+            .collect::<Result<_, _>>()
+            .map_err(|err| ProxyError::Tls(format!("failed to parse {field_name} PEM: {err}")))?;
+        if let Some(key) = pkcs8.into_iter().next() {
+            return Ok(key);
+        }
+
+        let mut reader2 = BufReader::new(key_bytes.as_slice());
+        let rsa: Vec<PrivateKeyDer<'static>> = rsa_private_keys(&mut reader2)
+            .map(|r| r.map(PrivateKeyDer::Pkcs1))
+            .collect::<Result<_, _>>()
+            .map_err(|err| ProxyError::Tls(format!("failed to parse {field_name} PEM: {err}")))?;
+        rsa.into_iter().next().ok_or_else(|| {
+            ProxyError::Tls(format!(
+                "no supported private key found in {field_name} '{}'",
+                path
+            ))
+        })
+    }
+
+    fn load_certified_key(
+        cert_path: &str,
+        key_path: &str,
+        cert_field: &str,
+        key_field: &str,
+    ) -> Result<CertifiedKey, ProxyError> {
+        let certs = Self::load_tls_cert_chain_from_pem_file(cert_path, cert_field)?;
+        let key = Self::load_tls_private_key_from_pem_file(key_path, key_field)?;
+        let signing_key = rustls::crypto::ring::sign::any_supported_type(&key).map_err(|err| {
+            ProxyError::Tls(format!(
+                "failed to parse private key from {} '{}': {}",
+                key_field, key_path, err
+            ))
+        })?;
+        let certified = CertifiedKey::new(certs, signing_key);
+        certified.keys_match().map_err(|err| {
+            ProxyError::Tls(format!(
+                "certificate/key mismatch for {} '{}' and {} '{}': {}",
+                cert_field, cert_path, key_field, key_path, err
+            ))
+        })?;
+        Ok(certified)
+    }
+
     fn build_server_tls_acceptor(
         config: &SpookyConfig,
         enforce_client_auth: bool,
         alpn_protocols: Vec<Vec<u8>>,
     ) -> Result<TlsAcceptor, ProxyError> {
-        use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
+        use rustls_pemfile::certs;
         use std::io::BufReader;
-
-        let cert_bytes = std::fs::read(&config.listen.tls.cert).map_err(|err| {
-            ProxyError::Tls(format!(
-                "failed to read TLS cert '{}': {}",
-                config.listen.tls.cert, err
-            ))
-        })?;
-        let key_bytes = std::fs::read(&config.listen.tls.key).map_err(|err| {
-            ProxyError::Tls(format!(
-                "failed to read TLS key '{}': {}",
-                config.listen.tls.key, err
-            ))
-        })?;
-
-        let server_certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-            certs(&mut BufReader::new(cert_bytes.as_slice()))
-                .collect::<Result<_, _>>()
-                .map_err(|err| ProxyError::Tls(format!("failed to parse TLS cert PEM: {}", err)))?;
-
-        let key = {
-            let mut reader = BufReader::new(key_bytes.as_slice());
-            let pkcs8: Vec<rustls::pki_types::PrivateKeyDer<'static>> =
-                pkcs8_private_keys(&mut reader)
-                    .map(|r| r.map(rustls::pki_types::PrivateKeyDer::Pkcs8))
-                    .collect::<Result<_, _>>()
-                    .map_err(|err| {
-                        ProxyError::Tls(format!("failed to parse PKCS8 key PEM: {}", err))
-                    })?;
-            if let Some(key) = pkcs8.into_iter().next() {
-                key
-            } else {
-                let mut reader2 = BufReader::new(key_bytes.as_slice());
-                let rsa: Vec<rustls::pki_types::PrivateKeyDer<'static>> =
-                    rsa_private_keys(&mut reader2)
-                        .map(|r| r.map(rustls::pki_types::PrivateKeyDer::Pkcs1))
-                        .collect::<Result<_, _>>()
-                        .map_err(|err| {
-                            ProxyError::Tls(format!("failed to parse RSA key PEM: {}", err))
-                        })?;
-                rsa.into_iter().next().ok_or_else(|| {
-                    ProxyError::Tls("no supported private key found in TLS key file".to_string())
-                })?
-            }
-        };
 
         let builder = if enforce_client_auth && config.listen.tls.client_auth.enabled {
             let ca_file = config
@@ -3915,9 +4000,60 @@ impl QUICListener {
             RustlsServerConfig::builder().with_no_client_auth()
         };
 
-        let mut tls_config = builder.with_single_cert(server_certs, key).map_err(|err| {
-            ProxyError::Tls(format!("failed to build rustls ServerConfig: {}", err))
-        })?;
+        let legacy_pair = Self::legacy_tls_cert_pair(config)?;
+        let mut fallback_certified_key = if let Some((cert, key)) = legacy_pair {
+            Some(Self::load_certified_key(
+                cert,
+                key,
+                "listen.tls.cert",
+                "listen.tls.key",
+            )?)
+        } else {
+            None
+        };
+
+        let mut sni_resolver = ResolvesServerCertUsingSni::new();
+        for (idx, entry) in config.listen.tls.certificates.iter().enumerate() {
+            let cert_field = format!("listen.tls.certificates[{idx}].cert");
+            let key_field = format!("listen.tls.certificates[{idx}].key");
+            let certified = Self::load_certified_key(&entry.cert, &entry.key, &cert_field, &key_field)?;
+
+            sni_resolver
+                .add(entry.server_name.as_str(), certified.clone())
+                .map_err(|err| {
+                    ProxyError::Tls(format!(
+                        "failed to add SNI certificate mapping for '{}' in listen.tls.certificates[{idx}]: {}",
+                        entry.server_name, err
+                    ))
+                })?;
+
+            if fallback_certified_key.is_none() {
+                fallback_certified_key = Some(certified);
+            }
+        }
+
+        let Some(fallback) = fallback_certified_key else {
+            return Err(ProxyError::Tls(
+                "listen.tls requires either cert/key or certificates entries".to_string(),
+            ));
+        };
+
+        let mut tls_config = if config.listen.tls.certificates.is_empty() {
+            let certs = fallback.cert.clone();
+            let key = Self::load_tls_private_key_from_pem_file(
+                config.listen.tls.key.as_str(),
+                "listen.tls.key",
+            )?;
+            builder.with_single_cert(certs, key).map_err(|err| {
+                ProxyError::Tls(format!("failed to build rustls ServerConfig: {}", err))
+            })?
+        } else {
+            let resolver = Arc::new(FallbackServerCertResolver {
+                sni_resolver,
+                fallback: Arc::new(fallback),
+            });
+            builder.with_cert_resolver(resolver)
+        };
 
         tls_config.alpn_protocols = alpn_protocols;
 
