@@ -536,6 +536,8 @@ fn prefer_route(
             RoutePreference::KeepCurrent => Some(current),
             RoutePreference::TakeCandidatePathLen
             | RoutePreference::TakeCandidateHostSpecific
+            | RoutePreference::TakeCandidateExactHost
+            | RoutePreference::TakeCandidateWildcardSpecificity
             | RoutePreference::TakeCandidateMethodSpecific
             | RoutePreference::TakeCandidateLexicalOrder => Some(candidate),
         },
