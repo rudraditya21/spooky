@@ -261,9 +261,9 @@ fn validate_request_parts(
         && let (Some(authority_value), Some(host_value)) = (authority.as_deref(), host.as_deref())
     {
         let normalized_authority = normalize_host_for_routing(authority_value)
-            .unwrap_or_else(|| authority_value.to_ascii_lowercase());
+            .unwrap_or_else(|| authority_value.to_ascii_lowercase().into());
         let normalized_host = normalize_host_for_routing(host_value)
-            .unwrap_or_else(|| host_value.to_ascii_lowercase());
+            .unwrap_or_else(|| host_value.to_ascii_lowercase().into());
         if normalized_authority != normalized_host {
             return Err((
                 http::StatusCode::BAD_REQUEST,
