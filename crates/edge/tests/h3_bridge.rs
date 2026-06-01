@@ -102,6 +102,7 @@ fn make_config(port: u32, backend_addr: String, cert: String, key: String) -> Co
             tls: Tls {
                 cert,
                 key,
+                certificates: vec![],
                 client_auth: ClientAuth::default(),
             },
         },

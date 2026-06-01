@@ -112,6 +112,7 @@ fn make_config(
             tls: Tls {
                 cert,
                 key,
+                certificates: vec![],
                 client_auth: ClientAuth::default(),
             },
         },
