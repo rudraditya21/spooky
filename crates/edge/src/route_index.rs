@@ -1138,7 +1138,7 @@ mod tests {
             index
                 .lookup_with_decision("/api/users", Some("x.a.example.com"))
                 .map(|decision| decision.reason),
-            Some(RouteDecisionReason::WildcardSpecificityTieBreak)
+            Some(RouteDecisionReason::HostPathLongerOrEqual)
         );
     }
 
