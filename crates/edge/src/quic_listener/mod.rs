@@ -289,11 +289,28 @@ type LbHeaderLookup<'a> = dyn Fn(&str) -> Option<String> + 'a;
 
 struct BootstrapStreamingBody {
     inner: Incoming,
+    max_bytes: Option<usize>,
+    bytes_seen: usize,
+    capped: bool,
 }
 
 impl BootstrapStreamingBody {
     fn new(inner: Incoming) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            max_bytes: None,
+            bytes_seen: 0,
+            capped: false,
+        }
+    }
+
+    fn with_max_bytes(inner: Incoming, max_bytes: usize) -> Self {
+        Self {
+            inner,
+            max_bytes: Some(max_bytes),
+            bytes_seen: 0,
+            capped: false,
+        }
     }
 }
 
@@ -305,8 +322,23 @@ impl Body for BootstrapStreamingBody {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        if self.capped {
+            return Poll::Ready(None);
+        }
+
         match Pin::new(&mut self.inner).poll_frame(cx) {
-            Poll::Ready(Some(Ok(frame))) => Poll::Ready(Some(Ok(frame))),
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(limit) = self.max_bytes
+                    && let Some(data) = frame.data_ref()
+                {
+                    self.bytes_seen = self.bytes_seen.saturating_add(data.len());
+                    if self.bytes_seen > limit {
+                        self.capped = true;
+                        return Poll::Ready(None);
+                    }
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
             Poll::Ready(Some(Err(_))) => Poll::Ready(None),
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
@@ -4490,10 +4522,12 @@ impl QUICListener {
                                             Response::new(boxed_full(Bytes::new()))
                                         }));
                                 }
-                                let resp_body =
-                                    BootstrapStreamingBody::new(upstream_resp.into_body())
-                                        .map_err(|never| match never {})
-                                        .boxed();
+                                let resp_body = BootstrapStreamingBody::with_max_bytes(
+                                    upstream_resp.into_body(),
+                                    max_response_body_bytes,
+                                )
+                                .map_err(|never| match never {})
+                                .boxed();
 
                                 Ok(resp_builder
                                     .body(resp_body)
