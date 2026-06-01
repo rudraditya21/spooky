@@ -328,13 +328,13 @@ impl Body for BootstrapStreamingBody {
 
         match Pin::new(&mut self.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
-                if let Some(limit) = self.max_bytes {
-                    if let Some(data) = frame.data_ref() {
-                        self.bytes_seen = self.bytes_seen.saturating_add(data.len());
-                        if self.bytes_seen > limit {
-                            self.capped = true;
-                            return Poll::Ready(None);
-                        }
+                if let Some(limit) = self.max_bytes
+                    && let Some(data) = frame.data_ref()
+                {
+                    self.bytes_seen = self.bytes_seen.saturating_add(data.len());
+                    if self.bytes_seen > limit {
+                        self.capped = true;
+                        return Poll::Ready(None);
                     }
                 }
                 Poll::Ready(Some(Ok(frame)))
