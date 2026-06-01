@@ -179,7 +179,9 @@ pub enum ResponseChunk {
         headers: Vec<(Vec<u8>, Vec<u8>)>,
     },
     Data(Bytes),
-    Trailers { headers: Vec<(Vec<u8>, Vec<u8>)> },
+    Trailers {
+        headers: Vec<(Vec<u8>, Vec<u8>)>,
+    },
     End,
     Error(ProxyError),
 }

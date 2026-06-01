@@ -3098,8 +3098,7 @@ impl QUICListener {
                                                 .await;
                                             return;
                                         }
-                                        Ok(Some(Ok(f))) => {
-                                            match f.into_data() {
+                                        Ok(Some(Ok(f))) => match f.into_data() {
                                             Ok(data) => {
                                                 if !data.is_empty() {
                                                     saw_body_progress = true;
@@ -3163,7 +3162,8 @@ impl QUICListener {
                                             }
                                             Err(frame) => {
                                                 if let Ok(trailers) = frame.into_trailers() {
-                                                    let trailer_headers = collect_h3_trailers(&trailers);
+                                                    let trailer_headers =
+                                                        collect_h3_trailers(&trailers);
                                                     if !trailer_headers.is_empty()
                                                         && chunk_tx
                                                             .send(ResponseChunk::Trailers {
@@ -3176,8 +3176,7 @@ impl QUICListener {
                                                     }
                                                 }
                                             }
-                                            }
-                                        }
+                                        },
                                         Ok(Some(Err(_))) => {
                                             let _ = chunk_tx
                                                 .send(ResponseChunk::Error(ProxyError::Transport(
@@ -5429,18 +5428,25 @@ mod tests {
         );
         let collected = collect_h3_trailers(&trailers);
         assert_eq!(collected.len(), 2);
-        assert!(collected
-            .iter()
-            .any(|(k, v)| k.as_slice() == b"grpc-status" && v.as_slice() == b"0"));
-        assert!(collected
-            .iter()
-            .any(|(k, v)| k.as_slice() == b"grpc-message" && v.as_slice() == b"ok"));
+        assert!(
+            collected
+                .iter()
+                .any(|(k, v)| k.as_slice() == b"grpc-status" && v.as_slice() == b"0")
+        );
+        assert!(
+            collected
+                .iter()
+                .any(|(k, v)| k.as_slice() == b"grpc-message" && v.as_slice() == b"ok")
+        );
     }
 
     #[test]
     fn h3_trailer_collection_strips_hop_by_hop_and_content_length() {
         let mut trailers = HeaderMap::new();
-        trailers.insert(http::header::CONTENT_LENGTH, HeaderValue::from_static("123"));
+        trailers.insert(
+            http::header::CONTENT_LENGTH,
+            HeaderValue::from_static("123"),
+        );
         trailers.insert(http::header::TE, HeaderValue::from_static("trailers"));
         trailers.insert(http::header::TRAILER, HeaderValue::from_static("x-next"));
         trailers.insert(
