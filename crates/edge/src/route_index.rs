@@ -819,6 +819,7 @@ mod tests {
                 key: None,
             },
             host_policy: Default::default(),
+        forwarded_headers: Default::default(),
             route: RouteMatch {
                 host: host.map(str::to_string),
                 path_prefix: path_prefix.map(str::to_string),

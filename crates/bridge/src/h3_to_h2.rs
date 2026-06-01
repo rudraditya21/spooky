@@ -10,7 +10,7 @@ use http_body_util::combinators::BoxBody;
 use quiche::h3::NameValue;
 use spooky_config::{
     backend_endpoint::BackendEndpoint,
-    config::{UpstreamHostPolicy, UpstreamHostPolicyMode},
+    config::{ForwardedHeaderPolicy, ForwardedHeaderPolicyMode, UpstreamHostPolicy, UpstreamHostPolicyMode},
 };
 
 pub use spooky_errors::BridgeError;
@@ -21,6 +21,23 @@ pub struct ForwardedContext<'a> {
     pub request_id: u64,
     pub traceparent: Option<&'a str>,
 }
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ForwardedHeaderChains<'a> {
+    pub forwarded: &'a [Vec<u8>],
+    pub x_forwarded_for: &'a [Vec<u8>],
+    pub x_forwarded_proto: &'a [Vec<u8>],
+    pub x_forwarded_host: &'a [Vec<u8>],
+}
+
+#[derive(Debug, Default)]
+pub struct ForwardedHeaderValues {
+    pub forwarded: Option<HeaderValue>,
+    pub x_forwarded_for: Option<HeaderValue>,
+    pub x_forwarded_proto: Option<HeaderValue>,
+    pub x_forwarded_host: Option<HeaderValue>,
+}
+
 
 /// Build an HTTP/2 request with a pre-boxed streaming body.
 /// `content_length` is `Some(n)` only when the full length is known upfront
@@ -58,6 +75,7 @@ pub fn build_h2_request_for_endpoint(
     build_h2_request_for_endpoint_with_host_policy(
         endpoint,
         &UpstreamHostPolicy::default(),
+        &ForwardedHeaderPolicy::default(),
         method,
         path,
         headers,
@@ -71,6 +89,7 @@ pub fn build_h2_request_for_endpoint(
 pub fn build_h2_request_for_endpoint_with_host_policy(
     endpoint: &BackendEndpoint,
     host_policy: &UpstreamHostPolicy,
+    forwarded_policy: &ForwardedHeaderPolicy,
     method: &str,
     path: &str,
     headers: &[quiche::h3::Header],
@@ -83,10 +102,30 @@ pub fn build_h2_request_for_endpoint_with_host_policy(
     let mut builder = Request::builder().method(method.clone());
     let connection_tokens = connection_header_tokens(headers);
     let mut host_from_headers: Option<String> = None;
+    let mut forwarded_from_headers: Vec<Vec<u8>> = Vec::new();
+    let mut x_forwarded_for_from_headers: Vec<Vec<u8>> = Vec::new();
+    let mut x_forwarded_proto_from_headers: Vec<Vec<u8>> = Vec::new();
+    let mut x_forwarded_host_from_headers: Vec<Vec<u8>> = Vec::new();
 
     for header in headers {
         let name = header.name();
         if name.starts_with(b":") {
+            continue;
+        }
+        if name.eq_ignore_ascii_case(b"forwarded") {
+            forwarded_from_headers.push(header.value().to_vec());
+            continue;
+        }
+        if name.eq_ignore_ascii_case(b"x-forwarded-for") {
+            x_forwarded_for_from_headers.push(header.value().to_vec());
+            continue;
+        }
+        if name.eq_ignore_ascii_case(b"x-forwarded-proto") {
+            x_forwarded_proto_from_headers.push(header.value().to_vec());
+            continue;
+        }
+        if name.eq_ignore_ascii_case(b"x-forwarded-host") {
+            x_forwarded_host_from_headers.push(header.value().to_vec());
             continue;
         }
 
@@ -148,29 +187,29 @@ pub fn build_h2_request_for_endpoint_with_host_policy(
         );
     }
 
-    let forwarded_value = format!(
-        "for={};proto=https;host=\"{}\"",
-        forwarded_for_value(forwarded_ctx.client_addr.ip()),
-        escape_forwarded_host(host_value),
-    );
-    builder = builder
-        .header(
-            HeaderName::from_static("forwarded"),
-            HeaderValue::from_str(&forwarded_value).map_err(|_| BridgeError::InvalidHeader)?,
-        )
-        .header(
-            HeaderName::from_static("x-forwarded-for"),
-            HeaderValue::from_str(&forwarded_ctx.client_addr.ip().to_string())
-                .map_err(|_| BridgeError::InvalidHeader)?,
-        )
-        .header(
-            HeaderName::from_static("x-forwarded-proto"),
-            HeaderValue::from_static("https"),
-        )
-        .header(
-            HeaderName::from_static("x-forwarded-host"),
-            HeaderValue::from_str(host_value).map_err(|_| BridgeError::InvalidHeader)?,
-        );
+    let forwarded_values = build_forwarded_header_values(
+        forwarded_policy,
+        ForwardedHeaderChains {
+            forwarded: &forwarded_from_headers,
+            x_forwarded_for: &x_forwarded_for_from_headers,
+            x_forwarded_proto: &x_forwarded_proto_from_headers,
+            x_forwarded_host: &x_forwarded_host_from_headers,
+        },
+        forwarded_ctx.client_addr.ip(),
+        host_value,
+    )?;
+    if let Some(value) = forwarded_values.forwarded {
+        builder = builder.header(HeaderName::from_static("forwarded"), value);
+    }
+    if let Some(value) = forwarded_values.x_forwarded_for {
+        builder = builder.header(HeaderName::from_static("x-forwarded-for"), value);
+    }
+    if let Some(value) = forwarded_values.x_forwarded_proto {
+        builder = builder.header(HeaderName::from_static("x-forwarded-proto"), value);
+    }
+    if let Some(value) = forwarded_values.x_forwarded_host {
+        builder = builder.header(HeaderName::from_static("x-forwarded-host"), value);
+    }
 
     builder.body(body).map_err(BridgeError::Build)
 }
@@ -193,6 +232,84 @@ pub fn resolve_upstream_host_value<'a>(
             .ok_or(BridgeError::InvalidHeader),
         UpstreamHostPolicyMode::Upstream => Ok(endpoint.authority()),
     }
+}
+
+pub fn build_forwarded_header_values(
+    policy: &ForwardedHeaderPolicy,
+    inbound: ForwardedHeaderChains<'_>,
+    client_ip: IpAddr,
+    host_value: &str,
+) -> Result<ForwardedHeaderValues, BridgeError> {
+    let forwarded_current = format!(
+        "for={};proto=https;host=\"{}\"",
+        forwarded_for_value(client_ip),
+        escape_forwarded_host(host_value),
+    );
+    let x_forwarded_for_current = client_ip.to_string();
+    let x_forwarded_proto_current = "https";
+    let x_forwarded_host_current = host_value;
+
+    Ok(ForwardedHeaderValues {
+        forwarded: merge_forwarded_chain(
+            policy.mode,
+            inbound.forwarded,
+            Some(forwarded_current.as_bytes()),
+        )?,
+        x_forwarded_for: merge_forwarded_chain(
+            policy.mode,
+            inbound.x_forwarded_for,
+            Some(x_forwarded_for_current.as_bytes()),
+        )?,
+        x_forwarded_proto: merge_forwarded_chain(
+            policy.mode,
+            inbound.x_forwarded_proto,
+            Some(x_forwarded_proto_current.as_bytes()),
+        )?,
+        x_forwarded_host: merge_forwarded_chain(
+            policy.mode,
+            inbound.x_forwarded_host,
+            Some(x_forwarded_host_current.as_bytes()),
+        )?,
+    })
+}
+
+fn merge_forwarded_chain(
+    mode: ForwardedHeaderPolicyMode,
+    inbound: &[Vec<u8>],
+    current: Option<&[u8]>,
+) -> Result<Option<HeaderValue>, BridgeError> {
+    match mode {
+        ForwardedHeaderPolicyMode::Preserve => join_header_chain(inbound),
+        ForwardedHeaderPolicyMode::Append => {
+            let mut values = inbound.to_vec();
+            if let Some(current) = current {
+                values.push(current.to_vec());
+            }
+            join_header_chain(&values)
+        }
+        ForwardedHeaderPolicyMode::Overwrite => current
+            .map(HeaderValue::from_bytes)
+            .transpose()
+            .map_err(|_| BridgeError::InvalidHeader),
+    }
+}
+
+fn join_header_chain(values: &[Vec<u8>]) -> Result<Option<HeaderValue>, BridgeError> {
+    if values.is_empty() {
+        return Ok(None);
+    }
+
+    let mut joined = Vec::new();
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            joined.extend_from_slice(b", ");
+        }
+        joined.extend_from_slice(value);
+    }
+
+    HeaderValue::from_bytes(&joined)
+        .map(Some)
+        .map_err(|_| BridgeError::InvalidHeader)
 }
 
 fn connection_header_tokens(headers: &[quiche::h3::Header]) -> HashSet<String> {
@@ -262,7 +379,7 @@ mod tests {
     use quiche::h3::Header;
     use spooky_config::{
         backend_endpoint::BackendEndpoint,
-        config::{UpstreamHostPolicy, UpstreamHostPolicyMode},
+        config::{ForwardedHeaderPolicy, ForwardedHeaderPolicyMode, UpstreamHostPolicy, UpstreamHostPolicyMode},
     };
 
     use super::{
@@ -399,6 +516,106 @@ mod tests {
     }
 
     #[test]
+    fn forwarded_header_policy_append_and_preserve_behave_as_expected() {
+        let endpoint = BackendEndpoint::parse("backend.internal:443").expect("endpoint");
+        let headers = vec![
+            Header::new(b"forwarded", b"for=1.2.3.4;proto=http;host=\"old.example\""),
+            Header::new(b"x-forwarded-for", b"1.2.3.4"),
+            Header::new(b"x-forwarded-proto", b"http"),
+            Header::new(b"x-forwarded-host", b"old.example"),
+        ];
+
+        let host_policy = UpstreamHostPolicy::default();
+        let append_policy = ForwardedHeaderPolicy {
+            mode: ForwardedHeaderPolicyMode::Append,
+        };
+        let req = build_h2_request_for_endpoint_with_host_policy(
+            &endpoint,
+            &host_policy,
+            &append_policy,
+            "GET",
+            "/",
+            &headers,
+            Empty::<Bytes>::new().boxed(),
+            None,
+            ForwardedContext {
+                client_addr: "203.0.113.55:43210".parse().expect("client"),
+                request_authority: Some("api.example.com"),
+                request_id: 0,
+                traceparent: None,
+            },
+        )
+        .expect("append request");
+
+        assert_eq!(
+            req.headers().get("forwarded").and_then(|h| h.to_str().ok()),
+            Some("for=1.2.3.4;proto=http;host=\"old.example\", for=203.0.113.55;proto=https;host=\"api.example.com\"")
+        );
+        assert_eq!(
+            req.headers()
+                .get("x-forwarded-for")
+                .and_then(|h| h.to_str().ok()),
+            Some("1.2.3.4, 203.0.113.55")
+        );
+        assert_eq!(
+            req.headers()
+                .get("x-forwarded-proto")
+                .and_then(|h| h.to_str().ok()),
+            Some("http, https")
+        );
+        assert_eq!(
+            req.headers()
+                .get("x-forwarded-host")
+                .and_then(|h| h.to_str().ok()),
+            Some("old.example, api.example.com")
+        );
+
+        let preserve_policy = ForwardedHeaderPolicy {
+            mode: ForwardedHeaderPolicyMode::Preserve,
+        };
+        let req = build_h2_request_for_endpoint_with_host_policy(
+            &endpoint,
+            &host_policy,
+            &preserve_policy,
+            "GET",
+            "/",
+            &headers,
+            Empty::<Bytes>::new().boxed(),
+            None,
+            ForwardedContext {
+                client_addr: "203.0.113.55:43210".parse().expect("client"),
+                request_authority: Some("api.example.com"),
+                request_id: 0,
+                traceparent: None,
+            },
+        )
+        .expect("preserve request");
+
+        assert_eq!(
+            req.headers().get("forwarded").and_then(|h| h.to_str().ok()),
+            Some("for=1.2.3.4;proto=http;host=\"old.example\"")
+        );
+        assert_eq!(
+            req.headers()
+                .get("x-forwarded-for")
+                .and_then(|h| h.to_str().ok()),
+            Some("1.2.3.4")
+        );
+        assert_eq!(
+            req.headers()
+                .get("x-forwarded-proto")
+                .and_then(|h| h.to_str().ok()),
+            Some("http")
+        );
+        assert_eq!(
+            req.headers()
+                .get("x-forwarded-host")
+                .and_then(|h| h.to_str().ok()),
+            Some("old.example")
+        );
+    }
+
+    #[test]
     fn forwarded_header_formats_ipv6_clients() {
         let req = build_h2_request(
             "backend.internal:443",
@@ -432,6 +649,7 @@ mod tests {
         let req = build_h2_request_for_endpoint_with_host_policy(
             &endpoint,
             &policy,
+            &ForwardedHeaderPolicy::default(),
             "GET",
             "/",
             &[],
@@ -468,6 +686,7 @@ mod tests {
         let req = build_h2_request_for_endpoint_with_host_policy(
             &endpoint,
             &policy,
+            &ForwardedHeaderPolicy::default(),
             "GET",
             "/",
             &[],

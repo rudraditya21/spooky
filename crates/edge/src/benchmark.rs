@@ -30,6 +30,7 @@ fn build_benchmark_upstream(host: Option<String>, path_prefix: String) -> Upstre
             key: None,
         },
         host_policy: Default::default(),
+        forwarded_headers: Default::default(),
         route: RouteMatch {
             host,
             path_prefix: Some(path_prefix),

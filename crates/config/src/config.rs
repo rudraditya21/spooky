@@ -201,6 +201,9 @@ pub struct Upstream {
     #[serde(default)]
     pub host_policy: UpstreamHostPolicy,
 
+    #[serde(default)]
+    pub forwarded_headers: ForwardedHeaderPolicy,
+
     pub route: RouteMatch, // Route matching criteria for this upstream
 
     pub backends: Vec<Backend>,
@@ -220,6 +223,24 @@ pub enum UpstreamHostPolicyMode {
     )]
     Upstream,
 }
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ForwardedHeaderPolicyMode {
+    #[default]
+    #[serde(alias = "overwrite")]
+    Overwrite,
+    Append,
+    Preserve,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ForwardedHeaderPolicy {
+    #[serde(default)]
+    pub mode: ForwardedHeaderPolicyMode,
+}
+
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

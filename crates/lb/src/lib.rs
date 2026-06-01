@@ -1025,6 +1025,7 @@ mod tests {
                 key: None,
             },
             host_policy: Default::default(),
+        forwarded_headers: Default::default(),
             route: RouteMatch {
                 path_prefix: Some("/".to_string()),
                 ..Default::default()

@@ -60,6 +60,7 @@ fn make_config(port: u32, cert: String, key: String, backend_address: String) ->
                 key: None,
             },
             host_policy: Default::default(),
+        forwarded_headers: Default::default(),
             route: RouteMatch {
                 path_prefix: Some("/".to_string()),
                 ..Default::default()
@@ -800,6 +801,7 @@ fn make_config_with_rate_limit(
                 key: None,
             },
             host_policy: Default::default(),
+        forwarded_headers: Default::default(),
             route: RouteMatch {
                 path_prefix: Some("/".to_string()),
                 ..Default::default()

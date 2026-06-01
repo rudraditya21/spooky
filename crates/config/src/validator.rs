@@ -1292,6 +1292,7 @@ mod tests {
                     key: None,
                 },
                 host_policy: Default::default(),
+        forwarded_headers: Default::default(),
                 route: RouteMatch {
                     host: None,
                     path_prefix: Some("/".to_string()),
@@ -2022,6 +2023,7 @@ upstream:
                 key: None,
             },
             host_policy: Default::default(),
+        forwarded_headers: Default::default(),
             route: RouteMatch {
                 host: Some("api.example.com".to_string()),
                 path_prefix: Some("/api".to_string()),
@@ -2060,6 +2062,7 @@ upstream:
                 key: None,
             },
             host_policy: Default::default(),
+        forwarded_headers: Default::default(),
             route: RouteMatch {
                 host: Some("api.example.com".to_string()),
                 path_prefix: Some("/api".to_string()),
