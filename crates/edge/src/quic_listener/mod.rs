@@ -3409,7 +3409,13 @@ impl QUICListener {
                             for (name, value) in &headers {
                                 h3_headers.push(quiche::h3::Header::new(name, value));
                             }
-                            match h3.send_additional_headers(quic, stream_id, &h3_headers, false) {
+                            match h3.send_additional_headers(
+                                quic,
+                                stream_id,
+                                &h3_headers,
+                                true,
+                                false,
+                            ) {
                                 Ok(_) => {}
                                 Err(quiche::h3::Error::StreamBlocked) => {
                                     req.pending_chunk = Some(ResponseChunk::Trailers { headers });
