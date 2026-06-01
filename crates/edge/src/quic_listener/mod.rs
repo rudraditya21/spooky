@@ -5073,7 +5073,8 @@ mod tests {
             false,
             vec![b"h2".to_vec()],
         )
-        .expect_err("mismatched SNI cert mapping should fail");
+        .err()
+        .expect("mismatched SNI cert mapping should fail");
         assert!(
             err.to_string()
                 .contains("failed to add SNI certificate mapping"),
