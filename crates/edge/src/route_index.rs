@@ -1123,6 +1123,7 @@ mod tests {
             "narrow".to_string(),
             test_upstream(Some("*.a.example.com"), Some("/api")),
         );
+        upstreams.insert("default".to_string(), test_upstream(None, Some("/")));
         let index = RouteIndex::from_upstreams(&upstreams);
 
         assert_eq!(
