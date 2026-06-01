@@ -169,7 +169,11 @@ fn normalized_route_method(method: Option<&str>) -> Option<String> {
 
 fn normalize_sni_server_name(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
-    if trimmed.is_empty() || trimmed.contains(':') || trimmed.contains('*') {
+    if trimmed.is_empty()
+        || trimmed.contains(':')
+        || trimmed.contains('*')
+        || trimmed.chars().any(char::is_whitespace)
+    {
         return None;
     }
     let without_trailing_dot = trimmed.trim_end_matches('.');
