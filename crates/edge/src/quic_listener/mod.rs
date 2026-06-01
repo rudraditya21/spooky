@@ -209,6 +209,27 @@ fn response_size_exceeded_after_chunk(
     *response_bytes_received > max_response_body_bytes
 }
 
+fn is_connect_method(method: &str) -> bool {
+    method.eq_ignore_ascii_case("CONNECT")
+}
+
+fn is_connect_tunnel_response(method: &str, status: StatusCode) -> bool {
+    is_connect_method(method) && status.is_success()
+}
+
+fn can_poll_upstream_result(req: &RequestEnvelope) -> bool {
+    if is_connect_method(&req.method)
+        && (req.phase == StreamPhase::ReceivingRequest || req.phase == StreamPhase::AwaitingUpstream)
+    {
+        return true;
+    }
+
+    req.phase == StreamPhase::AwaitingUpstream
+        && req.request_fin_received
+        && req.body_tx.is_none()
+        && req.body_buf.is_empty()
+}
+
 fn header_has_token(value: &http::HeaderValue, token: &str) -> bool {
     value
         .to_str()
@@ -2521,7 +2542,8 @@ impl QUICListener {
                                     // Enforce cap on total bytes received for the stream,
                                     // including chunks already forwarded to the H2 body channel.
                                     let next_total = req.body_bytes_received.saturating_add(read);
-                                    if next_total > max_request_body_bytes {
+                                    let request_is_connect = is_connect_method(&req.method);
+                                    if !request_is_connect && next_total > max_request_body_bytes {
                                         payload_too_large = Some((
                                             req.upstream_name
                                                 .clone()
@@ -2814,13 +2836,10 @@ impl QUICListener {
             // Only transition to response handling once request-body ingestion is
             // complete. This preserves request-size enforcement semantics:
             // oversized requests must still be able to terminate with 413 even if
-            // upstream produced an early response.
-            let can_poll_upstream = streams.get(&stream_id).is_some_and(|req| {
-                req.phase == StreamPhase::AwaitingUpstream
-                    && req.request_fin_received
-                    && req.body_tx.is_none()
-                    && req.body_buf.is_empty()
-            });
+            // upstream produced an early response. CONNECT is the exception:
+            // successful CONNECT establishes a tunnel and must not wait for request FIN.
+            let can_poll_upstream =
+                streams.get(&stream_id).is_some_and(can_poll_upstream_result);
 
             // upstream_ready: Option<UpstreamResult>
             //   None          → oneshot not yet resolved (or not eligible), skip
@@ -2885,13 +2904,18 @@ impl QUICListener {
                 }
                 match forward_result.forward {
                     Ok((status, resp_headers, body)) => {
+                        let connect_tunnel = streams
+                            .get(&stream_id)
+                            .is_some_and(|req| is_connect_tunnel_response(&req.method, status));
                         // If upstream advertised a response length beyond our hard cap,
                         // fail fast with 503 before sending any downstream headers/body.
                         let upstream_content_length = resp_headers
                             .get(http::header::CONTENT_LENGTH)
                             .and_then(|v| v.to_str().ok())
                             .and_then(|v| v.parse::<usize>().ok());
-                        if upstream_content_length.is_some_and(|len| len > max_response_body_bytes)
+                        if !connect_tunnel
+                            && upstream_content_length
+                                .is_some_and(|len| len > max_response_body_bytes)
                         {
                             if let Some(req) = streams.get(&stream_id) {
                                 metrics.inc_failure();
@@ -2946,10 +2970,12 @@ impl QUICListener {
                             format!("h3=\":{}\"; ma=86400", listen_port).into_bytes(),
                         ));
 
-                        let defer_headers_until_body_validated = upstream_content_length.is_none();
-                        let immediate_end = upstream_content_length == Some(0)
-                            || status == http::StatusCode::NO_CONTENT
-                            || status == http::StatusCode::NOT_MODIFIED;
+                        let defer_headers_until_body_validated =
+                            upstream_content_length.is_none() && !connect_tunnel;
+                        let immediate_end = !connect_tunnel
+                            && (upstream_content_length == Some(0)
+                                || status == http::StatusCode::NO_CONTENT
+                                || status == http::StatusCode::NOT_MODIFIED);
                         let mut immediate_terminal = false;
 
                         if !defer_headers_until_body_validated {
@@ -3066,6 +3092,7 @@ impl QUICListener {
                                 tokio::time::Instant::now() + backend_body_total_timeout;
                             let deferred_status = status;
                             let deferred_headers = owned_h3_headers.clone();
+                            let tunnel_mode = connect_tunnel;
                             let fut = async move {
                                 use http_body_util::BodyExt;
                                 let mut body: hyper::body::Incoming = body;
@@ -3103,11 +3130,13 @@ impl QUICListener {
                                                 if !data.is_empty() {
                                                     saw_body_progress = true;
                                                 }
-                                                if response_size_exceeded_after_chunk(
-                                                    &mut response_bytes_received,
-                                                    data.len(),
-                                                    max_response_body_bytes,
-                                                ) {
+                                                if !tunnel_mode
+                                                    && response_size_exceeded_after_chunk(
+                                                        &mut response_bytes_received,
+                                                        data.len(),
+                                                        max_response_body_bytes,
+                                                    )
+                                                {
                                                     let _ = chunk_tx
                                                         .send(ResponseChunk::Error(ProxyError::Pool(
                                                             PoolError::BackendOverloaded(
@@ -4974,7 +5003,8 @@ mod tests {
 
     use super::{
         ConnectionRoutes, TokenBucket, abort_stream, classify_active_health_check_response,
-        collect_h3_trailers, connection_header_tokens, purge_connection_routes,
+        can_poll_upstream_result, collect_h3_trailers, connection_header_tokens,
+        is_connect_tunnel_response, purge_connection_routes,
         resolve_primary_from_radix_prefix, response_size_exceeded_after_chunk,
         should_strip_bootstrap_request_header, should_strip_bootstrap_response_header,
         should_strip_h3_response_header, sweep_closed_connections,
@@ -5546,6 +5576,37 @@ mod tests {
         assert_eq!(received, 10);
         assert!(response_size_exceeded_after_chunk(&mut received, 1, 10));
         assert_eq!(received, 11);
+    }
+
+    #[test]
+    fn connect_tunnel_response_detected_only_for_success_status() {
+        assert!(is_connect_tunnel_response("CONNECT", StatusCode::OK));
+        assert!(is_connect_tunnel_response("connect", StatusCode::NO_CONTENT));
+        assert!(!is_connect_tunnel_response("CONNECT", StatusCode::BAD_GATEWAY));
+        assert!(!is_connect_tunnel_response("GET", StatusCode::OK));
+    }
+
+    #[test]
+    fn connect_can_poll_upstream_before_request_fin() {
+        let (_tx, rx) = oneshot::channel::<crate::UpstreamResult>();
+        let mut req = make_envelope(StreamPhase::ReceivingRequest);
+        req.method = "CONNECT".to_string();
+        req.request_fin_received = false;
+        req.upstream_result_rx = Some(rx);
+        assert!(can_poll_upstream_result(&req));
+    }
+
+    #[test]
+    fn non_connect_requires_request_completion_before_upstream_poll() {
+        let (_tx, rx) = oneshot::channel::<crate::UpstreamResult>();
+        let mut req = make_envelope(StreamPhase::AwaitingUpstream);
+        req.method = "GET".to_string();
+        req.request_fin_received = false;
+        req.upstream_result_rx = Some(rx);
+        assert!(!can_poll_upstream_result(&req));
+
+        req.request_fin_received = true;
+        assert!(can_poll_upstream_result(&req));
     }
 
     #[test]
