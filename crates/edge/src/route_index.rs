@@ -1063,6 +1063,128 @@ mod tests {
         }
     }
 
+    #[test]
+    fn wildcard_host_route_matches_subdomains() {
+        let mut upstreams = HashMap::new();
+        upstreams.insert(
+            "wildcard".to_string(),
+            test_upstream(Some("*.example.com"), Some("/api")),
+        );
+        upstreams.insert("default".to_string(), test_upstream(None, Some("/")));
+        let index = RouteIndex::from_upstreams(&upstreams);
+
+        assert_eq!(
+            index.lookup("/api/users", Some("tenant.example.com")),
+            Some("wildcard")
+        );
+        assert_eq!(
+            scan_lookup(&upstreams, "/api/users", Some("tenant.example.com")),
+            Some("wildcard")
+        );
+        assert_eq!(
+            index.lookup("/api/users", Some("example.com")),
+            Some("default")
+        );
+    }
+
+    #[test]
+    fn exact_host_route_beats_wildcard_on_tie() {
+        let mut upstreams = HashMap::new();
+        upstreams.insert(
+            "wildcard".to_string(),
+            test_upstream(Some("*.example.com"), Some("/api")),
+        );
+        upstreams.insert(
+            "exact".to_string(),
+            test_upstream(Some("api.example.com"), Some("/api")),
+        );
+        let index = RouteIndex::from_upstreams(&upstreams);
+
+        assert_eq!(
+            index.lookup("/api/users", Some("api.example.com")),
+            Some("exact")
+        );
+        assert_eq!(
+            scan_lookup(&upstreams, "/api/users", Some("api.example.com")),
+            Some("exact")
+        );
+    }
+
+    #[test]
+    fn more_specific_wildcard_beats_less_specific_wildcard() {
+        let mut upstreams = HashMap::new();
+        upstreams.insert(
+            "wide".to_string(),
+            test_upstream(Some("*.example.com"), Some("/api")),
+        );
+        upstreams.insert(
+            "narrow".to_string(),
+            test_upstream(Some("*.a.example.com"), Some("/api")),
+        );
+        let index = RouteIndex::from_upstreams(&upstreams);
+
+        assert_eq!(
+            index.lookup("/api/users", Some("x.a.example.com")),
+            Some("narrow")
+        );
+        assert_eq!(
+            scan_lookup(&upstreams, "/api/users", Some("x.a.example.com")),
+            Some("narrow")
+        );
+        assert_eq!(
+            index
+                .lookup_with_decision("/api/users", Some("x.a.example.com"))
+                .map(|decision| decision.reason),
+            Some(RouteDecisionReason::WildcardSpecificityTieBreak)
+        );
+    }
+
+    #[test]
+    fn wildcard_keeps_method_and_path_precedence() {
+        let mut upstreams = HashMap::new();
+        upstreams.insert(
+            "wildcard-post".to_string(),
+            test_upstream_with_method(Some("*.example.com"), Some("/api"), Some("POST")),
+        );
+        upstreams.insert(
+            "wildcard-all".to_string(),
+            test_upstream_with_method(Some("*.example.com"), Some("/api"), None),
+        );
+        upstreams.insert(
+            "wildcard-deep".to_string(),
+            test_upstream(Some("*.example.com"), Some("/api/v2")),
+        );
+        let index = RouteIndex::from_upstreams(&upstreams);
+
+        assert_eq!(
+            index.lookup_for_method("/api/items", Some("tenant.example.com"), Some("POST")),
+            Some("wildcard-post")
+        );
+        assert_eq!(
+            scan_lookup_for_method(
+                &upstreams,
+                "/api/items",
+                Some("tenant.example.com"),
+                Some("POST")
+            ),
+            Some("wildcard-post")
+        );
+
+        assert_eq!(
+            index.lookup_for_method("/api/v2/items", Some("tenant.example.com"), Some("GET")),
+            Some("wildcard-deep")
+        );
+        assert_eq!(
+            scan_lookup_for_method(
+                &upstreams,
+                "/api/v2/items",
+                Some("tenant.example.com"),
+                Some("GET")
+            ),
+            Some("wildcard-deep")
+        );
+    }
+
     fn build_route_table(route_count: usize) -> HashMap<String, Upstream> {
         let mut upstreams = HashMap::with_capacity(route_count);
         for i in 0..route_count {
