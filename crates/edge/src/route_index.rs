@@ -107,6 +107,8 @@ pub(crate) enum RouteDecisionReason {
     HostPathLongerOrEqual,
     DefaultPathLonger,
     HostSpecificTieBreak,
+    ExactHostTieBreak,
+    WildcardSpecificityTieBreak,
     MethodSpecificTieBreak,
     LexicalTieBreak,
 }
@@ -387,28 +389,32 @@ impl RouteIndex {
         host: Option<&str>,
         method: Option<&str>,
     ) -> Option<RouteDecision<'a>> {
-        let host_best = host.and_then(|raw_host| {
-            let parsed_host = parsed_host_for_routing(raw_host)?;
-            let host_trie = if host_has_uppercase_ascii(parsed_host) {
-                let normalized = parsed_host.to_ascii_lowercase();
-                self.host_tries.get(normalized.as_str())
-            } else {
-                self.host_tries.get(parsed_host)
-            }?;
-            host_trie.longest_prefix(path, method, &self.upstream_methods)
-        });
+        let host_best = host
+            .and_then(normalize_host_for_routing)
+            .and_then(|normalized_host| self.lookup_host_candidate(path, normalized_host, method));
 
         let default_best = self
             .default_trie
-            .longest_prefix(path, method, &self.upstream_methods);
+            .longest_prefix(path, method, &self.upstream_methods)
+            .map(|route| RouteCandidate {
+                route,
+                host_match_kind: HostMatchKind::Default,
+                wildcard_suffix_len: 0,
+            });
         if let Some(best) = host_best
-            && best.path_len >= self.default_max_path_len
+            && best.route.path_len >= self.default_max_path_len
         {
             let reason = match default_best {
                 None => RouteDecisionReason::HostTrieNoDefault,
-                Some(default_route) => match compare_route(default_route, best) {
+                Some(default_route) => match compare_route_candidate(default_route, best) {
                     RoutePreference::TakeCandidateHostSpecific => {
                         RouteDecisionReason::HostSpecificTieBreak
+                    }
+                    RoutePreference::TakeCandidateExactHost => {
+                        RouteDecisionReason::ExactHostTieBreak
+                    }
+                    RoutePreference::TakeCandidateWildcardSpecificity => {
+                        RouteDecisionReason::WildcardSpecificityTieBreak
                     }
                     RoutePreference::TakeCandidateMethodSpecific => {
                         RouteDecisionReason::MethodSpecificTieBreak
@@ -420,33 +426,39 @@ impl RouteIndex {
                 },
             };
             return Some(RouteDecision {
-                upstream: self.upstream_names[best.upstream_idx].as_str(),
-                matched_path_len: best.path_len,
-                host_specific: best.host_specific,
+                upstream: self.upstream_names[best.route.upstream_idx].as_str(),
+                matched_path_len: best.route.path_len,
+                host_specific: best.route.host_specific,
                 reason,
             });
         }
 
         match (default_best, host_best) {
             (Some(default_route), None) => Some(RouteDecision {
-                upstream: self.upstream_names[default_route.upstream_idx].as_str(),
-                matched_path_len: default_route.path_len,
-                host_specific: default_route.host_specific,
+                upstream: self.upstream_names[default_route.route.upstream_idx].as_str(),
+                matched_path_len: default_route.route.path_len,
+                host_specific: default_route.route.host_specific,
                 reason: RouteDecisionReason::DefaultPathLonger,
             }),
             (None, Some(host_route)) => Some(RouteDecision {
-                upstream: self.upstream_names[host_route.upstream_idx].as_str(),
-                matched_path_len: host_route.path_len,
-                host_specific: host_route.host_specific,
+                upstream: self.upstream_names[host_route.route.upstream_idx].as_str(),
+                matched_path_len: host_route.route.path_len,
+                host_specific: host_route.route.host_specific,
                 reason: RouteDecisionReason::HostTrieNoDefault,
             }),
             (Some(current), Some(candidate)) => {
-                let reason = match compare_route(current, candidate) {
+                let reason = match compare_route_candidate(current, candidate) {
                     RoutePreference::TakeCandidatePathLen => {
                         RouteDecisionReason::HostPathLongerOrEqual
                     }
                     RoutePreference::TakeCandidateHostSpecific => {
                         RouteDecisionReason::HostSpecificTieBreak
+                    }
+                    RoutePreference::TakeCandidateExactHost => {
+                        RouteDecisionReason::ExactHostTieBreak
+                    }
+                    RoutePreference::TakeCandidateWildcardSpecificity => {
+                        RouteDecisionReason::WildcardSpecificityTieBreak
                     }
                     RoutePreference::TakeCandidateMethodSpecific => {
                         RouteDecisionReason::MethodSpecificTieBreak
@@ -456,14 +468,14 @@ impl RouteIndex {
                     }
                     RoutePreference::KeepCurrent => RouteDecisionReason::DefaultPathLonger,
                 };
-                let selected = match compare_route(current, candidate) {
+                let selected = match compare_route_candidate(current, candidate) {
                     RoutePreference::KeepCurrent => current,
                     _ => candidate,
                 };
                 Some(RouteDecision {
-                    upstream: self.upstream_names[selected.upstream_idx].as_str(),
-                    matched_path_len: selected.path_len,
-                    host_specific: selected.host_specific,
+                    upstream: self.upstream_names[selected.route.upstream_idx].as_str(),
+                    matched_path_len: selected.route.path_len,
+                    host_specific: selected.route.host_specific,
                     reason,
                 })
             }
@@ -627,8 +639,8 @@ pub(crate) fn scan_lookup_for_method<'a>(
     method: Option<&str>,
 ) -> Option<&'a str> {
     let path_bytes = path.as_bytes();
-    let normalized_request_host = host.and_then(parsed_host_for_routing);
-    let mut best_match: Option<(&str, usize, bool, bool)> = None;
+    let normalized_request_host = host.and_then(normalize_host_for_routing);
+    let mut best_match: Option<(&str, usize, bool, HostMatchKind, usize, bool)> = None;
 
     for (upstream_name, upstream) in upstreams {
         let has_method_match = match (
@@ -645,18 +657,29 @@ pub(crate) fn scan_lookup_for_method<'a>(
             continue;
         }
 
-        let has_host_match = match (&upstream.route.host, normalized_request_host) {
-            (Some(route_host), Some(request_host)) => {
-                if route_host == request_host {
-                    true
-                } else {
-                    parsed_host_for_routing(route_host)
-                        .is_some_and(|route_host| route_host.eq_ignore_ascii_case(request_host))
+        let (has_host_match, host_match_kind, wildcard_suffix_len) =
+            match (&upstream.route.host, normalized_request_host.as_deref()) {
+                (None, _) => (true, HostMatchKind::Default, 0usize),
+                (Some(_), None) => (false, HostMatchKind::Default, 0usize),
+                (Some(route_host), Some(request_host)) => {
+                    match parse_configured_host_pattern(route_host) {
+                        Some(ConfiguredHostPattern::Exact(route_host_exact)) => (
+                            route_host_exact.eq_ignore_ascii_case(request_host),
+                            HostMatchKind::Exact,
+                            0,
+                        ),
+                        Some(ConfiguredHostPattern::WildcardSuffix(suffix)) => (
+                            request_host.len() > suffix.len() + 1
+                                && request_host.ends_with(&suffix)
+                                && request_host.as_bytes()[request_host.len() - suffix.len() - 1]
+                                    == b'.',
+                            HostMatchKind::Wildcard,
+                            suffix.len(),
+                        ),
+                        None => (false, HostMatchKind::Default, 0usize),
+                    }
                 }
-            }
-            (None, _) => true,
-            (Some(_), None) => false,
-        };
+            };
 
         let path_match_len = match &upstream.route.path_prefix {
             Some(path_prefix) => {
@@ -692,15 +715,32 @@ pub(crate) fn scan_lookup_for_method<'a>(
             .is_some_and(|value| !value.trim().is_empty());
 
         match best_match {
-            Some((best_name, best_len, best_host_specific, best_method_specific)) => {
+            Some((
+                best_name,
+                best_len,
+                best_host_specific,
+                best_host_match_kind,
+                best_wildcard_suffix_len,
+                best_method_specific,
+            )) => {
                 if path_match_len > best_len
                     || (path_match_len == best_len && host_specific && !best_host_specific)
                     || (path_match_len == best_len
                         && host_specific == best_host_specific
+                        && host_match_kind > best_host_match_kind)
+                    || (path_match_len == best_len
+                        && host_specific == best_host_specific
+                        && host_match_kind == HostMatchKind::Wildcard
+                        && best_host_match_kind == HostMatchKind::Wildcard
+                        && wildcard_suffix_len > best_wildcard_suffix_len)
+                    || (path_match_len == best_len
+                        && host_specific == best_host_specific
+                        && host_match_kind == best_host_match_kind
                         && method_specific
                         && !best_method_specific)
                     || (path_match_len == best_len
                         && host_specific == best_host_specific
+                        && host_match_kind == best_host_match_kind
                         && method_specific == best_method_specific
                         && upstream_name.as_str() < best_name)
                 {
@@ -708,6 +748,8 @@ pub(crate) fn scan_lookup_for_method<'a>(
                         upstream_name.as_str(),
                         path_match_len,
                         host_specific,
+                        host_match_kind,
+                        wildcard_suffix_len,
                         method_specific,
                     ));
                 }
@@ -717,13 +759,15 @@ pub(crate) fn scan_lookup_for_method<'a>(
                     upstream_name.as_str(),
                     path_match_len,
                     host_specific,
+                    host_match_kind,
+                    wildcard_suffix_len,
                     method_specific,
                 ));
             }
         }
     }
 
-    best_match.map(|(name, _, _, _)| name)
+    best_match.map(|(name, _, _, _, _, _)| name)
 }
 
 #[cfg(test)]
