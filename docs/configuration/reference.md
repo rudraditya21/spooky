@@ -215,17 +215,24 @@ Route matching determines which upstream pool handles a request. Routes are eval
 
 | Property | Type | Required | Default | Description |
 |----------|------|----------|---------|-------------|
-| `host` | string | No | - | Host header to match (e.g., `api.example.com`) |
+| `host` | string | No | - | Host matcher. Supports exact hosts (`api.example.com`) and leading-wildcard suffix patterns (`*.example.com`) |
 | `path_prefix` | string | No | - | Path prefix to match (e.g., `/api`) |
 | `method` | string | No | - | HTTP method to match (case-insensitive, e.g. `GET`, `POST`) |
 
 Route matching rules:
 
-1. If `host` is specified, the request Host header must match exactly
+1. If `host` is specified:
+   - Exact form: request Host must match exactly (case-insensitive after normalization)
+   - Wildcard form: `*.example.com` matches subdomains like `api.example.com`, but not the bare apex `example.com`
 2. If `path_prefix` is specified, the request path must start with the prefix
 3. If both are specified, both conditions must match
 4. Routes are evaluated by longest-prefix matching - the route with the most specific (longest) path prefix is selected
-5. For equal-length prefixes, ties are deterministic: host-specific routes win over host-agnostic routes, then lexicographically smaller upstream name wins
+5. For equal-length prefixes, ties are deterministic:
+   - host-specific routes win over host-agnostic routes
+   - exact-host matches win over wildcard-host matches
+   - among wildcard matches, longer suffixes win (`*.a.example.com` beats `*.example.com`)
+   - method-specific routes win over method-agnostic routes
+   - then lexicographically smaller upstream name wins
 
 #### Route Examples
 
@@ -240,6 +247,14 @@ upstream:
   web_pool:
     route:
       host: "www.example.com"
+    backends: [...]
+
+# Wildcard host routing
+upstream:
+  tenant_pool:
+    route:
+      host: "*.example.com"
+      path_prefix: "/api"
     backends: [...]
 
 # Path-based routing
