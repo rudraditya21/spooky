@@ -167,6 +167,26 @@ fn normalized_route_method(method: Option<&str>) -> Option<String> {
         .map(|value| value.to_ascii_uppercase())
 }
 
+fn normalize_sni_server_name(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.contains(':')
+        || trimmed.contains('*')
+        || trimmed.chars().any(char::is_whitespace)
+    {
+        return None;
+    }
+    let without_trailing_dot = trimmed.trim_end_matches('.');
+    if without_trailing_dot.is_empty() {
+        return None;
+    }
+    let ascii = idna::domain_to_ascii(without_trailing_dot).ok()?;
+    if ascii.parse::<IpAddr>().is_ok() {
+        return None;
+    }
+    Some(ascii.to_ascii_lowercase())
+}
+
 type RouteMatcherKey = (Option<String>, Option<String>, Option<String>);
 
 pub fn validate(config: &Config) -> bool {
@@ -826,12 +846,68 @@ pub fn validate(config: &Config) -> bool {
     }
 
     // --- Validate TLS certs ---
-    if !validate_pem_certificates(&config.listen.tls.cert, "listen.tls.cert") {
+    let legacy_cert = config.listen.tls.cert.trim();
+    let legacy_key = config.listen.tls.key.trim();
+    let has_legacy_cert_pair = !legacy_cert.is_empty() || !legacy_key.is_empty();
+    let has_sni_certificates = !config.listen.tls.certificates.is_empty();
+
+    if !has_legacy_cert_pair && !has_sni_certificates {
+        error!("listen.tls requires either cert/key or certificates entries");
         return false;
     }
 
-    if !validate_pem_private_key(&config.listen.tls.key, "listen.tls.key") {
-        return false;
+    if has_legacy_cert_pair {
+        if legacy_cert.is_empty() || legacy_key.is_empty() {
+            error!("listen.tls.cert and listen.tls.key must both be set when either is provided");
+            return false;
+        }
+        if !validate_pem_certificates(legacy_cert, "listen.tls.cert") {
+            return false;
+        }
+        if !validate_pem_private_key(legacy_key, "listen.tls.key") {
+            return false;
+        }
+    }
+
+    let mut seen_sni_names: HashMap<String, usize> = HashMap::new();
+    for (idx, entry) in config.listen.tls.certificates.iter().enumerate() {
+        let field_prefix = format!("listen.tls.certificates[{idx}]");
+        let sni_name = match normalize_sni_server_name(&entry.server_name) {
+            Some(sni) => sni,
+            None => {
+                error!(
+                    "{field_prefix}.server_name '{}' is not a valid DNS hostname",
+                    entry.server_name
+                );
+                return false;
+            }
+        };
+
+        if let Some(first_idx) = seen_sni_names.insert(sni_name.clone(), idx) {
+            error!(
+                "{field_prefix}.server_name '{}' duplicates listen.tls.certificates[{}].server_name",
+                entry.server_name, first_idx
+            );
+            return false;
+        }
+
+        let cert = entry.cert.trim();
+        if cert.is_empty() {
+            error!("{field_prefix}.cert cannot be empty");
+            return false;
+        }
+        if !validate_pem_certificates(cert, &format!("{field_prefix}.cert")) {
+            return false;
+        }
+
+        let key = entry.key.trim();
+        if key.is_empty() {
+            error!("{field_prefix}.key cannot be empty");
+            return false;
+        }
+        if !validate_pem_private_key(key, &format!("{field_prefix}.key")) {
+            return false;
+        }
     }
 
     // --- Validate optional downstream client-auth (mTLS) ---
@@ -1082,7 +1158,7 @@ mod tests {
     use crate::config::{
         Backend, ClientAuth, Config, ControlApi, HealthCheck, Listen, LoadBalancing, Log,
         LogFormat, MetricsEndpoint, Observability, Performance, Resilience, RouteMatch, Security,
-        Tls, Tracing, Upstream, UpstreamTls,
+        Tls, TlsCertificate, Tracing, Upstream, UpstreamTls,
     };
     use rcgen::{Certificate, CertificateParams, SanType};
     use std::collections::HashMap;
@@ -1144,6 +1220,7 @@ mod tests {
                 tls: Tls {
                     cert: cert.to_string(),
                     key: key.to_string(),
+                    certificates: vec![],
                     client_auth: ClientAuth::default(),
                 },
             },
@@ -1548,6 +1625,60 @@ upstream:
         std::fs::write(&key, "not-a-pem-key").expect("write key");
 
         let cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        assert!(!validate(&cfg));
+    }
+
+    #[test]
+    fn accepts_sni_certificates_without_legacy_cert_pair() {
+        let dir = tempdir().expect("tempdir");
+        let (cert, key) = write_test_certs(dir.path());
+
+        let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        cfg.listen.tls.cert = String::new();
+        cfg.listen.tls.key = String::new();
+        cfg.listen.tls.certificates = vec![TlsCertificate {
+            server_name: "api.example.com".to_string(),
+            cert: cert.to_string_lossy().to_string(),
+            key: key.to_string_lossy().to_string(),
+        }];
+
+        assert!(validate(&cfg));
+    }
+
+    #[test]
+    fn rejects_duplicate_sni_certificate_server_names() {
+        let dir = tempdir().expect("tempdir");
+        let (cert, key) = write_test_certs(dir.path());
+
+        let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        cfg.listen.tls.certificates = vec![
+            TlsCertificate {
+                server_name: "api.example.com".to_string(),
+                cert: cert.to_string_lossy().to_string(),
+                key: key.to_string_lossy().to_string(),
+            },
+            TlsCertificate {
+                server_name: "API.EXAMPLE.COM".to_string(),
+                cert: cert.to_string_lossy().to_string(),
+                key: key.to_string_lossy().to_string(),
+            },
+        ];
+
+        assert!(!validate(&cfg));
+    }
+
+    #[test]
+    fn rejects_invalid_sni_certificate_server_name() {
+        let dir = tempdir().expect("tempdir");
+        let (cert, key) = write_test_certs(dir.path());
+
+        let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        cfg.listen.tls.certificates = vec![TlsCertificate {
+            server_name: "not a hostname".to_string(),
+            cert: cert.to_string_lossy().to_string(),
+            key: key.to_string_lossy().to_string(),
+        }];
+
         assert!(!validate(&cfg));
     }
 

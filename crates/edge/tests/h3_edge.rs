@@ -88,6 +88,7 @@ fn make_config(port: u32, cert: String, key: String, backend_address: String) ->
             tls: Tls {
                 cert,
                 key,
+                certificates: vec![],
                 client_auth: ClientAuth::default(),
             },
         },
@@ -826,6 +827,7 @@ fn make_config_with_rate_limit(
             tls: Tls {
                 cert,
                 key,
+                certificates: vec![],
                 client_auth: ClientAuth::default(),
             },
         },

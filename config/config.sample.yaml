@@ -5,8 +5,15 @@ listen:
     address: "0.0.0.0"
     port: 9889
     tls:
-        cert: certs/proxy-fullchain.pem # path to cert
-        key: certs/proxy-key-pkcs8.pem # path to key
+        cert: certs/proxy-fullchain.pem # default/fallback cert (used when SNI is absent or unmatched)
+        key: certs/proxy-key-pkcs8.pem # default/fallback key
+        certificates:                  # optional SNI certificate mappings
+            - server_name: "api.example.com"
+              cert: certs/api-fullchain.pem
+              key: certs/api-key-pkcs8.pem
+            - server_name: "www.example.com"
+              cert: certs/www-fullchain.pem
+              key: certs/www-key-pkcs8.pem
         client_auth:
             enabled: false              # set true to request/verify client certificates (mTLS)
             require_client_cert: false  # when true, close connections that complete handshake without a client cert

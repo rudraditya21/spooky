@@ -112,8 +112,9 @@ The following table lists all default configuration values used when properties 
 | `listen.protocol` | `"http3"` | Native ingress protocol (HTTP/3 over QUIC); TLS bootstrap ingress for HTTP/1.1/2 compatibility is also active |
 | `listen.port` | `9889` | Listening port |
 | `listen.address` | `"0.0.0.0"` | Listening address |
-| `listen.tls.cert` | Required | TLS certificate file path |
-| `listen.tls.key` | Required | TLS private key file path |
+| `listen.tls.cert` | optional | Legacy/default TLS certificate file path |
+| `listen.tls.key` | optional | Legacy/default TLS private key file path |
+| `listen.tls.certificates` | `[]` | Optional SNI certificate mappings (`server_name` + `cert` + `key`) |
 | `upstream[].route.path_prefix` | none | Path prefix for routing (set explicitly; use `/` for catch-all) |
 | `upstream[].backends[].weight` | `100` | Backend weight for load balancing |
 | `upstream[].backends[].health_check.path` | `"/health"` | Health check endpoint |
@@ -160,8 +161,18 @@ Spooky also exposes a TLS bootstrap ingress for HTTP/1.1 and HTTP/2 clients. Thi
 
 | Property | Type | Required | Description |
 |----------|------|----------|-------------|
-| `cert` | string | Yes | Path to TLS certificate file (PEM format) |
-| `key` | string | Yes | Path to TLS private key file (PEM format, PKCS#8 recommended) |
+| `cert` | string | Conditionally | Legacy/default TLS certificate path. Required with `key` when no `certificates` entries are configured |
+| `key` | string | Conditionally | Legacy/default TLS private key path. Required with `cert` when no `certificates` entries are configured |
+| `certificates` | array | No | SNI certificate entries |
+| `certificates[].server_name` | string | Yes | Exact SNI hostname (DNS name) to match |
+| `certificates[].cert` | string | Yes | Certificate path for that SNI hostname |
+| `certificates[].key` | string | Yes | Private key path for that SNI hostname |
+
+Certificate selection order:
+
+1. Exact SNI match in `listen.tls.certificates`.
+2. Fallback to `listen.tls.cert`/`listen.tls.key` when configured.
+3. If legacy pair is not configured, fallback to the first entry in `listen.tls.certificates`.
 
 ### Examples
 
@@ -183,6 +194,22 @@ listen:
   tls:
     cert: "certs/localhost.crt"
     key: "certs/localhost.key"
+
+# Multi-domain SNI certificates with legacy fallback
+listen:
+  protocol: http3
+  address: "0.0.0.0"
+  port: 9889
+  tls:
+    cert: "/etc/spooky/certs/default.crt"
+    key: "/etc/spooky/certs/default.key"
+    certificates:
+      - server_name: "api.example.com"
+        cert: "/etc/spooky/certs/api.crt"
+        key: "/etc/spooky/certs/api.key"
+      - server_name: "www.example.com"
+        cert: "/etc/spooky/certs/www.crt"
+        key: "/etc/spooky/certs/www.key"
 ```
 
 ## Upstream Configuration
@@ -865,7 +892,7 @@ Spooky validates configuration at startup and reports errors before attempting t
 ### Common Validation Errors
 
 1. **Missing required fields**
-   - TLS certificate or key paths not specified
+   - Neither `listen.tls.cert/key` nor `listen.tls.certificates` specified
    - Backend address or ID missing
    - Route configuration empty
 
