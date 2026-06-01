@@ -66,8 +66,36 @@ pub(crate) fn abort_stream(req: &mut RequestEnvelope, metrics: &Metrics) -> Stre
 }
 
 impl QUICListener {
-    fn send_error_health_failure_reason() -> Option<HealthFailureReason> {
-        None
+    fn classify_send_error_detail(is_connect: bool, detail: &str) -> HealthFailureReason {
+        let normalized = detail.to_ascii_lowercase();
+        if normalized.contains("timeout") || normalized.contains("timed out") {
+            return HealthFailureReason::Timeout;
+        }
+
+        if is_connect
+            && (normalized.contains("tls")
+                || normalized.contains("rustls")
+                || normalized.contains("webpki")
+                || normalized.contains("certificate")
+                || normalized.contains("x509")
+                || normalized.contains("hostname")
+                || normalized.contains("dns name")
+                || normalized.contains("subjectaltname")
+                || normalized.contains("unknownissuer")
+                || normalized.contains("invalidcertificate")
+                || normalized.contains("alpn"))
+        {
+            return HealthFailureReason::Tls;
+        }
+
+        HealthFailureReason::Transport
+    }
+
+    fn send_error_health_failure_reason(
+        err: &hyper_util::client::legacy::Error,
+    ) -> HealthFailureReason {
+        let detail = Self::format_error_chain(err);
+        Self::classify_send_error_detail(err.is_connect(), &detail)
     }
 
     fn format_error_chain(err: &(dyn StdError + 'static)) -> String {
@@ -293,17 +321,24 @@ impl QUICListener {
                 )
             }
             Err(ProxyError::Pool(PoolError::Send(ref send_err))) => {
-                // Log the full inner error — commonly exposes TLS/cert/SNI mismatches
-                // that look like transport failures but are actually local config errors.
-                // Do NOT mark backend health as failed: the backend may be fully operational;
-                // this path is usually a local proxy configuration/runtime issue.
+                // Log full upstream send/connect detail and map it into a backend
+                // health failure reason so repeated failures can eject unhealthy backends.
                 let send_err_detail = Self::format_error_chain(send_err);
+                let failure_reason = Self::send_error_health_failure_reason(send_err);
                 error!(
-                    "Upstream send failed for {} (possible TLS/cert/SNI misconfiguration): {}",
-                    backend_addr, send_err_detail
+                    "Upstream send failed for {} (health_reason={:?}): {}",
+                    backend_addr,
+                    failure_reason,
+                    send_err_detail
                 );
-                if let Some(reason) = Self::send_error_health_failure_reason() {
-                    metrics.inc_health_failure(reason);
+                metrics.inc_health_failure(failure_reason);
+                if let Some(pool) = &upstream_pool
+                    && let Some(t) = pool.write().ok().and_then(|mut p| {
+                        p.pool
+                            .mark_request_failure(backend_index, failure_reason)
+                    })
+                {
+                    Self::log_health_transition(backend_addr, t);
                 }
                 metrics.inc_failure();
                 metrics.inc_backend_error();
@@ -536,8 +571,33 @@ mod tests {
     }
 
     #[test]
-    fn send_error_does_not_map_to_backend_health_failure_reason() {
-        assert_eq!(QUICListener::send_error_health_failure_reason(), None);
+    fn send_connect_error_with_tls_details_maps_to_tls_health_failure() {
+        assert_eq!(
+            QUICListener::classify_send_error_detail(
+                true,
+                "client error (Connect): tls handshake failed: invalid certificate"
+            ),
+            HealthFailureReason::Tls
+        );
+    }
+
+    #[test]
+    fn send_connect_error_without_tls_details_maps_to_transport_health_failure() {
+        assert_eq!(
+            QUICListener::classify_send_error_detail(
+                true,
+                "client error (Connect): connection refused"
+            ),
+            HealthFailureReason::Transport
+        );
+    }
+
+    #[test]
+    fn send_error_with_timeout_detail_maps_to_timeout_health_failure() {
+        assert_eq!(
+            QUICListener::classify_send_error_detail(false, "request timed out"),
+            HealthFailureReason::Timeout
+        );
     }
 
     #[derive(Debug)]
