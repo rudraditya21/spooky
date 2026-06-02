@@ -2,15 +2,18 @@ use std::convert::Infallible;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::future::Future;
-use std::io::BufReader;
 use std::io;
+use std::io::BufReader;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::Duration;
-use std::{collections::HashMap, task::{Context, Poll}};
+use std::{
+    collections::HashMap,
+    task::{Context, Poll},
+};
 
 use http_body_util::combinators::BoxBody;
 use hyper::body::Bytes;
@@ -92,6 +95,12 @@ impl SharedDnsResolver {
             .read()
             .ok()
             .and_then(|guard| guard.get(&normalize_dns_cache_host(host)).cloned())
+    }
+}
+
+impl Default for SharedDnsResolver {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
