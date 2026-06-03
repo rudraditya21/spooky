@@ -820,6 +820,7 @@ mod tests {
             },
             host_policy: Default::default(),
             forwarded_headers: Default::default(),
+            tls: None,
             route: RouteMatch {
                 host: host.map(str::to_string),
                 path_prefix: path_prefix.map(str::to_string),

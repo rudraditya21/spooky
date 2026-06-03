@@ -75,6 +75,7 @@ fn make_config(port: u32, backend_addr: String, cert: String, key: String) -> Co
             },
             host_policy: Default::default(),
             forwarded_headers: Default::default(),
+            tls: None,
             route: RouteMatch {
                 path_prefix: Some("/".to_string()),
                 ..Default::default()
@@ -108,6 +109,7 @@ fn make_config(port: u32, backend_addr: String, cert: String, key: String) -> Co
                 client_auth: ClientAuth::default(),
             },
         },
+        listeners: vec![],
         upstream,
         load_balancing: Some(LoadBalancing {
             lb_type: "random".to_string(),
