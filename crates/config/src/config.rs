@@ -71,6 +71,9 @@ pub struct Config {
 
     pub listen: Listen,
 
+    #[serde(default)]
+    pub listeners: Vec<Listen>,
+
     pub upstream: HashMap<String, Upstream>,
 
     #[serde(default)]
@@ -120,6 +123,14 @@ impl Default for PrivilegeDrop {
             user: security_default_user(),
             group: security_default_group(),
         }
+    }
+}
+
+pub fn effective_listens(config: &Config) -> Vec<Listen> {
+    if config.listeners.is_empty() {
+        vec![config.listen.clone()]
+    } else {
+        config.listeners.clone()
     }
 }
 
@@ -204,6 +215,9 @@ pub struct Upstream {
 
     #[serde(default)]
     pub forwarded_headers: ForwardedHeaderPolicy,
+
+    #[serde(default)]
+    pub tls: Option<UpstreamTls>,
 
     pub route: RouteMatch, // Route matching criteria for this upstream
 

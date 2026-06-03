@@ -1,6 +1,7 @@
 use crate::backend_endpoint::{BackendEndpoint, BackendScheme};
 use crate::config::{
-    CURRENT_CONFIG_VERSION, Config, SUPPORTED_CONFIG_VERSIONS, UpstreamHostPolicyMode,
+    CURRENT_CONFIG_VERSION, Config, Listen, SUPPORTED_CONFIG_VERSIONS, UpstreamHostPolicyMode,
+    UpstreamTls,
 };
 use log::{error, info, warn};
 use std::collections::HashMap;
@@ -102,6 +103,166 @@ fn validate_pem_private_key(path: &str, field_name: &str) -> bool {
             false
         }
     }
+}
+
+fn validate_upstream_tls(field_prefix: &str, tls: &UpstreamTls) -> bool {
+    if !tls.verify_certificates {
+        warn!(
+            "{}.verify_certificates=false: upstream TLS certificate verification is disabled; only use in trusted/development environments",
+            field_prefix
+        );
+    }
+
+    if let Some(ca_file) = tls.ca_file.as_ref() {
+        if ca_file.trim().is_empty() {
+            error!("{}.ca_file cannot be empty when provided", field_prefix);
+            return false;
+        }
+        if !validate_pem_certificates(ca_file, &format!("{}.ca_file", field_prefix)) {
+            return false;
+        }
+    }
+
+    if let Some(ca_dir) = tls.ca_dir.as_ref() {
+        if ca_dir.trim().is_empty() {
+            error!("{}.ca_dir cannot be empty when provided", field_prefix);
+            return false;
+        }
+        let metadata = match std::fs::metadata(ca_dir) {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                error!("Cannot stat {}.ca_dir '{}': {}", field_prefix, ca_dir, err);
+                return false;
+            }
+        };
+        if !metadata.is_dir() {
+            error!("{}.ca_dir must be a directory: {}", field_prefix, ca_dir);
+            return false;
+        }
+    }
+
+    true
+}
+
+fn validate_listen_config(listen: &Listen, field_prefix: &str) -> bool {
+    if listen.protocol != "http3" {
+        error!(
+            "{} protocol: expected 'http3', found '{}'",
+            field_prefix, listen.protocol
+        );
+        return false;
+    }
+
+    if listen.address.is_empty() {
+        error!("{} address is empty", field_prefix);
+        return false;
+    }
+
+    if listen.port == 0 {
+        error!(
+            "Invalid {} port: {} (must be between 1 and 65535)",
+            field_prefix, listen.port
+        );
+        return false;
+    }
+
+    let tls_prefix = format!("{}.tls", field_prefix);
+    let legacy_cert = listen.tls.cert.trim();
+    let legacy_key = listen.tls.key.trim();
+    let has_legacy_cert_pair = !legacy_cert.is_empty() || !legacy_key.is_empty();
+    let has_sni_certificates = !listen.tls.certificates.is_empty();
+
+    if !has_legacy_cert_pair && !has_sni_certificates {
+        error!(
+            "{} requires either cert/key or certificates entries",
+            tls_prefix
+        );
+        return false;
+    }
+
+    if has_legacy_cert_pair {
+        if legacy_cert.is_empty() || legacy_key.is_empty() {
+            error!(
+                "{}.cert and {}.key must both be set when either is provided",
+                tls_prefix, tls_prefix
+            );
+            return false;
+        }
+        if !validate_pem_certificates(legacy_cert, &format!("{}.cert", tls_prefix)) {
+            return false;
+        }
+        if !validate_pem_private_key(legacy_key, &format!("{}.key", tls_prefix)) {
+            return false;
+        }
+    }
+
+    let mut seen_sni_names: HashMap<String, usize> = HashMap::new();
+    for (idx, entry) in listen.tls.certificates.iter().enumerate() {
+        let field_prefix = format!("{}.certificates[{idx}]", tls_prefix);
+        let sni_name = match normalize_sni_server_name(&entry.server_name) {
+            Some(sni) => sni,
+            None => {
+                error!(
+                    "{}.server_name '{}' is not a valid DNS hostname",
+                    field_prefix, entry.server_name
+                );
+                return false;
+            }
+        };
+
+        if let Some(first_idx) = seen_sni_names.insert(sni_name.clone(), idx) {
+            error!(
+                "{}.server_name '{}' duplicates {}.certificates[{}].server_name",
+                field_prefix, entry.server_name, tls_prefix, first_idx
+            );
+            return false;
+        }
+
+        let cert = entry.cert.trim();
+        if cert.is_empty() {
+            error!("{}.cert cannot be empty", field_prefix);
+            return false;
+        }
+        if !validate_pem_certificates(cert, &format!("{}.cert", field_prefix)) {
+            return false;
+        }
+
+        let key = entry.key.trim();
+        if key.is_empty() {
+            error!("{}.key cannot be empty", field_prefix);
+            return false;
+        }
+        if !validate_pem_private_key(key, &format!("{}.key", field_prefix)) {
+            return false;
+        }
+    }
+
+    if listen.tls.client_auth.require_client_cert && !listen.tls.client_auth.enabled {
+        error!(
+            "{}.client_auth.require_client_cert requires client_auth.enabled=true",
+            tls_prefix
+        );
+        return false;
+    }
+
+    if listen.tls.client_auth.enabled {
+        let Some(ca_file) = listen.tls.client_auth.ca_file.as_ref() else {
+            error!(
+                "{}.client_auth.ca_file is required when client_auth.enabled=true",
+                tls_prefix
+            );
+            return false;
+        };
+        if ca_file.trim().is_empty() {
+            error!("{}.client_auth.ca_file cannot be empty", tls_prefix);
+            return false;
+        }
+        if !validate_pem_certificates(ca_file, &format!("{}.client_auth.ca_file", tls_prefix)) {
+            return false;
+        }
+    }
+
+    true
 }
 
 fn is_loopback_bind_address(raw: &str) -> bool {
@@ -255,13 +416,29 @@ pub fn validate(config: &Config) -> bool {
         );
     }
 
-    // --- Validate protocol ---
-    if config.listen.protocol != "http3" {
-        error!(
-            "Invalid protocol: expected 'http3', found '{}'",
-            config.listen.protocol
-        );
+    // --- Validate listen blocks ---
+    if !validate_listen_config(&config.listen, "listen") {
         return false;
+    }
+    for (idx, listen) in config.listeners.iter().enumerate() {
+        if !validate_listen_config(listen, &format!("listeners[{idx}]")) {
+            return false;
+        }
+    }
+
+    let mut seen_listener_bindings: HashMap<(String, u16), String> = HashMap::new();
+    let listen_key = (config.listen.address.clone(), config.listen.port);
+    seen_listener_bindings.insert(listen_key, "listen".to_string());
+    for (idx, listen) in config.listeners.iter().enumerate() {
+        let key = (listen.address.clone(), listen.port);
+        let current = format!("listeners[{idx}]");
+        if let Some(existing) = seen_listener_bindings.insert(key, current.clone()) {
+            error!(
+                "listener binding conflict: {} duplicates {} on {}:{}",
+                current, existing, listen.address, listen.port
+            );
+            return false;
+        }
     }
 
     // --- Validate log level ---
@@ -280,21 +457,6 @@ pub fn validate(config: &Config) -> bool {
             .any(|lb_type| lb_type.eq_ignore_ascii_case(&lb.lb_type))
     {
         error!("Invalid global load balancing type: {}", lb.lb_type);
-        return false;
-    }
-
-    // --- Validate listen address ---
-    if config.listen.address.is_empty() {
-        error!("Listen address is empty");
-        return false;
-    }
-
-    // --- Validate listen port ---
-    if config.listen.port == 0 {
-        error!(
-            "Invalid listen port: {} (must be between 1 and 65535)",
-            config.listen.port
-        );
         return false;
     }
 
@@ -930,128 +1092,19 @@ pub fn validate(config: &Config) -> bool {
         }
     }
 
-    // --- Validate TLS certs ---
-    let legacy_cert = config.listen.tls.cert.trim();
-    let legacy_key = config.listen.tls.key.trim();
-    let has_legacy_cert_pair = !legacy_cert.is_empty() || !legacy_key.is_empty();
-    let has_sni_certificates = !config.listen.tls.certificates.is_empty();
-
-    if !has_legacy_cert_pair && !has_sni_certificates {
-        error!("listen.tls requires either cert/key or certificates entries");
-        return false;
-    }
-
-    if has_legacy_cert_pair {
-        if legacy_cert.is_empty() || legacy_key.is_empty() {
-            error!("listen.tls.cert and listen.tls.key must both be set when either is provided");
-            return false;
-        }
-        if !validate_pem_certificates(legacy_cert, "listen.tls.cert") {
-            return false;
-        }
-        if !validate_pem_private_key(legacy_key, "listen.tls.key") {
-            return false;
-        }
-    }
-
-    let mut seen_sni_names: HashMap<String, usize> = HashMap::new();
-    for (idx, entry) in config.listen.tls.certificates.iter().enumerate() {
-        let field_prefix = format!("listen.tls.certificates[{idx}]");
-        let sni_name = match normalize_sni_server_name(&entry.server_name) {
-            Some(sni) => sni,
-            None => {
-                error!(
-                    "{field_prefix}.server_name '{}' is not a valid DNS hostname",
-                    entry.server_name
-                );
-                return false;
-            }
-        };
-
-        if let Some(first_idx) = seen_sni_names.insert(sni_name.clone(), idx) {
-            error!(
-                "{field_prefix}.server_name '{}' duplicates listen.tls.certificates[{}].server_name",
-                entry.server_name, first_idx
-            );
-            return false;
-        }
-
-        let cert = entry.cert.trim();
-        if cert.is_empty() {
-            error!("{field_prefix}.cert cannot be empty");
-            return false;
-        }
-        if !validate_pem_certificates(cert, &format!("{field_prefix}.cert")) {
-            return false;
-        }
-
-        let key = entry.key.trim();
-        if key.is_empty() {
-            error!("{field_prefix}.key cannot be empty");
-            return false;
-        }
-        if !validate_pem_private_key(key, &format!("{field_prefix}.key")) {
-            return false;
-        }
-    }
-
-    // --- Validate optional downstream client-auth (mTLS) ---
-    if config.listen.tls.client_auth.require_client_cert && !config.listen.tls.client_auth.enabled {
-        error!("listen.tls.client_auth.require_client_cert requires client_auth.enabled=true");
-        return false;
-    }
-
-    if config.listen.tls.client_auth.enabled {
-        let Some(ca_file) = config.listen.tls.client_auth.ca_file.as_ref() else {
-            error!("listen.tls.client_auth.ca_file is required when client_auth.enabled=true");
-            return false;
-        };
-        if ca_file.trim().is_empty() {
-            error!("listen.tls.client_auth.ca_file cannot be empty");
-            return false;
-        }
-        if !validate_pem_certificates(ca_file, "listen.tls.client_auth.ca_file") {
-            return false;
-        }
-    }
-
     // --- Validate upstream TLS trust-store configuration ---
-    if !config.upstream_tls.verify_certificates {
-        warn!(
-            "upstream_tls.verify_certificates=false: upstream TLS certificate verification is disabled; only use in trusted/development environments"
-        );
-    }
-
-    if let Some(ca_file) = config.upstream_tls.ca_file.as_ref() {
-        if ca_file.trim().is_empty() {
-            error!("upstream_tls.ca_file cannot be empty when provided");
-            return false;
-        }
-        if !validate_pem_certificates(ca_file, "upstream_tls.ca_file") {
-            return false;
-        }
-    }
-
-    if let Some(ca_dir) = config.upstream_tls.ca_dir.as_ref() {
-        if ca_dir.trim().is_empty() {
-            error!("upstream_tls.ca_dir cannot be empty when provided");
-            return false;
-        }
-        let metadata = match std::fs::metadata(ca_dir) {
-            Ok(metadata) => metadata,
-            Err(err) => {
-                error!("Cannot stat upstream_tls.ca_dir '{}': {}", ca_dir, err);
-                return false;
-            }
-        };
-        if !metadata.is_dir() {
-            error!("upstream_tls.ca_dir must be a directory: {}", ca_dir);
-            return false;
-        }
+    if !validate_upstream_tls("upstream_tls", &config.upstream_tls) {
+        return false;
     }
 
     // --- Validate upstream routes ---
     for (upstream_name, upstream) in &config.upstream {
+        if let Some(tls) = upstream.tls.as_ref()
+            && !validate_upstream_tls(&format!("upstream['{}'].tls", upstream_name), tls)
+        {
+            return false;
+        }
+
         // Validate route matcher has at least one condition
         let has_host = upstream.route.host.is_some();
         let has_path = upstream.route.path_prefix.is_some();
@@ -1298,6 +1351,7 @@ mod tests {
                 },
                 host_policy: Default::default(),
                 forwarded_headers: Default::default(),
+                tls: None,
                 route: RouteMatch {
                     host: None,
                     path_prefix: Some("/".to_string()),
@@ -1332,6 +1386,7 @@ mod tests {
                     client_auth: ClientAuth::default(),
                 },
             },
+            listeners: vec![],
             upstream,
             load_balancing: Some(LoadBalancing {
                 lb_type: "random".to_string(),
@@ -2035,6 +2090,7 @@ upstream:
             },
             host_policy: Default::default(),
             forwarded_headers: Default::default(),
+            tls: None,
             route: RouteMatch {
                 host: Some("api.example.com".to_string()),
                 path_prefix: Some("/api".to_string()),
@@ -2074,6 +2130,7 @@ upstream:
             },
             host_policy: Default::default(),
             forwarded_headers: Default::default(),
+            tls: None,
             route: RouteMatch {
                 host: Some("api.example.com".to_string()),
                 path_prefix: Some("/api".to_string()),
