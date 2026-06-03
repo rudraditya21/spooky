@@ -3,10 +3,11 @@ use super::*;
 impl QUICListener {
     pub(super) fn spawn_health_checks(
         upstream_pools: HashMap<String, Arc<RwLock<UpstreamPool>>>,
-        health_client: Arc<H2Client>,
+        health_clients: Arc<HashMap<String, Arc<H2Client>>>,
         metrics: Arc<Metrics>,
     ) {
         struct HealthCheckJob {
+            upstream_name: String,
             upstream_pool: Arc<RwLock<UpstreamPool>>,
             index: usize,
             address: String,
@@ -18,7 +19,7 @@ impl QUICListener {
         }
 
         let mut grouped_jobs: HashMap<u64, Vec<HealthCheckJob>> = HashMap::new();
-        for (_upstream_name, upstream_pool) in upstream_pools.iter() {
+        for (upstream_name, upstream_pool) in upstream_pools.iter() {
             let pool = match upstream_pool.read() {
                 Ok(pool) => pool,
                 Err(_) => continue,
@@ -52,6 +53,7 @@ impl QUICListener {
                 };
                 let next_due_at = Instant::now() + Duration::from_millis(initial_jitter_ms);
                 let job = HealthCheckJob {
+                    upstream_name: upstream_name.clone(),
                     upstream_pool: Arc::clone(upstream_pool),
                     index,
                     address,
@@ -78,7 +80,7 @@ impl QUICListener {
         };
 
         for (base_interval_ms, mut jobs) in grouped_jobs {
-            let health_client = Arc::clone(&health_client);
+            let health_clients = Arc::clone(&health_clients);
             let task_metrics = Arc::clone(&metrics);
             let handle = handle.clone();
             let supervise_metrics = Arc::clone(&task_metrics);
@@ -107,6 +109,10 @@ impl QUICListener {
                             {
                                 Ok(req) => req,
                                 Err(_) => continue,
+                            };
+
+                            let Some(health_client) = health_clients.get(&job.upstream_name) else {
+                                continue;
                             };
 
                             let result =

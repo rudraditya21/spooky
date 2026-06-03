@@ -55,7 +55,7 @@ use tracing::{Instrument, info_span};
 
 use spooky_config::{
     backend_endpoint::{BackendEndpoint, BackendScheme},
-    config::{Config as SpookyConfig, ForwardedHeaderPolicy, UpstreamHostPolicy},
+    config::{Config as SpookyConfig, ForwardedHeaderPolicy, UpstreamHostPolicy, UpstreamTls},
 };
 
 use crate::{
@@ -418,13 +418,23 @@ impl QUICListener {
         Self::new_with_socket_and_shared_state(config, socket, shared_state)
     }
 
-    fn upstream_tls_client_config(config: &SpookyConfig) -> TlsClientConfig {
+    fn upstream_tls_client_config(tls: &UpstreamTls) -> TlsClientConfig {
         TlsClientConfig {
-            verify_certificates: config.upstream_tls.verify_certificates,
-            strict_sni: config.upstream_tls.strict_sni,
-            ca_file: config.upstream_tls.ca_file.clone(),
-            ca_dir: config.upstream_tls.ca_dir.clone(),
+            verify_certificates: tls.verify_certificates,
+            strict_sni: tls.strict_sni,
+            ca_file: tls.ca_file.clone(),
+            ca_dir: tls.ca_dir.clone(),
         }
+    }
+
+    fn effective_upstream_tls(
+        config: &SpookyConfig,
+        upstream: &spooky_config::config::Upstream,
+    ) -> UpstreamTls {
+        upstream
+            .tls
+            .clone()
+            .unwrap_or_else(|| config.upstream_tls.clone())
     }
 
     pub fn build_shared_state(config: &SpookyConfig) -> Result<SharedRuntimeState, ProxyError> {
@@ -471,7 +481,13 @@ impl QUICListener {
 
         let mut backend_addresses = Vec::new();
         let mut seen_backend_origins: HashMap<String, (String, String)> = HashMap::new();
+        let mut backend_tls_configs: HashMap<String, TlsClientConfig> = HashMap::new();
+        let mut upstream_tls_configs: HashMap<String, TlsClientConfig> = HashMap::new();
         for (upstream_name, upstream) in &config.upstream {
+            let upstream_tls = Self::effective_upstream_tls(config, upstream);
+            let upstream_tls_client = Self::upstream_tls_client_config(&upstream_tls);
+            upstream_tls_configs.insert(upstream_name.clone(), upstream_tls_client.clone());
+
             for backend in &upstream.backends {
                 let endpoint = match BackendEndpoint::parse(&backend.address) {
                     Ok(endpoint) => endpoint,
@@ -493,6 +509,7 @@ impl QUICListener {
                     )));
                 }
                 backend_addresses.push(backend.address.clone());
+                backend_tls_configs.insert(backend.address.clone(), upstream_tls_client.clone());
             }
         }
 
@@ -500,17 +517,18 @@ impl QUICListener {
         let h2_pool = Arc::new(
             H2Pool::new(
                 backend_addresses,
+                backend_tls_configs,
                 max_inflight_per_backend,
                 config.performance.h2_pool_max_idle_per_backend,
                 Duration::from_millis(config.performance.h2_pool_idle_timeout_ms),
                 Duration::from_millis(config.performance.backend_connect_timeout_ms),
-                Self::upstream_tls_client_config(config),
                 backend_dns_resolver.clone(),
             )
             .map_err(ProxyError::Tls)?,
         );
         let mut upstream_pools = HashMap::new();
         let mut upstream_inflight = HashMap::new();
+        let mut upstream_health_clients = HashMap::new();
 
         for (name, upstream) in &config.upstream {
             let upstream_pool = UpstreamPool::from_upstream(upstream).map_err(|err| {
@@ -521,6 +539,16 @@ impl QUICListener {
             })?;
             upstream_pools.insert(name.clone(), Arc::new(RwLock::new(upstream_pool)));
             upstream_inflight.insert(name.clone(), Arc::new(Semaphore::new(per_upstream_limit)));
+            let tls = upstream_tls_configs.get(name).cloned().unwrap_or_default();
+            let client = H2Client::new(
+                config.performance.h2_pool_max_idle_per_backend.max(1),
+                Duration::from_millis(config.performance.h2_pool_idle_timeout_ms.max(1)),
+                Duration::from_millis(config.performance.backend_connect_timeout_ms.max(1)),
+                tls,
+                backend_dns_resolver.clone(),
+            )
+            .map_err(ProxyError::Tls)?;
+            upstream_health_clients.insert(name.clone(), Arc::new(client));
         }
 
         config
@@ -578,6 +606,7 @@ impl QUICListener {
                     .collect(),
             ),
             backend_dns_resolver,
+            upstream_health_clients: Arc::new(upstream_health_clients),
             forwarded_header_policies: Arc::new(
                 config
                     .upstream
@@ -609,28 +638,13 @@ impl QUICListener {
         shared_state
             .watchdog
             .set_expected_workers(worker_count.max(1));
-        let health_client = match H2Client::new(
-            config.performance.h2_pool_max_idle_per_backend.max(1),
-            Duration::from_millis(config.performance.h2_pool_idle_timeout_ms.max(1)),
-            Duration::from_millis(config.performance.backend_connect_timeout_ms.max(1)),
-            Self::upstream_tls_client_config(config),
-            shared_state.backend_dns_resolver.clone(),
-        ) {
-            Ok(client) => Arc::new(client),
-            Err(err) => {
-                return Err(ProxyError::Transport(format!(
-                    "failed to initialize control-plane H2 client: {err}"
-                )));
-            }
-        };
         Self::spawn_health_checks(
             shared_state.upstream_pools.clone(),
-            health_client,
+            Arc::clone(&shared_state.upstream_health_clients),
             Arc::clone(&shared_state.metrics),
         );
         Self::spawn_metrics_endpoint(config, Arc::clone(&shared_state.metrics))?;
         Self::spawn_control_api_endpoint(config, shared_state, worker_count)?;
-        Self::spawn_bootstrap_tls_listener(config, shared_state)?;
         Self::spawn_watchdog(
             config,
             Arc::clone(&shared_state.metrics),
@@ -4197,7 +4211,7 @@ impl QUICListener {
         Self::build_server_tls_acceptor(config, true, vec![b"h2".to_vec(), b"http/1.1".to_vec()])
     }
 
-    fn spawn_bootstrap_tls_listener(
+    pub fn spawn_bootstrap_tls_listener(
         config: &SpookyConfig,
         shared_state: &SharedRuntimeState,
     ) -> Result<(), ProxyError> {
@@ -5160,6 +5174,7 @@ mod tests {
             },
             host_policy: Default::default(),
             forwarded_headers: Default::default(),
+            tls: None,
             route: RouteMatch {
                 host: None,
                 path_prefix: Some("/api".to_string()),
@@ -5221,6 +5236,7 @@ mod tests {
                     client_auth: ClientAuth::default(),
                 },
             },
+            listeners: vec![],
             upstream: upstreams,
             load_balancing: Some(LoadBalancing {
                 lb_type: "round-robin".to_string(),

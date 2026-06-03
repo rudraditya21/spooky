@@ -20,11 +20,11 @@ pub struct H2Pool {
 impl H2Pool {
     pub fn new<I>(
         backends: I,
+        backend_tls: HashMap<String, TlsClientConfig>,
         max_inflight: usize,
         max_idle_per_backend: usize,
         pool_idle_timeout: Duration,
         connect_timeout: Duration,
-        tls: TlsClientConfig,
         dns_resolver: SharedDnsResolver,
     ) -> Result<Self, String>
     where
@@ -38,7 +38,7 @@ impl H2Pool {
                 max_idle_per_backend,
                 pool_idle_timeout,
                 connect_timeout,
-                tls.clone(),
+                backend_tls.get(&backend).cloned().unwrap_or_default(),
                 dns_resolver.clone(),
             )?;
             map.insert(

@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -90,11 +91,11 @@ async fn pool_limits_inflight_per_backend() {
     let pool = Arc::new(
         H2Pool::new(
             vec![backend.clone()],
+            HashMap::from([(backend.clone(), TlsClientConfig::default())]),
             1,
             64,
             Duration::from_secs(30),
             Duration::from_secs(2),
-            TlsClientConfig::default(),
             SharedDnsResolver::new(),
         )
         .expect("pool"),
@@ -139,11 +140,11 @@ async fn pool_limits_inflight_per_backend() {
 async fn pool_rejects_unknown_backend() {
     let pool = H2Pool::new(
         vec!["127.0.0.1:12345".to_string()],
+        HashMap::from([("127.0.0.1:12345".to_string(), TlsClientConfig::default())]),
         1,
         64,
         Duration::from_secs(30),
         Duration::from_secs(2),
-        TlsClientConfig::default(),
         SharedDnsResolver::new(),
     )
     .expect("pool");
@@ -168,11 +169,11 @@ async fn pool_reports_overload_when_inflight_is_exhausted() {
     let pool = Arc::new(
         H2Pool::new(
             vec![backend.clone()],
+            HashMap::from([(backend.clone(), TlsClientConfig::default())]),
             1,
             64,
             Duration::from_secs(30),
             Duration::from_secs(2),
-            TlsClientConfig::default(),
             SharedDnsResolver::new(),
         )
         .expect("pool"),
