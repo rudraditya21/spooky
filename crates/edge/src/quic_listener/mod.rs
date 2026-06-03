@@ -42,7 +42,7 @@ use spooky_bridge::h3_to_h2::{
 };
 use spooky_errors::{PoolError, ProxyError, is_retryable};
 use spooky_lb::{HealthFailureReason, HealthTransition, UpstreamPool};
-use spooky_transport::h2_client::{H2Client, TlsClientConfig};
+use spooky_transport::h2_client::{H2Client, SharedDnsResolver, TlsClientConfig};
 use spooky_transport::h2_pool::H2Pool;
 use tokio::runtime::Handle;
 use tokio::sync::{
@@ -496,6 +496,7 @@ impl QUICListener {
             }
         }
 
+        let backend_dns_resolver = SharedDnsResolver::new();
         let h2_pool = Arc::new(
             H2Pool::new(
                 backend_addresses,
@@ -504,6 +505,7 @@ impl QUICListener {
                 Duration::from_millis(config.performance.h2_pool_idle_timeout_ms),
                 Duration::from_millis(config.performance.backend_connect_timeout_ms),
                 Self::upstream_tls_client_config(config),
+                backend_dns_resolver.clone(),
             )
             .map_err(ProxyError::Tls)?,
         );
@@ -575,6 +577,7 @@ impl QUICListener {
                     })
                     .collect(),
             ),
+            backend_dns_resolver,
             forwarded_header_policies: Arc::new(
                 config
                     .upstream
@@ -611,6 +614,7 @@ impl QUICListener {
             Duration::from_millis(config.performance.h2_pool_idle_timeout_ms.max(1)),
             Duration::from_millis(config.performance.backend_connect_timeout_ms.max(1)),
             Self::upstream_tls_client_config(config),
+            shared_state.backend_dns_resolver.clone(),
         ) {
             Ok(client) => Arc::new(client),
             Err(err) => {
@@ -711,6 +715,7 @@ impl QUICListener {
             h3_config,
             h2_pool: Arc::clone(&shared_state.h2_pool),
             backend_endpoints: Arc::clone(&shared_state.backend_endpoints),
+            backend_dns_resolver: shared_state.backend_dns_resolver.clone(),
             upstream_host_policies: Arc::clone(&shared_state.upstream_host_policies),
             forwarded_header_policies: Arc::clone(&shared_state.forwarded_header_policies),
             upstream_pools: shared_state.upstream_pools.clone(),

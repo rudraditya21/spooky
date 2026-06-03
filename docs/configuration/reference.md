@@ -131,6 +131,8 @@ The following table lists all default configuration values used when properties 
 | `performance.new_connections_per_sec` | `2000` | Token-bucket refill rate for new QUIC connections (conns/sec) |
 | `performance.new_connections_burst` | `500` | Burst capacity for new QUIC connections |
 | `performance.max_active_connections` | `20000` | Hard cap on concurrently tracked active QUIC connections per worker |
+| `performance.backend_dns_refresh_enabled` | `false` | Enable periodic control-plane DNS refresh for hostname-based upstream backends |
+| `performance.backend_dns_refresh_interval_ms` | `30000` | Refresh interval for hostname-based backend DNS records |
 | `performance.quic_max_idle_timeout_ms` | `5000` | QUIC idle timeout — connection closed after this many ms of inactivity |
 | `performance.quic_initial_max_data` | `10000000` | Connection-level flow control window (bytes) |
 | `performance.quic_initial_max_stream_data` | `1000000` | Per-stream flow control window (bytes) |
@@ -692,6 +694,8 @@ Controls resource limits, tuning knobs, and connection-flood protection. All fie
 | `udp_send_buffer_bytes` | integer | No | `8388608` | UDP socket send buffer size (bytes) |
 | `h2_pool_max_idle_per_backend` | integer | No | `256` | Maximum idle HTTP/2 connections kept open per backend |
 | `h2_pool_idle_timeout_ms` | integer | No | `90000` | How long an idle H2 connection is kept before being closed (ms) |
+| `backend_dns_refresh_enabled` | bool | No | `false` | Enable periodic DNS refresh for hostname-based upstream backends |
+| `backend_dns_refresh_interval_ms` | integer | No | `30000` | Control-plane DNS refresh interval for hostname-based upstream backends (ms) |
 | `new_connections_per_sec` | integer | No | `2000` | Steady-state rate at which new QUIC connections are accepted (token-bucket refill, connections/sec) |
 | `new_connections_burst` | integer | No | `500` | Burst capacity above the steady-state rate; the bucket starts full so the first burst of legitimate connections always succeeds |
 | `max_active_connections` | integer | No | `20000` | Hard cap on active QUIC connections per worker; unknown `Initial` packets are dropped once this cap is reached |

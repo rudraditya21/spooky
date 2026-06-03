@@ -19,6 +19,7 @@ use crate::default::{
     observe_default_routing_transparency_include_reason, observe_default_tracing_sample_ratio,
     observe_default_tracing_service_name, perf_default_backend_body_idle_timeout_ms,
     perf_default_backend_body_total_timeout_ms, perf_default_backend_connect_timeout_ms,
+    perf_default_backend_dns_refresh_enabled, perf_default_backend_dns_refresh_interval_ms,
     perf_default_backend_timeout_ms, perf_default_backend_total_request_timeout_ms,
     perf_default_client_body_idle_timeout_ms, perf_default_control_plane_threads,
     perf_default_global_inflight_limit, perf_default_h2_pool_idle_timeout_ms,
@@ -413,6 +414,14 @@ pub struct Performance {
     #[serde(default = "perf_default_h2_pool_idle_timeout_ms")]
     pub h2_pool_idle_timeout_ms: u64,
 
+    /// Enables periodic DNS refresh for hostname-based upstream backends.
+    #[serde(default = "perf_default_backend_dns_refresh_enabled")]
+    pub backend_dns_refresh_enabled: bool,
+
+    /// Control-plane interval for refreshing hostname-based backend DNS records.
+    #[serde(default = "perf_default_backend_dns_refresh_interval_ms")]
+    pub backend_dns_refresh_interval_ms: u64,
+
     #[serde(default = "perf_default_per_backend_inflight_limit")]
     pub per_backend_inflight_limit: usize,
 
@@ -500,6 +509,8 @@ impl Default for Performance {
             udp_send_buffer_bytes: perf_default_udp_send_buffer_bytes(),
             h2_pool_max_idle_per_backend: perf_default_h2_pool_max_idle_per_backend(),
             h2_pool_idle_timeout_ms: perf_default_h2_pool_idle_timeout_ms(),
+            backend_dns_refresh_enabled: perf_default_backend_dns_refresh_enabled(),
+            backend_dns_refresh_interval_ms: perf_default_backend_dns_refresh_interval_ms(),
             per_backend_inflight_limit: perf_default_per_backend_inflight_limit(),
             new_connections_per_sec: perf_default_new_connections_per_sec(),
             new_connections_burst: perf_default_new_connections_burst(),

@@ -159,6 +159,14 @@ pub fn perf_default_h2_pool_idle_timeout_ms() -> u64 {
     90_000
 }
 
+pub fn perf_default_backend_dns_refresh_enabled() -> bool {
+    false
+}
+
+pub fn perf_default_backend_dns_refresh_interval_ms() -> u64 {
+    30_000
+}
+
 pub fn perf_default_per_backend_inflight_limit() -> usize {
     64
 }

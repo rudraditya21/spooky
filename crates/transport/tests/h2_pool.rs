@@ -13,7 +13,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
 
 use spooky_transport::{
-    h2_client::TlsClientConfig,
+    h2_client::{SharedDnsResolver, TlsClientConfig},
     h2_pool::{H2Pool, PoolError},
 };
 
@@ -95,6 +95,7 @@ async fn pool_limits_inflight_per_backend() {
             Duration::from_secs(30),
             Duration::from_secs(2),
             TlsClientConfig::default(),
+            SharedDnsResolver::new(),
         )
         .expect("pool"),
     );
@@ -143,6 +144,7 @@ async fn pool_rejects_unknown_backend() {
         Duration::from_secs(30),
         Duration::from_secs(2),
         TlsClientConfig::default(),
+        SharedDnsResolver::new(),
     )
     .expect("pool");
     let req = Request::builder()
@@ -171,6 +173,7 @@ async fn pool_reports_overload_when_inflight_is_exhausted() {
             Duration::from_secs(30),
             Duration::from_secs(2),
             TlsClientConfig::default(),
+            SharedDnsResolver::new(),
         )
         .expect("pool"),
     );

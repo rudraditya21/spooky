@@ -6,7 +6,7 @@ use spooky_config::{
 };
 use spooky_errors::ProxyError;
 use spooky_lb::UpstreamPool;
-use spooky_transport::h2_pool::H2Pool;
+use spooky_transport::{h2_client::SharedDnsResolver, h2_pool::H2Pool};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::UdpSocket,
@@ -27,6 +27,7 @@ use crate::watchdog::WatchdogCoordinator;
 pub struct SharedRuntimeState {
     pub(crate) h2_pool: Arc<H2Pool>,
     pub(crate) backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
+    pub(crate) backend_dns_resolver: SharedDnsResolver,
     pub(crate) upstream_host_policies: Arc<HashMap<String, UpstreamHostPolicy>>,
     pub(crate) forwarded_header_policies: Arc<HashMap<String, ForwardedHeaderPolicy>>,
     pub(crate) upstream_pools: HashMap<String, Arc<RwLock<UpstreamPool>>>,
@@ -80,6 +81,7 @@ pub struct QUICListener {
     pub h3_config: Arc<quiche::h3::Config>,
     pub h2_pool: Arc<H2Pool>,
     pub backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
+    pub backend_dns_resolver: SharedDnsResolver,
     pub upstream_host_policies: Arc<HashMap<String, UpstreamHostPolicy>>,
     pub forwarded_header_policies: Arc<HashMap<String, ForwardedHeaderPolicy>>,
     pub upstream_pools: HashMap<String, Arc<RwLock<UpstreamPool>>>,

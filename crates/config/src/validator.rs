@@ -389,6 +389,11 @@ pub fn validate(config: &Config) -> bool {
         return false;
     }
 
+    if config.performance.backend_dns_refresh_interval_ms == 0 {
+        error!("performance.backend_dns_refresh_interval_ms must be greater than 0");
+        return false;
+    }
+
     if config.performance.per_backend_inflight_limit == 0 {
         error!("performance.per_backend_inflight_limit must be greater than 0");
         return false;
@@ -1399,6 +1404,8 @@ upstream:
         assert_eq!(cfg.performance.udp_send_buffer_bytes, 8 * 1024 * 1024);
         assert_eq!(cfg.performance.h2_pool_max_idle_per_backend, 256);
         assert_eq!(cfg.performance.h2_pool_idle_timeout_ms, 90_000);
+        assert!(!cfg.performance.backend_dns_refresh_enabled);
+        assert_eq!(cfg.performance.backend_dns_refresh_interval_ms, 30_000);
         assert_eq!(cfg.performance.per_backend_inflight_limit, 64);
         assert_eq!(cfg.performance.max_active_connections, 20_000);
         assert_eq!(cfg.performance.max_request_body_bytes, 1_000_000);
@@ -1502,6 +1509,10 @@ upstream:
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.performance.h2_pool_idle_timeout_ms = 0;
+        assert!(!validate(&cfg));
+
+        cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        cfg.performance.backend_dns_refresh_interval_ms = 0;
         assert!(!validate(&cfg));
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());

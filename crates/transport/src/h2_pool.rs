@@ -5,7 +5,7 @@ use hyper::Request;
 use hyper::body::{Bytes, Incoming};
 use tokio::sync::{Semaphore, TryAcquireError};
 
-use crate::h2_client::{H2Client, TlsClientConfig};
+use crate::h2_client::{H2Client, SharedDnsResolver, TlsClientConfig};
 pub use spooky_errors::PoolError;
 
 struct BackendHandle {
@@ -25,6 +25,7 @@ impl H2Pool {
         pool_idle_timeout: Duration,
         connect_timeout: Duration,
         tls: TlsClientConfig,
+        dns_resolver: SharedDnsResolver,
     ) -> Result<Self, String>
     where
         I: IntoIterator<Item = String>,
@@ -38,6 +39,7 @@ impl H2Pool {
                 pool_idle_timeout,
                 connect_timeout,
                 tls.clone(),
+                dns_resolver.clone(),
             )?;
             map.insert(
                 backend,
