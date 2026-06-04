@@ -38,6 +38,11 @@ nav:
   - Configuration:
       - Reference: configuration/reference.md
       - TLS Setup: configuration/tls.md
+  - How-To Guides:
+      - Overview: howto/README.md
+      - Certificates: howto/01-certificates.md
+      - Configuration: howto/02-configuration.md
+      - Run Spooky: howto/03-run.md
   - User Guide:
       - Basics: user-guide/basics.md
       - Load Balancing: user-guide/load-balancing.md
