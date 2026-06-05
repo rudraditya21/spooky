@@ -172,9 +172,7 @@ pub struct RuntimeUpstream {
     pub name: String,
     pub load_balancing: LoadBalancing,
     pub route: RouteMatch,
-    pub host_policy: RuntimeHostPolicy,
-    pub forwarded_headers: RuntimeForwardedHeaderPolicy,
-    pub protocol_policy: RuntimeProtocolPolicy,
+    pub policy: RuntimeUpstreamPolicy,
     pub effective_tls: UpstreamTls,
     pub backends: Vec<RuntimeBackend>,
 }
@@ -190,9 +188,13 @@ impl RuntimeUpstream {
             name: name.to_string(),
             load_balancing: upstream.load_balancing.clone(),
             route: upstream.route.clone(),
-            host_policy: RuntimeHostPolicy(upstream.host_policy.clone()),
-            forwarded_headers: RuntimeForwardedHeaderPolicy(upstream.forwarded_headers.clone()),
-            protocol_policy: RuntimeProtocolPolicy(config.resilience.protocol.clone()),
+            policy: RuntimeUpstreamPolicy {
+                host: RuntimeHostPolicy(upstream.host_policy.clone()),
+                forwarded_headers: RuntimeForwardedHeaderPolicy(
+                    upstream.forwarded_headers.clone(),
+                ),
+                protocol: RuntimeProtocolPolicy(config.resilience.protocol.clone()),
+            },
             effective_tls: effective_tls.clone(),
             backends: upstream
                 .backends
@@ -213,14 +215,21 @@ pub struct RuntimeBackend {
     pub effective_tls: UpstreamTls,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RuntimeHostPolicy(pub UpstreamHostPolicy);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RuntimeForwardedHeaderPolicy(pub ForwardedHeaderPolicy);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RuntimeProtocolPolicy(pub ProtocolPolicy);
+
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeUpstreamPolicy {
+    pub host: RuntimeHostPolicy,
+    pub forwarded_headers: RuntimeForwardedHeaderPolicy,
+    pub protocol: RuntimeProtocolPolicy,
+}
 
 pub fn runtime_listeners(config: &Config) -> Result<Vec<RuntimeListener>, String> {
     let listeners = if config.listeners.is_empty() {
@@ -423,9 +432,9 @@ mod tests {
         );
         assert_eq!(upstream.backends.len(), 1);
         assert_eq!(upstream.backends[0].backend.address, "https://api.internal:8443");
-        assert_eq!(upstream.host_policy.0.mode, UpstreamHostPolicyMode::Upstream);
+        assert_eq!(upstream.policy.host.0.mode, UpstreamHostPolicyMode::Upstream);
         assert_eq!(
-            upstream.forwarded_headers.0.mode,
+            upstream.policy.forwarded_headers.0.mode,
             ForwardedHeaderPolicyMode::Append
         );
     }

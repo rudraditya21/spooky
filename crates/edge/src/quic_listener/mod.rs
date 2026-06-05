@@ -55,8 +55,8 @@ use tracing::{Instrument, info_span};
 
 use spooky_config::{
     backend_endpoint::{BackendEndpoint, BackendScheme},
-    config::{Config as SpookyConfig, ForwardedHeaderPolicy, UpstreamHostPolicy, UpstreamTls},
-    runtime::{RuntimeConfig, RuntimeListenerTls},
+    config::{Config as SpookyConfig, UpstreamTls},
+    runtime::{RuntimeConfig, RuntimeListenerTls, RuntimeUpstreamPolicy},
 };
 
 use crate::{
@@ -618,18 +618,11 @@ impl QUICListener {
             ),
             backend_dns_resolver,
             upstream_health_clients: Arc::new(upstream_health_clients),
-            forwarded_header_policies: Arc::new(
-                config
-                    .upstream
+            upstream_policies: Arc::new(
+                runtime_config
+                    .upstreams
                     .iter()
-                    .map(|(name, upstream)| (name.clone(), upstream.forwarded_headers.clone()))
-                    .collect(),
-            ),
-            upstream_host_policies: Arc::new(
-                config
-                    .upstream
-                    .iter()
-                    .map(|(name, upstream)| (name.clone(), upstream.host_policy.clone()))
+                    .map(|(name, upstream)| (name.clone(), upstream.policy.clone()))
                     .collect(),
             ),
             upstream_pools,
@@ -743,8 +736,7 @@ impl QUICListener {
             h2_pool: Arc::clone(&shared_state.h2_pool),
             backend_endpoints: Arc::clone(&shared_state.backend_endpoints),
             backend_dns_resolver: shared_state.backend_dns_resolver.clone(),
-            upstream_host_policies: Arc::clone(&shared_state.upstream_host_policies),
-            forwarded_header_policies: Arc::clone(&shared_state.forwarded_header_policies),
+            upstream_policies: Arc::clone(&shared_state.upstream_policies),
             upstream_pools: shared_state.upstream_pools.clone(),
             upstream_inflight: shared_state.upstream_inflight.clone(),
             global_inflight: Arc::clone(&shared_state.global_inflight),
@@ -1523,8 +1515,7 @@ impl QUICListener {
                 &mut connection,
                 Arc::clone(&h2_pool),
                 Arc::clone(&self.backend_endpoints),
-                Arc::clone(&self.upstream_host_policies),
-                Arc::clone(&self.forwarded_header_policies),
+                Arc::clone(&self.upstream_policies),
                 &self.upstream_pools,
                 &self.upstream_inflight,
                 Arc::clone(&self.global_inflight),
@@ -1770,8 +1761,7 @@ impl QUICListener {
         connection: &mut QuicConnection,
         h2_pool: Arc<H2Pool>,
         backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
-        upstream_host_policies: Arc<HashMap<String, UpstreamHostPolicy>>,
-        forwarded_header_policies: Arc<HashMap<String, ForwardedHeaderPolicy>>,
+        upstream_policies: Arc<HashMap<String, RuntimeUpstreamPolicy>>,
         upstream_pools: &HashMap<String, Arc<RwLock<UpstreamPool>>>,
         upstream_inflight: &HashMap<String, Arc<Semaphore>>,
         global_inflight: Arc<Semaphore>,
@@ -2159,18 +2149,14 @@ impl QUICListener {
                                     continue;
                                 }
                             };
-                            let host_policy = upstream_host_policies
-                                .get(&upstream_name)
-                                .cloned()
-                                .unwrap_or_default();
-                            let forwarded_header_policy = forwarded_header_policies
+                            let upstream_policy = upstream_policies
                                 .get(&upstream_name)
                                 .cloned()
                                 .unwrap_or_default();
                             let request = match build_h2_request_for_endpoint_with_host_policy(
                                 &backend_endpoint,
-                                &host_policy,
-                                &forwarded_header_policy,
+                                &upstream_policy.host.0,
+                                &upstream_policy.forwarded_headers.0,
                                 &method,
                                 &path,
                                 &list,
@@ -4195,8 +4181,7 @@ impl QUICListener {
 
         let h2_pool = Arc::clone(&shared_state.h2_pool);
         let backend_endpoints = Arc::clone(&shared_state.backend_endpoints);
-        let upstream_host_policies = Arc::clone(&shared_state.upstream_host_policies);
-        let forwarded_header_policies = Arc::clone(&shared_state.forwarded_header_policies);
+        let upstream_policies = Arc::clone(&shared_state.upstream_policies);
         let metrics = Arc::clone(&shared_state.metrics);
         let resilience = Arc::clone(&shared_state.resilience);
         let upstream_pools = shared_state.upstream_pools.clone();
@@ -4269,8 +4254,7 @@ impl QUICListener {
                 let alt_svc = alt_svc_value.clone();
                 let h2_pool = Arc::clone(&h2_pool);
                 let backend_endpoints = Arc::clone(&backend_endpoints);
-                let upstream_host_policies = Arc::clone(&upstream_host_policies);
-                let forwarded_header_policies = Arc::clone(&forwarded_header_policies);
+                let upstream_policies = Arc::clone(&upstream_policies);
                 let metrics = Arc::clone(&metrics);
                 let resilience = Arc::clone(&resilience);
                 let upstream_pools = upstream_pools.clone();
@@ -4300,8 +4284,7 @@ impl QUICListener {
                             let alt = alt_svc_conn.clone();
                             let h2_pool = Arc::clone(&h2_pool);
                             let backend_endpoints = Arc::clone(&backend_endpoints);
-                            let upstream_host_policies = Arc::clone(&upstream_host_policies);
-                            let forwarded_header_policies = Arc::clone(&forwarded_header_policies);
+                            let upstream_policies = Arc::clone(&upstream_policies);
                             let metrics = Arc::clone(&metrics);
                             let resilience = Arc::clone(&resilience);
                             let upstream_pools = upstream_pools.clone();
@@ -4432,7 +4415,7 @@ impl QUICListener {
                                     }
                                 };
 
-                                let host_policy = upstream_host_policies
+                                let upstream_policy = upstream_policies
                                     .get(&upstream_name)
                                     .cloned()
                                     .unwrap_or_default();
@@ -4442,7 +4425,7 @@ impl QUICListener {
                                     .and_then(|value| value.to_str().ok());
                                 let upstream_host = match resolve_upstream_host_value(
                                     &endpoint,
-                                    &host_policy,
+                                    &upstream_policy.host.0,
                                     authority.as_deref(),
                                     request_host,
                                 ) {
@@ -4526,12 +4509,8 @@ impl QUICListener {
                                 upstream_req =
                                     upstream_req.header(http::header::HOST, upstream_host);
 
-                                let forwarded_policy = forwarded_header_policies
-                                    .get(&upstream_name)
-                                    .cloned()
-                                    .unwrap_or_default();
                                 let forwarded_values = match build_forwarded_header_values(
-                                    &forwarded_policy,
+                                    &upstream_policy.forwarded_headers.0,
                                     ForwardedHeaderChains {
                                         forwarded: &forwarded_from_headers,
                                         x_forwarded_for: &x_forwarded_for_from_headers,

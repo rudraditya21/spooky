@@ -2,7 +2,8 @@ use bytes::Bytes;
 use core::net::SocketAddr;
 use spooky_config::{
     backend_endpoint::BackendEndpoint,
-    config::{Config, ForwardedHeaderPolicy, UpstreamHostPolicy},
+    config::Config,
+    runtime::RuntimeUpstreamPolicy,
 };
 use spooky_errors::ProxyError;
 use spooky_lb::UpstreamPool;
@@ -31,8 +32,7 @@ pub struct SharedRuntimeState {
     pub(crate) h2_pool: Arc<H2Pool>,
     pub(crate) backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
     pub(crate) backend_dns_resolver: SharedDnsResolver,
-    pub(crate) upstream_host_policies: Arc<HashMap<String, UpstreamHostPolicy>>,
-    pub(crate) forwarded_header_policies: Arc<HashMap<String, ForwardedHeaderPolicy>>,
+    pub(crate) upstream_policies: Arc<HashMap<String, RuntimeUpstreamPolicy>>,
     pub(crate) upstream_health_clients: Arc<HashMap<String, Arc<H2Client>>>,
     pub(crate) upstream_pools: HashMap<String, Arc<RwLock<UpstreamPool>>>,
     pub(crate) upstream_inflight: HashMap<String, Arc<Semaphore>>,
@@ -86,8 +86,7 @@ pub struct QUICListener {
     pub h2_pool: Arc<H2Pool>,
     pub backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
     pub backend_dns_resolver: SharedDnsResolver,
-    pub upstream_host_policies: Arc<HashMap<String, UpstreamHostPolicy>>,
-    pub forwarded_header_policies: Arc<HashMap<String, ForwardedHeaderPolicy>>,
+    pub upstream_policies: Arc<HashMap<String, RuntimeUpstreamPolicy>>,
     pub upstream_pools: HashMap<String, Arc<RwLock<UpstreamPool>>>,
     pub upstream_inflight: HashMap<String, Arc<Semaphore>>,
     pub global_inflight: Arc<Semaphore>,
