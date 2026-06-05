@@ -49,14 +49,19 @@ pub struct RuntimeListener {
 }
 
 impl RuntimeListener {
-    fn new(index: usize, source: RuntimeListenerSource, listen: Listen) -> Self {
-        let tls = RuntimeListenerTls::from_listen(&listen);
-        Self {
+    fn new(
+        index: usize,
+        source: RuntimeListenerSource,
+        listen: Listen,
+        label: &str,
+    ) -> Result<Self, String> {
+        let tls = RuntimeListenerTls::normalize(&listen, label)?;
+        Ok(Self {
             index,
             source,
             listen,
             tls,
-        }
+        })
     }
 
     pub fn bind_key(&self) -> (String, u16) {
@@ -72,29 +77,45 @@ pub enum RuntimeListenerSource {
 
 #[derive(Debug, Clone)]
 pub struct RuntimeListenerTls {
-    pub default_identity: Option<RuntimeTlsIdentity>,
+    pub default_identity: RuntimeTlsIdentity,
     pub sni_identities: HashMap<String, RuntimeTlsIdentity>,
     pub client_auth: ClientAuth,
 }
 
 impl RuntimeListenerTls {
-    fn from_listen(listen: &Listen) -> Self {
+    pub fn normalize(listen: &Listen, label: &str) -> Result<Self, String> {
         let mut sni_identities = HashMap::new();
+        let legacy_identity = RuntimeTlsIdentity::from_legacy_pair(listen, label)?;
+
         for entry in &listen.tls.certificates {
-            sni_identities.insert(
-                entry.server_name.clone(),
-                RuntimeTlsIdentity::from_certificate(entry),
-            );
+            let identity = RuntimeTlsIdentity::from_certificate(entry, label)?;
+            let server_name = entry.server_name.trim().to_ascii_lowercase();
+            if let Some(existing) = sni_identities.insert(server_name.clone(), identity) {
+                return Err(format!(
+                    "{label}.tls.certificates contains duplicate server_name '{server_name}' for '{}' and '{}'",
+                    existing.cert_path, entry.cert
+                ));
+            }
         }
 
-        let default_identity = RuntimeTlsIdentity::from_legacy_pair(&listen)
-            .or_else(|| listen.tls.certificates.first().map(RuntimeTlsIdentity::from_certificate));
+        let default_identity = match legacy_identity {
+            Some(identity) => identity,
+            None => listen
+                .tls
+                .certificates
+                .first()
+                .map(|entry| RuntimeTlsIdentity::from_certificate(entry, label))
+                .transpose()?
+                .ok_or_else(|| {
+                    format!("{label}.tls requires either cert/key or certificates entries")
+                })?,
+        };
 
-        Self {
+        Ok(Self {
             default_identity,
             sni_identities,
             client_auth: listen.tls.client_auth.clone(),
-        }
+        })
     }
 }
 
@@ -105,24 +126,44 @@ pub struct RuntimeTlsIdentity {
 }
 
 impl RuntimeTlsIdentity {
-    fn from_certificate(certificate: &TlsCertificate) -> Self {
-        Self {
-            cert_path: certificate.cert.clone(),
-            key_path: certificate.key.clone(),
+    fn from_certificate(certificate: &TlsCertificate, label: &str) -> Result<Self, String> {
+        let server_name = certificate.server_name.trim();
+        if server_name.is_empty() {
+            return Err(format!(
+                "{label}.tls.certificates entries must include a non-empty server_name"
+            ));
         }
+
+        let cert_path = certificate.cert.trim();
+        let key_path = certificate.key.trim();
+        if cert_path.is_empty() || key_path.is_empty() {
+            return Err(format!(
+                "{label}.tls.certificates entries must include non-empty cert and key"
+            ));
+        }
+
+        Ok(Self {
+            cert_path: cert_path.to_string(),
+            key_path: key_path.to_string(),
+        })
     }
 
-    fn from_legacy_pair(listen: &Listen) -> Option<Self> {
+    fn from_legacy_pair(listen: &Listen, label: &str) -> Result<Option<Self>, String> {
         let cert = listen.tls.cert.trim();
         let key = listen.tls.key.trim();
         if cert.is_empty() || key.is_empty() {
-            return None;
+            if cert.is_empty() && key.is_empty() {
+                return Ok(None);
+            }
+            return Err(format!(
+                "{label}.tls.cert and {label}.tls.key must both be set when either is provided"
+            ));
         }
 
-        Some(Self {
+        Ok(Some(Self {
             cert_path: cert.to_string(),
             key_path: key.to_string(),
-        })
+        }))
     }
 }
 
@@ -187,7 +228,8 @@ pub fn runtime_listeners(config: &Config) -> Result<Vec<RuntimeListener>, String
             0,
             RuntimeListenerSource::LegacyListen,
             config.listen.clone(),
-        )]
+            "listen",
+        )?]
     } else {
         config
             .listeners
@@ -195,9 +237,14 @@ pub fn runtime_listeners(config: &Config) -> Result<Vec<RuntimeListener>, String
             .cloned()
             .enumerate()
             .map(|(index, listen)| {
-                RuntimeListener::new(index, RuntimeListenerSource::ExplicitListeners, listen)
+                RuntimeListener::new(
+                    index,
+                    RuntimeListenerSource::ExplicitListeners,
+                    listen,
+                    &format!("listeners[{index}]"),
+                )
             })
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?
     };
 
     validate_listener_bindings(&listeners)?;
@@ -237,7 +284,12 @@ mod tests {
                 protocol: "http3".to_string(),
                 port: 443,
                 address: "0.0.0.0".to_string(),
-                tls: Tls::default(),
+                tls: Tls {
+                    cert: "/tmp/tls/default.pem".to_string(),
+                    key: "/tmp/tls/default.key".to_string(),
+                    certificates: Vec::new(),
+                    client_auth: ClientAuth::default(),
+                },
             },
             listeners: Vec::new(),
             upstream: HashMap::new(),
@@ -331,10 +383,10 @@ mod tests {
 
         assert_eq!(
             tls.default_identity,
-            Some(RuntimeTlsIdentity {
+            RuntimeTlsIdentity {
                 cert_path: "/tmp/tls/cert.pem".to_string(),
                 key_path: "/tmp/tls/key.pem".to_string(),
-            })
+            }
         );
         assert!(tls.sni_identities.contains_key("api.example.com"));
     }
@@ -398,5 +450,35 @@ mod tests {
 
         let err = runtime_listeners(&config).expect_err("duplicate listeners must fail");
         assert!(err.contains("listener binding conflict"));
+    }
+
+    #[test]
+    fn runtime_listener_tls_rejects_partial_legacy_pair() {
+        let mut config = sample_config();
+        config.listen.tls.cert = "/tmp/tls/cert.pem".to_string();
+        config.listen.tls.key.clear();
+
+        let err = runtime_listeners(&config).expect_err("partial legacy pair must fail");
+        assert!(err.contains("listen.tls.cert and listen.tls.key must both be set"));
+    }
+
+    #[test]
+    fn runtime_listener_tls_rejects_duplicate_sni_names() {
+        let mut config = sample_config();
+        config.listen.tls.certificates = vec![
+            TlsCertificate {
+                server_name: "api.example.com".to_string(),
+                cert: "/tmp/tls/api.pem".to_string(),
+                key: "/tmp/tls/api.key".to_string(),
+            },
+            TlsCertificate {
+                server_name: "API.EXAMPLE.COM".to_string(),
+                cert: "/tmp/tls/api-2.pem".to_string(),
+                key: "/tmp/tls/api-2.key".to_string(),
+            },
+        ];
+
+        let err = runtime_listeners(&config).expect_err("duplicate sni names must fail");
+        assert!(err.contains("duplicate server_name"));
     }
 }
