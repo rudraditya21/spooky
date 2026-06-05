@@ -1,4 +1,4 @@
-use std::{collections::HashMap, net::IpAddr};
+use std::{collections::HashMap, fmt, net::IpAddr};
 
 use crate::{
     backend_endpoint::BackendEndpoint,
@@ -21,7 +21,7 @@ pub struct RuntimeConfig {
 }
 
 impl RuntimeConfig {
-    pub fn from_config(config: &Config) -> Result<Self, String> {
+    pub fn from_config(config: &Config) -> Result<Self, RuntimeConfigError> {
         Ok(Self {
             version: config.version,
             listeners: runtime_listeners(config)?,
@@ -33,6 +33,103 @@ impl RuntimeConfig {
         })
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeConfigError {
+    ConfigInvalid(String),
+    TlsMaterialInvalid(String),
+    BackendAddressInvalid {
+        upstream: String,
+        backend: String,
+        address: String,
+        reason: String,
+    },
+    DuplicateRouteAmbiguity {
+        upstream: String,
+        existing_upstream: String,
+        host: Option<String>,
+        path_prefix: Option<String>,
+        method: Option<String>,
+    },
+    ListenerBindConflict {
+        current: String,
+        existing: String,
+        address: String,
+        port: u16,
+    },
+    UnsupportedPolicyCombination(String),
+}
+
+impl RuntimeConfigError {
+    pub fn category(&self) -> &'static str {
+        match self {
+            Self::ConfigInvalid(_) => "config_invalid",
+            Self::TlsMaterialInvalid(_) => "tls_material_invalid",
+            Self::BackendAddressInvalid { .. } => "backend_address_invalid",
+            Self::DuplicateRouteAmbiguity { .. } => "duplicate_route_ambiguity",
+            Self::ListenerBindConflict { .. } => "listener_bind_conflict",
+            Self::UnsupportedPolicyCombination(_) => "unsupported_policy_combination",
+        }
+    }
+}
+
+impl fmt::Display for RuntimeConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ConfigInvalid(message)
+            | Self::TlsMaterialInvalid(message)
+            | Self::UnsupportedPolicyCombination(message) => {
+                write!(f, "{}: {}", self.category(), message)
+            }
+            Self::BackendAddressInvalid {
+                upstream,
+                backend,
+                address,
+                reason,
+            } => write!(
+                f,
+                "{}: upstream '{}' backend '{}' address '{}' is invalid: {}",
+                self.category(),
+                upstream,
+                backend,
+                address,
+                reason
+            ),
+            Self::DuplicateRouteAmbiguity {
+                upstream,
+                existing_upstream,
+                host,
+                path_prefix,
+                method,
+            } => write!(
+                f,
+                "{}: upstream '{}' conflicts with upstream '{}' for host={:?} path_prefix={:?} method={:?}",
+                self.category(),
+                upstream,
+                existing_upstream,
+                host,
+                path_prefix,
+                method
+            ),
+            Self::ListenerBindConflict {
+                current,
+                existing,
+                address,
+                port,
+            } => write!(
+                f,
+                "{}: {} duplicates {} on {}:{}",
+                self.category(),
+                current,
+                existing,
+                address,
+                port
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RuntimeConfigError {}
 
 #[derive(Debug, Clone)]
 pub struct RuntimeListener {
@@ -48,7 +145,7 @@ impl RuntimeListener {
         source: RuntimeListenerSource,
         listen: Listen,
         label: &str,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, RuntimeConfigError> {
         let tls = RuntimeListenerTls::normalize(&listen, label)?;
         Ok(Self {
             index,
@@ -77,40 +174,40 @@ pub struct RuntimeListenerTls {
 }
 
 impl RuntimeListenerTls {
-    pub fn normalize(listen: &Listen, label: &str) -> Result<Self, String> {
+    pub fn normalize(listen: &Listen, label: &str) -> Result<Self, RuntimeConfigError> {
         let mut sni_identities = HashMap::new();
         let legacy_identity = RuntimeTlsIdentity::from_legacy_pair(listen, label)?;
 
         if !listen.tls.client_auth.enabled && listen.tls.client_auth.require_client_cert {
-            return Err(format!(
+            return Err(RuntimeConfigError::UnsupportedPolicyCombination(format!(
                 "{label}.tls.client_auth.require_client_cert requires client_auth.enabled=true"
-            ));
+            )));
         }
         if listen.tls.client_auth.enabled {
             let Some(ca_file) = listen.tls.client_auth.ca_file.as_deref().map(str::trim) else {
-                return Err(format!(
+                return Err(RuntimeConfigError::TlsMaterialInvalid(format!(
                     "{label}.tls.client_auth.ca_file is required when client_auth.enabled=true"
-                ));
+                )));
             };
             if ca_file.is_empty() {
-                return Err(format!(
+                return Err(RuntimeConfigError::TlsMaterialInvalid(format!(
                     "{label}.tls.client_auth.ca_file must be non-empty when client_auth.enabled=true"
-                ));
+                )));
             }
         }
 
         for entry in &listen.tls.certificates {
             let identity = RuntimeTlsIdentity::from_certificate(entry, label)?;
             let server_name = normalize_sni_server_name(&entry.server_name).ok_or_else(|| {
-                format!(
+                RuntimeConfigError::TlsMaterialInvalid(format!(
                     "{label}.tls.certificates entries must include a valid DNS server_name"
-                )
+                ))
             })?;
             if let Some(existing) = sni_identities.insert(server_name.clone(), identity) {
-                return Err(format!(
+                return Err(RuntimeConfigError::TlsMaterialInvalid(format!(
                     "{label}.tls.certificates contains duplicate server_name '{server_name}' for '{}' and '{}'",
                     existing.cert_path, entry.cert
-                ));
+                )));
             }
         }
 
@@ -122,9 +219,9 @@ impl RuntimeListenerTls {
                 .first()
                 .map(|entry| RuntimeTlsIdentity::from_certificate(entry, label))
                 .transpose()?
-                .ok_or_else(|| {
-                    format!("{label}.tls requires either cert/key or certificates entries")
-                })?,
+                .ok_or_else(|| RuntimeConfigError::TlsMaterialInvalid(format!(
+                    "{label}.tls requires either cert/key or certificates entries"
+                )))?,
         };
 
         Ok(Self {
@@ -142,20 +239,23 @@ pub struct RuntimeTlsIdentity {
 }
 
 impl RuntimeTlsIdentity {
-    fn from_certificate(certificate: &TlsCertificate, label: &str) -> Result<Self, String> {
+    fn from_certificate(
+        certificate: &TlsCertificate,
+        label: &str,
+    ) -> Result<Self, RuntimeConfigError> {
         let server_name = certificate.server_name.trim();
         if server_name.is_empty() {
-            return Err(format!(
+            return Err(RuntimeConfigError::TlsMaterialInvalid(format!(
                 "{label}.tls.certificates entries must include a non-empty server_name"
-            ));
+            )));
         }
 
         let cert_path = certificate.cert.trim();
         let key_path = certificate.key.trim();
         if cert_path.is_empty() || key_path.is_empty() {
-            return Err(format!(
+            return Err(RuntimeConfigError::TlsMaterialInvalid(format!(
                 "{label}.tls.certificates entries must include non-empty cert and key"
-            ));
+            )));
         }
 
         Ok(Self {
@@ -164,16 +264,19 @@ impl RuntimeTlsIdentity {
         })
     }
 
-    fn from_legacy_pair(listen: &Listen, label: &str) -> Result<Option<Self>, String> {
+    fn from_legacy_pair(
+        listen: &Listen,
+        label: &str,
+    ) -> Result<Option<Self>, RuntimeConfigError> {
         let cert = listen.tls.cert.trim();
         let key = listen.tls.key.trim();
         if cert.is_empty() || key.is_empty() {
             if cert.is_empty() && key.is_empty() {
                 return Ok(None);
             }
-            return Err(format!(
+            return Err(RuntimeConfigError::TlsMaterialInvalid(format!(
                 "{label}.tls.cert and {label}.tls.key must both be set when either is provided"
-            ));
+            )));
         }
 
         Ok(Some(Self {
@@ -247,7 +350,7 @@ pub struct RuntimeUpstreamPolicy {
     pub protocol: RuntimeProtocolPolicy,
 }
 
-pub fn runtime_listeners(config: &Config) -> Result<Vec<RuntimeListener>, String> {
+pub fn runtime_listeners(config: &Config) -> Result<Vec<RuntimeListener>, RuntimeConfigError> {
     let listeners = if config.listeners.is_empty() {
         vec![RuntimeListener::new(
             0,
@@ -276,7 +379,9 @@ pub fn runtime_listeners(config: &Config) -> Result<Vec<RuntimeListener>, String
     Ok(listeners)
 }
 
-fn validate_listener_bindings(listeners: &[RuntimeListener]) -> Result<(), String> {
+fn validate_listener_bindings(
+    listeners: &[RuntimeListener],
+) -> Result<(), RuntimeConfigError> {
     let mut seen = HashMap::new();
     for listener in listeners {
         let bind_key = listener.bind_key();
@@ -285,18 +390,25 @@ fn validate_listener_bindings(listeners: &[RuntimeListener]) -> Result<(), Strin
             listener.listen.address, listener.listen.port, listener.index
         );
         if let Some(existing) = seen.insert(bind_key, current.clone()) {
-            return Err(format!(
-                "listener binding conflict: {current} duplicates {existing}"
-            ));
+            return Err(RuntimeConfigError::ListenerBindConflict {
+                current,
+                existing,
+                address: listener.listen.address.clone(),
+                port: listener.listen.port,
+            });
         }
     }
 
     Ok(())
 }
 
-fn normalize_upstreams(config: &Config) -> Result<HashMap<String, RuntimeUpstream>, String> {
+fn normalize_upstreams(
+    config: &Config,
+) -> Result<HashMap<String, RuntimeUpstream>, RuntimeConfigError> {
     if config.upstream.is_empty() {
-        return Err("no upstreams configured".to_string());
+        return Err(RuntimeConfigError::ConfigInvalid(
+            "no upstreams configured".to_string(),
+        ));
     }
 
     validate_protocol_policy(&config.resilience.protocol)?;
@@ -315,10 +427,13 @@ fn normalize_upstreams(config: &Config) -> Result<HashMap<String, RuntimeUpstrea
         );
         if let Some(existing) = seen_route_matchers.insert(route_key.clone(), upstream_name.clone())
         {
-            return Err(format!(
-                "ambiguous route matcher: upstream '{upstream_name}' conflicts with upstream '{existing}' for host={:?} path_prefix={:?} method={:?}",
-                route_key.0, route_key.1, route_key.2
-            ));
+            return Err(RuntimeConfigError::DuplicateRouteAmbiguity {
+                upstream: upstream_name.clone(),
+                existing_upstream: existing,
+                host: route_key.0.clone(),
+                path_prefix: route_key.1.clone(),
+                method: route_key.2.clone(),
+            });
         }
 
         let runtime_upstream = RuntimeUpstream::from_config(config, upstream_name.as_str(), upstream);
@@ -326,20 +441,24 @@ fn normalize_upstreams(config: &Config) -> Result<HashMap<String, RuntimeUpstrea
 
         for backend in &runtime_upstream.backends {
             if backend.backend.id.trim().is_empty() {
-                return Err(format!("upstream '{upstream_name}' contains an empty backend id"));
+                return Err(RuntimeConfigError::ConfigInvalid(format!(
+                    "upstream '{upstream_name}' contains an empty backend id"
+                )));
             }
             if backend.backend.address.trim().is_empty() {
-                return Err(format!(
+                return Err(RuntimeConfigError::ConfigInvalid(format!(
                     "backend '{}' in upstream '{}' has an empty address",
                     backend.backend.id, upstream_name
-                ));
+                )));
             }
 
             let endpoint = BackendEndpoint::parse(&backend.backend.address).map_err(|err| {
-                format!(
-                    "invalid backend address '{}' in upstream '{}' (backend '{}'): {}",
-                    backend.backend.address, upstream_name, backend.backend.id, err
-                )
+                RuntimeConfigError::BackendAddressInvalid {
+                    upstream: upstream_name.clone(),
+                    backend: backend.backend.id.clone(),
+                    address: backend.backend.address.clone(),
+                    reason: err,
+                }
             })?;
 
             let origin = endpoint.origin();
@@ -347,10 +466,15 @@ fn normalize_upstreams(config: &Config) -> Result<HashMap<String, RuntimeUpstrea
                 origin.clone(),
                 (upstream_name.clone(), backend.backend.id.clone()),
             ) {
-                return Err(format!(
-                    "duplicate backend address '{}' detected: upstream '{}' backend '{}' conflicts with upstream '{}' backend '{}'",
-                    origin, upstream_name, backend.backend.id, existing_upstream, existing_backend
-                ));
+                return Err(RuntimeConfigError::BackendAddressInvalid {
+                    upstream: upstream_name.clone(),
+                    backend: backend.backend.id.clone(),
+                    address: origin,
+                    reason: format!(
+                        "conflicts with upstream '{}' backend '{}'",
+                        existing_upstream, existing_backend
+                    ),
+                });
             }
         }
 
@@ -360,61 +484,65 @@ fn normalize_upstreams(config: &Config) -> Result<HashMap<String, RuntimeUpstrea
     Ok(normalized)
 }
 
-fn validate_protocol_policy(policy: &ProtocolPolicy) -> Result<(), String> {
+fn validate_protocol_policy(policy: &ProtocolPolicy) -> Result<(), RuntimeConfigError> {
     if policy.max_headers_count == 0 {
-        return Err("resilience.protocol.max_headers_count must be greater than 0".to_string());
+        return Err(RuntimeConfigError::ConfigInvalid(
+            "resilience.protocol.max_headers_count must be greater than 0".to_string(),
+        ));
     }
     if policy.max_headers_bytes == 0 {
-        return Err("resilience.protocol.max_headers_bytes must be greater than 0".to_string());
+        return Err(RuntimeConfigError::ConfigInvalid(
+            "resilience.protocol.max_headers_bytes must be greater than 0".to_string(),
+        ));
     }
     if policy
         .allowed_methods
         .iter()
         .any(|method| method.trim().is_empty())
     {
-        return Err(
+        return Err(RuntimeConfigError::ConfigInvalid(
             "resilience.protocol.allowed_methods must not contain empty values".to_string(),
-        );
+        ));
     }
     if policy
         .denied_path_prefixes
         .iter()
         .any(|prefix| prefix.is_empty() || !prefix.starts_with('/'))
     {
-        return Err(
+        return Err(RuntimeConfigError::ConfigInvalid(
             "resilience.protocol.denied_path_prefixes must contain '/'-prefixed paths"
                 .to_string(),
-        );
+        ));
     }
     if !policy.allow_connect
         && (!policy.connect_allowed_ports.is_empty() || !policy.connect_allowed_authorities.is_empty())
     {
-        return Err(
+        return Err(RuntimeConfigError::UnsupportedPolicyCombination(
             "resilience.protocol.connect_allowed_ports/connect_allowed_authorities require allow_connect=true"
                 .to_string(),
-        );
+        ));
     }
     if policy.connect_allowed_ports.contains(&0) {
-        return Err(
+        return Err(RuntimeConfigError::ConfigInvalid(
             "resilience.protocol.connect_allowed_ports must contain ports in range 1-65535"
                 .to_string(),
-        );
+        ));
     }
     if policy
         .connect_allowed_authorities
         .iter()
         .any(|authority| !is_valid_connect_authority(authority))
     {
-        return Err(
+        return Err(RuntimeConfigError::ConfigInvalid(
             "resilience.protocol.connect_allowed_authorities must contain authority-form host:port targets"
                 .to_string(),
-        );
+        ));
     }
     if policy.allow_0rtt && policy.early_data_safe_methods.is_empty() {
-        return Err(
+        return Err(RuntimeConfigError::UnsupportedPolicyCombination(
             "resilience.protocol.early_data_safe_methods must be non-empty when allow_0rtt=true"
                 .to_string(),
-        );
+        ));
     }
     Ok(())
 }
@@ -423,21 +551,21 @@ fn validate_upstream_policy(
     config: &Config,
     upstream_name: &str,
     upstream: &Upstream,
-) -> Result<(), String> {
+) -> Result<(), RuntimeConfigError> {
     match upstream.host_policy.mode {
         UpstreamHostPolicyMode::PassThrough | UpstreamHostPolicyMode::Upstream => {
             if upstream.host_policy.host.is_some() {
-                return Err(format!(
+                return Err(RuntimeConfigError::UnsupportedPolicyCombination(format!(
                     "upstream '{upstream_name}' sets host_policy.host but mode is not rewrite"
-                ));
+                )));
             }
         }
         UpstreamHostPolicyMode::Rewrite => match upstream.host_policy.host.as_deref() {
             Some(host) if valid_static_host_header(host) => {}
             _ => {
-                return Err(format!(
+                return Err(RuntimeConfigError::UnsupportedPolicyCombination(format!(
                     "upstream '{upstream_name}' requires a valid non-empty host_policy.host when mode=rewrite"
-                ));
+                )));
             }
         },
     }
@@ -445,41 +573,44 @@ fn validate_upstream_policy(
     if let Some(path) = upstream.route.path_prefix.as_deref()
         && (path.is_empty() || !path.starts_with('/'))
     {
-        return Err(format!(
+        return Err(RuntimeConfigError::ConfigInvalid(format!(
             "upstream '{upstream_name}' has an invalid route.path_prefix '{}'",
             path
-        ));
+        )));
     }
 
     if normalized_route_method(upstream.route.method.as_deref()).as_deref() == Some("CONNECT")
         && !config.resilience.protocol.allow_connect
     {
-        return Err(format!(
+        return Err(RuntimeConfigError::UnsupportedPolicyCombination(format!(
             "upstream '{upstream_name}' routes CONNECT but resilience.protocol.allow_connect=false"
-        ));
+        )));
     }
 
     Ok(())
 }
 
-fn validate_runtime_upstream_tls(upstream_name: &str, tls: &UpstreamTls) -> Result<(), String> {
+fn validate_runtime_upstream_tls(
+    upstream_name: &str,
+    tls: &UpstreamTls,
+) -> Result<(), RuntimeConfigError> {
     if tls
         .ca_file
         .as_deref()
         .is_some_and(|value| value.trim().is_empty())
     {
-        return Err(format!(
+        return Err(RuntimeConfigError::TlsMaterialInvalid(format!(
             "upstream '{upstream_name}' has an empty effective upstream_tls.ca_file"
-        ));
+        )));
     }
     if tls
         .ca_dir
         .as_deref()
         .is_some_and(|value| value.trim().is_empty())
     {
-        return Err(format!(
+        return Err(RuntimeConfigError::TlsMaterialInvalid(format!(
             "upstream '{upstream_name}' has an empty effective upstream_tls.ca_dir"
-        ));
+        )));
     }
     Ok(())
 }
@@ -750,7 +881,8 @@ mod tests {
         ];
 
         let err = runtime_listeners(&config).expect_err("duplicate listeners must fail");
-        assert!(err.contains("listener binding conflict"));
+        assert_eq!(err.category(), "listener_bind_conflict");
+        assert!(err.to_string().contains("duplicates"));
     }
 
     #[test]
@@ -760,7 +892,11 @@ mod tests {
         config.listen.tls.key.clear();
 
         let err = runtime_listeners(&config).expect_err("partial legacy pair must fail");
-        assert!(err.contains("listen.tls.cert and listen.tls.key must both be set"));
+        assert_eq!(err.category(), "tls_material_invalid");
+        assert!(
+            err.to_string()
+                .contains("listen.tls.cert and listen.tls.key must both be set")
+        );
     }
 
     #[test]
@@ -780,7 +916,8 @@ mod tests {
         ];
 
         let err = runtime_listeners(&config).expect_err("duplicate sni names must fail");
-        assert!(err.contains("duplicate server_name"));
+        assert_eq!(err.category(), "tls_material_invalid");
+        assert!(err.to_string().contains("duplicate server_name"));
     }
 
     #[test]
@@ -794,7 +931,8 @@ mod tests {
             .host = Some("ignored.example.com".to_string());
 
         let err = RuntimeConfig::from_config(&config).expect_err("conflicting host policy");
-        assert!(err.contains("mode is not rewrite"));
+        assert_eq!(err.category(), "unsupported_policy_combination");
+        assert!(err.to_string().contains("mode is not rewrite"));
     }
 
     #[test]
@@ -806,7 +944,8 @@ mod tests {
         );
 
         let err = RuntimeConfig::from_config(&config).expect_err("duplicate routes");
-        assert!(err.contains("ambiguous route matcher"));
+        assert_eq!(err.category(), "duplicate_route_ambiguity");
+        assert!(err.to_string().contains("conflicts with upstream"));
     }
 
     #[test]
@@ -821,6 +960,7 @@ mod tests {
         config.resilience.protocol.allow_connect = false;
 
         let err = RuntimeConfig::from_config(&config).expect_err("connect route must fail");
-        assert!(err.contains("allow_connect=false"));
+        assert_eq!(err.category(), "unsupported_policy_combination");
+        assert!(err.to_string().contains("allow_connect=false"));
     }
 }
