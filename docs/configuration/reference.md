@@ -94,6 +94,24 @@ Server listening configuration. Defines the protocol, address, and port for inco
 
 Optional multi-listener array. When set, overrides the top-level `listen` block. Each entry is an independent listener with its own address, port, and TLS identity. Spooky spawns a separate QUIC worker group and bootstrap TLS listener per entry.
 
+### Runtime Normalization And Precedence
+
+Spooky normalizes configuration into one canonical runtime model before any listener starts.
+
+Precedence rules:
+
+1. `listeners[]` is the only effective listener set when it is non-empty.
+2. The top-level `listen` block is only used when `listeners[]` is empty.
+3. Listener TLS fallback order is:
+   1. exact SNI match in `listen.tls.certificates`
+   2. legacy `listen.tls.cert` + `listen.tls.key` when configured
+   3. otherwise the first `listen.tls.certificates[]` entry becomes the default identity
+4. Upstream TLS precedence is:
+   1. `upstream.<name>.tls`
+   2. global `upstream_tls`
+
+Startup rejects ambiguous or contradictory combinations, including duplicate effective listener binds, duplicate normalized route matchers, partial legacy listener cert/key pairs, invalid or duplicate SNI `server_name` entries, `host_policy.host` outside `mode: rewrite`, and `CONNECT` routing/policy conflicts.
+
 ### upstream
 
 Named upstream pool definitions. Each key represents a unique upstream pool with its own routing rules, load balancing strategy, and backend servers.
@@ -222,7 +240,7 @@ listen:
 
 Use `listeners` instead of `listen` when you need multiple independent listeners — for example, a public-facing port and a private/internal port with different TLS identities.
 
-`listeners` and `listen` share the same per-entry schema. When `listeners` is set, the top-level `listen` block is ignored.
+`listeners` and `listen` share the same per-entry schema. When `listeners` is set, the top-level `listen` block is ignored for runtime listener selection and listener validation.
 
 ```yaml
 # Single listener — use the top-level listen block (default)
@@ -274,7 +292,7 @@ upstream:
 | `route` | object | Yes | - | Route matching criteria |
 | `backends` | array | Yes | - | List of backend servers |
 | `host_policy` | object | No | `pass-through` | Controls how the `Host`/`:authority` header is set on upstream requests |
-| `tls` | object | No | inherits `upstream_tls` | Per-upstream TLS policy override (verify_certificates, strict_sni, ca_file, ca_dir) |
+| `tls` | object | No | inherits `upstream_tls` | Per-upstream TLS policy override (verify_certificates, strict_sni, ca_file, ca_dir); wins over global `upstream_tls` when set |
 | `forwarded_headers` | object | No | `overwrite` | Controls `X-Forwarded-For` forwarding behavior |
 
 ### Route Matching
@@ -457,7 +475,7 @@ Controls how the `Host` / `:authority` header is set on requests forwarded to th
 | Property | Type | Required | Default | Description |
 |----------|------|----------|---------|-------------|
 | `mode` | string | No | `pass-through` | Header rewrite mode: `pass-through`, `rewrite`, or `upstream` |
-| `host` | string | No | - | Static host to use when `mode: rewrite` |
+| `host` | string | No | - | Static host to use when `mode: rewrite`; rejected for other modes |
 
 #### Modes
 

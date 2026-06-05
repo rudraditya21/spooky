@@ -1150,10 +1150,11 @@ pub fn validate(config: &Config) -> bool {
         match upstream.host_policy.mode {
             UpstreamHostPolicyMode::PassThrough | UpstreamHostPolicyMode::Upstream => {
                 if upstream.host_policy.host.is_some() {
-                    warn!(
-                        "upstream {}.host_policy.host is ignored unless mode is rewrite",
+                    error!(
+                        "upstream {}.host_policy.host is invalid unless mode is rewrite",
                         upstream_name
                     );
+                    return false;
                 }
             }
             UpstreamHostPolicyMode::Rewrite => match upstream.host_policy.host.as_deref() {
@@ -2159,5 +2160,44 @@ upstream:
             .insert("test_upstream_2".to_string(), post_route);
 
         assert!(validate(&cfg));
+    }
+
+    #[test]
+    fn listeners_override_invalid_legacy_listen_block() {
+        let dir = tempdir().expect("tempdir");
+        let (legacy_cert, legacy_key) = write_test_certs(dir.path());
+        let (listener_cert, listener_key) = write_test_certs(dir.path());
+
+        let mut cfg = base_config(&legacy_cert.to_string_lossy(), &legacy_key.to_string_lossy());
+        cfg.listen.tls.cert.clear();
+        cfg.listen.tls.key.clear();
+        cfg.listeners = vec![Listen {
+            protocol: "http3".to_string(),
+            port: 9443,
+            address: "127.0.0.1".to_string(),
+            tls: Tls {
+                cert: listener_cert.to_string_lossy().to_string(),
+                key: listener_key.to_string_lossy().to_string(),
+                certificates: vec![],
+                client_auth: ClientAuth::default(),
+            },
+        }];
+
+        assert!(validate(&cfg));
+    }
+
+    #[test]
+    fn rejects_host_policy_host_when_mode_is_not_rewrite() {
+        let dir = tempdir().expect("tempdir");
+        let (cert, key) = write_test_certs(dir.path());
+
+        let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        cfg.upstream
+            .get_mut("test_upstream")
+            .expect("upstream")
+            .host_policy
+            .host = Some("ignored.example.com".to_string());
+
+        assert!(!validate(&cfg));
     }
 }
