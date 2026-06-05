@@ -56,7 +56,7 @@ use tracing::{Instrument, info_span};
 use spooky_config::{
     backend_endpoint::{BackendEndpoint, BackendScheme},
     config::{Config as SpookyConfig, ForwardedHeaderPolicy, UpstreamHostPolicy, UpstreamTls},
-    runtime::RuntimeListenerTls,
+    runtime::{RuntimeConfig, RuntimeListenerTls},
 };
 
 use crate::{
@@ -428,17 +428,9 @@ impl QUICListener {
         }
     }
 
-    fn effective_upstream_tls(
-        config: &SpookyConfig,
-        upstream: &spooky_config::config::Upstream,
-    ) -> UpstreamTls {
-        upstream
-            .tls
-            .clone()
-            .unwrap_or_else(|| config.upstream_tls.clone())
-    }
-
     pub fn build_shared_state(config: &SpookyConfig) -> Result<SharedRuntimeState, ProxyError> {
+        let runtime_config =
+            RuntimeConfig::from_config(config).map_err(|err| ProxyError::Transport(err.to_string()))?;
         let worker_threads = config.performance.worker_threads.max(1);
         let shard_count = config.performance.packet_shards_per_worker.max(1);
         let active_worker_threads = if worker_threads > 1 && !config.performance.reuseport {
@@ -484,33 +476,42 @@ impl QUICListener {
         let mut seen_backend_origins: HashMap<String, (String, String)> = HashMap::new();
         let mut backend_tls_configs: HashMap<String, TlsClientConfig> = HashMap::new();
         let mut upstream_tls_configs: HashMap<String, TlsClientConfig> = HashMap::new();
-        for (upstream_name, upstream) in &config.upstream {
-            let upstream_tls = Self::effective_upstream_tls(config, upstream);
-            let upstream_tls_client = Self::upstream_tls_client_config(&upstream_tls);
+        for (upstream_name, upstream) in &runtime_config.upstreams {
+            let upstream_tls_client = Self::upstream_tls_client_config(&upstream.effective_tls);
             upstream_tls_configs.insert(upstream_name.clone(), upstream_tls_client.clone());
 
             for backend in &upstream.backends {
-                let endpoint = match BackendEndpoint::parse(&backend.address) {
+                let endpoint = match BackendEndpoint::parse(&backend.backend.address) {
                     Ok(endpoint) => endpoint,
                     Err(err) => {
                         return Err(ProxyError::Transport(format!(
                             "invalid backend address '{}' in upstream '{}' (backend '{}'): {}",
-                            backend.address, upstream_name, backend.id, err
+                            backend.backend.address, upstream_name, backend.backend.id, err
                         )));
                     }
                 };
 
                 let origin = endpoint.origin();
                 if let Some((existing_upstream, existing_backend)) = seen_backend_origins
-                    .insert(origin.clone(), (upstream_name.clone(), backend.id.clone()))
+                    .insert(
+                        origin.clone(),
+                        (upstream_name.clone(), backend.backend.id.clone()),
+                    )
                 {
                     return Err(ProxyError::Transport(format!(
                         "duplicate backend address '{}' detected while building H2 pool: upstream '{}' backend '{}' conflicts with upstream '{}' backend '{}'",
-                        origin, upstream_name, backend.id, existing_upstream, existing_backend
+                        origin,
+                        upstream_name,
+                        backend.backend.id,
+                        existing_upstream,
+                        existing_backend
                     )));
                 }
-                backend_addresses.push(backend.address.clone());
-                backend_tls_configs.insert(backend.address.clone(), upstream_tls_client.clone());
+                backend_addresses.push(backend.backend.address.clone());
+                backend_tls_configs.insert(
+                    backend.backend.address.clone(),
+                    upstream_tls_client.clone(),
+                );
             }
         }
 
@@ -531,7 +532,13 @@ impl QUICListener {
         let mut upstream_inflight = HashMap::new();
         let mut upstream_health_clients = HashMap::new();
 
-        for (name, upstream) in &config.upstream {
+        for (name, runtime_upstream) in &runtime_config.upstreams {
+            let upstream = config.upstream.get(name).ok_or_else(|| {
+                ProxyError::Transport(format!(
+                    "normalized upstream '{}' missing from raw config",
+                    name
+                ))
+            })?;
             let upstream_pool = UpstreamPool::from_upstream(upstream).map_err(|err| {
                 ProxyError::Transport(format!(
                     "failed to create upstream pool '{}': {}",
@@ -540,7 +547,10 @@ impl QUICListener {
             })?;
             upstream_pools.insert(name.clone(), Arc::new(RwLock::new(upstream_pool)));
             upstream_inflight.insert(name.clone(), Arc::new(Semaphore::new(per_upstream_limit)));
-            let tls = upstream_tls_configs.get(name).cloned().unwrap_or_default();
+            let tls = upstream_tls_configs
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| Self::upstream_tls_client_config(&runtime_upstream.effective_tls));
             let client = H2Client::new(
                 config.performance.h2_pool_max_idle_per_backend.max(1),
                 Duration::from_millis(config.performance.h2_pool_idle_timeout_ms.max(1)),
