@@ -6,7 +6,7 @@ use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
 mod privilege_drop;
 mod runtime_guard;
 
-use spooky_config::config::{Config, effective_listens};
+use spooky_config::{config::Config, runtime::RuntimeConfig};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -114,22 +114,30 @@ fn main() {
     );
     runtime_guard::install_panic_hook();
 
-    // Require root only when binding privileged ports (< 1024).
     let uid = unsafe { libc::getuid() };
-    let binds_privileged_port = std::iter::once(&config_yaml.listen)
-        .chain(config_yaml.listeners.iter())
-        .any(|listen| listen.port < 1024);
-    if uid != 0 && binds_privileged_port {
+
+    // Validate Configurations
+    if !validate_config(&config_yaml) {
+        fatal_startup_error("Configuration validation failed. Exiting...", true, 1);
+    }
+
+    let runtime_config = match RuntimeConfig::from_config(&config_yaml) {
+        Ok(config) => config,
+        Err(err) => {
+            fatal_startup_error(
+                &format!("Runtime configuration normalization failed: {err}"),
+                true,
+                1,
+            );
+        }
+    };
+
+    if uid != 0 && runtime_config.listeners.iter().any(|listener| listener.listen.port < 1024) {
         fatal_startup_error(
             "binding a privileged port requires root or CAP_NET_BIND_SERVICE. Use ports >= 1024 for unprivileged startup.",
             true,
             1,
         );
-    }
-
-    // Validate Configurations
-    if !validate_config(&config_yaml) {
-        fatal_startup_error("Configuration validation failed. Exiting...", true, 1);
     }
 
     let control_plane_threads = config_yaml.performance.control_plane_threads.max(1);
@@ -154,10 +162,10 @@ fn main() {
         }
     };
 
-    runtime.block_on(run(config_yaml, uid));
+    runtime.block_on(run(config_yaml, runtime_config, uid));
 }
 
-async fn run(config_yaml: Config, uid: libc::uid_t) {
+async fn run(config_yaml: Config, runtime_config: RuntimeConfig, uid: libc::uid_t) {
     let shared_state = match QUICListener::build_shared_state(&config_yaml) {
         Ok(shared_state) => Arc::new(shared_state),
         Err(e) => {
@@ -176,8 +184,10 @@ async fn run(config_yaml: Config, uid: libc::uid_t) {
         std::process::exit(1);
     }
 
-    let listens = effective_listens(&config_yaml);
-    let binds_privileged_port = listens.iter().any(|listen| listen.port < 1024);
+    let binds_privileged_port = runtime_config
+        .listeners
+        .iter()
+        .any(|listener| listener.listen.port < 1024);
     if uid != 0 && binds_privileged_port {
         fatal_startup_error(
             "binding a privileged port requires root or CAP_NET_BIND_SERVICE. Use ports >= 1024 for unprivileged startup.",
@@ -199,16 +209,16 @@ async fn run(config_yaml: Config, uid: libc::uid_t) {
     let mut worker_handles: Vec<thread::JoinHandle<Result<(), String>>> = Vec::new();
     let mut worker_index_base = 0usize;
 
-    for (listener_idx, listen) in listens.iter().enumerate() {
+    for listener in &runtime_config.listeners {
         let mut listener_config = config_yaml.clone();
-        listener_config.listen = listen.clone();
+        listener_config.listen = listener.listen.clone();
 
         if let Err(err) =
             QUICListener::spawn_bootstrap_tls_listener(&listener_config, &shared_state)
         {
             error!(
                 "Failed to initialize bootstrap TLS listener {} ({}:{}): {}",
-                listener_idx, listen.address, listen.port, err
+                listener.index, listener.listen.address, listener.listen.port, err
             );
             std::process::exit(1);
         }
@@ -237,15 +247,19 @@ async fn run(config_yaml: Config, uid: libc::uid_t) {
     info!("Spooky is starting");
     info!(
         "Ingress listeners={} packet_shards_per_worker={} reuseport={} pin_workers={}",
-        listens.len(),
+        runtime_config.listeners.len(),
         shard_count,
         config_yaml.performance.reuseport,
         config_yaml.performance.pin_workers
     );
-    for (idx, listen) in listens.iter().enumerate() {
+    for listener in &runtime_config.listeners {
         info!(
             "Listener {}: HTTP/3 (QUIC) on UDP {}:{}, HTTP/1.1+HTTP/2 bootstrap (TLS) on TCP {}:{} with Alt-Svc upgrade",
-            idx, listen.address, listen.port, listen.address, listen.port,
+            listener.index,
+            listener.listen.address,
+            listener.listen.port,
+            listener.listen.address,
+            listener.listen.port,
         );
     }
     info!(

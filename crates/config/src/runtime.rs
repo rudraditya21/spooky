@@ -18,10 +18,10 @@ pub struct RuntimeConfig {
 }
 
 impl RuntimeConfig {
-    pub fn from_config(config: &Config) -> Self {
-        Self {
+    pub fn from_config(config: &Config) -> Result<Self, String> {
+        Ok(Self {
             version: config.version,
-            listeners: runtime_listeners(config),
+            listeners: runtime_listeners(config)?,
             upstreams: config
                 .upstream
                 .iter()
@@ -36,7 +36,7 @@ impl RuntimeConfig {
             observability: config.observability.clone(),
             resilience: config.resilience.clone(),
             security: config.security.clone(),
-        }
+        })
     }
 }
 
@@ -57,6 +57,10 @@ impl RuntimeListener {
             listen,
             tls,
         }
+    }
+
+    pub fn bind_key(&self) -> (String, u16) {
+        (self.listen.address.trim().to_ascii_lowercase(), self.listen.port)
     }
 }
 
@@ -177,24 +181,45 @@ pub struct RuntimeForwardedHeaderPolicy(pub ForwardedHeaderPolicy);
 #[derive(Debug, Clone)]
 pub struct RuntimeProtocolPolicy(pub ProtocolPolicy);
 
-pub fn runtime_listeners(config: &Config) -> Vec<RuntimeListener> {
-    if config.listeners.is_empty() {
-        return vec![RuntimeListener::new(
+pub fn runtime_listeners(config: &Config) -> Result<Vec<RuntimeListener>, String> {
+    let listeners = if config.listeners.is_empty() {
+        vec![RuntimeListener::new(
             0,
             RuntimeListenerSource::LegacyListen,
             config.listen.clone(),
-        )];
+        )]
+    } else {
+        config
+            .listeners
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, listen)| {
+                RuntimeListener::new(index, RuntimeListenerSource::ExplicitListeners, listen)
+            })
+            .collect()
+    };
+
+    validate_listener_bindings(&listeners)?;
+    Ok(listeners)
+}
+
+fn validate_listener_bindings(listeners: &[RuntimeListener]) -> Result<(), String> {
+    let mut seen = HashMap::new();
+    for listener in listeners {
+        let bind_key = listener.bind_key();
+        let current = format!(
+            "{}:{} (listener #{})",
+            listener.listen.address, listener.listen.port, listener.index
+        );
+        if let Some(existing) = seen.insert(bind_key, current.clone()) {
+            return Err(format!(
+                "listener binding conflict: {current} duplicates {existing}"
+            ));
+        }
     }
 
-    config
-        .listeners
-        .iter()
-        .cloned()
-        .enumerate()
-        .map(|(index, listen)| {
-            RuntimeListener::new(index, RuntimeListenerSource::ExplicitListeners, listen)
-        })
-        .collect()
+    Ok(())
 }
 
 #[cfg(test)]
@@ -257,7 +282,7 @@ mod tests {
     #[test]
     fn runtime_listeners_uses_legacy_listen_when_explicit_list_is_empty() {
         let config = sample_config();
-        let listeners = runtime_listeners(&config);
+        let listeners = runtime_listeners(&config).expect("legacy listeners");
 
         assert_eq!(listeners.len(), 1);
         assert_eq!(listeners[0].source, RuntimeListenerSource::LegacyListen);
@@ -282,7 +307,7 @@ mod tests {
             },
         ];
 
-        let listeners = runtime_listeners(&config);
+        let listeners = runtime_listeners(&config).expect("explicit listeners");
 
         assert_eq!(listeners.len(), 2);
         assert_eq!(listeners[0].source, RuntimeListenerSource::ExplicitListeners);
@@ -301,7 +326,7 @@ mod tests {
             key: "/tmp/tls/api.key".to_string(),
         }];
 
-        let listeners = runtime_listeners(&config);
+        let listeners = runtime_listeners(&config).expect("runtime listeners");
         let tls = &listeners[0].tls;
 
         assert_eq!(
@@ -334,7 +359,7 @@ mod tests {
             ca_dir: Some("/tmp/roots/upstream".to_string()),
         });
 
-        let runtime = RuntimeConfig::from_config(&config);
+        let runtime = RuntimeConfig::from_config(&config).expect("runtime config");
         let upstream = runtime.upstreams.get("api").expect("runtime upstream");
 
         assert_eq!(upstream.name, "api");
@@ -351,5 +376,27 @@ mod tests {
             upstream.forwarded_headers.0.mode,
             ForwardedHeaderPolicyMode::Append
         );
+    }
+
+    #[test]
+    fn runtime_listeners_reject_duplicate_effective_bindings() {
+        let mut config = sample_config();
+        config.listeners = vec![
+            Listen {
+                protocol: "http3".to_string(),
+                port: 8443,
+                address: "127.0.0.1".to_string(),
+                tls: Tls::default(),
+            },
+            Listen {
+                protocol: "http3".to_string(),
+                port: 8443,
+                address: "127.0.0.1".to_string(),
+                tls: Tls::default(),
+            },
+        ];
+
+        let err = runtime_listeners(&config).expect_err("duplicate listeners must fail");
+        assert!(err.contains("listener binding conflict"));
     }
 }

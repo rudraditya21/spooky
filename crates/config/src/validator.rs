@@ -416,26 +416,38 @@ pub fn validate(config: &Config) -> bool {
         );
     }
 
-    // --- Validate listen blocks ---
-    if !validate_listen_config(&config.listen, "listen") {
-        return false;
-    }
-    for (idx, listen) in config.listeners.iter().enumerate() {
-        if !validate_listen_config(listen, &format!("listeners[{idx}]")) {
+    // --- Validate effective listen blocks ---
+    if config.listeners.is_empty() {
+        if !validate_listen_config(&config.listen, "listen") {
             return false;
+        }
+    } else {
+        for (idx, listen) in config.listeners.iter().enumerate() {
+            if !validate_listen_config(listen, &format!("listeners[{idx}]")) {
+                return false;
+            }
         }
     }
 
+    let effective_listeners: Vec<(String, &crate::config::Listen)> = if config.listeners.is_empty()
+    {
+        vec![("listen".to_string(), &config.listen)]
+    } else {
+        config
+            .listeners
+            .iter()
+            .enumerate()
+            .map(|(idx, listen)| (format!("listeners[{idx}]"), listen))
+            .collect()
+    };
+
     let mut seen_listener_bindings: HashMap<(String, u16), String> = HashMap::new();
-    let listen_key = (config.listen.address.clone(), config.listen.port);
-    seen_listener_bindings.insert(listen_key, "listen".to_string());
-    for (idx, listen) in config.listeners.iter().enumerate() {
+    for (label, listen) in effective_listeners {
         let key = (listen.address.clone(), listen.port);
-        let current = format!("listeners[{idx}]");
-        if let Some(existing) = seen_listener_bindings.insert(key, current.clone()) {
+        if let Some(existing) = seen_listener_bindings.insert(key, label.clone()) {
             error!(
                 "listener binding conflict: {} duplicates {} on {}:{}",
-                current, existing, listen.address, listen.port
+                label, existing, listen.address, listen.port
             );
             return false;
         }
