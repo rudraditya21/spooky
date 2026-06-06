@@ -206,17 +206,40 @@ mod tests {
             true,
         );
         metrics.inc_backend_dns_refresh_failure();
+        metrics.inc_backend_client_rotation("backend.internal:443");
+        metrics.record_backend_connect_attempt(
+            "backend.internal:443",
+            "backend.internal",
+            &[
+                "10.0.0.10:443".parse().expect("addr one"),
+                "10.0.0.11:443".parse().expect("addr two"),
+            ],
+        );
 
         let output = metrics.render_prometheus();
         assert!(output.contains("spooky_backend_dns_refresh_success_total 1"));
         assert!(output.contains("spooky_backend_dns_refresh_failure_total 1"));
         assert!(output.contains("spooky_backend_dns_address_set_changes_total 1"));
+        assert!(output.contains("spooky_backend_client_rotations_total 1"));
         assert!(output.contains(
             "spooky_backend_dns_last_refresh_success_seconds{backend=\"backend.internal:443\"} 42"
         ));
         assert!(
             output.contains(
                 "spooky_backend_dns_resolved_addresses{backend=\"backend.internal:443\"} 2"
+            )
+        );
+        assert!(
+            output.contains("spooky_backend_client_rotations{backend=\"backend.internal:443\"} 1")
+        );
+        assert!(
+            output.contains(
+                "spooky_backend_connect_attempt_total{backend=\"backend.internal:443\",hostname=\"backend.internal\",resolved_addr=\"10.0.0.10:443\"} 1"
+            )
+        );
+        assert!(
+            output.contains(
+                "spooky_backend_connect_attempt_total{backend=\"backend.internal:443\",hostname=\"backend.internal\",resolved_addr=\"10.0.0.11:443\"} 1"
             )
         );
     }

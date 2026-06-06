@@ -14,6 +14,7 @@ enum BackendDnsRefreshOutcome {
         current_addrs: Vec<SocketAddr>,
         generation: u64,
         refreshed_at: SystemTime,
+        client_rotated: bool,
     },
     Unchanged {
         backend_addr: String,
@@ -84,6 +85,7 @@ impl QUICListener {
                             current_addrs,
                             generation,
                             refreshed_at,
+                            client_rotated,
                         } => {
                             task_metrics.record_backend_dns_refresh_success(
                                 &backend_addr,
@@ -91,6 +93,9 @@ impl QUICListener {
                                 current_addrs.len(),
                                 true,
                             );
+                            if client_rotated {
+                                task_metrics.inc_backend_client_rotation(&backend_addr);
+                            }
                             if previous_addrs.is_empty() {
                                 info!(
                                     "backend DNS refresh populated '{}' (backend '{}') with {:?} generation={}",
@@ -204,9 +209,14 @@ async fn refresh_backend_hostname(
             .map(|addr| SocketAddr::new(ip_only(addr), 0)),
     );
 
-    if update.changed() {
-        let _ = h2_pool.rotate_backend_client(&update.backend_addr);
-    }
+    let client_rotated = if update.changed() {
+        matches!(
+            h2_pool.rotate_backend_client(&update.backend_addr),
+            Ok(Some(_))
+        )
+    } else {
+        false
+    };
 
     if update.changed() {
         BackendDnsRefreshOutcome::Updated {
@@ -216,6 +226,7 @@ async fn refresh_backend_hostname(
             current_addrs: update.current_addrs,
             generation: update.refresh_generation,
             refreshed_at,
+            client_rotated,
         }
     } else {
         BackendDnsRefreshOutcome::Unchanged {

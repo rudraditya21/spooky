@@ -500,6 +500,14 @@ impl Metrics {
                 .load(Ordering::Relaxed)
         ));
         out.push_str(
+            "# HELP spooky_backend_client_rotations_total Total backend client rotations triggered by DNS address-set changes.\n",
+        );
+        out.push_str("# TYPE spooky_backend_client_rotations_total counter\n");
+        out.push_str(&format!(
+            "spooky_backend_client_rotations_total {}\n",
+            self.backend_client_rotations.load(Ordering::Relaxed)
+        ));
+        out.push_str(
             "# HELP spooky_backend_dns_last_refresh_success_seconds Unix timestamp of the last successful backend DNS refresh.\n",
         );
         out.push_str("# TYPE spooky_backend_dns_last_refresh_success_seconds gauge\n");
@@ -507,6 +515,14 @@ impl Metrics {
             "# HELP spooky_backend_dns_resolved_addresses Current number of resolved addresses retained for a backend identity.\n",
         );
         out.push_str("# TYPE spooky_backend_dns_resolved_addresses gauge\n");
+        out.push_str(
+            "# HELP spooky_backend_client_rotations Per-backend client rotation count triggered by DNS changes.\n",
+        );
+        out.push_str("# TYPE spooky_backend_client_rotations counter\n");
+        out.push_str(
+            "# HELP spooky_backend_connect_attempt_total Observed backend send attempts grouped by backend identity, hostname, and retained resolved address.\n",
+        );
+        out.push_str("# TYPE spooky_backend_connect_attempt_total counter\n");
         for (backend, state) in self.snapshot_backend_dns_state() {
             let backend = escape_prometheus_label(&backend);
             out.push_str(&format!(
@@ -516,6 +532,22 @@ impl Metrics {
             out.push_str(&format!(
                 "spooky_backend_dns_resolved_addresses{{backend=\"{}\"}} {}\n",
                 backend, state.resolved_address_count
+            ));
+        }
+        for (backend, state) in self.snapshot_backend_rotation_state() {
+            let backend = escape_prometheus_label(&backend);
+            out.push_str(&format!(
+                "spooky_backend_client_rotations{{backend=\"{}\"}} {}\n",
+                backend, state.rotations
+            ));
+        }
+        for (key, count) in self.snapshot_backend_connect_attempts() {
+            let backend = escape_prometheus_label(&key.backend);
+            let hostname = escape_prometheus_label(&key.hostname);
+            let resolved_addr = escape_prometheus_label(&key.resolved_addr);
+            out.push_str(&format!(
+                "spooky_backend_connect_attempt_total{{backend=\"{}\",hostname=\"{}\",resolved_addr=\"{}\"}} {}\n",
+                backend, hostname, resolved_addr, count
             ));
         }
         out.push_str(

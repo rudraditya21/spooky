@@ -438,6 +438,22 @@ impl QUICListener {
         }
     }
 
+    fn record_backend_connect_attempt(
+        metrics: &Metrics,
+        backend_resolution_store: &RuntimeBackendResolutionStore,
+        backend: &str,
+    ) {
+        if let Some(resolution) = backend_resolution_store.get(backend) {
+            metrics.record_backend_connect_attempt(
+                backend,
+                &resolution.authority_host,
+                &resolution.resolved_addrs,
+            );
+        } else {
+            metrics.record_backend_connect_attempt(backend, backend, &[]);
+        }
+    }
+
     pub fn build_shared_state(config: &RuntimeConfig) -> Result<SharedRuntimeState, ProxyError> {
         let worker_threads = config.performance.worker_threads.max(1);
         let shard_count = config.performance.packet_shards_per_worker.max(1);
@@ -663,6 +679,7 @@ impl QUICListener {
             shared_state.upstream_pools.clone(),
             Arc::clone(&shared_state.h2_pool),
             Arc::clone(&shared_state.backend_endpoints),
+            Arc::clone(&shared_state.backend_resolution_store),
             Arc::clone(&shared_state.metrics),
         );
         Self::spawn_metrics_endpoint(config, Arc::clone(&shared_state.metrics))?;
@@ -1540,6 +1557,7 @@ impl QUICListener {
                 &mut connection,
                 Arc::clone(&h2_pool),
                 Arc::clone(&self.backend_endpoints),
+                Arc::clone(&self.backend_resolution_store),
                 Arc::clone(&self.upstream_policies),
                 &self.upstream_pools,
                 &self.upstream_inflight,
@@ -1549,7 +1567,7 @@ impl QUICListener {
                 self.backend_body_total_timeout,
                 self.backend_total_request_timeout,
                 &self.routing_index,
-                &self.metrics,
+                Arc::clone(&self.metrics),
                 &self.resilience,
                 self.max_request_body_bytes,
                 self.max_response_body_bytes,
@@ -1786,6 +1804,7 @@ impl QUICListener {
         connection: &mut QuicConnection,
         h2_pool: Arc<H2Pool>,
         backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
+        backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
         upstream_policies: Arc<HashMap<String, RuntimeUpstreamPolicy>>,
         upstream_pools: &HashMap<String, Arc<RwLock<UpstreamPool>>>,
         upstream_inflight: &HashMap<String, Arc<Semaphore>>,
@@ -1795,7 +1814,7 @@ impl QUICListener {
         backend_body_total_timeout: Duration,
         backend_total_request_timeout: Duration,
         routing_index: &RouteIndex,
-        metrics: &Metrics,
+        metrics: Arc<Metrics>,
         resilience: &RuntimeResilience,
         max_request_body_bytes: usize,
         max_response_body_bytes: usize,
@@ -2225,6 +2244,8 @@ impl QUICListener {
                             let retry_budget = Arc::clone(&resilience.retry_budget);
                             let route_name = upstream_name.clone();
                             let backend_endpoints = Arc::clone(&backend_endpoints);
+                            let backend_resolutions = Arc::clone(&backend_resolution_store);
+                            let send_metrics = Arc::clone(&metrics);
                             let allow_hedge = bodyless_mode
                                 && resilience.hedging_allowed_for(&method, &upstream_name, true);
                             let hedge_delay = resilience.hedging_delay;
@@ -2262,12 +2283,19 @@ impl QUICListener {
                                             BoxBody<Bytes, std::convert::Infallible>,
                                         >,
                                          cb: Arc<crate::resilience::CircuitBreakers>,
-                                         h2: Arc<H2Pool>| async move {
+                                         h2: Arc<H2Pool>,
+                                         metrics: Arc<Metrics>,
+                                         backend_resolutions: Arc<RuntimeBackendResolutionStore>| async move {
                                             if !cb.allow_request(&backend) {
                                                 return Err(ProxyError::Pool(
                                                     PoolError::CircuitOpen(backend),
                                                 ));
                                             }
+                                            Self::record_backend_connect_attempt(
+                                                &metrics,
+                                                &backend_resolutions,
+                                                &backend,
+                                            );
                                             let send_result = tokio::time::timeout(
                                                 backend_timeout,
                                                 h2.send(&backend, req),
@@ -2302,6 +2330,8 @@ impl QUICListener {
                                                 request,
                                                 Arc::clone(&cb),
                                                 Arc::clone(&h2),
+                                                Arc::clone(&send_metrics),
+                                                Arc::clone(&backend_resolutions),
                                             );
                                             tokio::pin!(primary_fut);
                                             let hedge_sleep = tokio::time::sleep(hedge_delay);
@@ -2319,6 +2349,8 @@ impl QUICListener {
                                                     hedge_request,
                                                     Arc::clone(&cb),
                                                     Arc::clone(&h2),
+                                                    Arc::clone(&send_metrics),
+                                                    Arc::clone(&backend_resolutions),
                                                 );
                                                 tokio::pin!(hedge_fut);
                                                 tokio::select! {
@@ -2344,6 +2376,8 @@ impl QUICListener {
                                                 request,
                                                 Arc::clone(&cb),
                                                 Arc::clone(&h2),
+                                                Arc::clone(&send_metrics),
+                                                Arc::clone(&backend_resolutions),
                                             )
                                             .await?
                                         }
@@ -2353,6 +2387,8 @@ impl QUICListener {
                                             request,
                                             Arc::clone(&cb),
                                             Arc::clone(&h2),
+                                            Arc::clone(&send_metrics),
+                                            Arc::clone(&backend_resolutions),
                                         )
                                         .await
                                         {
@@ -2393,6 +2429,8 @@ impl QUICListener {
                                                         retry_request,
                                                         Arc::clone(&cb),
                                                         Arc::clone(&h2),
+                                                        Arc::clone(&send_metrics),
+                                                        Arc::clone(&backend_resolutions),
                                                     )
                                                     .await?
                                                 } else {
@@ -2600,7 +2638,7 @@ impl QUICListener {
                                             if let Err(err) = Self::enqueue_request_chunk(
                                                 req,
                                                 chunk,
-                                                metrics,
+                                                &metrics,
                                                 max_request_body_bytes,
                                                 request_buffer_global_cap_bytes,
                                             ) {
@@ -2626,7 +2664,7 @@ impl QUICListener {
                                     b"request body not allowed for this request\n",
                                 )?;
                                 if let Some(req) = connection.streams.get_mut(&stream_id) {
-                                    abort_stream(req, metrics);
+                                    abort_stream(req, &metrics);
                                 }
                                 connection.streams.remove(&stream_id);
                                 resilience.adaptive_admission.observe(elapsed, true);
@@ -2643,7 +2681,7 @@ impl QUICListener {
                                     b"request body too large\n",
                                 )?;
                                 if let Some(req) = connection.streams.get_mut(&stream_id) {
-                                    abort_stream(req, metrics);
+                                    abort_stream(req, &metrics);
                                 }
                                 connection.streams.remove(&stream_id);
                                 resilience.adaptive_admission.observe(elapsed, true);
@@ -2673,7 +2711,7 @@ impl QUICListener {
                                     .adaptive_admission
                                     .observe(req.start.elapsed(), true);
                                 if let Some(req) = connection.streams.get_mut(&stream_id) {
-                                    abort_stream(req, metrics);
+                                    abort_stream(req, &metrics);
                                 }
                                 connection.streams.remove(&stream_id);
                                 break;
@@ -2702,7 +2740,7 @@ impl QUICListener {
                                     .observe(req.start.elapsed(), true);
                             }
                             if let Some(req) = connection.streams.get_mut(&stream_id) {
-                                abort_stream(req, metrics);
+                                abort_stream(req, &metrics);
                             }
                             connection.streams.remove(&stream_id);
                             let _ = Self::send_simple_response(
@@ -2720,7 +2758,7 @@ impl QUICListener {
                     if let Some(req) = connection.streams.get_mut(&stream_id) {
                         req.request_fin_received = true;
 
-                        Self::flush_request_buffer(req, metrics);
+                        Self::flush_request_buffer(req, &metrics);
                         // If buffer is now empty, drop body_tx to signal end-of-body.
                         if req.body_buf.is_empty() {
                             req.body_tx = None;
@@ -2733,7 +2771,7 @@ impl QUICListener {
                 }
                 Ok((stream_id, quiche::h3::Event::Reset(error_code))) => {
                     if let Some(req) = connection.streams.get_mut(&stream_id) {
-                        let phase = abort_stream(req, metrics);
+                        let phase = abort_stream(req, &metrics);
                         debug!(
                             "stream {} reset by client (error_code={}, phase={:?}): resources released",
                             stream_id, error_code, phase
@@ -2756,7 +2794,7 @@ impl QUICListener {
             routing_index,
             backend_body_idle_timeout,
             backend_body_total_timeout,
-            metrics,
+            &metrics,
             backend_total_request_timeout,
             resilience,
             max_response_body_bytes,
@@ -4213,6 +4251,7 @@ impl QUICListener {
 
         let h2_pool = Arc::clone(&shared_state.h2_pool);
         let backend_endpoints = Arc::clone(&shared_state.backend_endpoints);
+        let backend_resolution_store = Arc::clone(&shared_state.backend_resolution_store);
         let upstream_policies = Arc::clone(&shared_state.upstream_policies);
         let metrics = Arc::clone(&shared_state.metrics);
         let resilience = Arc::clone(&shared_state.resilience);
@@ -4284,6 +4323,7 @@ impl QUICListener {
                 let alt_svc = alt_svc_value.clone();
                 let h2_pool = Arc::clone(&h2_pool);
                 let backend_endpoints = Arc::clone(&backend_endpoints);
+                let backend_resolution_store = Arc::clone(&backend_resolution_store);
                 let upstream_policies = Arc::clone(&upstream_policies);
                 let metrics = Arc::clone(&metrics);
                 let resilience = Arc::clone(&resilience);
@@ -4314,6 +4354,7 @@ impl QUICListener {
                             let alt = alt_svc_conn.clone();
                             let h2_pool = Arc::clone(&h2_pool);
                             let backend_endpoints = Arc::clone(&backend_endpoints);
+                            let backend_resolution_store = Arc::clone(&backend_resolution_store);
                             let upstream_policies = Arc::clone(&upstream_policies);
                             let metrics = Arc::clone(&metrics);
                             let resilience = Arc::clone(&resilience);
@@ -4750,6 +4791,11 @@ impl QUICListener {
                                         }
                                     }
                                 } else {
+                                    Self::record_backend_connect_attempt(
+                                        &metrics,
+                                        &backend_resolution_store,
+                                        &backend_addr,
+                                    );
                                     match tokio::time::timeout(
                                         backend_timeout,
                                         h2_pool.send(&backend_addr, upstream_req),
