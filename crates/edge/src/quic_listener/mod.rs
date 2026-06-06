@@ -669,15 +669,16 @@ impl QUICListener {
         shared_state
             .watchdog
             .set_expected_workers(worker_count.max(1));
-        Self::spawn_health_checks(
-            shared_state.upstream_pools.clone(),
-            Arc::clone(&shared_state.upstream_health_clients),
-            Arc::clone(&shared_state.metrics),
-        );
         Self::spawn_backend_dns_refresh(
             config,
             Arc::clone(&shared_state.backend_resolution_store),
             shared_state.backend_dns_resolver.clone(),
+            Arc::clone(&shared_state.metrics),
+        );
+        Self::spawn_health_checks(
+            shared_state.upstream_pools.clone(),
+            Arc::clone(&shared_state.backend_endpoints),
+            Arc::clone(&shared_state.upstream_health_clients),
             Arc::clone(&shared_state.metrics),
         );
         Self::spawn_metrics_endpoint(config, Arc::clone(&shared_state.metrics))?;

@@ -3,6 +3,7 @@ use super::*;
 impl QUICListener {
     pub(super) fn spawn_health_checks(
         upstream_pools: HashMap<String, Arc<RwLock<UpstreamPool>>>,
+        backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
         health_clients: Arc<HashMap<String, Arc<H2Client>>>,
         metrics: Arc<Metrics>,
     ) {
@@ -35,12 +36,12 @@ impl QUICListener {
                 } else {
                     &health.path
                 };
-                let endpoint = match BackendEndpoint::parse(&address) {
-                    Ok(endpoint) => endpoint,
-                    Err(err) => {
+                let endpoint = match backend_endpoints.get(&address) {
+                    Some(endpoint) => endpoint,
+                    None => {
                         error!(
-                            "disabling health checks for backend '{}' due to invalid endpoint: {}",
-                            address, err
+                            "disabling health checks for backend '{}' due to missing canonical endpoint",
+                            address
                         );
                         continue;
                     }
