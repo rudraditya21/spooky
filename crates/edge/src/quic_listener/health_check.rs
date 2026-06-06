@@ -11,7 +11,9 @@ impl QUICListener {
             upstream_name: String,
             upstream_pool: Arc<RwLock<UpstreamPool>>,
             index: usize,
-            address: String,
+            // Stable configured backend identity. DNS refresh changes connect targets
+            // underneath this identity without changing health ownership.
+            backend_identity: String,
             health_uri: String,
             timeout: Duration,
             base_interval_ms: u64,
@@ -57,7 +59,7 @@ impl QUICListener {
                     upstream_name: upstream_name.clone(),
                     upstream_pool: Arc::clone(upstream_pool),
                     index,
-                    address,
+                    backend_identity: address,
                     health_uri: endpoint.uri_for_path(path),
                     timeout: Duration::from_millis(health.timeout_ms.max(1)),
                     base_interval_ms,
@@ -153,7 +155,7 @@ impl QUICListener {
                             job.next_due_at = Instant::now() + Duration::from_millis(delay_ms);
 
                             if let Some(transition) = transition {
-                                Self::log_health_transition(&job.address, transition);
+                                Self::log_health_transition(&job.backend_identity, transition);
                             }
                         }
                     }
