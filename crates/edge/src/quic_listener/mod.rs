@@ -5288,7 +5288,12 @@ mod tests {
                 protocol: "http3".to_string(),
                 port: 9889,
                 address: "127.0.0.1".to_string(),
-                tls: Tls::default(),
+                tls: Tls {
+                    cert: "cert.pem".to_string(),
+                    key: "key.pem".to_string(),
+                    certificates: Vec::new(),
+                    client_auth: ClientAuth::default(),
+                },
             },
             listeners: vec![],
             upstream: upstreams,
