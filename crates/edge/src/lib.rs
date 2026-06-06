@@ -197,6 +197,31 @@ mod tests {
     }
 
     #[test]
+    fn metrics_render_includes_backend_dns_refresh_telemetry() {
+        let metrics = Metrics::default();
+        metrics.record_backend_dns_refresh_success(
+            "backend.internal:443",
+            std::time::UNIX_EPOCH + Duration::from_secs(42),
+            2,
+            true,
+        );
+        metrics.inc_backend_dns_refresh_failure();
+
+        let output = metrics.render_prometheus();
+        assert!(output.contains("spooky_backend_dns_refresh_success_total 1"));
+        assert!(output.contains("spooky_backend_dns_refresh_failure_total 1"));
+        assert!(output.contains("spooky_backend_dns_address_set_changes_total 1"));
+        assert!(output.contains(
+            "spooky_backend_dns_last_refresh_success_seconds{backend=\"backend.internal:443\"} 42"
+        ));
+        assert!(
+            output.contains(
+                "spooky_backend_dns_resolved_addresses{backend=\"backend.internal:443\"} 2"
+            )
+        );
+    }
+
+    #[test]
     fn stable_hash64_is_deterministic() {
         let first = stable_hash64(b"/api/orders");
         let second = stable_hash64(b"/api/orders");
