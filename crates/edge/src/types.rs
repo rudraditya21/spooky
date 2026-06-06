@@ -6,10 +6,7 @@ use spooky_config::{
 };
 use spooky_errors::ProxyError;
 use spooky_lb::UpstreamPool;
-use spooky_transport::{
-    h2_client::{H2Client, SharedDnsResolver},
-    h2_pool::H2Pool,
-};
+use spooky_transport::{h2_client::SharedDnsResolver, h2_pool::H2Pool};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::UdpSocket,
@@ -33,7 +30,6 @@ pub struct SharedRuntimeState {
     pub(crate) backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
     pub(crate) backend_dns_resolver: SharedDnsResolver,
     pub(crate) upstream_policies: Arc<HashMap<String, RuntimeUpstreamPolicy>>,
-    pub(crate) upstream_health_clients: Arc<HashMap<String, Arc<H2Client>>>,
     pub(crate) upstream_pools: HashMap<String, Arc<RwLock<UpstreamPool>>>,
     pub(crate) upstream_inflight: HashMap<String, Arc<Semaphore>>,
     pub(crate) global_inflight: Arc<Semaphore>,

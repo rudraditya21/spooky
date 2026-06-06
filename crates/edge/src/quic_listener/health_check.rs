@@ -3,12 +3,11 @@ use super::*;
 impl QUICListener {
     pub(super) fn spawn_health_checks(
         upstream_pools: HashMap<String, Arc<RwLock<UpstreamPool>>>,
+        h2_pool: Arc<H2Pool>,
         backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
-        health_clients: Arc<HashMap<String, Arc<H2Client>>>,
         metrics: Arc<Metrics>,
     ) {
         struct HealthCheckJob {
-            upstream_name: String,
             upstream_pool: Arc<RwLock<UpstreamPool>>,
             index: usize,
             // Stable configured backend identity. DNS refresh changes connect targets
@@ -56,7 +55,6 @@ impl QUICListener {
                 };
                 let next_due_at = Instant::now() + Duration::from_millis(initial_jitter_ms);
                 let job = HealthCheckJob {
-                    upstream_name: upstream_name.clone(),
                     upstream_pool: Arc::clone(upstream_pool),
                     index,
                     backend_identity: address,
@@ -83,7 +81,7 @@ impl QUICListener {
         };
 
         for (base_interval_ms, mut jobs) in grouped_jobs {
-            let health_clients = Arc::clone(&health_clients);
+            let h2_pool = Arc::clone(&h2_pool);
             let task_metrics = Arc::clone(&metrics);
             let handle = handle.clone();
             let supervise_metrics = Arc::clone(&task_metrics);
@@ -114,13 +112,11 @@ impl QUICListener {
                                 Err(_) => continue,
                             };
 
-                            let Some(health_client) = health_clients.get(&job.upstream_name) else {
-                                continue;
-                            };
-
-                            let result =
-                                tokio::time::timeout(job.timeout, health_client.send(request))
-                                    .await;
+                            let result = tokio::time::timeout(
+                                job.timeout,
+                                h2_pool.send(&job.backend_identity, request),
+                            )
+                            .await;
 
                             let outcome = match result {
                                 Ok(Ok(response)) => {

@@ -42,7 +42,7 @@ use spooky_bridge::h3_to_h2::{
 };
 use spooky_errors::{PoolError, ProxyError, is_retryable};
 use spooky_lb::{HealthFailureReason, HealthTransition, UpstreamPool};
-use spooky_transport::h2_client::{H2Client, SharedDnsResolver, TlsClientConfig};
+use spooky_transport::h2_client::{SharedDnsResolver, TlsClientConfig};
 use spooky_transport::h2_pool::H2Pool;
 use tokio::runtime::Handle;
 use tokio::sync::{
@@ -484,10 +484,8 @@ impl QUICListener {
         let mut backend_resolutions = Vec::new();
         let mut seen_backend_origins: HashMap<String, (String, String)> = HashMap::new();
         let mut backend_tls_configs: HashMap<String, TlsClientConfig> = HashMap::new();
-        let mut upstream_tls_configs: HashMap<String, TlsClientConfig> = HashMap::new();
         for (upstream_name, upstream) in &config.upstreams {
             let upstream_tls_client = Self::upstream_tls_client_config(&upstream.effective_tls);
-            upstream_tls_configs.insert(upstream_name.clone(), upstream_tls_client.clone());
 
             for backend in &upstream.backends {
                 let endpoint = match BackendEndpoint::parse(&backend.backend.address) {
@@ -560,8 +558,6 @@ impl QUICListener {
         );
         let mut upstream_pools = HashMap::new();
         let mut upstream_inflight = HashMap::new();
-        let mut upstream_health_clients = HashMap::new();
-
         for (name, runtime_upstream) in &config.upstreams {
             let upstream_pool = UpstreamPool::from_upstream(&runtime_upstream.as_config_upstream())
                 .map_err(|err| {
@@ -572,18 +568,6 @@ impl QUICListener {
                 })?;
             upstream_pools.insert(name.clone(), Arc::new(RwLock::new(upstream_pool)));
             upstream_inflight.insert(name.clone(), Arc::new(Semaphore::new(per_upstream_limit)));
-            let tls = upstream_tls_configs.get(name).cloned().unwrap_or_else(|| {
-                Self::upstream_tls_client_config(&runtime_upstream.effective_tls)
-            });
-            let client = H2Client::new(
-                config.performance.h2_pool_max_idle_per_backend.max(1),
-                Duration::from_millis(config.performance.h2_pool_idle_timeout_ms.max(1)),
-                Duration::from_millis(config.performance.backend_connect_timeout_ms.max(1)),
-                tls,
-                backend_dns_resolver.clone(),
-            )
-            .map_err(ProxyError::Tls)?;
-            upstream_health_clients.insert(name.clone(), Arc::new(client));
         }
 
         config
@@ -643,7 +627,6 @@ impl QUICListener {
             ),
             backend_resolution_store,
             backend_dns_resolver,
-            upstream_health_clients: Arc::new(upstream_health_clients),
             upstream_policies: Arc::new(
                 config
                     .upstreams
@@ -671,14 +654,15 @@ impl QUICListener {
             .set_expected_workers(worker_count.max(1));
         Self::spawn_backend_dns_refresh(
             config,
+            Arc::clone(&shared_state.h2_pool),
             Arc::clone(&shared_state.backend_resolution_store),
             shared_state.backend_dns_resolver.clone(),
             Arc::clone(&shared_state.metrics),
         );
         Self::spawn_health_checks(
             shared_state.upstream_pools.clone(),
+            Arc::clone(&shared_state.h2_pool),
             Arc::clone(&shared_state.backend_endpoints),
-            Arc::clone(&shared_state.upstream_health_clients),
             Arc::clone(&shared_state.metrics),
         );
         Self::spawn_metrics_endpoint(config, Arc::clone(&shared_state.metrics))?;
