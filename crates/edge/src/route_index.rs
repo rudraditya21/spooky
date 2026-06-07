@@ -91,11 +91,19 @@ struct RouteCandidate {
     wildcard_suffix_len: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HostLookupResult {
+    candidate: RouteCandidate,
+    decision_reason: Option<RouteDecisionReason>,
+}
+
 /// Route precedence (deterministic):
 /// 1) Longest matching path_prefix wins.
 /// 2) On equal path length, host-specific routes win over host-agnostic routes.
-/// 3) On equal host/path match, method-specific routes win over method-agnostic routes.
-/// 4) On remaining ties, lexicographically smaller upstream name wins.
+/// 3) On equal host/path match, exact-host routes win over wildcard-host routes.
+/// 4) On equal wildcard host/path match, longer wildcard suffixes win.
+/// 5) On equal host/path match, method-specific routes win over method-agnostic routes.
+/// 6) On remaining ties, lexicographically smaller upstream name wins.
 ///
 /// `order` stores the lexicographic rank of upstream name (smaller rank = smaller name),
 /// so trie updates are independent of HashMap insertion order.
@@ -376,9 +384,9 @@ impl RouteIndex {
             });
 
         if let Some(best) = host_best
-            && best.route.path_len >= self.default_max_path_len
+            && best.candidate.route.path_len >= self.default_max_path_len
         {
-            return Some(self.upstream_names[best.route.upstream_idx].as_str());
+            return Some(self.upstream_names[best.candidate.route.upstream_idx].as_str());
         }
 
         let best = prefer_route_candidate(
@@ -389,7 +397,7 @@ impl RouteIndex {
                     host_match_kind: HostMatchKind::Default,
                     wildcard_suffix_len: 0,
                 }),
-            host_best,
+            host_best.map(|value| value.candidate),
         );
         best.map(|candidate| self.upstream_names[candidate.route.upstream_idx].as_str())
     }
@@ -424,34 +432,36 @@ impl RouteIndex {
                 wildcard_suffix_len: 0,
             });
         if let Some(best) = host_best
-            && best.route.path_len >= self.default_max_path_len
+            && best.candidate.route.path_len >= self.default_max_path_len
         {
-            let reason = match default_best {
+            let fallback_reason = match default_best {
                 None => RouteDecisionReason::HostTrieNoDefault,
-                Some(default_route) => match compare_route_candidate(default_route, best) {
-                    RoutePreference::TakeCandidateHostSpecific => {
-                        RouteDecisionReason::HostSpecificTieBreak
+                Some(default_route) => {
+                    match compare_route_candidate(default_route, best.candidate) {
+                        RoutePreference::TakeCandidateHostSpecific => {
+                            RouteDecisionReason::HostSpecificTieBreak
+                        }
+                        RoutePreference::TakeCandidateExactHost => {
+                            RouteDecisionReason::ExactHostTieBreak
+                        }
+                        RoutePreference::TakeCandidateWildcardSpecificity => {
+                            RouteDecisionReason::WildcardSpecificityTieBreak
+                        }
+                        RoutePreference::TakeCandidateMethodSpecific => {
+                            RouteDecisionReason::MethodSpecificTieBreak
+                        }
+                        RoutePreference::TakeCandidateLexicalOrder => {
+                            RouteDecisionReason::LexicalTieBreak
+                        }
+                        _ => RouteDecisionReason::HostPathLongerOrEqual,
                     }
-                    RoutePreference::TakeCandidateExactHost => {
-                        RouteDecisionReason::ExactHostTieBreak
-                    }
-                    RoutePreference::TakeCandidateWildcardSpecificity => {
-                        RouteDecisionReason::WildcardSpecificityTieBreak
-                    }
-                    RoutePreference::TakeCandidateMethodSpecific => {
-                        RouteDecisionReason::MethodSpecificTieBreak
-                    }
-                    RoutePreference::TakeCandidateLexicalOrder => {
-                        RouteDecisionReason::LexicalTieBreak
-                    }
-                    _ => RouteDecisionReason::HostPathLongerOrEqual,
-                },
+                }
             };
             return Some(RouteDecision {
-                upstream: self.upstream_names[best.route.upstream_idx].as_str(),
-                matched_path_len: best.route.path_len,
-                host_specific: best.route.host_specific,
-                reason,
+                upstream: self.upstream_names[best.candidate.route.upstream_idx].as_str(),
+                matched_path_len: best.candidate.route.path_len,
+                host_specific: best.candidate.route.host_specific,
+                reason: best.decision_reason.unwrap_or(fallback_reason),
             });
         }
 
@@ -463,13 +473,16 @@ impl RouteIndex {
                 reason: RouteDecisionReason::DefaultPathLonger,
             }),
             (None, Some(host_route)) => Some(RouteDecision {
-                upstream: self.upstream_names[host_route.route.upstream_idx].as_str(),
-                matched_path_len: host_route.route.path_len,
-                host_specific: host_route.route.host_specific,
-                reason: RouteDecisionReason::HostTrieNoDefault,
+                upstream: self.upstream_names[host_route.candidate.route.upstream_idx].as_str(),
+                matched_path_len: host_route.candidate.route.path_len,
+                host_specific: host_route.candidate.route.host_specific,
+                reason: host_route
+                    .decision_reason
+                    .unwrap_or(RouteDecisionReason::HostTrieNoDefault),
             }),
             (Some(current), Some(candidate)) => {
-                let reason = match compare_route_candidate(current, candidate) {
+                let preference = compare_route_candidate(current, candidate.candidate);
+                let fallback_reason = match preference {
                     RoutePreference::TakeCandidatePathLen => {
                         RouteDecisionReason::HostPathLongerOrEqual
                     }
@@ -490,15 +503,19 @@ impl RouteIndex {
                     }
                     RoutePreference::KeepCurrent => RouteDecisionReason::DefaultPathLonger,
                 };
-                let selected = match compare_route_candidate(current, candidate) {
+                let selected = match preference {
                     RoutePreference::KeepCurrent => current,
-                    _ => candidate,
+                    _ => candidate.candidate,
                 };
                 Some(RouteDecision {
                     upstream: self.upstream_names[selected.route.upstream_idx].as_str(),
                     matched_path_len: selected.route.path_len,
                     host_specific: selected.route.host_specific,
-                    reason,
+                    reason: if selected == candidate.candidate {
+                        candidate.decision_reason.unwrap_or(fallback_reason)
+                    } else {
+                        fallback_reason
+                    },
                 })
             }
             (None, None) => None,
@@ -510,7 +527,7 @@ impl RouteIndex {
         path: &str,
         normalized_host: &str,
         method: Option<&str>,
-    ) -> Option<RouteCandidate> {
+    ) -> Option<HostLookupResult> {
         let exact_best = self
             .host_tries
             .get(normalized_host)
@@ -521,7 +538,7 @@ impl RouteIndex {
                 wildcard_suffix_len: 0,
             });
 
-        let mut wildcard_best: Option<RouteCandidate> = None;
+        let mut wildcard_best: Option<HostLookupResult> = None;
         let mut remaining = normalized_host;
         while let Some(dot_idx) = remaining.find('.') {
             let suffix = &remaining[dot_idx + 1..];
@@ -537,12 +554,12 @@ impl RouteIndex {
                         host_match_kind: HostMatchKind::Wildcard,
                         wildcard_suffix_len: suffix.len(),
                     });
-                wildcard_best = prefer_route_candidate(wildcard_best, candidate);
+                wildcard_best = prefer_host_lookup_result(wildcard_best, candidate);
             }
             remaining = suffix;
         }
 
-        prefer_route_candidate(wildcard_best, exact_best)
+        prefer_host_lookup_result(wildcard_best, exact_best)
     }
 }
 
@@ -583,6 +600,49 @@ fn prefer_route_candidate(
             | RoutePreference::TakeCandidateMethodSpecific
             | RoutePreference::TakeCandidateLexicalOrder => Some(candidate),
         },
+    }
+}
+
+#[inline(always)]
+fn route_preference_reason(preference: RoutePreference) -> Option<RouteDecisionReason> {
+    match preference {
+        RoutePreference::KeepCurrent => None,
+        RoutePreference::TakeCandidatePathLen => Some(RouteDecisionReason::HostPathLongerOrEqual),
+        RoutePreference::TakeCandidateHostSpecific => {
+            Some(RouteDecisionReason::HostSpecificTieBreak)
+        }
+        RoutePreference::TakeCandidateExactHost => Some(RouteDecisionReason::ExactHostTieBreak),
+        RoutePreference::TakeCandidateWildcardSpecificity => {
+            Some(RouteDecisionReason::WildcardSpecificityTieBreak)
+        }
+        RoutePreference::TakeCandidateMethodSpecific => {
+            Some(RouteDecisionReason::MethodSpecificTieBreak)
+        }
+        RoutePreference::TakeCandidateLexicalOrder => Some(RouteDecisionReason::LexicalTieBreak),
+    }
+}
+
+#[inline(always)]
+fn prefer_host_lookup_result(
+    current: Option<HostLookupResult>,
+    candidate: Option<RouteCandidate>,
+) -> Option<HostLookupResult> {
+    match (current, candidate) {
+        (None, None) => None,
+        (Some(route), None) => Some(route),
+        (None, Some(candidate)) => Some(HostLookupResult {
+            candidate,
+            decision_reason: None,
+        }),
+        (Some(current), Some(candidate)) => {
+            match compare_route_candidate(current.candidate, candidate) {
+                RoutePreference::KeepCurrent => Some(current),
+                preference => Some(HostLookupResult {
+                    candidate,
+                    decision_reason: route_preference_reason(preference),
+                }),
+            }
+        }
     }
 }
 
@@ -1139,6 +1199,12 @@ mod tests {
             scan_lookup(&upstreams, "/api/users", Some("api.example.com")),
             Some("exact")
         );
+        assert_eq!(
+            index
+                .lookup_with_decision("/api/users", Some("api.example.com"))
+                .map(|decision| decision.reason),
+            Some(RouteDecisionReason::ExactHostTieBreak)
+        );
     }
 
     #[test]
@@ -1167,7 +1233,7 @@ mod tests {
             index
                 .lookup_with_decision("/api/users", Some("x.a.example.com"))
                 .map(|decision| decision.reason),
-            Some(RouteDecisionReason::HostPathLongerOrEqual)
+            Some(RouteDecisionReason::WildcardSpecificityTieBreak)
         );
     }
 
@@ -1200,6 +1266,16 @@ mod tests {
                 Some("POST")
             ),
             Some("wildcard-post")
+        );
+        assert_eq!(
+            index
+                .lookup_with_decision_for_method(
+                    "/api/items",
+                    Some("tenant.example.com"),
+                    Some("POST")
+                )
+                .map(|decision| decision.reason),
+            Some(RouteDecisionReason::MethodSpecificTieBreak)
         );
 
         assert_eq!(
