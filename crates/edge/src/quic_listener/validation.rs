@@ -32,6 +32,7 @@ pub(super) fn validate_request_headers(
     let mut authority = None::<String>;
     let mut host = None::<String>;
     let mut scheme_seen = false;
+    let mut h3_upgrade_requested = false;
 
     for header in list {
         header_bytes = header_bytes.saturating_add(header.name().len() + header.value().len());
@@ -96,6 +97,22 @@ pub(super) fn validate_request_headers(
                     b"invalid host header\n",
                 )?);
             }
+            b"connection" => {
+                let value = strict_header_value(
+                    header.value(),
+                    b"invalid connection header\n",
+                )?;
+                if value
+                    .split(',')
+                    .any(|part| part.trim().eq_ignore_ascii_case("upgrade"))
+                {
+                    h3_upgrade_requested = true;
+                }
+            }
+            b"upgrade" => {
+                let _ = strict_header_value(header.value(), b"invalid upgrade header\n")?;
+                h3_upgrade_requested = true;
+            }
             b":scheme" => {
                 if scheme_seen {
                     return Err((
@@ -115,6 +132,14 @@ pub(super) fn validate_request_headers(
             }
             _ => {}
         }
+    }
+
+    if h3_upgrade_requested {
+        return Err((
+            http::StatusCode::BAD_REQUEST,
+            b"HTTP/3 does not support Upgrade requests\n",
+            false,
+        ));
     }
 
     let content_length = parse_h3_content_length(list)?;
@@ -631,6 +656,24 @@ mod tests {
             validate_request_headers(&headers, &resilience).expect_err("malformed host rejected");
         assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
         assert_eq!(err.1, b"invalid host header\n");
+        assert!(!err.2);
+    }
+
+    #[test]
+    fn rejects_http3_connection_upgrade_requests() {
+        let resilience = runtime_resilience();
+        let headers = vec![
+            h3_header(b":method", b"GET"),
+            h3_header(b":path", b"/"),
+            h3_header(b":authority", b"example.com"),
+            h3_header(b"connection", b"keep-alive, Upgrade"),
+            h3_header(b"upgrade", b"websocket"),
+        ];
+
+        let err = validate_request_headers(&headers, &resilience)
+            .expect_err("HTTP/3 Upgrade requests must be rejected");
+        assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.1, b"HTTP/3 does not support Upgrade requests\n");
         assert!(!err.2);
     }
 

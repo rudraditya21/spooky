@@ -218,6 +218,15 @@ fn is_connect_method(method: &str) -> bool {
     method.eq_ignore_ascii_case("CONNECT")
 }
 
+fn is_head_method(method: &str) -> bool {
+    method.eq_ignore_ascii_case("HEAD")
+}
+
+fn is_bodyless_request_mode(method: &str, content_length: Option<usize>) -> bool {
+    content_length.unwrap_or(0) == 0
+        && (method.eq_ignore_ascii_case("GET") || is_head_method(method))
+}
+
 fn is_connect_tunnel_response(method: &str, status: StatusCode) -> bool {
     is_connect_method(method) && status.is_success()
 }
@@ -2156,9 +2165,7 @@ impl QUICListener {
                                     )
                                 },
                             );
-                            let bodyless_mode = content_length.unwrap_or(0) == 0
-                                && (method.eq_ignore_ascii_case("GET")
-                                    || method.eq_ignore_ascii_case("HEAD"));
+                            let bodyless_mode = is_bodyless_request_mode(&method, content_length);
                             let (tx, boxed, request_fin_received) = if bodyless_mode {
                                 (None, BoxBody::new(Full::new(Bytes::new())), true)
                             } else {
@@ -2983,6 +2990,9 @@ impl QUICListener {
                 }
                 match forward_result.forward {
                     Ok((status, resp_headers, body)) => {
+                        let suppress_downstream_body = streams
+                            .get(&stream_id)
+                            .is_some_and(|req| is_head_method(&req.method));
                         let connect_tunnel = streams
                             .get(&stream_id)
                             .is_some_and(|req| is_connect_tunnel_response(&req.method, status));
@@ -2993,6 +3003,7 @@ impl QUICListener {
                             .and_then(|v| v.to_str().ok())
                             .and_then(|v| v.parse::<usize>().ok());
                         if !connect_tunnel
+                            && !suppress_downstream_body
                             && upstream_content_length
                                 .is_some_and(|len| len > max_response_body_bytes)
                         {
@@ -3049,12 +3060,14 @@ impl QUICListener {
                             format!("h3=\":{}\"; ma=86400", listen_port).into_bytes(),
                         ));
 
-                        let defer_headers_until_body_validated =
-                            upstream_content_length.is_none() && !connect_tunnel;
-                        let immediate_end = !connect_tunnel
-                            && (upstream_content_length == Some(0)
-                                || status == http::StatusCode::NO_CONTENT
-                                || status == http::StatusCode::NOT_MODIFIED);
+                        let defer_headers_until_body_validated = upstream_content_length.is_none()
+                            && !connect_tunnel
+                            && !suppress_downstream_body;
+                        let immediate_end = suppress_downstream_body
+                            || (!connect_tunnel
+                                && (upstream_content_length == Some(0)
+                                    || status == http::StatusCode::NO_CONTENT
+                                    || status == http::StatusCode::NOT_MODIFIED));
                         let mut immediate_terminal = false;
 
                         if !defer_headers_until_body_validated {
@@ -4398,6 +4411,7 @@ impl QUICListener {
                                 let path = request.path;
                                 let authority = request.authority;
                                 let content_length = request.content_length;
+                                let suppress_downstream_body = is_head_method(&method);
 
                                 let bootstrap_error = |status: StatusCode, body: &'static [u8]| {
                                     Ok(Response::builder()
@@ -4877,7 +4891,8 @@ impl QUICListener {
                                 };
 
                                 // Build downstream response with Alt-Svc injected
-                                if let Some(content_length) = upstream_resp
+                                if !suppress_downstream_body
+                                    && let Some(content_length) = upstream_resp
                                     .headers()
                                     .get(http::header::CONTENT_LENGTH)
                                     .and_then(|v| v.to_str().ok())
@@ -4959,12 +4974,16 @@ impl QUICListener {
                                             Response::new(boxed_full(Bytes::new()))
                                         }));
                                 }
-                                let resp_body = BootstrapStreamingBody::with_max_bytes(
-                                    upstream_resp.into_body(),
-                                    max_response_body_bytes,
-                                )
-                                .map_err(|never| match never {})
-                                .boxed();
+                                let resp_body = if suppress_downstream_body {
+                                    boxed_full(Bytes::new())
+                                } else {
+                                    BootstrapStreamingBody::with_max_bytes(
+                                        upstream_resp.into_body(),
+                                        max_response_body_bytes,
+                                    )
+                                    .map_err(|never| match never {})
+                                    .boxed()
+                                };
 
                                 Ok(resp_builder
                                     .body(resp_body)
@@ -5903,6 +5922,15 @@ mod tests {
             StatusCode::BAD_GATEWAY
         ));
         assert!(!is_connect_tunnel_response("GET", StatusCode::OK));
+    }
+
+    #[test]
+    fn bodyless_request_mode_only_applies_to_empty_get_and_head() {
+        assert!(is_bodyless_request_mode("GET", None));
+        assert!(is_bodyless_request_mode("HEAD", Some(0)));
+        assert!(!is_bodyless_request_mode("GET", Some(1)));
+        assert!(!is_bodyless_request_mode("POST", Some(0)));
+        assert!(!is_bodyless_request_mode("HEAD", Some(1)));
     }
 
     #[test]
