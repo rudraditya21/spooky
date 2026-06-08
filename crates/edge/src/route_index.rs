@@ -226,15 +226,26 @@ impl RouteTrie {
         method: Option<&str>,
         upstream_methods: &[Option<String>],
     ) -> Option<IndexedRoute> {
+        self.longest_prefix_with_reason(path, method, upstream_methods)
+            .map(|(route, _)| route)
+    }
+
+    fn longest_prefix_with_reason(
+        &self,
+        path: &str,
+        method: Option<&str>,
+        upstream_methods: &[Option<String>],
+    ) -> Option<(IndexedRoute, Option<RouteDecisionReason>)> {
         let mut node = &self.root;
-        let mut best = best_matching_route(&node.routes, path, method, upstream_methods, None);
+        let mut best =
+            best_matching_route_with_reason(&node.routes, path, method, upstream_methods, None);
 
         for byte in path.as_bytes() {
             let Some(next) = node.child(*byte) else {
                 break;
             };
             node = next;
-            best = best_matching_route(&node.routes, path, method, upstream_methods, best);
+            best = best_matching_route_with_reason(&node.routes, path, method, upstream_methods, best);
         }
 
         best
@@ -258,13 +269,13 @@ fn route_matches_method(
     }
 }
 
-fn best_matching_route(
+fn best_matching_route_with_reason(
     routes: &[IndexedRoute],
     path: &str,
     method: Option<&str>,
     upstream_methods: &[Option<String>],
-    current: Option<IndexedRoute>,
-) -> Option<IndexedRoute> {
+    current: Option<(IndexedRoute, Option<RouteDecisionReason>)>,
+) -> Option<(IndexedRoute, Option<RouteDecisionReason>)> {
     let mut best = current;
     for route in routes.iter().copied() {
         if !prefix_boundary_matches(path, route.path_len) {
@@ -273,7 +284,20 @@ fn best_matching_route(
         if !route_matches_method(route, method, upstream_methods) {
             continue;
         }
-        best = prefer_route(best, Some(route));
+        best = match best {
+            None => Some((route, None)),
+            Some((current_route, current_reason)) => {
+                match compare_route(current_route, route) {
+                    RoutePreference::KeepCurrent => Some((
+                        current_route,
+                        current_reason.or_else(|| {
+                            route_preference_reason(compare_route(route, current_route))
+                        }),
+                    )),
+                    preference => Some((route, route_preference_reason(preference))),
+                }
+            }
+        };
     }
     best
 }
@@ -531,11 +555,16 @@ impl RouteIndex {
         let exact_best = self
             .host_tries
             .get(normalized_host)
-            .and_then(|host_trie| host_trie.longest_prefix(path, method, &self.upstream_methods))
-            .map(|route| RouteCandidate {
-                route,
-                host_match_kind: HostMatchKind::Exact,
-                wildcard_suffix_len: 0,
+            .and_then(|host_trie| {
+                host_trie.longest_prefix_with_reason(path, method, &self.upstream_methods)
+            })
+            .map(|(route, decision_reason)| HostLookupResult {
+                candidate: RouteCandidate {
+                    route,
+                    host_match_kind: HostMatchKind::Exact,
+                    wildcard_suffix_len: 0,
+                },
+                decision_reason,
             });
 
         let mut wildcard_best: Option<HostLookupResult> = None;
@@ -548,11 +577,14 @@ impl RouteIndex {
 
             if let Some(trie) = self.wildcard_host_tries.get(suffix) {
                 let candidate = trie
-                    .longest_prefix(path, method, &self.upstream_methods)
-                    .map(|route| RouteCandidate {
-                        route,
-                        host_match_kind: HostMatchKind::Wildcard,
-                        wildcard_suffix_len: suffix.len(),
+                    .longest_prefix_with_reason(path, method, &self.upstream_methods)
+                    .map(|(route, decision_reason)| HostLookupResult {
+                        candidate: RouteCandidate {
+                            route,
+                            host_match_kind: HostMatchKind::Wildcard,
+                            wildcard_suffix_len: suffix.len(),
+                        },
+                        decision_reason,
                     });
                 wildcard_best = prefer_host_lookup_result(wildcard_best, candidate);
             }
@@ -560,26 +592,6 @@ impl RouteIndex {
         }
 
         prefer_host_lookup_result(wildcard_best, exact_best)
-    }
-}
-
-#[inline(always)]
-fn prefer_route(
-    current: Option<IndexedRoute>,
-    candidate: Option<IndexedRoute>,
-) -> Option<IndexedRoute> {
-    match (current, candidate) {
-        (None, None) => None,
-        (Some(route), None) | (None, Some(route)) => Some(route),
-        (Some(current), Some(candidate)) => match compare_route(current, candidate) {
-            RoutePreference::KeepCurrent => Some(current),
-            RoutePreference::TakeCandidatePathLen
-            | RoutePreference::TakeCandidateHostSpecific
-            | RoutePreference::TakeCandidateExactHost
-            | RoutePreference::TakeCandidateWildcardSpecificity
-            | RoutePreference::TakeCandidateMethodSpecific
-            | RoutePreference::TakeCandidateLexicalOrder => Some(candidate),
-        },
     }
 }
 
@@ -625,29 +637,33 @@ fn route_preference_reason(preference: RoutePreference) -> Option<RouteDecisionR
 #[inline(always)]
 fn prefer_host_lookup_result(
     current: Option<HostLookupResult>,
-    candidate: Option<RouteCandidate>,
+    candidate: Option<HostLookupResult>,
 ) -> Option<HostLookupResult> {
     match (current, candidate) {
         (None, None) => None,
         (Some(route), None) => Some(route),
-        (None, Some(candidate)) => Some(HostLookupResult {
-            candidate,
-            decision_reason: None,
-        }),
-        (Some(current), Some(candidate)) => match compare_route_candidate(current.candidate, candidate)
+        (None, Some(candidate)) => Some(candidate),
+        (Some(current), Some(candidate)) => match compare_route_candidate(current.candidate, candidate.candidate)
         {
             RoutePreference::KeepCurrent => {
-                let decision_reason = current.decision_reason.or_else(|| {
-                    route_preference_reason(compare_route_candidate(candidate, current.candidate))
-                });
+                let decision_reason = current.decision_reason.or(candidate.decision_reason).or_else(
+                    || {
+                        route_preference_reason(compare_route_candidate(
+                            candidate.candidate,
+                            current.candidate,
+                        ))
+                    },
+                );
                 Some(HostLookupResult {
                     candidate: current.candidate,
                     decision_reason,
                 })
             }
             preference => Some(HostLookupResult {
-                candidate,
-                decision_reason: route_preference_reason(preference),
+                candidate: candidate.candidate,
+                decision_reason: candidate
+                    .decision_reason
+                    .or_else(|| route_preference_reason(preference)),
             }),
         },
     }
