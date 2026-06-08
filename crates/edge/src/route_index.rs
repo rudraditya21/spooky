@@ -634,15 +634,22 @@ fn prefer_host_lookup_result(
             candidate,
             decision_reason: None,
         }),
-        (Some(current), Some(candidate)) => {
-            match compare_route_candidate(current.candidate, candidate) {
-                RoutePreference::KeepCurrent => Some(current),
-                preference => Some(HostLookupResult {
-                    candidate,
-                    decision_reason: route_preference_reason(preference),
-                }),
+        (Some(current), Some(candidate)) => match compare_route_candidate(current.candidate, candidate)
+        {
+            RoutePreference::KeepCurrent => {
+                let decision_reason = current.decision_reason.or_else(|| {
+                    route_preference_reason(compare_route_candidate(candidate, current.candidate))
+                });
+                Some(HostLookupResult {
+                    candidate: current.candidate,
+                    decision_reason,
+                })
             }
-        }
+            preference => Some(HostLookupResult {
+                candidate,
+                decision_reason: route_preference_reason(preference),
+            }),
+        },
     }
 }
 

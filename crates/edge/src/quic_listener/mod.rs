@@ -73,7 +73,7 @@ use crate::{
     },
     outcome_from_status,
     resilience::{RouteQueueRejection, RuntimeResilience},
-    route_index::{RouteDecisionReason, RouteIndex, normalize_host_for_routing},
+    route_index::{RouteDecisionReason, RouteIndex},
     types::{QuicConnectionErrorSnapshot, RuntimeBackendResolution, RuntimeBackendResolutionStore},
     watchdog::{WatchdogCoordinator, WatchdogRuntimeConfig, now_millis},
 };
@@ -143,6 +143,7 @@ fn connection_header_tokens(headers: &http::HeaderMap) -> HashSet<String> {
     tokens
 }
 
+#[cfg(test)]
 fn should_strip_bootstrap_request_header(
     name: &http::header::HeaderName,
     connection_tokens: &HashSet<String>,
@@ -4508,7 +4509,8 @@ impl QUICListener {
                                 let traceparent = req
                                     .headers()
                                     .get("traceparent")
-                                    .and_then(|value| value.to_str().ok());
+                                    .and_then(|value| value.to_str().ok())
+                                    .map(str::to_string);
                                 let upstream_req = if is_websocket_upgrade {
                                     let upstream_uri = match http::Uri::try_from(
                                         endpoint.uri_for_path(request_path),
@@ -4698,7 +4700,7 @@ impl QUICListener {
                                             client_addr: peer,
                                             request_authority: authority.as_deref(),
                                             request_id,
-                                            traceparent,
+                                            traceparent: traceparent.as_deref(),
                                         },
                                     ) {
                                         Ok(request) => request,
@@ -5217,6 +5219,8 @@ mod tests {
         runtime::{ListenerRuntimeConfig, RuntimeConfig},
     };
     use tempfile::tempdir;
+
+    use super::is_bodyless_request_mode;
 
     use crate::REQUEST_ID_COUNTER;
     use crate::cid_radix::CidRadix;
