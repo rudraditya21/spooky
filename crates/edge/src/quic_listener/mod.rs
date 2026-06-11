@@ -77,7 +77,11 @@ use crate::{
     outcome_from_status,
     resilience::{RouteQueueRejection, RuntimeResilience},
     route_index::{RouteDecisionReason, RouteIndex},
-    types::{QuicConnectionErrorSnapshot, RuntimeBackendResolution, RuntimeBackendResolutionStore},
+    types::{
+        ListenerTlsInventory, ListenerTlsReloadState, ListenerTlsReloadStore,
+        QuicConnectionErrorSnapshot, RuntimeBackendResolution, RuntimeBackendResolutionStore,
+        RuntimeLoadedClientAuthCa, RuntimeLoadedTlsIdentity, RuntimeTlsCertificateMetadata,
+    },
     watchdog::{WatchdogCoordinator, WatchdogRuntimeConfig, now_millis},
 };
 
@@ -107,19 +111,11 @@ struct FallbackServerCertResolver {
     fallback: Arc<CertifiedKey>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TlsCertificateMetadata {
-    serial_hex: String,
-    not_before_unix_seconds: u64,
-    not_after_unix_seconds: u64,
-    dns_names: Vec<String>,
-}
-
 #[derive(Clone)]
 struct LoadedListenerIdentity {
     identity: RuntimeTlsIdentity,
     certified_key: Arc<CertifiedKey>,
-    metadata: TlsCertificateMetadata,
+    metadata: RuntimeTlsCertificateMetadata,
 }
 
 #[derive(Clone)]
@@ -540,6 +536,13 @@ impl QUICListener {
             config.performance.h2_pool_idle_timeout_ms
         );
 
+        let listener_runtime_configs = config
+            .listener_runtime_configs()
+            .into_iter()
+            .map(|listener_config| (Self::listener_label(&listener_config), listener_config))
+            .collect::<HashMap<_, _>>();
+        let listener_tls_store = Arc::new(Self::build_listener_tls_reload_store(config)?);
+
         let mut backend_addresses = Vec::new();
         let mut backend_resolutions = Vec::new();
         let mut seen_backend_origins: HashMap<String, (String, String)> = HashMap::new();
@@ -672,6 +675,8 @@ impl QUICListener {
         let routing_index = Arc::new(RouteIndex::from_upstreams(&config.upstreams_as_config()));
 
         Ok(SharedRuntimeState {
+            listener_runtime_configs: Arc::new(listener_runtime_configs),
+            listener_tls_store,
             h2_pool,
             backend_endpoints: Arc::new(
                 config
@@ -779,6 +784,14 @@ impl QUICListener {
         })?;
         debug!("Listening on {}", local_addr);
 
+        let listener_label = Self::listener_label(&config);
+        let listener_tls_store = Arc::clone(&shared_state.listener_tls_store);
+        let tls_reload_generation = listener_tls_store.generation(&listener_label).ok_or_else(|| {
+            ProxyError::Transport(format!(
+                "missing TLS reload state for listener '{}'",
+                listener_label
+            ))
+        })?;
         let quic_config = Self::build_quic_config(&config)?;
         let h3_config =
             Arc::new(quiche::h3::Config::new().map_err(|err| {
@@ -812,6 +825,9 @@ impl QUICListener {
             socket,
             local_addr,
             config,
+            listener_label,
+            listener_tls_store,
+            tls_reload_generation,
             quic_config,
             h3_config,
             h2_pool: Arc::clone(&shared_state.h2_pool),
@@ -1040,6 +1056,29 @@ impl QUICListener {
         Ok(quic_config)
     }
 
+    fn sync_tls_reload_state_if_needed(&mut self) -> Result<(), ProxyError> {
+        let current_generation =
+            self.listener_tls_store
+                .generation(&self.listener_label)
+                .ok_or_else(|| {
+                    ProxyError::Transport(format!(
+                        "missing TLS reload state for listener '{}'",
+                        self.listener_label
+                    ))
+                })?;
+        if current_generation == self.tls_reload_generation {
+            return Ok(());
+        }
+
+        self.quic_config = Self::build_quic_config(&self.config)?;
+        self.tls_reload_generation = current_generation;
+        info!(
+            "Reloaded QUIC TLS configuration for listener {} at generation {}",
+            self.listener_label, self.tls_reload_generation
+        );
+        Ok(())
+    }
+
     pub fn start_draining(&mut self) {
         if self.draining {
             return;
@@ -1179,6 +1218,15 @@ impl QUICListener {
                 self.connections.len(),
                 peer
             );
+            return None;
+        }
+
+        if let Err(err) = self.sync_tls_reload_state_if_needed() {
+            error!(
+                "Failed to reload QUIC TLS configuration for listener {}: {}",
+                self.listener_label, err
+            );
+            self.metrics.inc_ingress_connection_create_failed();
             return None;
         }
 
@@ -4201,7 +4249,7 @@ impl QUICListener {
         cert: &CertificateDer<'static>,
         cert_field: &str,
         cert_path: &str,
-    ) -> Result<TlsCertificateMetadata, ProxyError> {
+    ) -> Result<RuntimeTlsCertificateMetadata, ProxyError> {
         let (_, certificate) = parse_x509_certificate(cert.as_ref()).map_err(|err| {
             ProxyError::Tls(format!(
                 "failed to parse X.509 metadata from {cert_field} '{}': {}",
@@ -4226,10 +4274,10 @@ impl QUICListener {
         dns_names.sort();
         dns_names.dedup();
 
-        Ok(TlsCertificateMetadata {
+        Ok(RuntimeTlsCertificateMetadata {
             serial_hex: certificate.tbs_certificate.raw_serial_as_string(),
-            not_before_unix_seconds: validity.not_before.timestamp().max(0) as u64,
-            not_after_unix_seconds: validity.not_after.timestamp().max(0) as u64,
+            not_before_unix_seconds: validity.not_before.timestamp(),
+            not_after_unix_seconds: validity.not_after.timestamp(),
             dns_names,
         })
     }
@@ -4332,19 +4380,51 @@ impl QUICListener {
         })
     }
 
-    fn build_server_tls_acceptor(
-        config: &ListenerRuntimeConfig,
+    fn listener_tls_inventory(loaded_tls: &LoadedListenerTlsMaterial) -> ListenerTlsInventory {
+        ListenerTlsInventory {
+            listener_tls: RuntimeListenerTls {
+                default_identity: loaded_tls.default_identity.identity.clone(),
+                sni_identities: loaded_tls
+                    .sni_identities
+                    .iter()
+                    .map(|(server_name, identity)| {
+                        (server_name.clone(), identity.identity.clone())
+                    })
+                    .collect(),
+                client_auth: loaded_tls.client_auth.clone(),
+            },
+            default_identity: RuntimeLoadedTlsIdentity {
+                identity: loaded_tls.default_identity.identity.clone(),
+                metadata: loaded_tls.default_identity.metadata.clone(),
+            },
+            sni_identities: loaded_tls
+                .sni_identities
+                .iter()
+                .map(|(server_name, identity)| {
+                    (
+                        server_name.clone(),
+                        RuntimeLoadedTlsIdentity {
+                            identity: identity.identity.clone(),
+                            metadata: identity.metadata.clone(),
+                        },
+                    )
+                })
+                .collect(),
+            client_auth_ca: loaded_tls
+                .client_auth_ca
+                .as_ref()
+                .map(|client_auth_ca| RuntimeLoadedClientAuthCa {
+                    ca_file: client_auth_ca.ca_file.clone(),
+                    certificate_count: client_auth_ca.certificate_count,
+                }),
+        }
+    }
+
+    fn build_server_tls_config_from_loaded(
+        loaded_tls: &LoadedListenerTlsMaterial,
         enforce_client_auth: bool,
         alpn_protocols: Vec<Vec<u8>>,
-    ) -> Result<TlsAcceptor, ProxyError> {
-        let loaded_tls = Self::load_listener_tls_material(config)?;
-        debug!(
-            "Building rustls downstream acceptor with default cert='{}' serial={} and {} explicit SNI identities",
-            loaded_tls.default_identity.identity.cert_path,
-            loaded_tls.default_identity.metadata.serial_hex,
-            loaded_tls.sni_identities.len()
-        );
-
+    ) -> Result<RustlsServerConfig, ProxyError> {
         let builder = if enforce_client_auth && loaded_tls.client_auth.enabled {
             let client_auth_ca = loaded_tls.client_auth_ca.clone().ok_or_else(|| {
                 ProxyError::Tls(
@@ -4389,16 +4469,59 @@ impl QUICListener {
             fallback: loaded_tls.default_identity.certified_key.clone(),
         });
         let mut tls_config = builder.with_cert_resolver(resolver);
-
         tls_config.alpn_protocols = alpn_protocols;
-
-        Ok(TlsAcceptor::from(Arc::new(tls_config)))
+        Ok(tls_config)
     }
 
-    fn build_bootstrap_tls_acceptor(
+    fn build_listener_tls_reload_state(
         config: &ListenerRuntimeConfig,
+    ) -> Result<ListenerTlsReloadState, ProxyError> {
+        let loaded_tls = Self::load_listener_tls_material(config)?;
+        let inventory = Self::listener_tls_inventory(&loaded_tls);
+        let bootstrap_server_config = Arc::new(Self::build_server_tls_config_from_loaded(
+            &loaded_tls,
+            true,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+        )?);
+        Ok(ListenerTlsReloadState {
+            generation: 0,
+            inventory,
+            bootstrap_server_config,
+        })
+    }
+
+    fn build_listener_tls_reload_store(
+        config: &RuntimeConfig,
+    ) -> Result<ListenerTlsReloadStore, ProxyError> {
+        let mut listeners = HashMap::new();
+        for listener_config in config.listener_runtime_configs() {
+            let listener_label = Self::listener_label(&listener_config);
+            let state = Self::build_listener_tls_reload_state(&listener_config)?;
+            listeners.insert(listener_label, state);
+        }
+        Ok(ListenerTlsReloadStore::new(listeners))
+    }
+
+    #[cfg(test)]
+    fn build_server_tls_acceptor(
+        config: &ListenerRuntimeConfig,
+        enforce_client_auth: bool,
+        alpn_protocols: Vec<Vec<u8>>,
     ) -> Result<TlsAcceptor, ProxyError> {
-        Self::build_server_tls_acceptor(config, true, vec![b"h2".to_vec(), b"http/1.1".to_vec()])
+        let loaded_tls = Self::load_listener_tls_material(config)?;
+        debug!(
+            "Building rustls downstream acceptor with default cert='{}' serial={} and {} explicit SNI identities",
+            loaded_tls.default_identity.identity.cert_path,
+            loaded_tls.default_identity.metadata.serial_hex,
+            loaded_tls.sni_identities.len()
+        );
+        Ok(TlsAcceptor::from(Arc::new(
+            Self::build_server_tls_config_from_loaded(
+                &loaded_tls,
+                enforce_client_auth,
+                alpn_protocols,
+            )?,
+        )))
     }
 
     fn listener_label(config: &ListenerRuntimeConfig) -> String {
@@ -4496,13 +4619,6 @@ impl QUICListener {
         config: &ListenerRuntimeConfig,
         shared_state: &SharedRuntimeState,
     ) -> Result<(), ProxyError> {
-        let acceptor = Self::build_bootstrap_tls_acceptor(config).map_err(|err| {
-            ProxyError::Tls(format!(
-                "failed to initialize bootstrap TLS listener config: {}",
-                err
-            ))
-        })?;
-
         let bind = format!(
             "{}:{}",
             config.listen.listen.address, config.listen.listen.port
@@ -4515,7 +4631,15 @@ impl QUICListener {
         let connection_timeout =
             Duration::from_millis(config.performance.client_body_idle_timeout_ms.max(1));
         let listener_label = Self::listener_label(config);
-        let listener_tls = Self::runtime_listener_tls(config)?;
+        shared_state
+            .listener_tls_store
+            .bootstrap_server_config(&listener_label)
+            .ok_or_else(|| {
+                ProxyError::Tls(format!(
+                    "failed to initialize bootstrap TLS listener config for '{}': missing reload state",
+                    listener_label
+                ))
+            })?;
 
         let h2_pool = Arc::clone(&shared_state.h2_pool);
         let backend_endpoints = Arc::clone(&shared_state.backend_endpoints);
@@ -4524,6 +4648,7 @@ impl QUICListener {
         let metrics = Arc::clone(&shared_state.metrics);
         let resilience = Arc::clone(&shared_state.resilience);
         let upstream_pools = shared_state.upstream_pools.clone();
+        let listener_tls_store = Arc::clone(&shared_state.listener_tls_store);
         let handle = match runtime_handle() {
             Some(h) => h,
             None => {
@@ -4587,7 +4712,6 @@ impl QUICListener {
                     }
                 };
 
-                let acceptor = acceptor.clone();
                 let alt_svc = alt_svc_value.clone();
                 let h2_pool = Arc::clone(&h2_pool);
                 let backend_endpoints = Arc::clone(&backend_endpoints);
@@ -4601,10 +4725,20 @@ impl QUICListener {
                 let max_response_body_bytes = max_response_body_bytes;
                 let timeout = connection_timeout;
                 let listener_label = listener_label.clone();
-                let listener_tls = listener_tls.clone();
+                let listener_tls_store = Arc::clone(&listener_tls_store);
 
                 tokio::spawn(async move {
                     let _permit = permit;
+                    let Some(server_config) =
+                        listener_tls_store.bootstrap_server_config(&listener_label)
+                    else {
+                        error!(
+                            "Bootstrap TLS listener missing live server config for listener {}",
+                            listener_label
+                        );
+                        return;
+                    };
+                    let acceptor = TlsAcceptor::from(server_config);
                     let tls_stream = match acceptor.accept(stream).await {
                         Ok(s) => s,
                         Err(err) => {
@@ -4620,9 +4754,16 @@ impl QUICListener {
                         }
                     };
 
+                    let Some(listener_tls) = listener_tls_store.inventory(&listener_label) else {
+                        error!(
+                            "Bootstrap TLS listener missing live inventory for listener {}",
+                            listener_label
+                        );
+                        return;
+                    };
                     let requested_sni = tls_stream.get_ref().1.server_name().map(str::to_string);
                     let (selection, identity) = Self::classify_downstream_tls_cert_selection(
-                        &listener_tls,
+                        &listener_tls.listener_tls,
                         requested_sni.as_deref(),
                     );
                     let negotiated = tls_stream.get_ref().1.alpn_protocol().map(|p| p.to_vec());
@@ -5801,6 +5942,92 @@ mod tests {
         let client_auth_ca = loaded.client_auth_ca.expect("client auth ca");
         assert_eq!(client_auth_ca.ca_file, client_ca_cert);
         assert_eq!(client_auth_ca.certificate_count, 1);
+    }
+
+    #[test]
+    fn listener_tls_reload_store_refreshes_inventory_and_generation() {
+        let dir = tempdir().expect("tempdir");
+        let (server_cert, server_key) =
+            write_test_cert_for_name(dir.path(), "server", "api.example.com");
+        let mut config = tls_test_config(server_cert, server_key, Vec::new());
+        config.listen.port = 0;
+
+        let runtime = RuntimeConfig::from_config(&config).expect("runtime config");
+        let shared = super::QUICListener::build_shared_state(&runtime).expect("shared state");
+        let listener_label = "127.0.0.1:0";
+        let initial_inventory = shared
+            .listener_tls_store
+            .inventory(listener_label)
+            .expect("initial inventory");
+        let initial_serial = initial_inventory.default_identity.metadata.serial_hex.clone();
+        assert_eq!(shared.listener_tls_store.generation(listener_label), Some(0));
+
+        let (_rotated_cert, _rotated_key) =
+            write_test_cert_for_name(dir.path(), "server", "api.example.com");
+        let listener_config = shared
+            .listener_runtime_configs
+            .get(listener_label)
+            .expect("listener runtime config");
+        let reloaded_state = super::QUICListener::build_listener_tls_reload_state(listener_config)
+            .expect("reloaded tls state");
+        let generation = shared
+            .listener_tls_store
+            .replace_listener(
+                listener_label,
+                reloaded_state.inventory,
+                reloaded_state.bootstrap_server_config,
+            )
+            .expect("replace listener");
+        assert_eq!(generation, 1);
+
+        let refreshed_inventory = shared
+            .listener_tls_store
+            .inventory(listener_label)
+            .expect("refreshed inventory");
+        assert_ne!(
+            refreshed_inventory.default_identity.metadata.serial_hex,
+            initial_serial
+        );
+    }
+
+    #[test]
+    fn quic_listener_syncs_tls_generation_after_reload() {
+        let dir = tempdir().expect("tempdir");
+        let (server_cert, server_key) =
+            write_test_cert_for_name(dir.path(), "server", "api.example.com");
+        let mut config = tls_test_config(server_cert, server_key, Vec::new());
+        config.listen.port = 0;
+        let runtime = RuntimeConfig::from_config(&config).expect("runtime config");
+        let shared = Arc::new(super::QUICListener::build_shared_state(&runtime).expect("shared"));
+        let listener_config = runtime
+            .primary_listener_runtime_config()
+            .expect("listener runtime config");
+        let socket = super::QUICListener::bind_socket(&listener_config, false).expect("socket");
+        let mut listener = super::QUICListener::new_with_socket_and_shared_state(
+            listener_config.clone(),
+            socket,
+            Arc::clone(&shared),
+        )
+        .expect("listener");
+        assert_eq!(listener.tls_reload_generation, 0);
+
+        let (_rotated_cert, _rotated_key) =
+            write_test_cert_for_name(dir.path(), "server", "api.example.com");
+        let reloaded_state = super::QUICListener::build_listener_tls_reload_state(&listener_config)
+            .expect("reloaded tls state");
+        shared
+            .listener_tls_store
+            .replace_listener(
+                &listener.listener_label,
+                reloaded_state.inventory,
+                reloaded_state.bootstrap_server_config,
+            )
+            .expect("replace listener");
+
+        listener
+            .sync_tls_reload_state_if_needed()
+            .expect("sync tls reload state");
+        assert_eq!(listener.tls_reload_generation, 1);
     }
 
     #[test]

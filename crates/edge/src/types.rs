@@ -2,10 +2,11 @@ use bytes::Bytes;
 use core::net::SocketAddr;
 use spooky_config::{
     backend_endpoint::BackendEndpoint,
-    runtime::{ListenerRuntimeConfig, RuntimeUpstreamPolicy},
+    runtime::{ListenerRuntimeConfig, RuntimeListenerTls, RuntimeTlsIdentity, RuntimeUpstreamPolicy},
 };
 use spooky_errors::ProxyError;
 use spooky_lb::UpstreamPool;
+use rustls::ServerConfig as RustlsServerConfig;
 use spooky_transport::{h2_client::SharedDnsResolver, h2_pool::H2Pool};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -25,6 +26,8 @@ use crate::route_index;
 use crate::watchdog::WatchdogCoordinator;
 
 pub struct SharedRuntimeState {
+    pub(crate) listener_runtime_configs: Arc<HashMap<String, ListenerRuntimeConfig>>,
+    pub(crate) listener_tls_store: Arc<ListenerTlsReloadStore>,
     pub(crate) h2_pool: Arc<H2Pool>,
     pub(crate) backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
     pub(crate) backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
@@ -78,6 +81,9 @@ pub struct QUICListener {
     pub socket: UdpSocket,
     pub local_addr: SocketAddr,
     pub config: ListenerRuntimeConfig,
+    pub listener_label: String,
+    pub listener_tls_store: Arc<ListenerTlsReloadStore>,
+    pub tls_reload_generation: u64,
     pub quic_config: quiche::Config,
     pub h3_config: Arc<quiche::h3::Config>,
     pub h2_pool: Arc<H2Pool>,
@@ -116,6 +122,120 @@ pub struct QUICListener {
     pub(crate) peer_routes: HashMap<SocketAddr, Arc<[u8]>>, // KEY: peer address, VALUE: primary SCID
     pub(crate) cid_radix: CidRadix,
     pub(crate) conn_rate_limiter: crate::quic_listener::TokenBucket,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeTlsCertificateMetadata {
+    pub serial_hex: String,
+    pub dns_names: Vec<String>,
+    pub not_before_unix_seconds: i64,
+    pub not_after_unix_seconds: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeLoadedTlsIdentity {
+    pub identity: RuntimeTlsIdentity,
+    pub metadata: RuntimeTlsCertificateMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeLoadedClientAuthCa {
+    pub ca_file: String,
+    pub certificate_count: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ListenerTlsInventory {
+    pub listener_tls: RuntimeListenerTls,
+    pub default_identity: RuntimeLoadedTlsIdentity,
+    pub sni_identities: HashMap<String, RuntimeLoadedTlsIdentity>,
+    pub client_auth_ca: Option<RuntimeLoadedClientAuthCa>,
+}
+
+pub struct ListenerTlsReloadState {
+    pub generation: u64,
+    pub inventory: ListenerTlsInventory,
+    pub bootstrap_server_config: Arc<RustlsServerConfig>,
+}
+
+pub struct ListenerTlsReloadStore {
+    listeners: RwLock<HashMap<String, ListenerTlsReloadState>>,
+}
+
+impl ListenerTlsReloadStore {
+    pub fn new(listeners: HashMap<String, ListenerTlsReloadState>) -> Self {
+        Self {
+            listeners: RwLock::new(listeners),
+        }
+    }
+
+    pub fn generation(&self, listener: &str) -> Option<u64> {
+        self.listeners
+            .read()
+            .ok()
+            .and_then(|listeners| listeners.get(listener).map(|state| state.generation))
+    }
+
+    pub fn bootstrap_server_config(&self, listener: &str) -> Option<Arc<RustlsServerConfig>> {
+        self.listeners.read().ok().and_then(|listeners| {
+            listeners
+                .get(listener)
+                .map(|state| Arc::clone(&state.bootstrap_server_config))
+        })
+    }
+
+    pub fn inventory(&self, listener: &str) -> Option<ListenerTlsInventory> {
+        self.listeners.read().ok().and_then(|listeners| {
+            listeners
+                .get(listener)
+                .map(|state| state.inventory.clone())
+        })
+    }
+
+    pub fn replace_listener(
+        &self,
+        listener: &str,
+        inventory: ListenerTlsInventory,
+        bootstrap_server_config: Arc<RustlsServerConfig>,
+    ) -> Result<u64, ProxyError> {
+        let mut listeners = self.listeners.write().map_err(|_| {
+            ProxyError::Transport("listener TLS reload store lock poisoned".to_string())
+        })?;
+        let state = listeners.get_mut(listener).ok_or_else(|| {
+            ProxyError::Transport(format!(
+                "listener TLS reload requested for unknown listener '{}'",
+                listener
+            ))
+        })?;
+        state.generation = state.generation.saturating_add(1);
+        state.inventory = inventory;
+        state.bootstrap_server_config = bootstrap_server_config;
+        Ok(state.generation)
+    }
+
+    pub fn snapshot(&self) -> HashMap<String, ListenerTlsInventory> {
+        self.listeners
+            .read()
+            .map(|listeners| {
+                listeners
+                    .iter()
+                    .map(|(listener, state)| (listener.clone(), state.inventory.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn generations(&self) -> HashMap<String, u64> {
+        self.listeners
+            .read()
+            .map(|listeners| {
+                listeners
+                    .iter()
+                    .map(|(listener, state)| (listener.clone(), state.generation))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

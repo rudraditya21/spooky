@@ -10,7 +10,8 @@ use crate::default::{
     observe_default_address, observe_default_control_api_address,
     observe_default_control_api_connection_timeout_ms, observe_default_control_api_health_path,
     observe_default_control_api_max_connections, observe_default_control_api_port,
-    observe_default_control_api_ready_path, observe_default_control_api_restart_path,
+    observe_default_control_api_ready_path, observe_default_control_api_reload_certs_path,
+    observe_default_control_api_restart_path,
     observe_default_control_api_runtime_path, observe_default_metrics_connection_timeout_ms,
     observe_default_metrics_max_connections, observe_default_metrics_path, observe_default_port,
     observe_default_routing_transparency_enabled,
@@ -926,6 +927,9 @@ pub struct ControlApi {
     #[serde(default = "observe_default_control_api_restart_path")]
     pub restart_path: String,
 
+    #[serde(default = "observe_default_control_api_reload_certs_path")]
+    pub reload_certs_path: String,
+
     #[serde(default)]
     pub auth_token: Option<String>,
 
@@ -947,6 +951,7 @@ impl Default for ControlApi {
             ready_path: observe_default_control_api_ready_path(),
             runtime_path: observe_default_control_api_runtime_path(),
             restart_path: observe_default_control_api_restart_path(),
+            reload_certs_path: observe_default_control_api_reload_certs_path(),
             auth_token: None,
             max_connections: observe_default_control_api_max_connections(),
             connection_timeout_ms: observe_default_control_api_connection_timeout_ms(),

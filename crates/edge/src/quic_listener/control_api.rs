@@ -8,6 +8,7 @@ pub(super) struct ControlApiPaths {
     pub(super) ready_path: String,
     pub(super) runtime_path: String,
     pub(super) restart_path: String,
+    pub(super) reload_certs_path: String,
 }
 
 #[derive(Clone)]
@@ -16,6 +17,9 @@ pub(super) struct ControlApiState {
     pub(super) resilience: Arc<RuntimeResilience>,
     pub(super) watchdog: Arc<WatchdogCoordinator>,
     pub(super) upstream_pools: HashMap<String, Arc<RwLock<UpstreamPool>>>,
+    pub(super) listener_runtime_configs: Arc<HashMap<String, ListenerRuntimeConfig>>,
+    pub(super) listener_tls_store: Arc<ListenerTlsReloadStore>,
+    pub(super) primary_listener_label: String,
     pub(super) expected_workers: usize,
     pub(super) started_at: Instant,
     pub(super) auth_token: Option<String>,
@@ -85,32 +89,37 @@ impl QUICListener {
         let listener_config = config.primary_listener_runtime_config().ok_or_else(|| {
             ProxyError::Transport("no effective listeners configured".to_string())
         })?;
-        let acceptor = match Self::build_server_tls_acceptor(
-            &listener_config,
-            false,
-            vec![b"http/1.1".to_vec()],
-        ) {
-            Ok(acceptor) => acceptor,
-            Err(err) => {
-                let msg = format!("failed to initialize control API TLS config: {err}");
-                if required {
-                    return Err(ProxyError::Tls(msg));
-                }
-                error!("{}", msg);
-                return Ok(());
+        let primary_listener_label = Self::listener_label(&listener_config);
+        if shared_state
+            .listener_tls_store
+            .bootstrap_server_config(&primary_listener_label)
+            .is_none()
+        {
+            let msg = format!(
+                "failed to initialize control API TLS config: missing reload state for listener '{}'",
+                primary_listener_label
+            );
+            if required {
+                return Err(ProxyError::Tls(msg));
             }
-        };
+            error!("{}", msg);
+            return Ok(());
+        }
         let paths = ControlApiPaths {
             health_path: endpoint.health_path.clone(),
             ready_path: endpoint.ready_path.clone(),
             runtime_path: endpoint.runtime_path.clone(),
             restart_path: endpoint.restart_path.clone(),
+            reload_certs_path: endpoint.reload_certs_path.clone(),
         };
         let state = ControlApiState {
             metrics: Arc::clone(&shared_state.metrics),
             resilience: Arc::clone(&shared_state.resilience),
             watchdog: Arc::clone(&shared_state.watchdog),
             upstream_pools: shared_state.upstream_pools.clone(),
+            listener_runtime_configs: Arc::clone(&shared_state.listener_runtime_configs),
+            listener_tls_store: Arc::clone(&shared_state.listener_tls_store),
+            primary_listener_label,
             expected_workers: worker_count.max(1),
             started_at: Instant::now(),
             auth_token: endpoint.auth_token.clone(),
@@ -175,11 +184,12 @@ impl QUICListener {
             Some(Arc::clone(&shared_state.metrics)),
             async move {
                 info!(
-                    "Control API endpoint listening on https://{}{} (ready={}, runtime={}, max_connections={}, connection_timeout_ms={})",
+                    "Control API endpoint listening on https://{}{} (ready={}, runtime={}, reload_certs={}, max_connections={}, connection_timeout_ms={})",
                     bind,
                     paths.health_path,
                     paths.ready_path,
                     paths.runtime_path,
+                    paths.reload_certs_path,
                     max_connections,
                     connection_timeout.as_millis()
                 );
@@ -205,13 +215,24 @@ impl QUICListener {
                         }
                     };
 
-                    let acceptor = acceptor.clone();
                     let paths = paths.clone();
                     let state = state.clone();
                     let timeout = connection_timeout;
 
                     tokio::spawn(async move {
                         let _permit = permit;
+                        let Some(server_config) =
+                            state.listener_tls_store.bootstrap_server_config(
+                                &state.primary_listener_label,
+                            )
+                        else {
+                            error!(
+                                "Control API endpoint missing live TLS config for listener {}",
+                                state.primary_listener_label
+                            );
+                            return;
+                        };
+                        let acceptor = TlsAcceptor::from(server_config);
                         let tls_stream = match acceptor.accept(stream).await {
                             Ok(stream) => stream,
                             Err(err) => {
@@ -314,6 +335,25 @@ impl QUICListener {
                 );
             }
             let (healthy_backends, total_backends) = state.snapshot_backend_health();
+            let tls_listeners = state
+                .listener_tls_store
+                .snapshot()
+                .into_iter()
+                .map(|(listener, inventory)| {
+                    (
+                        listener.clone(),
+                        json!({
+                            "default_cert": inventory.default_identity.identity.cert_path,
+                            "default_key": inventory.default_identity.identity.key_path,
+                            "default_cert_not_after_unix_seconds": inventory.default_identity.metadata.not_after_unix_seconds,
+                            "sni_names": inventory.sni_identities.keys().cloned().collect::<Vec<_>>(),
+                            "client_auth_enabled": inventory.listener_tls.client_auth.enabled,
+                            "require_client_cert": inventory.listener_tls.client_auth.require_client_cert,
+                            "generation": state.listener_tls_store.generation(&listener).unwrap_or(0),
+                        }),
+                    )
+                })
+                .collect::<serde_json::Map<String, serde_json::Value>>();
             let response = json!({
                 "uptime_ms": state.started_at.elapsed().as_millis() as u64,
                 "workers": {
@@ -343,12 +383,73 @@ impl QUICListener {
                     "backend_timeouts": state.metrics.backend_timeouts.load(Ordering::Relaxed),
                     "backend_errors": state.metrics.backend_errors.load(Ordering::Relaxed),
                 },
+                "tls": {
+                    "listeners": tls_listeners,
+                },
                 "extension_model": {
                     "status": "non_goal",
                     "details": "No plugin/middleware ABI is exposed in-process today; extension support remains a deliberate non-goal until a safe isolation model is designed.",
                 },
             });
             return Self::json_response(StatusCode::OK, response);
+        }
+
+        if req.method() == http::Method::POST && path == paths.reload_certs_path {
+            if !Self::control_api_is_authorized(&req, state) {
+                return Self::json_response(
+                    StatusCode::UNAUTHORIZED,
+                    json!({
+                        "reloaded": false,
+                        "error": "unauthorized",
+                    }),
+                );
+            }
+
+            let mut reloaded = Vec::new();
+            for (listener_label, listener_config) in state.listener_runtime_configs.iter() {
+                let reloaded_state = match Self::build_listener_tls_reload_state(listener_config) {
+                    Ok(state) => state,
+                    Err(err) => {
+                        return Self::json_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            json!({
+                                "reloaded": false,
+                                "listener": listener_label,
+                                "error": err.to_string(),
+                            }),
+                        );
+                    }
+                };
+                let generation = match state.listener_tls_store.replace_listener(
+                    listener_label,
+                    reloaded_state.inventory,
+                    reloaded_state.bootstrap_server_config,
+                ) {
+                    Ok(generation) => generation,
+                    Err(err) => {
+                        return Self::json_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            json!({
+                                "reloaded": false,
+                                "listener": listener_label,
+                                "error": err.to_string(),
+                            }),
+                        );
+                    }
+                };
+                reloaded.push(json!({
+                    "listener": listener_label,
+                    "generation": generation,
+                }));
+            }
+
+            return Self::json_response(
+                StatusCode::ACCEPTED,
+                json!({
+                    "reloaded": true,
+                    "listeners": reloaded,
+                }),
+            );
         }
 
         if req.method() == http::Method::POST && path == paths.restart_path {

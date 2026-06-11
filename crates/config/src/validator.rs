@@ -1035,6 +1035,10 @@ pub fn validate(config: &Config) -> bool {
                 "observability.control_api.restart_path",
                 config.observability.control_api.restart_path.as_str(),
             ),
+            (
+                "observability.control_api.reload_certs_path",
+                config.observability.control_api.reload_certs_path.as_str(),
+            ),
         ];
         for (name, path) in paths {
             if !path.starts_with('/') {
