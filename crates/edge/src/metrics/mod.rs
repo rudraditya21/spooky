@@ -96,6 +96,7 @@ pub struct Metrics {
     downstream_tls_handshake_failures: RwLock<HashMap<DownstreamTlsHandshakeFailureKey, u64>>,
     downstream_tls_cert_selections: RwLock<HashMap<DownstreamTlsCertSelectionKey, u64>>,
     downstream_tls_alpn_negotiated: RwLock<HashMap<DownstreamTlsAlpnKey, u64>>,
+    downstream_tls_cert_expiry: RwLock<HashMap<DownstreamTlsCertExpiryKey, i64>>,
     upstream_tls_failures: RwLock<HashMap<UpstreamTlsFailureKey, u64>>,
 }
 
@@ -140,6 +141,12 @@ pub(crate) struct UpstreamTlsFailureKey {
     pub(crate) backend: String,
     pub(crate) phase: String,
     pub(crate) reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct DownstreamTlsCertExpiryKey {
+    pub(crate) listener: String,
+    pub(crate) server_name: String,
 }
 
 const LATENCY_BUCKETS_MS: [u64; 14] = [
@@ -411,6 +418,7 @@ impl Metrics {
             downstream_tls_handshake_failures: RwLock::new(HashMap::new()),
             downstream_tls_cert_selections: RwLock::new(HashMap::new()),
             downstream_tls_alpn_negotiated: RwLock::new(HashMap::new()),
+            downstream_tls_cert_expiry: RwLock::new(HashMap::new()),
             upstream_tls_failures: RwLock::new(HashMap::new()),
         }
     }
@@ -797,6 +805,26 @@ impl Metrics {
             .unwrap_or_default()
     }
 
+    pub(crate) fn snapshot_downstream_tls_cert_expiry(
+        &self,
+    ) -> Vec<(DownstreamTlsCertExpiryKey, i64)> {
+        self.downstream_tls_cert_expiry
+            .read()
+            .map(|guard| {
+                let mut entries = guard
+                    .iter()
+                    .map(|(key, value)| (key.clone(), *value))
+                    .collect::<Vec<_>>();
+                entries.sort_by(|(left, _), (right, _)| {
+                    left.listener
+                        .cmp(&right.listener)
+                        .then_with(|| left.server_name.cmp(&right.server_name))
+                });
+                entries
+            })
+            .unwrap_or_default()
+    }
+
     fn current_worker_stats(&self) -> Option<&WorkerStatsAtomic> {
         let idx = WORKER_METRICS_SLOT.with(|current| current.get());
         self.worker_stats
@@ -1034,6 +1062,24 @@ impl Metrics {
                     reason: reason.to_string(),
                 })
                 .or_default() += 1;
+        }
+    }
+
+    pub fn replace_downstream_tls_cert_expiry<I>(&self, listener: &str, certs: I)
+    where
+        I: IntoIterator<Item = (String, i64)>,
+    {
+        if let Ok(mut guard) = self.downstream_tls_cert_expiry.write() {
+            guard.retain(|key, _| key.listener != listener);
+            for (server_name, not_after_unix_seconds) in certs {
+                guard.insert(
+                    DownstreamTlsCertExpiryKey {
+                        listener: listener.to_string(),
+                        server_name,
+                    },
+                    not_after_unix_seconds,
+                );
+            }
         }
     }
 

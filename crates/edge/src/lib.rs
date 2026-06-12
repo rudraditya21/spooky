@@ -289,6 +289,29 @@ mod tests {
     }
 
     #[test]
+    fn metrics_render_includes_downstream_tls_certificate_expiry() {
+        let metrics = Metrics::default();
+        metrics.replace_downstream_tls_cert_expiry(
+            "127.0.0.1:9889",
+            [
+                ("__default__".to_string(), 2_000_000_000),
+                ("api.example.com".to_string(), 2_100_000_000),
+            ],
+        );
+
+        let output = metrics.render_prometheus();
+        assert!(output.contains(
+            "spooky_downstream_tls_certificate_not_after_seconds{listener=\"127.0.0.1:9889\",server_name=\"__default__\"} 2000000000"
+        ));
+        assert!(output.contains(
+            "spooky_downstream_tls_certificate_not_after_seconds{listener=\"127.0.0.1:9889\",server_name=\"api.example.com\"} 2100000000"
+        ));
+        assert!(output.contains(
+            "spooky_downstream_tls_certificate_days_remaining{listener=\"127.0.0.1:9889\",server_name=\"api.example.com\"}"
+        ));
+    }
+
+    #[test]
     fn stable_hash64_is_deterministic() {
         let first = stable_hash64(b"/api/orders");
         let second = stable_hash64(b"/api/orders");

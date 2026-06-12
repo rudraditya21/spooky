@@ -520,6 +520,33 @@ impl Metrics {
             ));
         }
         out.push_str(
+            "# HELP spooky_downstream_tls_certificate_not_after_seconds Downstream certificate expiration timestamps grouped by listener and server name.\n",
+        );
+        out.push_str("# TYPE spooky_downstream_tls_certificate_not_after_seconds gauge\n");
+        out.push_str(
+            "# HELP spooky_downstream_tls_certificate_days_remaining Estimated whole days remaining before certificate expiration.\n",
+        );
+        out.push_str("# TYPE spooky_downstream_tls_certificate_days_remaining gauge\n");
+        let now_unix_seconds = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or_default();
+        for (key, value) in self.snapshot_downstream_tls_cert_expiry() {
+            out.push_str(&format!(
+                "spooky_downstream_tls_certificate_not_after_seconds{{listener=\"{}\",server_name=\"{}\"}} {}\n",
+                escape_prometheus_label(&key.listener),
+                escape_prometheus_label(&key.server_name),
+                value
+            ));
+            let days_remaining = ((value - now_unix_seconds).max(0) as f64) / 86_400.0;
+            out.push_str(&format!(
+                "spooky_downstream_tls_certificate_days_remaining{{listener=\"{}\",server_name=\"{}\"}} {:.6}\n",
+                escape_prometheus_label(&key.listener),
+                escape_prometheus_label(&key.server_name),
+                days_remaining
+            ));
+        }
+        out.push_str(
             "# HELP spooky_upstream_tls_failure_total Upstream TLS failures grouped by backend, request phase, and reason.\n",
         );
         out.push_str("# TYPE spooky_upstream_tls_failure_total counter\n");

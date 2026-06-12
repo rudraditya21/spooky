@@ -422,7 +422,7 @@ impl QUICListener {
                 };
                 let generation = match state.listener_tls_store.replace_listener(
                     listener_label,
-                    reloaded_state.inventory,
+                    reloaded_state.inventory.clone(),
                     reloaded_state.bootstrap_server_config,
                 ) {
                     Ok(generation) => generation,
@@ -437,6 +437,11 @@ impl QUICListener {
                         );
                     }
                 };
+                Self::update_listener_tls_expiry_metrics(
+                    &state.metrics,
+                    listener_label,
+                    &reloaded_state.inventory,
+                );
                 reloaded.push(json!({
                     "listener": listener_label,
                     "generation": generation,

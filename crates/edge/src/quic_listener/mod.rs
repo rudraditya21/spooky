@@ -688,6 +688,10 @@ impl QUICListener {
         let mut route_labels = config.upstreams.keys().cloned().collect::<Vec<_>>();
         route_labels.push("unrouted".to_string());
         let routing_index = Arc::new(RouteIndex::from_upstreams(&config.upstreams_as_config()));
+        let metrics = Arc::new(Metrics::new(worker_slots, route_labels));
+        for (listener_label, inventory) in listener_tls_store.snapshot() {
+            Self::update_listener_tls_expiry_metrics(&metrics, &listener_label, &inventory);
+        }
 
         Ok(SharedRuntimeState {
             listener_runtime_configs: Arc::new(listener_runtime_configs),
@@ -718,7 +722,7 @@ impl QUICListener {
             upstream_inflight,
             global_inflight: Arc::new(Semaphore::new(global_inflight_limit)),
             routing_index,
-            metrics: Arc::new(Metrics::new(worker_slots, route_labels)),
+            metrics,
             resilience,
             watchdog,
         })
@@ -4546,6 +4550,25 @@ impl QUICListener {
         )
     }
 
+    fn update_listener_tls_expiry_metrics(
+        metrics: &Metrics,
+        listener_label: &str,
+        inventory: &ListenerTlsInventory,
+    ) {
+        let mut certs = Vec::with_capacity(inventory.sni_identities.len() + 1);
+        certs.push((
+            "__default__".to_string(),
+            inventory.default_identity.metadata.not_after_unix_seconds,
+        ));
+        certs.extend(inventory.sni_identities.iter().map(|(server_name, identity)| {
+            (
+                server_name.clone(),
+                identity.metadata.not_after_unix_seconds,
+            )
+        }));
+        metrics.replace_downstream_tls_cert_expiry(listener_label, certs);
+    }
+
     fn classify_downstream_tls_cert_selection<'a>(
         listener_tls: &'a RuntimeListenerTls,
         requested_sni: Option<&str>,
@@ -4578,8 +4601,12 @@ impl QUICListener {
             || lower.contains("certificate required")
         {
             "missing_client_cert"
+        } else if lower.contains("unknownissuer") || lower.contains("unknown issuer") {
+            "unknown_issuer"
+        } else if lower.contains("expired") || lower.contains("not yet valid") {
+            "expired_client_cert"
         } else if lower.contains("certificate") || lower.contains("cert") {
-            "client_certificate"
+            "invalid_client_cert"
         } else if lower.contains("alpn") {
             "alpn"
         } else {
@@ -6107,6 +6134,34 @@ mod tests {
         assert_eq!(
             super::QUICListener::classify_upstream_failure_reason(false, "backend timed out"),
             (HealthFailureReason::Timeout, "timeout")
+        );
+    }
+
+    #[test]
+    fn classify_downstream_tls_failure_reason_distinguishes_client_auth_causes() {
+        assert_eq!(
+            super::QUICListener::classify_downstream_tls_failure_reason(
+                "peer sent no certificates"
+            ),
+            "missing_client_cert"
+        );
+        assert_eq!(
+            super::QUICListener::classify_downstream_tls_failure_reason(
+                "certificate verify failed: UnknownIssuer"
+            ),
+            "unknown_issuer"
+        );
+        assert_eq!(
+            super::QUICListener::classify_downstream_tls_failure_reason(
+                "certificate expired"
+            ),
+            "expired_client_cert"
+        );
+        assert_eq!(
+            super::QUICListener::classify_downstream_tls_failure_reason(
+                "bad certificate"
+            ),
+            "invalid_client_cert"
         );
     }
 
