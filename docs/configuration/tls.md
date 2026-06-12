@@ -234,6 +234,14 @@ Selection order:
 2. Fallback `listen.tls.cert` + `listen.tls.key`
 3. If no legacy fallback pair is configured, the first `certificates[]` entry becomes the default identity
 
+Fallback behavior details:
+
+- Both the native QUIC/HTTP/3 listener and the bootstrap TLS listener use the same selection order.
+- `server_name` matching is exact after hostname normalization. There is no wildcard SNI certificate lookup here; wildcard behavior must come from the certificate SANs themselves, not from the listener map.
+- If the client sends no SNI, Spooky always serves the default identity.
+- If the client sends an SNI hostname that is not present in `listen.tls.certificates`, Spooky serves the default identity rather than rejecting the handshake.
+- Startup rejects any `listen.tls.certificates[].server_name` mapping whose configured certificate SANs do not cover that hostname.
+
 ## File Permissions and Security
 
 ### Recommended Permissions
@@ -394,6 +402,34 @@ Reload behavior:
 
 - New QUIC and bootstrap TLS handshakes use the updated certificate material immediately after reload succeeds.
 - Existing connections are not interrupted or re-handshaken.
+- Existing QUIC connections keep the certificate and client-auth policy that were negotiated when their handshake completed. The new certificate material is only visible to later QUIC Initial packets and later bootstrap TCP+TLS accepts.
+- Existing HTTP/2 streams multiplexed over an already-established bootstrap TLS session are also unaffected. Only brand-new bootstrap TLS sessions observe the reloaded certificate set.
+
+### Downstream TLS Metrics
+
+Spooky exposes downstream TLS observability through Prometheus:
+
+- `spooky_downstream_tls_handshake_failure_total{listener,reason}`
+- `spooky_downstream_tls_certificate_selection_total{listener,selection}`
+- `spooky_downstream_tls_alpn_total{listener,protocol}`
+- `spooky_downstream_tls_certificate_not_after_seconds{listener,server_name}`
+- `spooky_downstream_tls_certificate_days_remaining{listener,server_name}`
+
+Important label values:
+
+- `reason=missing_client_cert`: mTLS listener required a client cert and none was presented
+- `reason=invalid_client_cert`: client cert was present but rejected for a generic certificate validation reason
+- `reason=expired_client_cert`: client cert was expired or not yet valid
+- `reason=unknown_issuer`: client cert chain was not rooted in the configured CA set
+- `reason=alpn`: handshake failed because no acceptable application protocol could be negotiated
+- `reason=handshake`: fallback bucket for other downstream TLS handshake failures
+
+Certificate-selection labels:
+
+- `selection=exact_sni`: exact SNI match in `listen.tls.certificates`
+- `selection=fallback_unmatched_sni`: client sent SNI, but no configured mapping matched, so Spooky served the default identity
+- `selection=fallback_no_sni`: client sent no SNI and Spooky served the default identity while additional SNI identities existed
+- `selection=default_only`: listener had only one effective identity, so that certificate was always served
 
 ### Monitoring Certificate Expiry
 

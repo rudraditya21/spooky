@@ -109,7 +109,7 @@ Precedence rules:
 4. Upstream TLS precedence is:
    1. `upstream.<name>.tls`
    2. global `upstream_tls`
-5. Listener certificate reload updates listener TLS material for new handshakes through `observability.control_api.reload_certs_path` without restarting the process.
+5. Listener certificate reload updates listener TLS material for new handshakes through `observability.control_api.reload_certs_path` without restarting the process. Existing QUIC connections and existing bootstrap TLS sessions keep the certificate and client-auth state that they already negotiated.
 
 Startup rejects ambiguous or contradictory combinations, including duplicate effective listener binds, duplicate normalized route matchers, partial legacy listener cert/key pairs, invalid or duplicate SNI `server_name` entries, `host_policy.host` outside `mode: rewrite`, and `CONNECT` routing/policy conflicts.
 
@@ -201,10 +201,23 @@ Certificate selection order:
 
 Operational notes:
 
+- If SNI is missing or unmatched, Spooky serves the default identity rather than rejecting the handshake.
+- `listen.tls.certificates[].server_name` must be covered by the mapped certificate SANs or startup fails.
 - Spooky exports downstream certificate expiry gauges:
   - `spooky_downstream_tls_certificate_not_after_seconds`
   - `spooky_downstream_tls_certificate_days_remaining`
 - Certificate reload affects new QUIC and bootstrap TLS handshakes only. Existing connections continue with the TLS session they already negotiated.
+- Downstream TLS metrics also include:
+  - `spooky_downstream_tls_handshake_failure_total{listener,reason}`
+  - `spooky_downstream_tls_certificate_selection_total{listener,selection}`
+  - `spooky_downstream_tls_alpn_total{listener,protocol}`
+- Important `reason` labels are:
+  - `missing_client_cert`
+  - `invalid_client_cert`
+  - `expired_client_cert`
+  - `unknown_issuer`
+  - `alpn`
+  - `handshake`
 
 ### Examples
 
