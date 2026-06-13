@@ -2556,8 +2556,7 @@ fn bootstrap_h2_required_client_auth_rejects_missing_certificate_and_accepts_val
             &[],
             None,
         ))
-        .err()
-        .expect("missing client certificate should fail");
+        .expect_err("missing client certificate should fail");
     assert!(
         missing_cert_err.contains("tls connect")
             || missing_cert_err.contains("sender ready")
@@ -2701,8 +2700,7 @@ fn bootstrap_tls_metrics_capture_missing_client_certificate_failures() {
             &[],
             None,
         ))
-        .err()
-        .expect("missing client cert should fail");
+        .expect_err("missing client cert should fail");
     assert!(
         err.contains("tls connect") || err.contains("sender ready") || err.contains("send request"),
         "unexpected error: {err}"
