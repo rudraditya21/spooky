@@ -1,5 +1,5 @@
 use crate::config::{CURRENT_CONFIG_VERSION, Config, SUPPORTED_CONFIG_VERSIONS};
-use serde_yml::{Mapping, Value};
+use serde_yaml::{Mapping, Value};
 use std::fs;
 
 pub fn read_config(filename: &str) -> Result<Config, String> {
@@ -12,12 +12,12 @@ pub fn read_config(filename: &str) -> Result<Config, String> {
 
 fn parse_config_text(text: &str) -> Result<Config, String> {
     let mut root: Value =
-        serde_yml::from_str(text).map_err(|err| format!("failed to parse YAML: {}", err))?;
+        serde_yaml::from_str(text).map_err(|err| format!("failed to parse YAML: {}", err))?;
     let config_version = extract_config_version(&root)?;
     ensure_supported_version(config_version)?;
     root = migrate_to_current_version(root, config_version)?;
     apply_global_lb_fallback(&mut root);
-    serde_yml::from_value(root)
+    serde_yaml::from_value(root)
         .map_err(|err| format!("failed to deserialize config structure: {}", err))
 }
 

@@ -1,8 +1,6 @@
 use std::{
     collections::HashMap,
     convert::Infallible,
-    fs::File,
-    io::BufReader,
     net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::{
@@ -33,6 +31,7 @@ use rand::RngCore;
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType, IsCa, SanType,
 };
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use tempfile::{TempDir, tempdir};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{
@@ -1336,9 +1335,8 @@ async fn start_h2_backend_with_grpc_routes() -> SocketAddr {
 }
 
 fn read_test_root_store(cert_path: &str) -> Result<RootCertStore, String> {
-    let file = File::open(cert_path).map_err(|err| format!("open cert file: {err}"))?;
-    let mut reader = BufReader::new(file);
-    let certs = rustls_pemfile::certs(&mut reader)
+    let certs = CertificateDer::pem_file_iter(cert_path)
+        .map_err(|err| format!("open cert file: {err}"))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|err| format!("parse certs: {err}"))?;
     let mut roots = RootCertStore::empty();
@@ -1351,9 +1349,8 @@ fn read_test_root_store(cert_path: &str) -> Result<RootCertStore, String> {
 }
 
 fn read_test_leaf_der(cert_path: &str) -> Result<Vec<u8>, String> {
-    let file = File::open(cert_path).map_err(|err| format!("open cert file: {err}"))?;
-    let mut reader = BufReader::new(file);
-    let certs = rustls_pemfile::certs(&mut reader)
+    let certs = CertificateDer::pem_file_iter(cert_path)
+        .map_err(|err| format!("open cert file: {err}"))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|err| format!("parse certs: {err}"))?;
     certs
@@ -1365,11 +1362,7 @@ fn read_test_leaf_der(cert_path: &str) -> Result<Vec<u8>, String> {
 fn read_test_private_key(
     key_path: &str,
 ) -> Result<tokio_rustls::rustls::pki_types::PrivateKeyDer<'static>, String> {
-    let file = File::open(key_path).map_err(|err| format!("open key file: {err}"))?;
-    let mut reader = BufReader::new(file);
-    rustls_pemfile::private_key(&mut reader)
-        .map_err(|err| format!("parse private key: {err}"))?
-        .ok_or_else(|| "missing private key".to_string())
+    PrivateKeyDer::from_pem_file(key_path).map_err(|err| format!("parse private key: {err}"))
 }
 
 #[derive(Clone, Debug)]
@@ -1453,10 +1446,8 @@ async fn connect_bootstrap_h2_with_client_auth(
     let builder = ClientConfig::builder().with_root_certificates(roots);
     let mut tls_config = if let Some((client_cert_path, client_key_path)) = client_identity {
         let client_chain = {
-            let file =
-                File::open(client_cert_path).map_err(|err| format!("open cert file: {err}"))?;
-            let mut reader = BufReader::new(file);
-            rustls_pemfile::certs(&mut reader)
+            CertificateDer::pem_file_iter(client_cert_path)
+                .map_err(|err| format!("open cert file: {err}"))?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|err| format!("parse certs: {err}"))?
         };

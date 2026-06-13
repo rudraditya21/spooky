@@ -4,9 +4,8 @@ use crate::config::{
     UpstreamTls,
 };
 use log::{error, info, warn};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::BufReader;
 use std::net::IpAddr;
 
 pub const VALID_LOG_LEVELS: &[&str] = &[
@@ -45,16 +44,14 @@ pub const VALID_LB_TYPES: &[&str] = &[
 ];
 
 fn validate_pem_certificates(path: &str, field_name: &str) -> bool {
-    let file = match File::open(path) {
-        Ok(file) => file,
+    let certs = match CertificateDer::pem_file_iter(path) {
+        Ok(iter) => iter.collect::<Result<Vec<_>, _>>(),
         Err(err) => {
             error!("Cannot open {} '{}': {}", field_name, path, err);
             return false;
         }
     };
-
-    let mut reader = BufReader::new(file);
-    let certs = match rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>() {
+    let certs = match certs {
         Ok(certs) => certs,
         Err(err) => {
             error!(
@@ -77,24 +74,8 @@ fn validate_pem_certificates(path: &str, field_name: &str) -> bool {
 }
 
 fn validate_pem_private_key(path: &str, field_name: &str) -> bool {
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(err) => {
-            error!("Cannot open {} '{}': {}", field_name, path, err);
-            return false;
-        }
-    };
-
-    let mut reader = BufReader::new(file);
-    match rustls_pemfile::private_key(&mut reader) {
-        Ok(Some(_)) => true,
-        Ok(None) => {
-            error!(
-                "{} '{}' does not contain a PEM private key",
-                field_name, path
-            );
-            false
-        }
+    match PrivateKeyDer::from_pem_file(path) {
+        Ok(_) => true,
         Err(err) => {
             error!(
                 "Cannot parse PEM private key from {} '{}': {}",
@@ -1453,7 +1434,7 @@ upstream:
             key.display()
         );
 
-        let cfg: Config = serde_yml::from_str(&yaml).expect("parse");
+        let cfg: Config = serde_yaml::from_str(&yaml).expect("parse");
         assert_eq!(cfg.performance.worker_threads, 1);
         assert_eq!(cfg.performance.control_plane_threads, 2);
         assert_eq!(cfg.performance.packet_shards_per_worker, 1);

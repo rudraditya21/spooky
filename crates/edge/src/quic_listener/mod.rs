@@ -39,6 +39,7 @@ use rustls::{
     server::{ClientHello, ResolvesServerCert, ResolvesServerCertUsingSni},
     sign::CertifiedKey,
 };
+use rustls_pki_types::pem::PemObject;
 use serde_json::json;
 use socket2::{Domain, Protocol, Socket, Type};
 use spooky_bridge::h3_to_h2::{
@@ -4345,14 +4346,10 @@ impl QUICListener {
         path: &str,
         field_name: &str,
     ) -> Result<Vec<CertificateDer<'static>>, ProxyError> {
-        use rustls_pemfile::certs;
-        use std::io::BufReader;
-
-        let cert_bytes = std::fs::read(path).map_err(|err| {
-            ProxyError::Tls(format!("failed to read {field_name} '{}': {}", path, err))
-        })?;
-
-        certs(&mut BufReader::new(cert_bytes.as_slice()))
+        CertificateDer::pem_file_iter(path)
+            .map_err(|err| {
+                ProxyError::Tls(format!("failed to read {field_name} '{}': {}", path, err))
+            })?
             .collect::<Result<_, _>>()
             .map_err(|err| ProxyError::Tls(format!("failed to parse {field_name} PEM: {err}")))
     }
@@ -4361,30 +4358,9 @@ impl QUICListener {
         path: &str,
         field_name: &str,
     ) -> Result<PrivateKeyDer<'static>, ProxyError> {
-        use rustls_pemfile::{pkcs8_private_keys, rsa_private_keys};
-        use std::io::BufReader;
-
-        let key_bytes = std::fs::read(path).map_err(|err| {
-            ProxyError::Tls(format!("failed to read {field_name} '{}': {}", path, err))
-        })?;
-
-        let mut reader = BufReader::new(key_bytes.as_slice());
-        let pkcs8: Vec<PrivateKeyDer<'static>> = pkcs8_private_keys(&mut reader)
-            .map(|r| r.map(PrivateKeyDer::Pkcs8))
-            .collect::<Result<_, _>>()
-            .map_err(|err| ProxyError::Tls(format!("failed to parse {field_name} PEM: {err}")))?;
-        if let Some(key) = pkcs8.into_iter().next() {
-            return Ok(key);
-        }
-
-        let mut reader2 = BufReader::new(key_bytes.as_slice());
-        let rsa: Vec<PrivateKeyDer<'static>> = rsa_private_keys(&mut reader2)
-            .map(|r| r.map(PrivateKeyDer::Pkcs1))
-            .collect::<Result<_, _>>()
-            .map_err(|err| ProxyError::Tls(format!("failed to parse {field_name} PEM: {err}")))?;
-        rsa.into_iter().next().ok_or_else(|| {
+        PrivateKeyDer::from_pem_file(path).map_err(|err| {
             ProxyError::Tls(format!(
-                "no supported private key found in {field_name} '{}'",
+                "failed to parse {field_name} PEM from '{}': {err}",
                 path
             ))
         })
@@ -4489,14 +4465,14 @@ impl QUICListener {
                 "listen.tls.client_auth.ca_file is required when mTLS is enabled".to_string(),
             )
         })?;
-        let ca_bytes = std::fs::read(ca_file).map_err(|err| {
-            ProxyError::Tls(format!(
-                "failed to read listen.tls.client_auth.ca_file '{}': {}",
-                ca_file, err
-            ))
-        })?;
         let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-            rustls_pemfile::certs(&mut std::io::BufReader::new(ca_bytes.as_slice()))
+            CertificateDer::pem_file_iter(ca_file)
+                .map_err(|err| {
+                    ProxyError::Tls(format!(
+                        "failed to read listen.tls.client_auth.ca_file '{}': {}",
+                        ca_file, err
+                    ))
+                })?
                 .collect::<Result<_, _>>()
                 .map_err(|err| {
                     ProxyError::Tls(format!(

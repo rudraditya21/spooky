@@ -1,9 +1,7 @@
 use std::convert::Infallible;
 use std::ffi::OsStr;
-use std::fs::File;
 use std::future::Future;
 use std::io;
-use std::io::BufReader;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::pin::Pin;
@@ -30,6 +28,7 @@ use hyper_util::client::legacy::{
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
+use rustls_pki_types::pem::PemObject;
 use tower_service::Service;
 
 #[derive(Debug, Clone)]
@@ -290,15 +289,14 @@ fn build_tls_config(tls: &TlsClientConfig) -> Result<ClientConfig, String> {
 }
 
 fn read_pem_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
-    let file = File::open(path).map_err(|err| {
-        format!(
-            "failed to open certificate file '{}': {}",
-            path.display(),
-            err
-        )
-    })?;
-    let mut reader = BufReader::new(file);
-    let certs = rustls_pemfile::certs(&mut reader)
+    let certs = CertificateDer::pem_file_iter(path)
+        .map_err(|err| {
+            format!(
+                "failed to open certificate file '{}': {}",
+                path.display(),
+                err
+            )
+        })?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|err| {
             format!(
