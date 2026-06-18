@@ -91,7 +91,7 @@ fn take_validation_error() -> Option<ValidationError> {
     validation_error_slot()
         .lock()
         .ok()
-        .and_then(|guard| guard.clone())
+        .and_then(|mut guard| guard.take())
 }
 
 macro_rules! validation_error {
