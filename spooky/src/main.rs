@@ -117,8 +117,12 @@ fn main() {
     let uid = unsafe { libc::getuid() };
 
     // Validate Configurations
-    if !validate_config(&config_yaml) {
-        fatal_startup_error("Configuration validation failed. Exiting...", true, 1);
+    if let Err(err) = validate_config(&config_yaml) {
+        fatal_startup_error(
+            &format!("Configuration validation failed: {err}"),
+            true,
+            1,
+        );
     }
 
     let runtime_config = match RuntimeConfig::from_config(&config_yaml) {
