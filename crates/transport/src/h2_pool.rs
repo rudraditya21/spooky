@@ -1,30 +1,56 @@
-use std::{collections::HashMap, convert::Infallible, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
 use http_body_util::combinators::BoxBody;
 use hyper::Request;
 use hyper::body::{Bytes, Incoming};
 use tokio::sync::{Semaphore, TryAcquireError};
 
-use crate::h2_client::{H2Client, TlsClientConfig};
+use crate::h2_client::{H2Client, SharedDnsResolver, TlsClientConfig};
 pub use spooky_errors::PoolError;
 
+struct BackendClientState {
+    client: Arc<H2Client>,
+    generation: u64,
+}
+
 struct BackendHandle {
-    client: H2Client,
+    tls: TlsClientConfig,
+    state: RwLock<BackendClientState>,
     inflight: Arc<Semaphore>,
 }
 
+// Connection pools are keyed by configured backend identity, not by resolved IP.
+// When DNS refresh updates a hostname's address set, new connects pick up the
+// refreshed resolver results, while already-pooled H2 connections may continue
+// using older addresses until Hyper retires them via the normal idle timeout.
 pub struct H2Pool {
     backends: HashMap<String, BackendHandle>,
+    max_idle_per_backend: usize,
+    pool_idle_timeout: Duration,
+    connect_timeout: Duration,
+    dns_resolver: SharedDnsResolver,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackendClientRotation {
+    pub previous_generation: u64,
+    pub current_generation: u64,
 }
 
 impl H2Pool {
     pub fn new<I>(
         backends: I,
+        backend_tls: HashMap<String, TlsClientConfig>,
         max_inflight: usize,
         max_idle_per_backend: usize,
         pool_idle_timeout: Duration,
         connect_timeout: Duration,
-        tls: TlsClientConfig,
+        dns_resolver: SharedDnsResolver,
     ) -> Result<Self, String>
     where
         I: IntoIterator<Item = String>,
@@ -33,25 +59,66 @@ impl H2Pool {
         let max_idle_per_backend = max_idle_per_backend.max(1);
         let mut map = HashMap::new();
         for backend in backends {
-            let client = H2Client::new(
+            let tls = backend_tls.get(&backend).cloned().unwrap_or_default();
+            let client = Arc::new(H2Client::new(
                 max_idle_per_backend,
                 pool_idle_timeout,
                 connect_timeout,
                 tls.clone(),
-            )?;
+                dns_resolver.clone(),
+            )?);
             map.insert(
                 backend,
                 BackendHandle {
-                    client,
+                    tls,
+                    state: RwLock::new(BackendClientState {
+                        client,
+                        generation: 0,
+                    }),
                     inflight: Arc::new(Semaphore::new(inflight)),
                 },
             );
         }
-        Ok(Self { backends: map })
+        Ok(Self {
+            backends: map,
+            max_idle_per_backend,
+            pool_idle_timeout,
+            connect_timeout,
+            dns_resolver,
+        })
     }
 
     pub fn has_backend(&self, backend: &str) -> bool {
         self.backends.contains_key(backend)
+    }
+
+    pub fn rotate_backend_client(
+        &self,
+        backend: &str,
+    ) -> Result<Option<BackendClientRotation>, String> {
+        let Some(handle) = self.backends.get(backend) else {
+            return Ok(None);
+        };
+
+        let client = Arc::new(H2Client::new(
+            self.max_idle_per_backend,
+            self.pool_idle_timeout,
+            self.connect_timeout,
+            handle.tls.clone(),
+            self.dns_resolver.clone(),
+        )?);
+
+        let mut state = handle
+            .state
+            .write()
+            .map_err(|_| format!("backend client state poisoned for '{backend}'"))?;
+        let previous_generation = state.generation;
+        state.client = client;
+        state.generation = state.generation.saturating_add(1);
+        Ok(Some(BackendClientRotation {
+            previous_generation,
+            current_generation: state.generation,
+        }))
     }
 
     pub async fn send(
@@ -63,6 +130,11 @@ impl H2Pool {
             .backends
             .get(backend)
             .ok_or_else(|| PoolError::UnknownBackend(backend.to_string()))?;
+        let client = handle
+            .state
+            .read()
+            .map(|state| Arc::clone(&state.client))
+            .map_err(|_| PoolError::InflightLimiterClosed)?;
 
         let _permit = match Arc::clone(&handle.inflight).try_acquire_owned() {
             Ok(permit) => permit,
@@ -71,6 +143,6 @@ impl H2Pool {
             }
             Err(TryAcquireError::Closed) => return Err(PoolError::InflightLimiterClosed),
         };
-        handle.client.send(req).await.map_err(PoolError::Send)
+        client.send(req).await.map_err(PoolError::Send)
     }
 }

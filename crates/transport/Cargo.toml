@@ -12,7 +12,8 @@ hyper-util.workspace = true
 hyper-rustls.workspace = true
 log.workspace = true
 rustls.workspace = true
-rustls-pemfile.workspace = true
+rustls-pki-types.workspace = true
 tokio.workspace = true
+tower-service = "0.3"
 webpki-roots.workspace = true
 spooky-errors = { path = "../errors" }

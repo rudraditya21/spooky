@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
     future::Future,
-    net::{ToSocketAddrs, UdpSocket},
+    net::{IpAddr, SocketAddr as StdSocketAddr, ToSocketAddrs, UdpSocket},
     pin::Pin,
     sync::{
         Arc, OnceLock, RwLock,
@@ -14,6 +14,11 @@ use std::{
 
 use core::net::SocketAddr;
 
+use boring::pkey::{PKey, Private};
+use boring::ssl::{
+    NameType, SelectCertError, SslContextBuilder, SslFiletype, SslMethod, SslVerifyMode,
+};
+use boring::x509::X509;
 use bytes::Bytes;
 use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
@@ -29,12 +34,21 @@ use quiche::Config;
 use quiche::h3::NameValue;
 use rand::RngCore;
 use rustls::{RootCertStore, ServerConfig as RustlsServerConfig, server::WebPkiClientVerifier};
+use rustls::{
+    pki_types::{CertificateDer, PrivateKeyDer},
+    server::{ClientHello, ResolvesServerCert, ResolvesServerCertUsingSni},
+    sign::CertifiedKey,
+};
+use rustls_pki_types::pem::PemObject;
 use serde_json::json;
 use socket2::{Domain, Protocol, Socket, Type};
-use spooky_bridge::h3_to_h2::{ForwardedContext, build_h2_request_for_endpoint};
+use spooky_bridge::h3_to_h2::{
+    ForwardedContext, ForwardedHeaderChains, build_forwarded_header_values,
+    build_h2_request_for_endpoint_with_host_policy, resolve_upstream_host_value,
+};
 use spooky_errors::{PoolError, ProxyError, is_retryable};
 use spooky_lb::{HealthFailureReason, HealthTransition, UpstreamPool};
-use spooky_transport::h2_client::{H2Client, TlsClientConfig};
+use spooky_transport::h2_client::{SharedDnsResolver, TlsClientConfig};
 use spooky_transport::h2_pool::H2Pool;
 use tokio::runtime::Handle;
 use tokio::sync::{
@@ -47,7 +61,11 @@ use tracing::{Instrument, info_span};
 
 use spooky_config::{
     backend_endpoint::{BackendEndpoint, BackendScheme},
-    config::Config as SpookyConfig,
+    config::{ClientAuth, UpstreamTls},
+    runtime::{
+        ListenerRuntimeConfig, RuntimeConfig, RuntimeListenerTls, RuntimeTlsIdentity,
+        RuntimeUpstreamPolicy,
+    },
 };
 
 use crate::{
@@ -63,11 +81,16 @@ use crate::{
     },
     outcome_from_status,
     resilience::{RouteQueueRejection, RuntimeResilience},
-    route_index::{RouteDecisionReason, RouteIndex, normalize_host_for_routing},
-    types::QuicConnectionErrorSnapshot,
+    route_index::{RouteDecisionReason, RouteIndex},
+    types::{
+        ListenerTlsInventory, ListenerTlsReloadState, ListenerTlsReloadStore,
+        QuicConnectionErrorSnapshot, RuntimeBackendResolution, RuntimeBackendResolutionStore,
+        RuntimeLoadedClientAuthCa, RuntimeLoadedTlsIdentity, RuntimeTlsCertificateMetadata,
+    },
     watchdog::{WatchdogCoordinator, WatchdogRuntimeConfig, now_millis},
 };
 
+mod backend_resolution;
 mod connection;
 mod control_api;
 mod forwarding;
@@ -85,12 +108,57 @@ use validation::{
     RequestBufferError, extract_header_value, generated_span_id, generated_trace_id,
     parse_traceparent, validate_http_request, validate_request_headers,
 };
+use x509_parser::{extensions::GeneralName, parse_x509_certificate};
+
+#[derive(Debug)]
+struct FallbackServerCertResolver {
+    sni_resolver: ResolvesServerCertUsingSni,
+    fallback: Arc<CertifiedKey>,
+}
+
+#[derive(Clone)]
+struct LoadedListenerIdentity {
+    identity: RuntimeTlsIdentity,
+    certified_key: Arc<CertifiedKey>,
+    metadata: RuntimeTlsCertificateMetadata,
+}
+
+#[derive(Clone)]
+struct LoadedClientAuthCa {
+    ca_file: String,
+    certificate_count: usize,
+    roots: Arc<RootCertStore>,
+}
+
+#[derive(Clone)]
+struct LoadedListenerTlsMaterial {
+    default_identity: LoadedListenerIdentity,
+    sni_identities: HashMap<String, LoadedListenerIdentity>,
+    client_auth: ClientAuth,
+    client_auth_ca: Option<LoadedClientAuthCa>,
+}
+
+struct QuicSniCertMaterial {
+    leaf: X509,
+    chain: Vec<X509>,
+    key: PKey<Private>,
+}
+
+impl ResolvesServerCert for FallbackServerCertResolver {
+    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        self.sni_resolver
+            .resolve(client_hello)
+            .or_else(|| Some(Arc::clone(&self.fallback)))
+    }
+}
 
 fn is_hop_header(name: &str) -> bool {
     matches!(
         name,
         "connection"
             | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
             | "proxy-connection"
             | "transfer-encoding"
             | "upgrade"
@@ -116,6 +184,7 @@ fn connection_header_tokens(headers: &http::HeaderMap) -> HashSet<String> {
     tokens
 }
 
+#[cfg(test)]
 fn should_strip_bootstrap_request_header(
     name: &http::header::HeaderName,
     connection_tokens: &HashSet<String>,
@@ -157,6 +226,27 @@ fn should_strip_h3_response_header(
         || name == http::header::CONTENT_LENGTH
 }
 
+fn collect_h3_trailers(trailers: &http::HeaderMap) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let connection_tokens = connection_header_tokens(trailers);
+    let mut out = Vec::with_capacity(trailers.len());
+    for (name, value) in trailers.iter() {
+        if should_strip_h3_response_header(name, &connection_tokens) {
+            continue;
+        }
+        out.push((name.as_str().as_bytes().to_vec(), value.as_bytes().to_vec()));
+    }
+    out
+}
+
+fn should_strip_bootstrap_response_header(
+    name: &http::header::HeaderName,
+    connection_tokens: &HashSet<String>,
+) -> bool {
+    connection_tokens.contains(name.as_str())
+        || is_hop_header(name.as_str())
+        || name.as_str().eq_ignore_ascii_case("alt-svc")
+}
+
 fn response_size_exceeded_after_chunk(
     response_bytes_received: &mut usize,
     chunk_len: usize,
@@ -164,6 +254,37 @@ fn response_size_exceeded_after_chunk(
 ) -> bool {
     *response_bytes_received = response_bytes_received.saturating_add(chunk_len);
     *response_bytes_received > max_response_body_bytes
+}
+
+fn is_connect_method(method: &str) -> bool {
+    method.eq_ignore_ascii_case("CONNECT")
+}
+
+fn is_head_method(method: &str) -> bool {
+    method.eq_ignore_ascii_case("HEAD")
+}
+
+fn is_bodyless_request_mode(method: &str, content_length: Option<usize>) -> bool {
+    content_length.unwrap_or(0) == 0
+        && (method.eq_ignore_ascii_case("GET") || is_head_method(method))
+}
+
+fn is_connect_tunnel_response(method: &str, status: StatusCode) -> bool {
+    is_connect_method(method) && status.is_success()
+}
+
+fn can_poll_upstream_result(req: &RequestEnvelope) -> bool {
+    if is_connect_method(&req.method)
+        && (req.phase == StreamPhase::ReceivingRequest
+            || req.phase == StreamPhase::AwaitingUpstream)
+    {
+        return true;
+    }
+
+    req.phase == StreamPhase::AwaitingUpstream
+        && req.request_fin_received
+        && req.body_tx.is_none()
+        && req.body_buf.is_empty()
 }
 
 fn header_has_token(value: &http::HeaderValue, token: &str) -> bool {
@@ -195,13 +316,6 @@ fn is_websocket_upgrade_request(req: &Request<Incoming>, use_h2: bool) -> bool {
         .get(http::header::CONNECTION)
         .map(|v| header_has_token(v, "upgrade"))
         .unwrap_or(false)
-}
-
-fn bootstrap_forwarded_for_value(ip: std::net::IpAddr) -> String {
-    match ip {
-        std::net::IpAddr::V4(v4) => v4.to_string(),
-        std::net::IpAddr::V6(v6) => format!("\"[{}]\"", v6),
-    }
 }
 
 fn extract_cookie_value(cookie_header: &str, cookie_name: &str) -> Option<String> {
@@ -277,11 +391,28 @@ type LbHeaderLookup<'a> = dyn Fn(&str) -> Option<String> + 'a;
 
 struct BootstrapStreamingBody {
     inner: Incoming,
+    max_bytes: Option<usize>,
+    bytes_seen: usize,
+    capped: bool,
 }
 
 impl BootstrapStreamingBody {
     fn new(inner: Incoming) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            max_bytes: None,
+            bytes_seen: 0,
+            capped: false,
+        }
+    }
+
+    fn with_max_bytes(inner: Incoming, max_bytes: usize) -> Self {
+        Self {
+            inner,
+            max_bytes: Some(max_bytes),
+            bytes_seen: 0,
+            capped: false,
+        }
     }
 }
 
@@ -293,8 +424,23 @@ impl Body for BootstrapStreamingBody {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        if self.capped {
+            return Poll::Ready(None);
+        }
+
         match Pin::new(&mut self.inner).poll_frame(cx) {
-            Poll::Ready(Some(Ok(frame))) => Poll::Ready(Some(Ok(frame))),
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(limit) = self.max_bytes
+                    && let Some(data) = frame.data_ref()
+                {
+                    self.bytes_seen = self.bytes_seen.saturating_add(data.len());
+                    if self.bytes_seen > limit {
+                        self.capped = true;
+                        return Poll::Ready(None);
+                    }
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
             Poll::Ready(Some(Err(_))) => Poll::Ready(None),
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
@@ -318,23 +464,48 @@ struct ResolvedBackend {
 }
 
 impl QUICListener {
-    pub fn new(config: SpookyConfig) -> Result<Self, ProxyError> {
-        let shared_state = Arc::new(Self::build_shared_state(&config)?);
-        Self::spawn_control_plane_tasks(&config, &shared_state, 1)?;
-        let socket = Self::bind_socket(&config, false)?;
-        Self::new_with_socket_and_shared_state(config, socket, shared_state)
+    pub fn new(config: spooky_config::config::Config) -> Result<Self, ProxyError> {
+        let runtime_config = RuntimeConfig::from_config(&config)
+            .map_err(|err| ProxyError::Transport(err.to_string()))?;
+        let listener_config = runtime_config
+            .listener_runtime_configs()
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                ProxyError::Transport("no effective listeners configured".to_string())
+            })?;
+        let shared_state = Arc::new(Self::build_shared_state(&runtime_config)?);
+        Self::spawn_control_plane_tasks(&runtime_config, &shared_state, 1)?;
+        let socket = Self::bind_socket(&listener_config, false)?;
+        Self::new_with_socket_and_shared_state(listener_config, socket, shared_state)
     }
 
-    fn upstream_tls_client_config(config: &SpookyConfig) -> TlsClientConfig {
+    fn upstream_tls_client_config(tls: &UpstreamTls) -> TlsClientConfig {
         TlsClientConfig {
-            verify_certificates: config.upstream_tls.verify_certificates,
-            strict_sni: config.upstream_tls.strict_sni,
-            ca_file: config.upstream_tls.ca_file.clone(),
-            ca_dir: config.upstream_tls.ca_dir.clone(),
+            verify_certificates: tls.verify_certificates,
+            strict_sni: tls.strict_sni,
+            ca_file: tls.ca_file.clone(),
+            ca_dir: tls.ca_dir.clone(),
         }
     }
 
-    pub fn build_shared_state(config: &SpookyConfig) -> Result<SharedRuntimeState, ProxyError> {
+    fn record_backend_connect_attempt(
+        metrics: &Metrics,
+        backend_resolution_store: &RuntimeBackendResolutionStore,
+        backend: &str,
+    ) {
+        if let Some(resolution) = backend_resolution_store.get(backend) {
+            metrics.record_backend_connect_attempt(
+                backend,
+                &resolution.authority_host,
+                &resolution.resolved_addrs,
+            );
+        } else {
+            metrics.record_backend_connect_attempt(backend, backend, &[]);
+        }
+    }
+
+    pub fn build_shared_state(config: &RuntimeConfig) -> Result<SharedRuntimeState, ProxyError> {
         let worker_threads = config.performance.worker_threads.max(1);
         let shard_count = config.performance.packet_shards_per_worker.max(1);
         let active_worker_threads = if worker_threads > 1 && !config.performance.reuseport {
@@ -376,54 +547,114 @@ impl QUICListener {
             config.performance.h2_pool_idle_timeout_ms
         );
 
+        let listener_runtime_configs = config
+            .listener_runtime_configs()
+            .into_iter()
+            .map(|listener_config| (Self::listener_label(&listener_config), listener_config))
+            .collect::<HashMap<_, _>>();
+        let listener_tls_store = Arc::new(Self::build_listener_tls_reload_store(config)?);
+
         let mut backend_addresses = Vec::new();
+        let mut backend_resolutions = Vec::new();
         let mut seen_backend_origins: HashMap<String, (String, String)> = HashMap::new();
-        for (upstream_name, upstream) in &config.upstream {
+        let mut backend_tls_configs: HashMap<String, TlsClientConfig> = HashMap::new();
+        for (upstream_name, upstream) in &config.upstreams {
+            let upstream_tls_client = Self::upstream_tls_client_config(&upstream.effective_tls);
+
             for backend in &upstream.backends {
-                let endpoint = match BackendEndpoint::parse(&backend.address) {
+                let endpoint = match BackendEndpoint::parse(&backend.backend.address) {
                     Ok(endpoint) => endpoint,
                     Err(err) => {
                         return Err(ProxyError::Transport(format!(
                             "invalid backend address '{}' in upstream '{}' (backend '{}'): {}",
-                            backend.address, upstream_name, backend.id, err
+                            backend.backend.address, upstream_name, backend.backend.id, err
                         )));
                     }
                 };
 
                 let origin = endpoint.origin();
-                if let Some((existing_upstream, existing_backend)) = seen_backend_origins
-                    .insert(origin.clone(), (upstream_name.clone(), backend.id.clone()))
-                {
+                if let Some((existing_upstream, existing_backend)) = seen_backend_origins.insert(
+                    origin.clone(),
+                    (upstream_name.clone(), backend.backend.id.clone()),
+                ) {
                     return Err(ProxyError::Transport(format!(
                         "duplicate backend address '{}' detected while building H2 pool: upstream '{}' backend '{}' conflicts with upstream '{}' backend '{}'",
-                        origin, upstream_name, backend.id, existing_upstream, existing_backend
+                        origin,
+                        upstream_name,
+                        backend.backend.id,
+                        existing_upstream,
+                        existing_backend
                     )));
                 }
-                backend_addresses.push(backend.address.clone());
+                backend_addresses.push(backend.backend.address.clone());
+                let authority_host = endpoint.authority_host().to_string();
+                let authority_port = endpoint.authority_port();
+                let resolution = if endpoint.authority_is_ip_literal() {
+                    let ip_addr = authority_host.parse::<IpAddr>().map_err(|err| {
+                        ProxyError::Transport(format!(
+                            "failed to parse IP literal backend '{}' in upstream '{}' (backend '{}'): {}",
+                            backend.backend.address, upstream_name, backend.backend.id, err
+                        ))
+                    })?;
+                    RuntimeBackendResolution::ip_literal(
+                        backend.backend.address.clone(),
+                        authority_host,
+                        authority_port,
+                        vec![StdSocketAddr::new(ip_addr, authority_port)],
+                    )
+                } else {
+                    RuntimeBackendResolution::hostname(
+                        backend.backend.address.clone(),
+                        authority_host,
+                        authority_port,
+                    )
+                };
+                backend_resolutions.push(resolution);
+                let authority_kind = if endpoint.authority_is_ip_literal() {
+                    "ip_literal"
+                } else {
+                    "hostname"
+                };
+                debug!(
+                    "Configured upstream TLS policy backend={} upstream={} verify_certificates={} strict_sni={} ca_file={:?} ca_dir={:?} authority_kind={}",
+                    backend.backend.address,
+                    upstream_name,
+                    upstream_tls_client.verify_certificates,
+                    upstream_tls_client.strict_sni,
+                    upstream_tls_client.ca_file,
+                    upstream_tls_client.ca_dir,
+                    authority_kind
+                );
+                backend_tls_configs
+                    .insert(backend.backend.address.clone(), upstream_tls_client.clone());
             }
         }
 
+        let backend_dns_resolver = SharedDnsResolver::new();
+        let backend_resolution_store =
+            Arc::new(RuntimeBackendResolutionStore::new(backend_resolutions));
         let h2_pool = Arc::new(
             H2Pool::new(
                 backend_addresses,
+                backend_tls_configs,
                 max_inflight_per_backend,
                 config.performance.h2_pool_max_idle_per_backend,
                 Duration::from_millis(config.performance.h2_pool_idle_timeout_ms),
                 Duration::from_millis(config.performance.backend_connect_timeout_ms),
-                Self::upstream_tls_client_config(config),
+                backend_dns_resolver.clone(),
             )
             .map_err(ProxyError::Tls)?,
         );
         let mut upstream_pools = HashMap::new();
         let mut upstream_inflight = HashMap::new();
-
-        for (name, upstream) in &config.upstream {
-            let upstream_pool = UpstreamPool::from_upstream(upstream).map_err(|err| {
-                ProxyError::Transport(format!(
-                    "failed to create upstream pool '{}': {}",
-                    name, err
-                ))
-            })?;
+        for (name, runtime_upstream) in &config.upstreams {
+            let upstream_pool = UpstreamPool::from_upstream(&runtime_upstream.as_config_upstream())
+                .map_err(|err| {
+                    ProxyError::Transport(format!(
+                        "failed to create upstream pool '{}': {}",
+                        name, err
+                    ))
+                })?;
             upstream_pools.insert(name.clone(), Arc::new(RwLock::new(upstream_pool)));
             upstream_inflight.insert(name.clone(), Arc::new(Semaphore::new(per_upstream_limit)));
         }
@@ -465,61 +696,73 @@ impl QUICListener {
             global_inflight_limit,
         ));
         let watchdog = Arc::new(WatchdogCoordinator::new(&config.resilience.watchdog));
-        let mut route_labels = config.upstream.keys().cloned().collect::<Vec<_>>();
+        let mut route_labels = config.upstreams.keys().cloned().collect::<Vec<_>>();
         route_labels.push("unrouted".to_string());
+        let routing_index = Arc::new(RouteIndex::from_upstreams(&config.upstreams_as_config()));
+        let metrics = Arc::new(Metrics::new(worker_slots, route_labels));
+        for (listener_label, inventory) in listener_tls_store.snapshot() {
+            Self::update_listener_tls_expiry_metrics(&metrics, &listener_label, &inventory);
+        }
 
         Ok(SharedRuntimeState {
+            listener_runtime_configs: Arc::new(listener_runtime_configs),
+            listener_tls_store,
             h2_pool,
             backend_endpoints: Arc::new(
                 config
-                    .upstream
+                    .upstreams
                     .values()
                     .flat_map(|upstream| upstream.backends.iter())
                     .filter_map(|backend| {
-                        BackendEndpoint::parse(&backend.address)
+                        BackendEndpoint::parse(&backend.backend.address)
                             .ok()
-                            .map(|endpoint| (backend.address.clone(), endpoint))
+                            .map(|endpoint| (backend.backend.address.clone(), endpoint))
                     })
+                    .collect(),
+            ),
+            backend_resolution_store,
+            backend_dns_resolver,
+            upstream_policies: Arc::new(
+                config
+                    .upstreams
+                    .iter()
+                    .map(|(name, upstream)| (name.clone(), upstream.policy.clone()))
                     .collect(),
             ),
             upstream_pools,
             upstream_inflight,
             global_inflight: Arc::new(Semaphore::new(global_inflight_limit)),
-            metrics: Arc::new(Metrics::new(worker_slots, route_labels)),
+            routing_index,
+            metrics,
             resilience,
             watchdog,
         })
     }
 
     pub fn spawn_control_plane_tasks(
-        config: &SpookyConfig,
+        config: &RuntimeConfig,
         shared_state: &SharedRuntimeState,
         worker_count: usize,
     ) -> Result<(), ProxyError> {
         shared_state
             .watchdog
             .set_expected_workers(worker_count.max(1));
-        let health_client = match H2Client::new(
-            config.performance.h2_pool_max_idle_per_backend.max(1),
-            Duration::from_millis(config.performance.h2_pool_idle_timeout_ms.max(1)),
-            Duration::from_millis(config.performance.backend_connect_timeout_ms.max(1)),
-            Self::upstream_tls_client_config(config),
-        ) {
-            Ok(client) => Arc::new(client),
-            Err(err) => {
-                return Err(ProxyError::Transport(format!(
-                    "failed to initialize control-plane H2 client: {err}"
-                )));
-            }
-        };
+        Self::spawn_backend_dns_refresh(
+            config,
+            Arc::clone(&shared_state.h2_pool),
+            Arc::clone(&shared_state.backend_resolution_store),
+            shared_state.backend_dns_resolver.clone(),
+            Arc::clone(&shared_state.metrics),
+        );
         Self::spawn_health_checks(
             shared_state.upstream_pools.clone(),
-            health_client,
+            Arc::clone(&shared_state.h2_pool),
+            Arc::clone(&shared_state.backend_endpoints),
+            Arc::clone(&shared_state.backend_resolution_store),
             Arc::clone(&shared_state.metrics),
         );
         Self::spawn_metrics_endpoint(config, Arc::clone(&shared_state.metrics))?;
         Self::spawn_control_api_endpoint(config, shared_state, worker_count)?;
-        Self::spawn_bootstrap_tls_listener(config, shared_state)?;
         Self::spawn_watchdog(
             config,
             Arc::clone(&shared_state.metrics),
@@ -530,7 +773,7 @@ impl QUICListener {
     }
 
     pub fn bind_reuseport_sockets(
-        config: &SpookyConfig,
+        config: &ListenerRuntimeConfig,
         workers: usize,
     ) -> Result<Vec<UdpSocket>, ProxyError> {
         let workers = workers.max(1);
@@ -541,7 +784,10 @@ impl QUICListener {
         Ok(sockets)
     }
 
-    pub fn bind_socket(config: &SpookyConfig, reuse_port: bool) -> Result<UdpSocket, ProxyError> {
+    pub fn bind_socket(
+        config: &ListenerRuntimeConfig,
+        reuse_port: bool,
+    ) -> Result<UdpSocket, ProxyError> {
         let bind_addr = Self::resolve_bind_addr(config)?;
         let socket = Self::create_udp_socket(
             bind_addr,
@@ -559,7 +805,7 @@ impl QUICListener {
     }
 
     pub fn new_with_socket_and_shared_state(
-        config: SpookyConfig,
+        config: ListenerRuntimeConfig,
         socket: UdpSocket,
         shared_state: Arc<SharedRuntimeState>,
     ) -> Result<Self, ProxyError> {
@@ -568,12 +814,22 @@ impl QUICListener {
         })?;
         debug!("Listening on {}", local_addr);
 
+        let listener_label = Self::listener_label(&config);
+        let listener_tls_store = Arc::clone(&shared_state.listener_tls_store);
+        let tls_reload_generation =
+            listener_tls_store
+                .generation(&listener_label)
+                .ok_or_else(|| {
+                    ProxyError::Transport(format!(
+                        "missing TLS reload state for listener '{}'",
+                        listener_label
+                    ))
+                })?;
         let quic_config = Self::build_quic_config(&config)?;
         let h3_config =
             Arc::new(quiche::h3::Config::new().map_err(|err| {
                 ProxyError::Transport(format!("failed to create h3 config: {err}"))
             })?);
-        let routing_index = RouteIndex::from_upstreams(&config.upstream);
         let backend_timeout = Duration::from_millis(config.performance.backend_timeout_ms);
         let backend_body_idle_timeout =
             Duration::from_millis(config.performance.backend_body_idle_timeout_ms);
@@ -596,7 +852,9 @@ impl QUICListener {
         let request_buffer_global_cap_bytes = config.performance.request_buffer_global_cap_bytes;
         let unknown_length_response_prebuffer_bytes =
             config.performance.unknown_length_response_prebuffer_bytes;
-        let require_client_cert = config.listen.tls.client_auth.require_client_cert;
+        let require_client_cert = Self::runtime_listener_tls(&config)?
+            .client_auth
+            .require_client_cert;
         let conn_rate_limiter = TokenBucket::new(
             config.performance.new_connections_per_sec,
             config.performance.new_connections_burst,
@@ -606,14 +864,20 @@ impl QUICListener {
             socket,
             local_addr,
             config,
+            listener_label,
+            listener_tls_store,
+            tls_reload_generation,
             quic_config,
             h3_config,
             h2_pool: Arc::clone(&shared_state.h2_pool),
             backend_endpoints: Arc::clone(&shared_state.backend_endpoints),
+            backend_resolution_store: Arc::clone(&shared_state.backend_resolution_store),
+            backend_dns_resolver: shared_state.backend_dns_resolver.clone(),
+            upstream_policies: Arc::clone(&shared_state.upstream_policies),
             upstream_pools: shared_state.upstream_pools.clone(),
             upstream_inflight: shared_state.upstream_inflight.clone(),
             global_inflight: Arc::clone(&shared_state.global_inflight),
-            routing_index,
+            routing_index: Arc::clone(&shared_state.routing_index),
             metrics: Arc::clone(&shared_state.metrics),
             resilience: Arc::clone(&shared_state.resilience),
             watchdog: Arc::clone(&shared_state.watchdog),
@@ -644,8 +908,11 @@ impl QUICListener {
         })
     }
 
-    fn resolve_bind_addr(config: &SpookyConfig) -> Result<SocketAddr, ProxyError> {
-        let socket_address = format!("{}:{}", config.listen.address, config.listen.port);
+    fn resolve_bind_addr(config: &ListenerRuntimeConfig) -> Result<SocketAddr, ProxyError> {
+        let socket_address = format!(
+            "{}:{}",
+            config.listen.listen.address, config.listen.listen.port
+        );
         socket_address
             .to_socket_addrs()
             .map_err(|err| {
@@ -736,29 +1003,28 @@ impl QUICListener {
         Ok(socket.into())
     }
 
-    fn build_quic_config(config: &SpookyConfig) -> Result<Config, ProxyError> {
-        let mut quic_config = Config::new(quiche::PROTOCOL_VERSION)
-            .map_err(|err| ProxyError::Transport(format!("failed to create QUIC config: {err}")))?;
+    fn runtime_listener_tls(
+        config: &ListenerRuntimeConfig,
+    ) -> Result<RuntimeListenerTls, ProxyError> {
+        Ok(config.listen.tls.clone())
+    }
 
-        match quic_config.load_cert_chain_from_pem_file(&config.listen.tls.cert) {
-            Ok(_) => debug!("Certificate loaded successfully"),
-            Err(e) => {
-                return Err(ProxyError::Tls(format!(
-                    "Failed to load certificate '{}': {}",
-                    config.listen.tls.cert, e
-                )));
-            }
+    fn build_quic_config(config: &ListenerRuntimeConfig) -> Result<Config, ProxyError> {
+        let loaded_tls = Self::load_listener_tls_material(config)?;
+        debug!(
+            "Loaded downstream default TLS identity cert='{}' serial={} san_dns={:?} sni_identities={}",
+            loaded_tls.default_identity.identity.cert_path,
+            loaded_tls.default_identity.metadata.serial_hex,
+            loaded_tls.default_identity.metadata.dns_names,
+            loaded_tls.sni_identities.len()
+        );
+        if let Some(client_auth_ca) = loaded_tls.client_auth_ca.as_ref() {
+            debug!(
+                "Loaded downstream client-auth CA bundle '{}' with {} certificates",
+                client_auth_ca.ca_file, client_auth_ca.certificate_count
+            );
         }
-
-        match quic_config.load_priv_key_from_pem_file(&config.listen.tls.key) {
-            Ok(_) => debug!("Private key loaded successfully"),
-            Err(e) => {
-                return Err(ProxyError::Tls(format!(
-                    "Failed to load key '{}': {}",
-                    config.listen.tls.key, e
-                )));
-            }
-        }
+        let mut quic_config = Self::build_quic_config_from_loaded(&loaded_tls)?;
 
         quic_config
             .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
@@ -781,37 +1047,211 @@ impl QUICListener {
         quic_config.set_initial_max_streams_uni(config.performance.quic_initial_max_streams_uni);
         quic_config.set_disable_active_migration(true);
 
-        if config.listen.tls.client_auth.enabled {
-            let ca_file = config
-                .listen
-                .tls
-                .client_auth
-                .ca_file
-                .as_ref()
-                .ok_or_else(|| {
-                    ProxyError::Tls(
-                        "listen.tls.client_auth.ca_file is required when mTLS is enabled"
-                            .to_string(),
-                    )
-                })?;
-            quic_config
-                .load_verify_locations_from_file(ca_file)
-                .map_err(|err| {
-                    ProxyError::Tls(format!(
-                        "failed to load listen.tls.client_auth.ca_file '{}': {}",
-                        ca_file, err
-                    ))
-                })?;
-            quic_config.verify_peer(true);
+        if loaded_tls.client_auth.enabled {
             info!(
                 "Downstream mTLS enabled (require_client_cert={})",
-                config.listen.tls.client_auth.require_client_cert
+                loaded_tls.client_auth.require_client_cert
             );
         } else {
             quic_config.verify_peer(false);
         }
 
         Ok(quic_config)
+    }
+
+    fn build_quic_config_from_loaded(
+        loaded_tls: &LoadedListenerTlsMaterial,
+    ) -> Result<Config, ProxyError> {
+        let tls_ctx_builder = Self::build_quic_ssl_context_builder(loaded_tls)?;
+        Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, tls_ctx_builder)
+            .map_err(|err| ProxyError::Transport(format!("failed to create QUIC config: {err}")))
+    }
+
+    fn build_quic_ssl_context_builder(
+        loaded_tls: &LoadedListenerTlsMaterial,
+    ) -> Result<SslContextBuilder, ProxyError> {
+        let mut default_builder = Self::build_quic_ssl_context_builder_for_identity(
+            &loaded_tls.default_identity.identity,
+            &loaded_tls.client_auth,
+            loaded_tls.client_auth_ca.as_ref(),
+        )?;
+
+        if loaded_tls.sni_identities.is_empty() {
+            return Ok(default_builder);
+        }
+
+        let mut sni_certs: HashMap<String, QuicSniCertMaterial> =
+            HashMap::with_capacity(loaded_tls.sni_identities.len());
+        for (server_name, identity) in &loaded_tls.sni_identities {
+            Self::validate_loaded_sni_identity(server_name, identity)?;
+            let cert_pem = std::fs::read(&identity.identity.cert_path).map_err(|err| {
+                ProxyError::Tls(format!(
+                    "failed to read SNI cert '{}': {}",
+                    identity.identity.cert_path, err
+                ))
+            })?;
+            let mut certs = X509::stack_from_pem(&cert_pem).map_err(|err| {
+                ProxyError::Tls(format!(
+                    "failed to parse SNI cert '{}': {}",
+                    identity.identity.cert_path, err
+                ))
+            })?;
+            if certs.is_empty() {
+                return Err(ProxyError::Tls(format!(
+                    "SNI cert '{}' contains no certificates",
+                    identity.identity.cert_path
+                )));
+            }
+            let leaf = certs.remove(0);
+            let chain = certs;
+            let key_pem = std::fs::read(&identity.identity.key_path).map_err(|err| {
+                ProxyError::Tls(format!(
+                    "failed to read SNI key '{}': {}",
+                    identity.identity.key_path, err
+                ))
+            })?;
+            let key = PKey::private_key_from_pem(&key_pem).map_err(|err| {
+                ProxyError::Tls(format!(
+                    "failed to parse SNI key '{}': {}",
+                    identity.identity.key_path, err
+                ))
+            })?;
+            sni_certs.insert(
+                server_name.clone(),
+                QuicSniCertMaterial { leaf, chain, key },
+            );
+        }
+
+        let sni_certs = Arc::new(sni_certs);
+        default_builder.set_select_certificate_callback(move |mut hello| {
+            let Some(server_name) = hello.servername(NameType::HOST_NAME) else {
+                return Ok(());
+            };
+            let normalized_server_name = server_name.to_ascii_lowercase();
+            let Some(data) = sni_certs.get(&normalized_server_name) else {
+                return Ok(());
+            };
+            let ssl = hello.ssl_mut();
+            ssl.set_certificate(&data.leaf).map_err(|err| {
+                error!(
+                    "failed to set QUIC SNI certificate for server_name='{}': {}",
+                    normalized_server_name, err
+                );
+                SelectCertError::ERROR
+            })?;
+            for cert in &data.chain {
+                ssl.add_chain_cert(cert).map_err(|err| {
+                    error!(
+                        "failed to add QUIC SNI chain cert for server_name='{}': {}",
+                        normalized_server_name, err
+                    );
+                    SelectCertError::ERROR
+                })?;
+            }
+            ssl.set_private_key(&data.key).map_err(|err| {
+                error!(
+                    "failed to set QUIC SNI key for server_name='{}': {}",
+                    normalized_server_name, err
+                );
+                SelectCertError::ERROR
+            })?;
+            Ok(())
+        });
+        Ok(default_builder)
+    }
+
+    fn build_quic_ssl_context_builder_for_identity(
+        identity: &RuntimeTlsIdentity,
+        client_auth: &ClientAuth,
+        client_auth_ca: Option<&LoadedClientAuthCa>,
+    ) -> Result<SslContextBuilder, ProxyError> {
+        let mut builder = SslContextBuilder::new(SslMethod::tls()).map_err(|err| {
+            ProxyError::Tls(format!(
+                "failed to build downstream QUIC TLS context for '{}': {}",
+                identity.cert_path, err
+            ))
+        })?;
+
+        builder
+            .set_certificate_chain_file(&identity.cert_path)
+            .map_err(|err| {
+                ProxyError::Tls(format!(
+                    "failed to load certificate '{}': {}",
+                    identity.cert_path, err
+                ))
+            })?;
+        builder
+            .set_private_key_file(&identity.key_path, SslFiletype::PEM)
+            .map_err(|err| {
+                ProxyError::Tls(format!(
+                    "failed to load key '{}': {}",
+                    identity.key_path, err
+                ))
+            })?;
+
+        if client_auth.enabled {
+            let client_auth_ca = client_auth_ca.ok_or_else(|| {
+                ProxyError::Tls(
+                    "listen.tls.client_auth.ca_file is required when mTLS is enabled".to_string(),
+                )
+            })?;
+            builder
+                .set_ca_file(&client_auth_ca.ca_file)
+                .map_err(|err| {
+                    ProxyError::Tls(format!(
+                        "failed to load listen.tls.client_auth.ca_file '{}': {}",
+                        client_auth_ca.ca_file, err
+                    ))
+                })?;
+            let verify_mode = if client_auth.require_client_cert {
+                SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT
+            } else {
+                SslVerifyMode::PEER
+            };
+            builder.set_verify(verify_mode);
+        } else {
+            builder.set_verify(SslVerifyMode::NONE);
+        }
+
+        Ok(builder)
+    }
+
+    fn tls_reload_generation_if_needed(
+        listener_label: &str,
+        current_generation: u64,
+        listener_tls_store: &ListenerTlsReloadStore,
+    ) -> Result<Option<u64>, ProxyError> {
+        let next_generation = listener_tls_store
+            .generation(listener_label)
+            .ok_or_else(|| {
+                ProxyError::Transport(format!(
+                    "missing TLS reload state for listener '{}'",
+                    listener_label
+                ))
+            })?;
+        if next_generation == current_generation {
+            return Ok(None);
+        }
+        Ok(Some(next_generation))
+    }
+
+    fn sync_tls_reload_state_if_needed(&mut self) -> Result<(), ProxyError> {
+        let Some(current_generation) = Self::tls_reload_generation_if_needed(
+            &self.listener_label,
+            self.tls_reload_generation,
+            &self.listener_tls_store,
+        )?
+        else {
+            return Ok(());
+        };
+
+        self.quic_config = Self::build_quic_config(&self.config)?;
+        self.tls_reload_generation = current_generation;
+        info!(
+            "Reloaded QUIC TLS configuration for listener {} at generation {}",
+            self.listener_label, self.tls_reload_generation
+        );
+        Ok(())
     }
 
     pub fn start_draining(&mut self) {
@@ -956,6 +1396,15 @@ impl QUICListener {
             return None;
         }
 
+        if let Err(err) = self.sync_tls_reload_state_if_needed() {
+            error!(
+                "Failed to reload QUIC TLS configuration for listener {}: {}",
+                self.listener_label, err
+            );
+            self.metrics.inc_ingress_connection_create_failed();
+            return None;
+        }
+
         let mut scid_bytes = [0u8; DEFAULT_SCID_LEN_BYTES];
         rand::thread_rng().fill_bytes(&mut scid_bytes);
 
@@ -982,6 +1431,9 @@ impl QUICListener {
             routing_scids: HashSet::from([Arc::from(&scid_bytes[..])]),
             packets_since_rotation: 0,
             last_scid_rotation: Instant::now(),
+            tls_observed: false,
+            tls_handshake_failure_recorded: false,
+            tls_client_auth_failure_recorded: false,
             last_peer_error_snapshot: None,
             last_local_error_snapshot: None,
         };
@@ -1369,10 +1821,20 @@ impl QUICListener {
             connection.quic.is_closed()
         );
 
+        self.maybe_record_quic_tls_observation(&mut connection);
+        self.maybe_record_quic_tls_handshake_failure(&mut connection);
+
         if self.require_client_cert
             && connection.quic.is_established()
             && connection.quic.peer_cert().is_none()
         {
+            if !connection.tls_client_auth_failure_recorded {
+                self.metrics.record_downstream_tls_handshake_failure(
+                    &Self::listener_label(&self.config),
+                    "missing_client_cert",
+                );
+                connection.tls_client_auth_failure_recorded = true;
+            }
             warn!(
                 "closing connection {}: downstream mTLS requires a client certificate",
                 connection.quic.trace_id()
@@ -1388,6 +1850,8 @@ impl QUICListener {
                 &mut connection,
                 Arc::clone(&h2_pool),
                 Arc::clone(&self.backend_endpoints),
+                Arc::clone(&self.backend_resolution_store),
+                Arc::clone(&self.upstream_policies),
                 &self.upstream_pools,
                 &self.upstream_inflight,
                 Arc::clone(&self.global_inflight),
@@ -1396,7 +1860,7 @@ impl QUICListener {
                 self.backend_body_total_timeout,
                 self.backend_total_request_timeout,
                 &self.routing_index,
-                &self.metrics,
+                Arc::clone(&self.metrics),
                 &self.resilience,
                 self.max_request_body_bytes,
                 self.max_response_body_bytes,
@@ -1407,7 +1871,7 @@ impl QUICListener {
                 self.config.observability.tracing.enabled,
                 self.config.observability.routing.enabled,
                 self.config.observability.routing.include_reason,
-                self.config.listen.port,
+                self.config.listen.listen.port,
                 self.max_streams_per_connection,
             )
         {
@@ -1494,7 +1958,7 @@ impl QUICListener {
                     self.max_response_body_bytes,
                     self.unknown_length_response_prebuffer_bytes,
                     self.client_body_idle_timeout,
-                    self.config.listen.port,
+                    self.config.listen.listen.port,
                 ) {
                     error!("advance_streams_non_blocking in timeout path: {:?}", e);
                 }
@@ -1657,6 +2121,8 @@ impl QUICListener {
         connection: &mut QuicConnection,
         h2_pool: Arc<H2Pool>,
         backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
+        backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
+        upstream_policies: Arc<HashMap<String, RuntimeUpstreamPolicy>>,
         upstream_pools: &HashMap<String, Arc<RwLock<UpstreamPool>>>,
         upstream_inflight: &HashMap<String, Arc<Semaphore>>,
         global_inflight: Arc<Semaphore>,
@@ -1665,7 +2131,7 @@ impl QUICListener {
         backend_body_total_timeout: Duration,
         backend_total_request_timeout: Duration,
         routing_index: &RouteIndex,
-        metrics: &Metrics,
+        metrics: Arc<Metrics>,
         resilience: &RuntimeResilience,
         max_request_body_bytes: usize,
         max_response_body_bytes: usize,
@@ -2026,9 +2492,7 @@ impl QUICListener {
                                     )
                                 },
                             );
-                            let bodyless_mode = content_length.unwrap_or(0) == 0
-                                && (method.eq_ignore_ascii_case("GET")
-                                    || method.eq_ignore_ascii_case("HEAD"));
+                            let bodyless_mode = is_bodyless_request_mode(&method, content_length);
                             let (tx, boxed, request_fin_received) = if bodyless_mode {
                                 (None, BoxBody::new(Full::new(Bytes::new())), true)
                             } else {
@@ -2063,8 +2527,14 @@ impl QUICListener {
                                     continue;
                                 }
                             };
-                            let request = match build_h2_request_for_endpoint(
+                            let upstream_policy = upstream_policies
+                                .get(&upstream_name)
+                                .cloned()
+                                .unwrap_or_default();
+                            let request = match build_h2_request_for_endpoint_with_host_policy(
                                 &backend_endpoint,
+                                &upstream_policy.host.0,
+                                &upstream_policy.forwarded_headers.0,
                                 &method,
                                 &path,
                                 &list,
@@ -2108,6 +2578,8 @@ impl QUICListener {
                             let retry_budget = Arc::clone(&resilience.retry_budget);
                             let route_name = upstream_name.clone();
                             let backend_endpoints = Arc::clone(&backend_endpoints);
+                            let backend_resolutions = Arc::clone(&backend_resolution_store);
+                            let send_metrics = Arc::clone(&metrics);
                             let allow_hedge = bodyless_mode
                                 && resilience.hedging_allowed_for(&method, &upstream_name, true);
                             let hedge_delay = resilience.hedging_delay;
@@ -2122,6 +2594,11 @@ impl QUICListener {
                                     client_addr: connection.peer_address,
                                     request_id,
                                     traceparent: traceparent.as_deref().map(Arc::<str>::from),
+                                    host_policy: upstream_policy.host.0.clone(),
+                                    forwarded_header_policy: upstream_policy
+                                        .forwarded_headers
+                                        .0
+                                        .clone(),
                                 })
                             });
                             let trace_span_for_upstream = trace_span.clone();
@@ -2140,12 +2617,19 @@ impl QUICListener {
                                             BoxBody<Bytes, std::convert::Infallible>,
                                         >,
                                          cb: Arc<crate::resilience::CircuitBreakers>,
-                                         h2: Arc<H2Pool>| async move {
+                                         h2: Arc<H2Pool>,
+                                         metrics: Arc<Metrics>,
+                                         backend_resolutions: Arc<RuntimeBackendResolutionStore>| async move {
                                             if !cb.allow_request(&backend) {
                                                 return Err(ProxyError::Pool(
                                                     PoolError::CircuitOpen(backend),
                                                 ));
                                             }
+                                            Self::record_backend_connect_attempt(
+                                                &metrics,
+                                                &backend_resolutions,
+                                                &backend,
+                                            );
                                             let send_result = tokio::time::timeout(
                                                 backend_timeout,
                                                 h2.send(&backend, req),
@@ -2180,6 +2664,8 @@ impl QUICListener {
                                                 request,
                                                 Arc::clone(&cb),
                                                 Arc::clone(&h2),
+                                                Arc::clone(&send_metrics),
+                                                Arc::clone(&backend_resolutions),
                                             );
                                             tokio::pin!(primary_fut);
                                             let hedge_sleep = tokio::time::sleep(hedge_delay);
@@ -2197,6 +2683,8 @@ impl QUICListener {
                                                     hedge_request,
                                                     Arc::clone(&cb),
                                                     Arc::clone(&h2),
+                                                    Arc::clone(&send_metrics),
+                                                    Arc::clone(&backend_resolutions),
                                                 );
                                                 tokio::pin!(hedge_fut);
                                                 tokio::select! {
@@ -2222,6 +2710,8 @@ impl QUICListener {
                                                 request,
                                                 Arc::clone(&cb),
                                                 Arc::clone(&h2),
+                                                Arc::clone(&send_metrics),
+                                                Arc::clone(&backend_resolutions),
                                             )
                                             .await?
                                         }
@@ -2231,6 +2721,8 @@ impl QUICListener {
                                             request,
                                             Arc::clone(&cb),
                                             Arc::clone(&h2),
+                                            Arc::clone(&send_metrics),
+                                            Arc::clone(&backend_resolutions),
                                         )
                                         .await
                                         {
@@ -2271,6 +2763,8 @@ impl QUICListener {
                                                         retry_request,
                                                         Arc::clone(&cb),
                                                         Arc::clone(&h2),
+                                                        Arc::clone(&send_metrics),
+                                                        Arc::clone(&backend_resolutions),
                                                     )
                                                     .await?
                                                 } else {
@@ -2460,7 +2954,8 @@ impl QUICListener {
                                     // Enforce cap on total bytes received for the stream,
                                     // including chunks already forwarded to the H2 body channel.
                                     let next_total = req.body_bytes_received.saturating_add(read);
-                                    if next_total > max_request_body_bytes {
+                                    let request_is_connect = is_connect_method(&req.method);
+                                    if !request_is_connect && next_total > max_request_body_bytes {
                                         payload_too_large = Some((
                                             req.upstream_name
                                                 .clone()
@@ -2477,7 +2972,7 @@ impl QUICListener {
                                             if let Err(err) = Self::enqueue_request_chunk(
                                                 req,
                                                 chunk,
-                                                metrics,
+                                                &metrics,
                                                 max_request_body_bytes,
                                                 request_buffer_global_cap_bytes,
                                             ) {
@@ -2503,7 +2998,7 @@ impl QUICListener {
                                     b"request body not allowed for this request\n",
                                 )?;
                                 if let Some(req) = connection.streams.get_mut(&stream_id) {
-                                    abort_stream(req, metrics);
+                                    abort_stream(req, &metrics);
                                 }
                                 connection.streams.remove(&stream_id);
                                 resilience.adaptive_admission.observe(elapsed, true);
@@ -2520,7 +3015,7 @@ impl QUICListener {
                                     b"request body too large\n",
                                 )?;
                                 if let Some(req) = connection.streams.get_mut(&stream_id) {
-                                    abort_stream(req, metrics);
+                                    abort_stream(req, &metrics);
                                 }
                                 connection.streams.remove(&stream_id);
                                 resilience.adaptive_admission.observe(elapsed, true);
@@ -2550,7 +3045,7 @@ impl QUICListener {
                                     .adaptive_admission
                                     .observe(req.start.elapsed(), true);
                                 if let Some(req) = connection.streams.get_mut(&stream_id) {
-                                    abort_stream(req, metrics);
+                                    abort_stream(req, &metrics);
                                 }
                                 connection.streams.remove(&stream_id);
                                 break;
@@ -2579,7 +3074,7 @@ impl QUICListener {
                                     .observe(req.start.elapsed(), true);
                             }
                             if let Some(req) = connection.streams.get_mut(&stream_id) {
-                                abort_stream(req, metrics);
+                                abort_stream(req, &metrics);
                             }
                             connection.streams.remove(&stream_id);
                             let _ = Self::send_simple_response(
@@ -2597,7 +3092,7 @@ impl QUICListener {
                     if let Some(req) = connection.streams.get_mut(&stream_id) {
                         req.request_fin_received = true;
 
-                        Self::flush_request_buffer(req, metrics);
+                        Self::flush_request_buffer(req, &metrics);
                         // If buffer is now empty, drop body_tx to signal end-of-body.
                         if req.body_buf.is_empty() {
                             req.body_tx = None;
@@ -2610,7 +3105,7 @@ impl QUICListener {
                 }
                 Ok((stream_id, quiche::h3::Event::Reset(error_code))) => {
                     if let Some(req) = connection.streams.get_mut(&stream_id) {
-                        let phase = abort_stream(req, metrics);
+                        let phase = abort_stream(req, &metrics);
                         debug!(
                             "stream {} reset by client (error_code={}, phase={:?}): resources released",
                             stream_id, error_code, phase
@@ -2633,7 +3128,7 @@ impl QUICListener {
             routing_index,
             backend_body_idle_timeout,
             backend_body_total_timeout,
-            metrics,
+            &metrics,
             backend_total_request_timeout,
             resilience,
             max_response_body_bytes,
@@ -2660,6 +3155,7 @@ impl QUICListener {
     ///      store `response_chunk_rx`, transition to SendingResponse.
     /// 4. Flush `response_chunk_rx` chunks into H3 (`try_recv` loop).
     ///    - `Data`  → `h3.send_body(..., false)`
+    ///    - `Trailers` → `h3.send_additional_headers(..., true, false)`
     ///    - `End`   → `h3.send_body(..., true)`, mark Completed
     ///    - `Error` → send 502, mark Failed
     /// 5. Remove streams in terminal phase (Completed / Failed).
@@ -2752,13 +3248,11 @@ impl QUICListener {
             // Only transition to response handling once request-body ingestion is
             // complete. This preserves request-size enforcement semantics:
             // oversized requests must still be able to terminate with 413 even if
-            // upstream produced an early response.
-            let can_poll_upstream = streams.get(&stream_id).is_some_and(|req| {
-                req.phase == StreamPhase::AwaitingUpstream
-                    && req.request_fin_received
-                    && req.body_tx.is_none()
-                    && req.body_buf.is_empty()
-            });
+            // upstream produced an early response. CONNECT is the exception:
+            // successful CONNECT establishes a tunnel and must not wait for request FIN.
+            let can_poll_upstream = streams
+                .get(&stream_id)
+                .is_some_and(can_poll_upstream_result);
 
             // upstream_ready: Option<UpstreamResult>
             //   None          → oneshot not yet resolved (or not eligible), skip
@@ -2823,13 +3317,22 @@ impl QUICListener {
                 }
                 match forward_result.forward {
                     Ok((status, resp_headers, body)) => {
+                        let suppress_downstream_body = streams
+                            .get(&stream_id)
+                            .is_some_and(|req| is_head_method(&req.method));
+                        let connect_tunnel = streams
+                            .get(&stream_id)
+                            .is_some_and(|req| is_connect_tunnel_response(&req.method, status));
                         // If upstream advertised a response length beyond our hard cap,
                         // fail fast with 503 before sending any downstream headers/body.
                         let upstream_content_length = resp_headers
                             .get(http::header::CONTENT_LENGTH)
                             .and_then(|v| v.to_str().ok())
                             .and_then(|v| v.parse::<usize>().ok());
-                        if upstream_content_length.is_some_and(|len| len > max_response_body_bytes)
+                        if !connect_tunnel
+                            && !suppress_downstream_body
+                            && upstream_content_length
+                                .is_some_and(|len| len > max_response_body_bytes)
                         {
                             if let Some(req) = streams.get(&stream_id) {
                                 metrics.inc_failure();
@@ -2884,10 +3387,14 @@ impl QUICListener {
                             format!("h3=\":{}\"; ma=86400", listen_port).into_bytes(),
                         ));
 
-                        let defer_headers_until_body_validated = upstream_content_length.is_none();
-                        let immediate_end = upstream_content_length == Some(0)
-                            || status == http::StatusCode::NO_CONTENT
-                            || status == http::StatusCode::NOT_MODIFIED;
+                        let defer_headers_until_body_validated = upstream_content_length.is_none()
+                            && !connect_tunnel
+                            && !suppress_downstream_body;
+                        let immediate_end = suppress_downstream_body
+                            || (!connect_tunnel
+                                && (upstream_content_length == Some(0)
+                                    || status == http::StatusCode::NO_CONTENT
+                                    || status == http::StatusCode::NOT_MODIFIED));
                         let mut immediate_terminal = false;
 
                         if !defer_headers_until_body_validated {
@@ -3004,11 +3511,13 @@ impl QUICListener {
                                 tokio::time::Instant::now() + backend_body_total_timeout;
                             let deferred_status = status;
                             let deferred_headers = owned_h3_headers.clone();
+                            let tunnel_mode = connect_tunnel;
                             let fut = async move {
                                 use http_body_util::BodyExt;
                                 let mut body: hyper::body::Incoming = body;
                                 let mut response_bytes_received: usize = 0;
                                 let mut buffered_chunks: Vec<Bytes> = Vec::new();
+                                let mut buffered_trailers: Option<Vec<(Vec<u8>, Vec<u8>)>> = None;
                                 let mut saw_body_progress = false;
                                 loop {
                                     let frame_fut = BodyExt::frame(&mut body);
@@ -3036,16 +3545,18 @@ impl QUICListener {
                                                 .await;
                                             return;
                                         }
-                                        Ok(Some(Ok(f))) => {
-                                            if let Ok(data) = f.into_data() {
+                                        Ok(Some(Ok(f))) => match f.into_data() {
+                                            Ok(data) => {
                                                 if !data.is_empty() {
                                                     saw_body_progress = true;
                                                 }
-                                                if response_size_exceeded_after_chunk(
-                                                    &mut response_bytes_received,
-                                                    data.len(),
-                                                    max_response_body_bytes,
-                                                ) {
+                                                if !tunnel_mode
+                                                    && response_size_exceeded_after_chunk(
+                                                        &mut response_bytes_received,
+                                                        data.len(),
+                                                        max_response_body_bytes,
+                                                    )
+                                                {
                                                     let _ = chunk_tx
                                                         .send(ResponseChunk::Error(ProxyError::Pool(
                                                             PoolError::BackendOverloaded(
@@ -3098,8 +3609,27 @@ impl QUICListener {
                                                     }
                                                 }
                                             }
-                                            // skip trailers / other frame types
-                                        }
+                                            Err(frame) => {
+                                                if let Ok(trailers) = frame.into_trailers() {
+                                                    let trailer_headers =
+                                                        collect_h3_trailers(&trailers);
+                                                    if !trailer_headers.is_empty() {
+                                                        if defer_headers_until_body_validated {
+                                                            buffered_trailers =
+                                                                Some(trailer_headers);
+                                                        } else if chunk_tx
+                                                            .send(ResponseChunk::Trailers {
+                                                                headers: trailer_headers,
+                                                            })
+                                                            .await
+                                                            .is_err()
+                                                        {
+                                                            return;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        },
                                         Ok(Some(Err(_))) => {
                                             let _ = chunk_tx
                                                 .send(ResponseChunk::Error(ProxyError::Transport(
@@ -3129,6 +3659,14 @@ impl QUICListener {
                                                         return;
                                                     }
                                                 }
+                                            }
+                                            if let Some(headers) = buffered_trailers
+                                                && chunk_tx
+                                                    .send(ResponseChunk::Trailers { headers })
+                                                    .await
+                                                    .is_err()
+                                            {
+                                                return;
                                             }
                                             let _ = chunk_tx.send(ResponseChunk::End).await;
                                             return;
@@ -3306,6 +3844,46 @@ impl QUICListener {
                                 Err(err) => {
                                     error!(
                                         "HTTP/3 send_body data protocol error on stream {}: {:?}",
+                                        stream_id, err
+                                    );
+                                    req.phase = StreamPhase::Failed;
+                                    metrics.inc_failure();
+                                    metrics.inc_backend_error();
+                                    let route_label =
+                                        req.upstream_name.as_deref().unwrap_or("unrouted");
+                                    metrics.record_route(
+                                        route_label,
+                                        req.start.elapsed(),
+                                        RouteOutcome::BackendError,
+                                    );
+                                    resilience
+                                        .adaptive_admission
+                                        .observe(req.start.elapsed(), true);
+                                    terminal = true;
+                                    break;
+                                }
+                            }
+                        }
+                        ResponseChunk::Trailers { headers } => {
+                            let mut h3_headers = Vec::with_capacity(headers.len());
+                            for (name, value) in &headers {
+                                h3_headers.push(quiche::h3::Header::new(name, value));
+                            }
+                            match h3.send_additional_headers(
+                                quic,
+                                stream_id,
+                                &h3_headers,
+                                false,
+                                false,
+                            ) {
+                                Ok(_) => {}
+                                Err(quiche::h3::Error::StreamBlocked) => {
+                                    req.pending_chunk = Some(ResponseChunk::Trailers { headers });
+                                    break;
+                                }
+                                Err(err) => {
+                                    error!(
+                                        "HTTP/3 send_additional_headers protocol error on stream {}: {:?}",
                                         stream_id, err
                                     );
                                     req.phase = StreamPhase::Failed;
@@ -3684,7 +4262,7 @@ impl QUICListener {
     }
 
     fn spawn_metrics_endpoint(
-        config: &SpookyConfig,
+        config: &RuntimeConfig,
         metrics: Arc<Metrics>,
     ) -> Result<(), ProxyError> {
         let endpoint = &config.observability.metrics;
@@ -3814,98 +4392,239 @@ impl QUICListener {
         Ok(())
     }
 
-    fn build_server_tls_acceptor(
-        config: &SpookyConfig,
-        enforce_client_auth: bool,
-        alpn_protocols: Vec<Vec<u8>>,
-    ) -> Result<TlsAcceptor, ProxyError> {
-        use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
-        use std::io::BufReader;
+    fn load_tls_cert_chain_from_pem_file(
+        path: &str,
+        field_name: &str,
+    ) -> Result<Vec<CertificateDer<'static>>, ProxyError> {
+        CertificateDer::pem_file_iter(path)
+            .map_err(|err| {
+                ProxyError::Tls(format!("failed to read {field_name} '{}': {}", path, err))
+            })?
+            .collect::<Result<_, _>>()
+            .map_err(|err| ProxyError::Tls(format!("failed to parse {field_name} PEM: {err}")))
+    }
 
-        let cert_bytes = std::fs::read(&config.listen.tls.cert).map_err(|err| {
+    fn load_tls_private_key_from_pem_file(
+        path: &str,
+        field_name: &str,
+    ) -> Result<PrivateKeyDer<'static>, ProxyError> {
+        PrivateKeyDer::from_pem_file(path).map_err(|err| {
             ProxyError::Tls(format!(
-                "failed to read TLS cert '{}': {}",
-                config.listen.tls.cert, err
+                "failed to parse {field_name} PEM from '{}': {err}",
+                path
+            ))
+        })
+    }
+
+    fn load_certified_key(
+        cert_path: &str,
+        key_path: &str,
+        cert_field: &str,
+        key_field: &str,
+    ) -> Result<CertifiedKey, ProxyError> {
+        let certs = Self::load_tls_cert_chain_from_pem_file(cert_path, cert_field)?;
+        let key = Self::load_tls_private_key_from_pem_file(key_path, key_field)?;
+        let signing_key = rustls::crypto::ring::sign::any_supported_type(&key).map_err(|err| {
+            ProxyError::Tls(format!(
+                "failed to parse private key from {} '{}': {}",
+                key_field, key_path, err
             ))
         })?;
-        let key_bytes = std::fs::read(&config.listen.tls.key).map_err(|err| {
+        let certified = CertifiedKey::new(certs, signing_key);
+        certified.keys_match().map_err(|err| {
             ProxyError::Tls(format!(
-                "failed to read TLS key '{}': {}",
-                config.listen.tls.key, err
+                "certificate/key mismatch for {} '{}' and {} '{}': {}",
+                cert_field, cert_path, key_field, key_path, err
+            ))
+        })?;
+        Ok(certified)
+    }
+
+    fn load_tls_certificate_metadata(
+        cert: &CertificateDer<'static>,
+        cert_field: &str,
+        cert_path: &str,
+    ) -> Result<RuntimeTlsCertificateMetadata, ProxyError> {
+        let (_, certificate) = parse_x509_certificate(cert.as_ref()).map_err(|err| {
+            ProxyError::Tls(format!(
+                "failed to parse X.509 metadata from {cert_field} '{}': {}",
+                cert_path, err
             ))
         })?;
 
-        let server_certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-            certs(&mut BufReader::new(cert_bytes.as_slice()))
-                .collect::<Result<_, _>>()
-                .map_err(|err| ProxyError::Tls(format!("failed to parse TLS cert PEM: {}", err)))?;
-
-        let key = {
-            let mut reader = BufReader::new(key_bytes.as_slice());
-            let pkcs8: Vec<rustls::pki_types::PrivateKeyDer<'static>> =
-                pkcs8_private_keys(&mut reader)
-                    .map(|r| r.map(rustls::pki_types::PrivateKeyDer::Pkcs8))
-                    .collect::<Result<_, _>>()
-                    .map_err(|err| {
-                        ProxyError::Tls(format!("failed to parse PKCS8 key PEM: {}", err))
-                    })?;
-            if let Some(key) = pkcs8.into_iter().next() {
-                key
-            } else {
-                let mut reader2 = BufReader::new(key_bytes.as_slice());
-                let rsa: Vec<rustls::pki_types::PrivateKeyDer<'static>> =
-                    rsa_private_keys(&mut reader2)
-                        .map(|r| r.map(rustls::pki_types::PrivateKeyDer::Pkcs1))
-                        .collect::<Result<_, _>>()
-                        .map_err(|err| {
-                            ProxyError::Tls(format!("failed to parse RSA key PEM: {}", err))
-                        })?;
-                rsa.into_iter().next().ok_or_else(|| {
-                    ProxyError::Tls("no supported private key found in TLS key file".to_string())
-                })?
+        let validity = certificate.validity();
+        let mut dns_names = Vec::new();
+        if let Ok(Some(san)) = certificate.tbs_certificate.subject_alternative_name() {
+            for general_name in &san.value.general_names {
+                if let GeneralName::DNSName(name) = general_name {
+                    dns_names.push(name.to_string());
+                }
             }
-        };
+        }
+        for common_name in certificate.subject().iter_common_name() {
+            if let Ok(name) = common_name.as_str() {
+                dns_names.push(name.to_string());
+            }
+        }
+        dns_names.sort();
+        dns_names.dedup();
 
-        let builder = if enforce_client_auth && config.listen.tls.client_auth.enabled {
-            let ca_file = config
-                .listen
-                .tls
-                .client_auth
-                .ca_file
-                .as_ref()
-                .ok_or_else(|| {
-                    ProxyError::Tls(
-                        "listen.tls.client_auth.ca_file is required when mTLS is enabled"
-                            .to_string(),
-                    )
+        Ok(RuntimeTlsCertificateMetadata {
+            serial_hex: certificate.tbs_certificate.raw_serial_as_string(),
+            not_before_unix_seconds: validity.not_before.timestamp(),
+            not_after_unix_seconds: validity.not_after.timestamp(),
+            dns_names,
+        })
+    }
+
+    fn load_listener_identity(
+        identity: &RuntimeTlsIdentity,
+        cert_field: &str,
+        key_field: &str,
+    ) -> Result<LoadedListenerIdentity, ProxyError> {
+        let certified_key = Arc::new(Self::load_certified_key(
+            &identity.cert_path,
+            &identity.key_path,
+            cert_field,
+            key_field,
+        )?);
+        let leaf = certified_key.cert.first().ok_or_else(|| {
+            ProxyError::Tls(format!(
+                "{cert_field} '{}' did not produce a leaf certificate",
+                identity.cert_path
+            ))
+        })?;
+        let metadata = Self::load_tls_certificate_metadata(leaf, cert_field, &identity.cert_path)?;
+
+        Ok(LoadedListenerIdentity {
+            identity: identity.clone(),
+            certified_key,
+            metadata,
+        })
+    }
+
+    fn load_client_auth_ca(
+        client_auth: &ClientAuth,
+    ) -> Result<Option<LoadedClientAuthCa>, ProxyError> {
+        if !client_auth.enabled {
+            return Ok(None);
+        }
+
+        let ca_file = client_auth.ca_file.as_ref().ok_or_else(|| {
+            ProxyError::Tls(
+                "listen.tls.client_auth.ca_file is required when mTLS is enabled".to_string(),
+            )
+        })?;
+        let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+            CertificateDer::pem_file_iter(ca_file)
+                .map_err(|err| {
+                    ProxyError::Tls(format!(
+                        "failed to read listen.tls.client_auth.ca_file '{}': {}",
+                        ca_file, err
+                    ))
+                })?
+                .collect::<Result<_, _>>()
+                .map_err(|err| {
+                    ProxyError::Tls(format!(
+                        "failed to parse listen.tls.client_auth.ca_file PEM: {}",
+                        err
+                    ))
                 })?;
-            let ca_bytes = std::fs::read(ca_file).map_err(|err| {
+        let mut roots = RootCertStore::empty();
+        for cert in certs {
+            roots.add(cert).map_err(|err| {
                 ProxyError::Tls(format!(
-                    "failed to read listen.tls.client_auth.ca_file '{}': {}",
+                    "failed to add certificate from listen.tls.client_auth.ca_file '{}': {}",
                     ca_file, err
                 ))
             })?;
-            let client_ca_certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-                certs(&mut BufReader::new(ca_bytes.as_slice()))
-                    .collect::<Result<_, _>>()
-                    .map_err(|err| {
-                        ProxyError::Tls(format!(
-                            "failed to parse listen.tls.client_auth.ca_file PEM: {}",
-                            err
-                        ))
-                    })?;
-            let mut roots = RootCertStore::empty();
-            for cert in client_ca_certs {
-                roots.add(cert).map_err(|err| {
-                    ProxyError::Tls(format!(
-                        "failed to add certificate from listen.tls.client_auth.ca_file '{}': {}",
-                        ca_file, err
-                    ))
-                })?;
-            }
+        }
 
-            let verifier_builder = WebPkiClientVerifier::builder(Arc::new(roots));
-            let verifier = if config.listen.tls.client_auth.require_client_cert {
+        Ok(Some(LoadedClientAuthCa {
+            ca_file: ca_file.clone(),
+            certificate_count: roots.len(),
+            roots: Arc::new(roots),
+        }))
+    }
+
+    fn load_listener_tls_material(
+        config: &ListenerRuntimeConfig,
+    ) -> Result<LoadedListenerTlsMaterial, ProxyError> {
+        let listener_tls = Self::runtime_listener_tls(config)?;
+        let default_identity = Self::load_listener_identity(
+            &listener_tls.default_identity,
+            "listen.tls.default_identity.cert",
+            "listen.tls.default_identity.key",
+        )?;
+
+        let mut sni_identities = HashMap::new();
+        for (server_name, identity) in &listener_tls.sni_identities {
+            let cert_field = format!("listen.tls.certificates['{server_name}'].cert");
+            let key_field = format!("listen.tls.certificates['{server_name}'].key");
+            let loaded_identity = Self::load_listener_identity(identity, &cert_field, &key_field)?;
+            Self::validate_loaded_sni_identity(server_name, &loaded_identity)?;
+            sni_identities.insert(server_name.clone(), loaded_identity);
+        }
+
+        Ok(LoadedListenerTlsMaterial {
+            default_identity,
+            sni_identities,
+            client_auth_ca: Self::load_client_auth_ca(&listener_tls.client_auth)?,
+            client_auth: listener_tls.client_auth,
+        })
+    }
+
+    fn listener_tls_inventory(loaded_tls: &LoadedListenerTlsMaterial) -> ListenerTlsInventory {
+        ListenerTlsInventory {
+            listener_tls: RuntimeListenerTls {
+                default_identity: loaded_tls.default_identity.identity.clone(),
+                sni_identities: loaded_tls
+                    .sni_identities
+                    .iter()
+                    .map(|(server_name, identity)| (server_name.clone(), identity.identity.clone()))
+                    .collect(),
+                client_auth: loaded_tls.client_auth.clone(),
+            },
+            default_identity: RuntimeLoadedTlsIdentity {
+                identity: loaded_tls.default_identity.identity.clone(),
+                metadata: loaded_tls.default_identity.metadata.clone(),
+            },
+            sni_identities: loaded_tls
+                .sni_identities
+                .iter()
+                .map(|(server_name, identity)| {
+                    (
+                        server_name.clone(),
+                        RuntimeLoadedTlsIdentity {
+                            identity: identity.identity.clone(),
+                            metadata: identity.metadata.clone(),
+                        },
+                    )
+                })
+                .collect(),
+            client_auth_ca: loaded_tls.client_auth_ca.as_ref().map(|client_auth_ca| {
+                RuntimeLoadedClientAuthCa {
+                    ca_file: client_auth_ca.ca_file.clone(),
+                    certificate_count: client_auth_ca.certificate_count,
+                }
+            }),
+        }
+    }
+
+    fn build_server_tls_config_from_loaded(
+        loaded_tls: &LoadedListenerTlsMaterial,
+        enforce_client_auth: bool,
+        alpn_protocols: Vec<Vec<u8>>,
+    ) -> Result<RustlsServerConfig, ProxyError> {
+        let builder = if enforce_client_auth && loaded_tls.client_auth.enabled {
+            let client_auth_ca = loaded_tls.client_auth_ca.clone().ok_or_else(|| {
+                ProxyError::Tls(
+                    "listen.tls.client_auth.ca_file is required when mTLS is enabled".to_string(),
+                )
+            })?;
+
+            let verifier_builder = WebPkiClientVerifier::builder(client_auth_ca.roots.clone());
+            let verifier = if loaded_tls.client_auth.require_client_cert {
                 verifier_builder.build()
             } else {
                 verifier_builder.allow_unauthenticated().build()
@@ -3922,46 +4641,333 @@ impl QUICListener {
             RustlsServerConfig::builder().with_no_client_auth()
         };
 
-        let mut tls_config = builder.with_single_cert(server_certs, key).map_err(|err| {
-            ProxyError::Tls(format!("failed to build rustls ServerConfig: {}", err))
-        })?;
-
+        let mut sni_resolver = ResolvesServerCertUsingSni::new();
+        for (server_name, identity) in &loaded_tls.sni_identities {
+            Self::validate_loaded_sni_identity(server_name, identity)?;
+            sni_resolver
+                .add(
+                    server_name.as_str(),
+                    identity.certified_key.as_ref().clone(),
+                )
+                .map_err(|err| {
+                    ProxyError::Tls(format!(
+                        "failed to add SNI certificate mapping for '{server_name}': {}",
+                        err
+                    ))
+                })?;
+        }
+        let resolver = Arc::new(FallbackServerCertResolver {
+            sni_resolver,
+            fallback: loaded_tls.default_identity.certified_key.clone(),
+        });
+        let mut tls_config = builder.with_cert_resolver(resolver);
         tls_config.alpn_protocols = alpn_protocols;
-
-        Ok(TlsAcceptor::from(Arc::new(tls_config)))
+        Ok(tls_config)
     }
 
-    fn build_bootstrap_tls_acceptor(config: &SpookyConfig) -> Result<TlsAcceptor, ProxyError> {
-        Self::build_server_tls_acceptor(config, true, vec![b"h2".to_vec(), b"http/1.1".to_vec()])
+    fn validate_loaded_sni_identity(
+        server_name: &str,
+        identity: &LoadedListenerIdentity,
+    ) -> Result<(), ProxyError> {
+        if Self::certificate_covers_server_name(&identity.metadata, server_name) {
+            return Ok(());
+        }
+
+        Err(ProxyError::Tls(format!(
+            "failed to add SNI certificate mapping for '{server_name}': certificate SANs {:?} do not cover server name",
+            identity.metadata.dns_names
+        )))
     }
 
-    fn spawn_bootstrap_tls_listener(
-        config: &SpookyConfig,
+    fn certificate_covers_server_name(
+        metadata: &RuntimeTlsCertificateMetadata,
+        server_name: &str,
+    ) -> bool {
+        metadata
+            .dns_names
+            .iter()
+            .any(|dns_name| Self::certificate_name_matches(dns_name, server_name))
+    }
+
+    fn certificate_name_matches(pattern: &str, server_name: &str) -> bool {
+        if pattern.eq_ignore_ascii_case(server_name) {
+            return true;
+        }
+
+        let Some(suffix) = pattern.strip_prefix("*.") else {
+            return false;
+        };
+        let suffix = suffix.to_ascii_lowercase();
+        let server_name = server_name.to_ascii_lowercase();
+        let Some(prefix) = server_name.strip_suffix(&suffix) else {
+            return false;
+        };
+        let Some(label) = prefix.strip_suffix('.') else {
+            return false;
+        };
+        !label.is_empty() && !label.contains('.')
+    }
+
+    fn build_listener_tls_reload_state(
+        config: &ListenerRuntimeConfig,
+    ) -> Result<ListenerTlsReloadState, ProxyError> {
+        let loaded_tls = Self::load_listener_tls_material(config)?;
+        let inventory = Self::listener_tls_inventory(&loaded_tls);
+        let bootstrap_server_config = Arc::new(Self::build_server_tls_config_from_loaded(
+            &loaded_tls,
+            true,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+        )?);
+        Ok(ListenerTlsReloadState {
+            generation: 0,
+            inventory,
+            bootstrap_server_config,
+        })
+    }
+
+    fn build_listener_tls_reload_store(
+        config: &RuntimeConfig,
+    ) -> Result<ListenerTlsReloadStore, ProxyError> {
+        let mut listeners = HashMap::new();
+        for listener_config in config.listener_runtime_configs() {
+            let listener_label = Self::listener_label(&listener_config);
+            let state = Self::build_listener_tls_reload_state(&listener_config)?;
+            listeners.insert(listener_label, state);
+        }
+        Ok(ListenerTlsReloadStore::new(listeners))
+    }
+
+    #[cfg(test)]
+    fn build_server_tls_acceptor(
+        config: &ListenerRuntimeConfig,
+        enforce_client_auth: bool,
+        alpn_protocols: Vec<Vec<u8>>,
+    ) -> Result<TlsAcceptor, ProxyError> {
+        let loaded_tls = Self::load_listener_tls_material(config)?;
+        debug!(
+            "Building rustls downstream acceptor with default cert='{}' serial={} and {} explicit SNI identities",
+            loaded_tls.default_identity.identity.cert_path,
+            loaded_tls.default_identity.metadata.serial_hex,
+            loaded_tls.sni_identities.len()
+        );
+        Ok(TlsAcceptor::from(Arc::new(
+            Self::build_server_tls_config_from_loaded(
+                &loaded_tls,
+                enforce_client_auth,
+                alpn_protocols,
+            )?,
+        )))
+    }
+
+    fn listener_label(config: &ListenerRuntimeConfig) -> String {
+        format!(
+            "{}:{}",
+            config.listen.listen.address, config.listen.listen.port
+        )
+    }
+
+    fn update_listener_tls_expiry_metrics(
+        metrics: &Metrics,
+        listener_label: &str,
+        inventory: &ListenerTlsInventory,
+    ) {
+        let mut certs = Vec::with_capacity(inventory.sni_identities.len() + 1);
+        certs.push((
+            "__default__".to_string(),
+            inventory.default_identity.metadata.not_after_unix_seconds,
+        ));
+        certs.extend(
+            inventory
+                .sni_identities
+                .iter()
+                .map(|(server_name, identity)| {
+                    (
+                        server_name.clone(),
+                        identity.metadata.not_after_unix_seconds,
+                    )
+                }),
+        );
+        metrics.replace_downstream_tls_cert_expiry(listener_label, certs);
+    }
+
+    fn classify_downstream_tls_cert_selection<'a>(
+        listener_tls: &'a RuntimeListenerTls,
+        requested_sni: Option<&str>,
+    ) -> (&'static str, &'a RuntimeTlsIdentity) {
+        let normalized_sni =
+            requested_sni.map(|value| value.trim().trim_end_matches('.').to_ascii_lowercase());
+        if let Some(sni) = normalized_sni.as_deref()
+            && let Some(identity) = listener_tls.sni_identities.get(sni)
+        {
+            return ("exact_sni", identity);
+        }
+
+        if requested_sni.is_none() {
+            if listener_tls.sni_identities.is_empty() {
+                ("default_only", &listener_tls.default_identity)
+            } else {
+                ("fallback_no_sni", &listener_tls.default_identity)
+            }
+        } else if listener_tls.sni_identities.is_empty() {
+            ("default_only", &listener_tls.default_identity)
+        } else {
+            ("fallback_unmatched_sni", &listener_tls.default_identity)
+        }
+    }
+
+    fn classify_downstream_tls_failure_reason(error: &str) -> &'static str {
+        let lower = error.to_ascii_lowercase();
+        if lower.contains("peer sent no certificates")
+            || lower.contains("peer sent no certificate")
+            || lower.contains("certificate required")
+        {
+            "missing_client_cert"
+        } else if lower.contains("unknownissuer") || lower.contains("unknown issuer") {
+            "unknown_issuer"
+        } else if lower.contains("expired") || lower.contains("not yet valid") {
+            "expired_client_cert"
+        } else if lower.contains("certificate") || lower.contains("cert") {
+            "invalid_client_cert"
+        } else if lower.contains("alpn")
+            || lower.contains("application protocol")
+            || lower.contains("no application protocol")
+        {
+            "alpn"
+        } else {
+            "handshake"
+        }
+    }
+
+    fn maybe_record_quic_tls_observation(&self, connection: &mut QuicConnection) {
+        if connection.tls_observed || !connection.quic.is_established() {
+            return;
+        }
+
+        let listener_label = Self::listener_label(&self.config);
+        let listener_tls = match Self::runtime_listener_tls(&self.config) {
+            Ok(listener_tls) => listener_tls,
+            Err(err) => {
+                debug!(
+                    "Skipping QUIC TLS observation for listener {}: {}",
+                    listener_label, err
+                );
+                return;
+            }
+        };
+        let requested_sni = connection.quic.server_name();
+        let (selection, identity) =
+            Self::classify_downstream_tls_cert_selection(&listener_tls, requested_sni);
+        let alpn = std::str::from_utf8(connection.quic.application_proto())
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or("none");
+        let client_cert_present = connection.quic.peer_cert().is_some();
+
+        self.metrics.inc_downstream_tls_handshake_success();
+        self.metrics
+            .record_downstream_tls_cert_selection(&listener_label, selection);
+        self.metrics
+            .record_downstream_tls_alpn(&listener_label, alpn);
+        debug!(
+            "QUIC TLS established listener={} peer={} sni={:?} selection={} cert='{}' alpn={} client_cert_present={}",
+            listener_label,
+            connection.peer_address,
+            requested_sni,
+            selection,
+            identity.cert_path,
+            alpn,
+            client_cert_present
+        );
+        connection.tls_observed = true;
+    }
+
+    fn maybe_record_quic_tls_handshake_failure(&self, connection: &mut QuicConnection) {
+        if connection.tls_observed
+            || connection.tls_handshake_failure_recorded
+            || connection.quic.is_established()
+        {
+            return;
+        }
+
+        // Record as soon as a connection error is present, not just when fully closed.
+        // local_error() is set the moment quiche sends CONNECTION_CLOSE, which happens
+        // during the draining period before is_closed() becomes true.
+        let Some(err) = connection
+            .quic
+            .local_error()
+            .or_else(|| connection.quic.peer_error())
+        else {
+            return;
+        };
+
+        let reason_text = if err.reason.is_empty() {
+            // QUIC CRYPTO_ERRORs (0x100–0x1ff) encode a TLS alert in the low byte (RFC 9001 §4.8).
+            // Map the alert to a description that classify_downstream_tls_failure_reason can match.
+            if !err.is_app && (0x100..=0x1ff).contains(&err.error_code) {
+                let tls_alert = err.error_code - 0x100;
+                match tls_alert {
+                    120 => "no application protocol".to_string(), // ALPN mismatch
+                    42 => "bad certificate".to_string(),
+                    45 => "certificate expired".to_string(),
+                    48 => "unknown certificate authority".to_string(),
+                    _ => format!("quic tls alert={}", tls_alert),
+                }
+            } else {
+                format!(
+                    "quic handshake error code={} is_app={}",
+                    err.error_code, err.is_app
+                )
+            }
+        } else {
+            String::from_utf8_lossy(&err.reason).into_owned()
+        };
+        let reason = Self::classify_downstream_tls_failure_reason(&reason_text);
+        self.metrics
+            .record_downstream_tls_handshake_failure(&Self::listener_label(&self.config), reason);
+        connection.tls_handshake_failure_recorded = true;
+        debug!(
+            "Recorded QUIC TLS handshake failure listener={} peer={} reason={} detail={}",
+            Self::listener_label(&self.config),
+            connection.peer_address,
+            reason,
+            reason_text
+        );
+    }
+
+    pub fn spawn_bootstrap_tls_listener(
+        config: &ListenerRuntimeConfig,
         shared_state: &SharedRuntimeState,
     ) -> Result<(), ProxyError> {
-        let acceptor = Self::build_bootstrap_tls_acceptor(config).map_err(|err| {
-            ProxyError::Tls(format!(
-                "failed to initialize bootstrap TLS listener config: {}",
-                err
-            ))
-        })?;
-
-        let bind = format!("{}:{}", config.listen.address, config.listen.port);
-        let alt_svc_value = format!("h3=\":{}\"; ma=86400", config.listen.port);
+        let bind = format!(
+            "{}:{}",
+            config.listen.listen.address, config.listen.listen.port
+        );
+        let alt_svc_value = format!("h3=\":{}\"; ma=86400", config.listen.listen.port);
         let backend_timeout = Duration::from_millis(config.performance.backend_timeout_ms);
         let max_request_body_bytes = config.performance.max_request_body_bytes;
         let max_response_body_bytes = config.performance.max_response_body_bytes;
         let max_connections = config.performance.max_active_connections.max(1);
         let connection_timeout =
             Duration::from_millis(config.performance.client_body_idle_timeout_ms.max(1));
+        let listener_label = Self::listener_label(config);
+        shared_state
+            .listener_tls_store
+            .bootstrap_server_config(&listener_label)
+            .ok_or_else(|| {
+                ProxyError::Tls(format!(
+                    "failed to initialize bootstrap TLS listener config for '{}': missing reload state",
+                    listener_label
+                ))
+            })?;
 
         let h2_pool = Arc::clone(&shared_state.h2_pool);
         let backend_endpoints = Arc::clone(&shared_state.backend_endpoints);
+        let backend_resolution_store = Arc::clone(&shared_state.backend_resolution_store);
+        let upstream_policies = Arc::clone(&shared_state.upstream_policies);
         let metrics = Arc::clone(&shared_state.metrics);
         let resilience = Arc::clone(&shared_state.resilience);
         let upstream_pools = shared_state.upstream_pools.clone();
-        let routing_index = RouteIndex::from_upstreams(&config.upstream);
-
+        let listener_tls_store = Arc::clone(&shared_state.listener_tls_store);
         let handle = match runtime_handle() {
             Some(h) => h,
             None => {
@@ -3994,7 +5000,7 @@ impl QUICListener {
             })?
         };
 
-        let routing_index = Arc::new(routing_index);
+        let routing_index = Arc::clone(&shared_state.routing_index);
 
         spawn_supervised_async_task(&handle, "bootstrap-tls-listener", None, async move {
             info!(
@@ -4025,10 +5031,11 @@ impl QUICListener {
                     }
                 };
 
-                let acceptor = acceptor.clone();
                 let alt_svc = alt_svc_value.clone();
                 let h2_pool = Arc::clone(&h2_pool);
                 let backend_endpoints = Arc::clone(&backend_endpoints);
+                let backend_resolution_store = Arc::clone(&backend_resolution_store);
+                let upstream_policies = Arc::clone(&upstream_policies);
                 let metrics = Arc::clone(&metrics);
                 let resilience = Arc::clone(&resilience);
                 let upstream_pools = upstream_pools.clone();
@@ -4036,18 +5043,71 @@ impl QUICListener {
                 let max_request_body_bytes = max_request_body_bytes;
                 let max_response_body_bytes = max_response_body_bytes;
                 let timeout = connection_timeout;
+                let listener_label = listener_label.clone();
+                let listener_tls_store = Arc::clone(&listener_tls_store);
 
                 tokio::spawn(async move {
                     let _permit = permit;
+                    let Some(server_config) =
+                        listener_tls_store.bootstrap_server_config(&listener_label)
+                    else {
+                        error!(
+                            "Bootstrap TLS listener missing live server config for listener {}",
+                            listener_label
+                        );
+                        return;
+                    };
+                    let acceptor = TlsAcceptor::from(server_config);
                     let tls_stream = match acceptor.accept(stream).await {
                         Ok(s) => s,
                         Err(err) => {
-                            debug!("Bootstrap TLS handshake failed from {}: {}", peer, err);
+                            let err_text = err.to_string();
+                            let reason = Self::classify_downstream_tls_failure_reason(&err_text);
+                            metrics
+                                .record_downstream_tls_handshake_failure(&listener_label, reason);
+                            debug!(
+                                "Bootstrap TLS handshake failed listener={} peer={} reason={} error={}",
+                                listener_label, peer, reason, err_text
+                            );
                             return;
                         }
                     };
 
+                    let Some(listener_tls) = listener_tls_store.inventory(&listener_label) else {
+                        error!(
+                            "Bootstrap TLS listener missing live inventory for listener {}",
+                            listener_label
+                        );
+                        return;
+                    };
+                    let requested_sni = tls_stream.get_ref().1.server_name().map(str::to_string);
+                    let (selection, identity) = Self::classify_downstream_tls_cert_selection(
+                        &listener_tls.listener_tls,
+                        requested_sni.as_deref(),
+                    );
                     let negotiated = tls_stream.get_ref().1.alpn_protocol().map(|p| p.to_vec());
+                    let negotiated_label = negotiated
+                        .as_deref()
+                        .and_then(|value| std::str::from_utf8(value).ok())
+                        .unwrap_or("none");
+                    let client_cert_present = tls_stream
+                        .get_ref()
+                        .1
+                        .peer_certificates()
+                        .is_some_and(|certs| !certs.is_empty());
+                    metrics.inc_downstream_tls_handshake_success();
+                    metrics.record_downstream_tls_cert_selection(&listener_label, selection);
+                    metrics.record_downstream_tls_alpn(&listener_label, negotiated_label);
+                    debug!(
+                        "Bootstrap TLS handshake success listener={} peer={} sni={:?} selection={} cert='{}' alpn={} client_cert_present={}",
+                        listener_label,
+                        peer,
+                        requested_sni,
+                        selection,
+                        identity.cert_path,
+                        negotiated_label,
+                        client_cert_present
+                    );
                     let use_h2 = negotiated.as_deref() == Some(b"h2");
 
                     let io = TokioIo::new(tls_stream);
@@ -4058,6 +5118,8 @@ impl QUICListener {
                             let alt = alt_svc_conn.clone();
                             let h2_pool = Arc::clone(&h2_pool);
                             let backend_endpoints = Arc::clone(&backend_endpoints);
+                            let backend_resolution_store = Arc::clone(&backend_resolution_store);
+                            let upstream_policies = Arc::clone(&upstream_policies);
                             let metrics = Arc::clone(&metrics);
                             let resilience = Arc::clone(&resilience);
                             let upstream_pools = upstream_pools.clone();
@@ -4100,6 +5162,7 @@ impl QUICListener {
                                 let path = request.path;
                                 let authority = request.authority;
                                 let content_length = request.content_length;
+                                let suppress_downstream_body = is_head_method(&method);
 
                                 let bootstrap_error = |status: StatusCode, body: &'static [u8]| {
                                     Ok(Response::builder()
@@ -4130,8 +5193,8 @@ impl QUICListener {
                                     &routing_index,
                                     Some(&lb_header_lookup),
                                 );
-                                let backend_addr = match resolved {
-                                    Ok(value) => value.backend_addr,
+                                let (backend_addr, upstream_name) = match resolved {
+                                    Ok(value) => (value.backend_addr, value.upstream_name),
                                     Err(ProxyError::Transport(reason)) => {
                                         let (status, body) =
                                             bootstrap_resolution_error_response(&reason);
@@ -4171,73 +5234,10 @@ impl QUICListener {
 
                                 // Build upstream request
                                 let request_path = if path.is_empty() { "/" } else { &path };
-                                let upstream_uri = match http::Uri::try_from(
-                                    endpoint.uri_for_path(request_path),
-                                ) {
-                                    Ok(u) => u,
-                                    Err(_) => {
-                                        return Ok(Response::builder()
-                                            .status(StatusCode::BAD_GATEWAY)
-                                            .header("alt-svc", &alt)
-                                            .body(boxed_full(Bytes::from_static(b"bad uri\n")))
-                                            .unwrap_or_else(|_| {
-                                                Response::new(boxed_full(Bytes::from_static(
-                                                    b"error\n",
-                                                )))
-                                            }));
-                                    }
-                                };
-
-                                let mut upstream_req =
-                                    Request::builder().method(method.as_str()).uri(upstream_uri);
-
-                                let bootstrap_connection_tokens =
-                                    connection_header_tokens(req.headers());
-                                for (name, value) in req.headers() {
-                                    if name == http::header::HOST {
-                                        continue;
-                                    }
-                                    if !is_websocket_upgrade
-                                        && should_strip_bootstrap_request_header(
-                                            name,
-                                            &bootstrap_connection_tokens,
-                                        )
-                                    {
-                                        continue;
-                                    }
-                                    if is_websocket_upgrade
-                                        && (name == http::header::PROXY_AUTHORIZATION
-                                            || name == http::header::PROXY_AUTHENTICATE
-                                            || name
-                                                .as_str()
-                                                .eq_ignore_ascii_case("proxy-connection")
-                                            || name.as_str().eq_ignore_ascii_case("forwarded")
-                                            || name
-                                                .as_str()
-                                                .eq_ignore_ascii_case("x-forwarded-for")
-                                            || name
-                                                .as_str()
-                                                .eq_ignore_ascii_case("x-forwarded-proto")
-                                            || name
-                                                .as_str()
-                                                .eq_ignore_ascii_case("x-forwarded-host"))
-                                    {
-                                        continue;
-                                    }
-                                    upstream_req = upstream_req.header(name, value);
-                                }
-                                upstream_req = upstream_req.header(
-                                    http::header::HOST,
-                                    authority.as_deref().unwrap_or(endpoint.authority()),
-                                );
-                                upstream_req = upstream_req.header(
-                                    "forwarded",
-                                    format!(
-                                        "for={};proto=https",
-                                        bootstrap_forwarded_for_value(peer.ip())
-                                    ),
-                                );
-
+                                let upstream_policy = upstream_policies
+                                    .get(&upstream_name)
+                                    .cloned()
+                                    .unwrap_or_default();
                                 if !is_websocket_upgrade
                                     && content_length
                                         .is_some_and(|value| value > max_request_body_bytes)
@@ -4255,28 +5255,219 @@ impl QUICListener {
                                         }));
                                 }
 
-                                let upstream_req = match if is_websocket_upgrade {
-                                    upstream_req.body(boxed_full(Bytes::new()))
+                                let request_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+                                let traceparent = req
+                                    .headers()
+                                    .get("traceparent")
+                                    .and_then(|value| value.to_str().ok())
+                                    .map(str::to_string);
+                                let upstream_req = if is_websocket_upgrade {
+                                    let upstream_uri = match http::Uri::try_from(
+                                        endpoint.uri_for_path(request_path),
+                                    ) {
+                                        Ok(uri) => uri,
+                                        Err(_) => {
+                                            return Ok(Response::builder()
+                                                .status(StatusCode::BAD_GATEWAY)
+                                                .header("alt-svc", &alt)
+                                                .body(boxed_full(Bytes::from_static(b"bad uri\n")))
+                                                .unwrap_or_else(|_| {
+                                                    Response::new(boxed_full(Bytes::from_static(
+                                                        b"error\n",
+                                                    )))
+                                                }));
+                                        }
+                                    };
+                                    let request_host = req
+                                        .headers()
+                                        .get(http::header::HOST)
+                                        .and_then(|value| value.to_str().ok());
+                                    let upstream_host = match resolve_upstream_host_value(
+                                        &endpoint,
+                                        &upstream_policy.host.0,
+                                        authority.as_deref(),
+                                        request_host,
+                                    ) {
+                                        Ok(host) => host,
+                                        Err(_) => {
+                                            return Ok(Response::builder()
+                                                .status(StatusCode::BAD_REQUEST)
+                                                .header("alt-svc", &alt)
+                                                .body(boxed_full(Bytes::from_static(
+                                                    b"invalid host policy\n",
+                                                )))
+                                                .unwrap_or_else(|_| {
+                                                    Response::new(boxed_full(Bytes::from_static(
+                                                        b"error\n",
+                                                    )))
+                                                }));
+                                        }
+                                    };
+
+                                    let mut upstream_req = Request::builder()
+                                        .method(method.as_str())
+                                        .uri(upstream_uri);
+                                    let mut forwarded_from_headers: Vec<Vec<u8>> = Vec::new();
+                                    let mut x_forwarded_for_from_headers: Vec<Vec<u8>> = Vec::new();
+                                    let mut x_forwarded_proto_from_headers: Vec<Vec<u8>> =
+                                        Vec::new();
+                                    let mut x_forwarded_host_from_headers: Vec<Vec<u8>> =
+                                        Vec::new();
+                                    for (name, value) in req.headers() {
+                                        if name == http::header::HOST {
+                                            continue;
+                                        }
+                                        if name.as_str().eq_ignore_ascii_case("forwarded") {
+                                            forwarded_from_headers.push(value.as_bytes().to_vec());
+                                            continue;
+                                        }
+                                        if name.as_str().eq_ignore_ascii_case("x-forwarded-for") {
+                                            x_forwarded_for_from_headers
+                                                .push(value.as_bytes().to_vec());
+                                            continue;
+                                        }
+                                        if name.as_str().eq_ignore_ascii_case("x-forwarded-proto") {
+                                            x_forwarded_proto_from_headers
+                                                .push(value.as_bytes().to_vec());
+                                            continue;
+                                        }
+                                        if name.as_str().eq_ignore_ascii_case("x-forwarded-host") {
+                                            x_forwarded_host_from_headers
+                                                .push(value.as_bytes().to_vec());
+                                            continue;
+                                        }
+                                        if name == http::header::PROXY_AUTHORIZATION
+                                            || name == http::header::PROXY_AUTHENTICATE
+                                            || name
+                                                .as_str()
+                                                .eq_ignore_ascii_case("proxy-connection")
+                                            || name == http::header::CONTENT_LENGTH
+                                            || name == http::header::TE
+                                            || name == http::header::TRAILER
+                                            || name == http::header::TRANSFER_ENCODING
+                                            || name.as_str().eq_ignore_ascii_case("keep-alive")
+                                            || name.as_str().eq_ignore_ascii_case("forwarded")
+                                            || name.as_str().eq_ignore_ascii_case("x-forwarded-for")
+                                            || name
+                                                .as_str()
+                                                .eq_ignore_ascii_case("x-forwarded-proto")
+                                            || name
+                                                .as_str()
+                                                .eq_ignore_ascii_case("x-forwarded-host")
+                                        {
+                                            continue;
+                                        }
+                                        upstream_req = upstream_req.header(name, value);
+                                    }
+                                    upstream_req =
+                                        upstream_req.header(http::header::HOST, upstream_host);
+
+                                    let forwarded_values = match build_forwarded_header_values(
+                                        &upstream_policy.forwarded_headers.0,
+                                        ForwardedHeaderChains {
+                                            forwarded: &forwarded_from_headers,
+                                            x_forwarded_for: &x_forwarded_for_from_headers,
+                                            x_forwarded_proto: &x_forwarded_proto_from_headers,
+                                            x_forwarded_host: &x_forwarded_host_from_headers,
+                                        },
+                                        peer.ip(),
+                                        upstream_host,
+                                    ) {
+                                        Ok(values) => values,
+                                        Err(err) => {
+                                            warn!(
+                                                "Bootstrap forwarded header policy failed: {}",
+                                                err
+                                            );
+                                            return Ok(Response::builder()
+                                                .status(StatusCode::BAD_REQUEST)
+                                                .header("alt-svc", &alt)
+                                                .body(boxed_full(Bytes::from_static(
+                                                    b"invalid forwarded headers\n",
+                                                )))
+                                                .unwrap_or_else(|_| {
+                                                    Response::new(boxed_full(Bytes::from_static(
+                                                        b"error\n",
+                                                    )))
+                                                }));
+                                        }
+                                    };
+                                    if let Some(value) = forwarded_values.forwarded {
+                                        upstream_req = upstream_req.header("forwarded", value);
+                                    }
+                                    if let Some(value) = forwarded_values.x_forwarded_for {
+                                        upstream_req =
+                                            upstream_req.header("x-forwarded-for", value);
+                                    }
+                                    if let Some(value) = forwarded_values.x_forwarded_proto {
+                                        upstream_req =
+                                            upstream_req.header("x-forwarded-proto", value);
+                                    }
+                                    if let Some(value) = forwarded_values.x_forwarded_host {
+                                        upstream_req =
+                                            upstream_req.header("x-forwarded-host", value);
+                                    }
+
+                                    match upstream_req.body(boxed_full(Bytes::new())) {
+                                        Ok(request) => request,
+                                        Err(_) => {
+                                            return Ok(Response::builder()
+                                                .status(StatusCode::BAD_GATEWAY)
+                                                .header("alt-svc", &alt)
+                                                .body(boxed_full(Bytes::from_static(
+                                                    b"request build error\n",
+                                                )))
+                                                .unwrap_or_else(|_| {
+                                                    Response::new(boxed_full(Bytes::from_static(
+                                                        b"error\n",
+                                                    )))
+                                                }));
+                                        }
+                                    }
                                 } else {
-                                    upstream_req.body(
+                                    let bridge_headers: Vec<quiche::h3::Header> = req
+                                        .headers()
+                                        .iter()
+                                        .map(|(name, value)| {
+                                            quiche::h3::Header::new(
+                                                name.as_str().as_bytes(),
+                                                value.as_bytes(),
+                                            )
+                                        })
+                                        .collect();
+                                    match build_h2_request_for_endpoint_with_host_policy(
+                                        &endpoint,
+                                        &upstream_policy.host.0,
+                                        &upstream_policy.forwarded_headers.0,
+                                        &method,
+                                        &path,
+                                        &bridge_headers,
                                         BootstrapStreamingBody::new(req.into_body())
                                             .map_err(|never| match never {})
                                             .boxed(),
-                                    )
-                                } {
-                                    Ok(r) => r,
-                                    Err(_) => {
-                                        return Ok(Response::builder()
-                                            .status(StatusCode::BAD_GATEWAY)
-                                            .header("alt-svc", &alt)
-                                            .body(boxed_full(Bytes::from_static(
-                                                b"request build error\n",
-                                            )))
-                                            .unwrap_or_else(|_| {
-                                                Response::new(boxed_full(Bytes::from_static(
-                                                    b"error\n",
+                                        None,
+                                        ForwardedContext {
+                                            client_addr: peer,
+                                            request_authority: authority.as_deref(),
+                                            request_id,
+                                            traceparent: traceparent.as_deref(),
+                                        },
+                                    ) {
+                                        Ok(request) => request,
+                                        Err(err) => {
+                                            warn!("Bootstrap request build failed: {}", err);
+                                            return Ok(Response::builder()
+                                                .status(StatusCode::BAD_REQUEST)
+                                                .header("alt-svc", &alt)
+                                                .body(boxed_full(Bytes::from_static(
+                                                    b"invalid request\n",
                                                 )))
-                                            }));
+                                                .unwrap_or_else(|_| {
+                                                    Response::new(boxed_full(Bytes::from_static(
+                                                        b"error\n",
+                                                    )))
+                                                }));
+                                        }
                                     }
                                 };
                                 let mut upstream_resp = if is_websocket_upgrade {
@@ -4409,6 +5600,11 @@ impl QUICListener {
                                         }
                                     }
                                 } else {
+                                    Self::record_backend_connect_attempt(
+                                        &metrics,
+                                        &backend_resolution_store,
+                                        &backend_addr,
+                                    );
                                     match tokio::time::timeout(
                                         backend_timeout,
                                         h2_pool.send(&backend_addr, upstream_req),
@@ -4447,11 +5643,12 @@ impl QUICListener {
                                 };
 
                                 // Build downstream response with Alt-Svc injected
-                                if let Some(content_length) = upstream_resp
-                                    .headers()
-                                    .get(http::header::CONTENT_LENGTH)
-                                    .and_then(|v| v.to_str().ok())
-                                    .and_then(|s| s.parse::<usize>().ok())
+                                if !suppress_downstream_body
+                                    && let Some(content_length) = upstream_resp
+                                        .headers()
+                                        .get(http::header::CONTENT_LENGTH)
+                                        .and_then(|v| v.to_str().ok())
+                                        .and_then(|s| s.parse::<usize>().ok())
                                     && content_length > max_response_body_bytes
                                 {
                                     return Ok(Response::builder()
@@ -4469,12 +5666,13 @@ impl QUICListener {
 
                                 let status = upstream_resp.status();
                                 let mut resp_builder = Response::builder().status(status);
+                                let response_connection_tokens =
+                                    connection_header_tokens(upstream_resp.headers());
                                 for (name, value) in upstream_resp.headers() {
-                                    if name == http::header::CONNECTION
-                                        || name.as_str() == "keep-alive"
-                                        || name.as_str() == "transfer-encoding"
-                                        || name.as_str() == "alt-svc"
-                                    {
+                                    if should_strip_bootstrap_response_header(
+                                        name,
+                                        &response_connection_tokens,
+                                    ) {
                                         continue;
                                     }
                                     resp_builder = resp_builder.header(name, value);
@@ -4528,10 +5726,16 @@ impl QUICListener {
                                             Response::new(boxed_full(Bytes::new()))
                                         }));
                                 }
-                                let resp_body =
-                                    BootstrapStreamingBody::new(upstream_resp.into_body())
-                                        .map_err(|never| match never {})
-                                        .boxed();
+                                let resp_body = if suppress_downstream_body {
+                                    boxed_full(Bytes::new())
+                                } else {
+                                    BootstrapStreamingBody::with_max_bytes(
+                                        upstream_resp.into_body(),
+                                        max_response_body_bytes,
+                                    )
+                                    .map_err(|never| match never {})
+                                    .boxed()
+                                };
 
                                 Ok(resp_builder
                                     .body(resp_body)
@@ -4751,10 +5955,22 @@ static FALLBACK_RT_THREADS: AtomicUsize = AtomicUsize::new(2);
 mod tests {
     use std::{
         collections::HashMap,
+        path::Path,
         sync::{Arc, RwLock},
     };
 
-    use spooky_config::config::{Backend, LoadBalancing, RouteMatch, Upstream};
+    use rcgen::{Certificate, CertificateParams, SanType};
+    use spooky_config::{
+        config::{
+            Backend, ClientAuth, Config as SpookyConfigConfig, Listen, LoadBalancing, Log,
+            Observability, Performance, Resilience, RouteMatch, Security, Tls, TlsCertificate,
+            Upstream, UpstreamTls,
+        },
+        runtime::{ListenerRuntimeConfig, RuntimeConfig},
+    };
+    use tempfile::tempdir;
+
+    use super::is_bodyless_request_mode;
 
     use crate::REQUEST_ID_COUNTER;
     use crate::cid_radix::CidRadix;
@@ -4765,11 +5981,14 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::{
-        ConnectionRoutes, TokenBucket, abort_stream, classify_active_health_check_response,
-        connection_header_tokens, purge_connection_routes, resolve_primary_from_radix_prefix,
+        ConnectionRoutes, TokenBucket, abort_stream, can_poll_upstream_result,
+        classify_active_health_check_response, collect_h3_trailers, connection_header_tokens,
+        is_connect_tunnel_response, purge_connection_routes, resolve_primary_from_radix_prefix,
         response_size_exceeded_after_chunk, should_strip_bootstrap_request_header,
-        should_strip_h3_response_header, sweep_closed_connections,
+        should_strip_bootstrap_response_header, should_strip_h3_response_header,
+        sweep_closed_connections,
     };
+    use spooky_lb::HealthFailureReason;
     type RoutingMaps = (
         HashMap<Arc<[u8]>, Arc<[u8]>>,
         CidRadix,
@@ -4790,6 +6009,9 @@ mod tests {
                 lb_type: lb_type.to_string(),
                 key: lb_key.map(str::to_string),
             },
+            host_policy: Default::default(),
+            forwarded_headers: Default::default(),
+            tls: None,
             route: RouteMatch {
                 host: None,
                 path_prefix: Some("/api".to_string()),
@@ -4810,6 +6032,511 @@ mod tests {
                 },
             ],
         }
+    }
+
+    fn write_test_cert_for_name(dir: &Path, cert_name: &str, dns_name: &str) -> (String, String) {
+        let mut params = CertificateParams::new(vec![dns_name.to_string()]);
+        params
+            .subject_alt_names
+            .push(SanType::DnsName(dns_name.to_string()));
+        let cert = Certificate::from_params(params).expect("failed to build cert");
+
+        let cert_path = dir.join(format!("{cert_name}.pem"));
+        let key_path = dir.join(format!("{cert_name}.key.pem"));
+
+        std::fs::write(&cert_path, cert.serialize_pem().expect("serialize cert"))
+            .expect("write cert");
+        std::fs::write(&key_path, cert.serialize_private_key_pem()).expect("write key");
+        (
+            cert_path.to_string_lossy().to_string(),
+            key_path.to_string_lossy().to_string(),
+        )
+    }
+
+    fn tls_test_config(
+        cert: String,
+        key: String,
+        certificates: Vec<TlsCertificate>,
+    ) -> SpookyConfigConfig {
+        let mut upstreams = HashMap::new();
+        upstreams.insert("api".to_string(), test_upstream("round-robin"));
+        SpookyConfigConfig {
+            version: 1,
+            listen: Listen {
+                protocol: "http3".to_string(),
+                port: 9889,
+                address: "127.0.0.1".to_string(),
+                tls: Tls {
+                    cert,
+                    key,
+                    certificates,
+                    client_auth: ClientAuth::default(),
+                },
+            },
+            listeners: vec![],
+            upstream: upstreams,
+            load_balancing: Some(LoadBalancing {
+                lb_type: "round-robin".to_string(),
+                key: None,
+            }),
+            upstream_tls: UpstreamTls::default(),
+            log: Log::default(),
+            performance: Performance::default(),
+            observability: Observability::default(),
+            resilience: Resilience::default(),
+            security: Security::default(),
+        }
+    }
+
+    fn tls_test_listener_config(config: &SpookyConfigConfig) -> ListenerRuntimeConfig {
+        RuntimeConfig::from_config(config)
+            .expect("runtime config")
+            .primary_listener_runtime_config()
+            .expect("listener runtime config")
+    }
+
+    fn dns_resolution_test_config(cert: String, key: String) -> SpookyConfigConfig {
+        let mut upstreams = HashMap::new();
+        upstreams.insert(
+            "api".to_string(),
+            Upstream {
+                load_balancing: LoadBalancing {
+                    lb_type: "round-robin".to_string(),
+                    key: None,
+                },
+                host_policy: Default::default(),
+                forwarded_headers: Default::default(),
+                tls: None,
+                route: RouteMatch {
+                    host: Some("api.example.com".to_string()),
+                    path_prefix: Some("/".to_string()),
+                    method: None,
+                },
+                backends: vec![
+                    Backend {
+                        id: "dns".to_string(),
+                        address: "backend.internal:8443".to_string(),
+                        weight: 1,
+                        health_check: None,
+                    },
+                    Backend {
+                        id: "ip".to_string(),
+                        address: "10.0.0.10:9443".to_string(),
+                        weight: 1,
+                        health_check: None,
+                    },
+                ],
+            },
+        );
+
+        SpookyConfigConfig {
+            version: 1,
+            listen: Listen {
+                protocol: "http3".to_string(),
+                port: 9889,
+                address: "127.0.0.1".to_string(),
+                tls: Tls {
+                    cert,
+                    key,
+                    certificates: Vec::new(),
+                    client_auth: ClientAuth::default(),
+                },
+            },
+            listeners: vec![],
+            upstream: upstreams,
+            load_balancing: Some(LoadBalancing {
+                lb_type: "round-robin".to_string(),
+                key: None,
+            }),
+            upstream_tls: UpstreamTls::default(),
+            log: Log::default(),
+            performance: Performance::default(),
+            observability: Observability::default(),
+            resilience: Resilience::default(),
+            security: Security::default(),
+        }
+    }
+
+    #[test]
+    fn runtime_listener_tls_uses_first_sni_entry_when_legacy_pair_is_missing() {
+        let dir = tempdir().expect("tempdir");
+        let (api_cert, api_key) = write_test_cert_for_name(dir.path(), "api", "api.example.com");
+        let (www_cert, www_key) = write_test_cert_for_name(dir.path(), "www", "www.example.com");
+        let config = tls_test_config(
+            String::new(),
+            String::new(),
+            vec![
+                TlsCertificate {
+                    server_name: "api.example.com".to_string(),
+                    cert: api_cert.clone(),
+                    key: api_key.clone(),
+                },
+                TlsCertificate {
+                    server_name: "www.example.com".to_string(),
+                    cert: www_cert,
+                    key: www_key,
+                },
+            ],
+        );
+
+        let runtime_tls =
+            super::QUICListener::runtime_listener_tls(&tls_test_listener_config(&config))
+                .expect("runtime listener tls");
+        assert_eq!(runtime_tls.default_identity.cert_path, api_cert);
+        assert_eq!(runtime_tls.default_identity.key_path, api_key);
+    }
+
+    #[test]
+    fn build_server_tls_acceptor_accepts_sni_certs_without_legacy_pair() {
+        let dir = tempdir().expect("tempdir");
+        let (api_cert, api_key) = write_test_cert_for_name(dir.path(), "api", "api.example.com");
+        let config = tls_test_config(
+            String::new(),
+            String::new(),
+            vec![TlsCertificate {
+                server_name: "api.example.com".to_string(),
+                cert: api_cert,
+                key: api_key,
+            }],
+        );
+
+        let acceptor = super::QUICListener::build_server_tls_acceptor(
+            &tls_test_listener_config(&config),
+            false,
+            vec![b"h2".to_vec()],
+        );
+        assert!(acceptor.is_ok());
+    }
+
+    #[test]
+    fn load_listener_tls_material_extracts_leaf_metadata() {
+        let dir = tempdir().expect("tempdir");
+        let (api_cert, api_key) = write_test_cert_for_name(dir.path(), "api", "api.example.com");
+        let runtime_config = tls_test_listener_config(&tls_test_config(
+            String::new(),
+            String::new(),
+            vec![TlsCertificate {
+                server_name: "api.example.com".to_string(),
+                cert: api_cert.clone(),
+                key: api_key.clone(),
+            }],
+        ));
+
+        let loaded = super::QUICListener::load_listener_tls_material(&runtime_config)
+            .expect("loaded listener tls");
+        let metadata = &loaded.default_identity.metadata;
+        assert!(
+            !metadata.serial_hex.is_empty(),
+            "serial should be populated"
+        );
+        assert!(
+            metadata.not_after_unix_seconds >= metadata.not_before_unix_seconds,
+            "certificate validity should be ordered"
+        );
+        assert!(
+            metadata
+                .dns_names
+                .iter()
+                .any(|name| name == "api.example.com"),
+            "expected SAN/CN metadata to include the configured hostname"
+        );
+    }
+
+    #[test]
+    fn load_listener_tls_material_loads_client_auth_ca_roots() {
+        let dir = tempdir().expect("tempdir");
+        let (server_cert, server_key) =
+            write_test_cert_for_name(dir.path(), "server", "api.example.com");
+        let (client_ca_cert, _client_ca_key) =
+            write_test_cert_for_name(dir.path(), "client-ca", "client-ca.example.com");
+        let mut config = tls_test_config(server_cert, server_key, Vec::new());
+        config.listen.tls.client_auth = ClientAuth {
+            enabled: true,
+            require_client_cert: true,
+            ca_file: Some(client_ca_cert.clone()),
+        };
+
+        let loaded =
+            super::QUICListener::load_listener_tls_material(&tls_test_listener_config(&config))
+                .expect("loaded listener tls");
+        let client_auth_ca = loaded.client_auth_ca.expect("client auth ca");
+        assert_eq!(client_auth_ca.ca_file, client_ca_cert);
+        assert_eq!(client_auth_ca.certificate_count, 1);
+    }
+
+    #[test]
+    fn listener_tls_reload_store_refreshes_inventory_and_generation() {
+        let dir = tempdir().expect("tempdir");
+        let (server_cert, server_key) =
+            write_test_cert_for_name(dir.path(), "server", "api.example.com");
+        let mut config = tls_test_config(server_cert, server_key, Vec::new());
+        config.listen.port = 0;
+
+        let runtime = RuntimeConfig::from_config(&config).expect("runtime config");
+        let shared = super::QUICListener::build_shared_state(&runtime).expect("shared state");
+        let listener_label = "127.0.0.1:0";
+        let initial_inventory = shared
+            .listener_tls_store
+            .inventory(listener_label)
+            .expect("initial inventory");
+        let initial_serial = initial_inventory
+            .default_identity
+            .metadata
+            .serial_hex
+            .clone();
+        assert_eq!(
+            shared.listener_tls_store.generation(listener_label),
+            Some(0)
+        );
+
+        let (_rotated_cert, _rotated_key) =
+            write_test_cert_for_name(dir.path(), "server", "api.example.com");
+        let listener_config = shared
+            .listener_runtime_configs
+            .get(listener_label)
+            .expect("listener runtime config");
+        let reloaded_state = super::QUICListener::build_listener_tls_reload_state(listener_config)
+            .expect("reloaded tls state");
+        let generation = shared
+            .listener_tls_store
+            .replace_listener(
+                listener_label,
+                reloaded_state.inventory,
+                reloaded_state.bootstrap_server_config,
+            )
+            .expect("replace listener");
+        assert_eq!(generation, 1);
+
+        let refreshed_inventory = shared
+            .listener_tls_store
+            .inventory(listener_label)
+            .expect("refreshed inventory");
+        assert_ne!(
+            refreshed_inventory.default_identity.metadata.serial_hex,
+            initial_serial
+        );
+    }
+
+    #[test]
+    fn quic_listener_syncs_tls_generation_after_reload() {
+        let dir = tempdir().expect("tempdir");
+        let (server_cert, server_key) =
+            write_test_cert_for_name(dir.path(), "server", "api.example.com");
+        let mut config = tls_test_config(server_cert, server_key, Vec::new());
+        config.listen.port = 0;
+        let runtime = RuntimeConfig::from_config(&config).expect("runtime config");
+        let shared = Arc::new(super::QUICListener::build_shared_state(&runtime).expect("shared"));
+        let listener_config = runtime
+            .primary_listener_runtime_config()
+            .expect("listener runtime config");
+        let listener_label = super::QUICListener::listener_label(&listener_config);
+        assert_eq!(
+            super::QUICListener::tls_reload_generation_if_needed(
+                &listener_label,
+                0,
+                &shared.listener_tls_store
+            )
+            .expect("initial generation"),
+            None
+        );
+
+        let (_rotated_cert, _rotated_key) =
+            write_test_cert_for_name(dir.path(), "server", "api.example.com");
+        let reloaded_state = super::QUICListener::build_listener_tls_reload_state(&listener_config)
+            .expect("reloaded tls state");
+        shared
+            .listener_tls_store
+            .replace_listener(
+                &listener_label,
+                reloaded_state.inventory,
+                reloaded_state.bootstrap_server_config,
+            )
+            .expect("replace listener");
+
+        assert_eq!(
+            super::QUICListener::tls_reload_generation_if_needed(
+                &listener_label,
+                0,
+                &shared.listener_tls_store
+            )
+            .expect("reloaded generation"),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn build_server_tls_acceptor_rejects_mismatched_sni_certificate_mapping() {
+        let dir = tempdir().expect("tempdir");
+        let (api_cert, api_key) = write_test_cert_for_name(dir.path(), "api", "api.example.com");
+        let config = tls_test_config(
+            String::new(),
+            String::new(),
+            vec![TlsCertificate {
+                server_name: "other.example.com".to_string(),
+                cert: api_cert,
+                key: api_key,
+            }],
+        );
+
+        let err = super::QUICListener::build_server_tls_acceptor(
+            &tls_test_listener_config(&config),
+            false,
+            vec![b"h2".to_vec()],
+        )
+        .err()
+        .expect("mismatched SNI cert mapping should fail");
+        assert!(
+            err.to_string()
+                .contains("failed to add SNI certificate mapping"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn build_quic_config_accepts_sni_certs_without_legacy_pair() {
+        let dir = tempdir().expect("tempdir");
+        let (api_cert, api_key) = write_test_cert_for_name(dir.path(), "api", "api.example.com");
+        let config = tls_test_config(
+            String::new(),
+            String::new(),
+            vec![TlsCertificate {
+                server_name: "api.example.com".to_string(),
+                cert: api_cert,
+                key: api_key,
+            }],
+        );
+
+        let quic_config =
+            super::QUICListener::build_quic_config(&tls_test_listener_config(&config));
+        if let Err(err) = quic_config {
+            panic!("unexpected error: {err}");
+        }
+    }
+
+    #[test]
+    fn build_quic_config_rejects_mismatched_sni_certificate_mapping() {
+        let dir = tempdir().expect("tempdir");
+        let (api_cert, api_key) = write_test_cert_for_name(dir.path(), "api", "api.example.com");
+        let config = tls_test_config(
+            String::new(),
+            String::new(),
+            vec![TlsCertificate {
+                server_name: "other.example.com".to_string(),
+                cert: api_cert,
+                key: api_key,
+            }],
+        );
+
+        let err = super::QUICListener::build_quic_config(&tls_test_listener_config(&config))
+            .err()
+            .expect("mismatched SNI cert mapping should fail");
+        assert!(
+            err.to_string()
+                .contains("failed to add SNI certificate mapping"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn certificate_name_matches_single_label_wildcards_only() {
+        assert!(super::QUICListener::certificate_name_matches(
+            "*.example.com",
+            "api.example.com"
+        ));
+        assert!(!super::QUICListener::certificate_name_matches(
+            "*.example.com",
+            "deep.api.example.com"
+        ));
+        assert!(!super::QUICListener::certificate_name_matches(
+            "*.example.com",
+            "example.com"
+        ));
+    }
+
+    #[test]
+    fn classify_upstream_failure_reason_distinguishes_tls_causes() {
+        assert_eq!(
+            super::QUICListener::classify_upstream_failure_reason(
+                true,
+                "tls handshake failed: UnknownIssuer"
+            ),
+            (HealthFailureReason::Tls, "unknown_issuer")
+        );
+        assert_eq!(
+            super::QUICListener::classify_upstream_failure_reason(
+                true,
+                "certificate expired while verifying backend"
+            ),
+            (HealthFailureReason::Tls, "expired_certificate")
+        );
+        assert_eq!(
+            super::QUICListener::classify_upstream_failure_reason(
+                true,
+                "certificate not valid for dns name api.example.com"
+            ),
+            (HealthFailureReason::Tls, "hostname_mismatch")
+        );
+        assert_eq!(
+            super::QUICListener::classify_upstream_failure_reason(true, "ALPN negotiation failed"),
+            (HealthFailureReason::Tls, "alpn")
+        );
+        assert_eq!(
+            super::QUICListener::classify_upstream_failure_reason(false, "backend timed out"),
+            (HealthFailureReason::Timeout, "timeout")
+        );
+    }
+
+    #[test]
+    fn classify_downstream_tls_failure_reason_distinguishes_client_auth_causes() {
+        assert_eq!(
+            super::QUICListener::classify_downstream_tls_failure_reason(
+                "peer sent no certificates"
+            ),
+            "missing_client_cert"
+        );
+        assert_eq!(
+            super::QUICListener::classify_downstream_tls_failure_reason(
+                "certificate verify failed: UnknownIssuer"
+            ),
+            "unknown_issuer"
+        );
+        assert_eq!(
+            super::QUICListener::classify_downstream_tls_failure_reason("certificate expired"),
+            "expired_client_cert"
+        );
+        assert_eq!(
+            super::QUICListener::classify_downstream_tls_failure_reason("bad certificate"),
+            "invalid_client_cert"
+        );
+    }
+
+    #[test]
+    fn build_shared_state_separates_backend_identity_from_resolution_state() {
+        let dir = tempdir().expect("tempdir");
+        let (cert, key) = write_test_cert_for_name(dir.path(), "server", "api.example.com");
+        let runtime =
+            RuntimeConfig::from_config(&dns_resolution_test_config(cert, key)).expect("runtime");
+        let shared = super::QUICListener::build_shared_state(&runtime).expect("shared state");
+        let snapshot = shared.backend_resolution_store.snapshot();
+
+        let dns_backend = snapshot
+            .get("backend.internal:8443")
+            .expect("dns backend resolution");
+        assert!(dns_backend.is_hostname());
+        assert_eq!(dns_backend.authority_host, "backend.internal");
+        assert_eq!(dns_backend.authority_port, 8443);
+        assert!(dns_backend.resolved_addrs.is_empty());
+
+        let ip_backend = snapshot
+            .get("10.0.0.10:9443")
+            .expect("ip backend resolution");
+        assert!(!ip_backend.is_hostname());
+        assert_eq!(ip_backend.authority_host, "10.0.0.10");
+        assert_eq!(ip_backend.authority_port, 9443);
+        assert_eq!(
+            ip_backend.resolved_addrs,
+            vec!["10.0.0.10:9443".parse().expect("addr")]
+        );
     }
 
     type TestRoutingContext = (
@@ -5083,6 +6810,58 @@ mod tests {
     }
 
     #[test]
+    fn h3_trailer_collection_preserves_end_to_end_trailers() {
+        let mut trailers = HeaderMap::new();
+        trailers.insert(
+            http::HeaderName::from_static("grpc-status"),
+            HeaderValue::from_static("0"),
+        );
+        trailers.insert(
+            http::HeaderName::from_static("grpc-message"),
+            HeaderValue::from_static("ok"),
+        );
+        let collected = collect_h3_trailers(&trailers);
+        assert_eq!(collected.len(), 2);
+        assert!(
+            collected
+                .iter()
+                .any(|(k, v)| k.as_slice() == b"grpc-status" && v.as_slice() == b"0")
+        );
+        assert!(
+            collected
+                .iter()
+                .any(|(k, v)| k.as_slice() == b"grpc-message" && v.as_slice() == b"ok")
+        );
+    }
+
+    #[test]
+    fn h3_trailer_collection_strips_hop_by_hop_and_content_length() {
+        let mut trailers = HeaderMap::new();
+        trailers.insert(
+            http::header::CONTENT_LENGTH,
+            HeaderValue::from_static("123"),
+        );
+        trailers.insert(http::header::TE, HeaderValue::from_static("trailers"));
+        trailers.insert(http::header::TRAILER, HeaderValue::from_static("x-next"));
+        trailers.insert(
+            http::header::CONNECTION,
+            HeaderValue::from_static("x-hop-token"),
+        );
+        trailers.insert(
+            http::HeaderName::from_static("x-hop-token"),
+            HeaderValue::from_static("secret"),
+        );
+        trailers.insert(
+            http::HeaderName::from_static("grpc-status"),
+            HeaderValue::from_static("0"),
+        );
+        let collected = collect_h3_trailers(&trailers);
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected[0].0.as_slice(), b"grpc-status");
+        assert_eq!(collected[0].1.as_slice(), b"0");
+    }
+
+    #[test]
     fn h3_response_filter_strips_connection_nominated_headers() {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -5095,6 +6874,64 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_response_filter_strips_standard_hop_by_hop_headers() {
+        let tokens = HashSet::new();
+        assert!(should_strip_bootstrap_response_header(
+            &http::header::CONNECTION,
+            &tokens
+        ));
+        assert!(should_strip_bootstrap_response_header(
+            &http::header::TE,
+            &tokens
+        ));
+        assert!(should_strip_bootstrap_response_header(
+            &http::header::TRAILER,
+            &tokens
+        ));
+        assert!(should_strip_bootstrap_response_header(
+            &http::header::TRANSFER_ENCODING,
+            &tokens
+        ));
+        assert!(should_strip_bootstrap_response_header(
+            &http::header::UPGRADE,
+            &tokens
+        ));
+        assert!(should_strip_bootstrap_response_header(
+            &http::header::PROXY_AUTHENTICATE,
+            &tokens
+        ));
+        assert!(should_strip_bootstrap_response_header(
+            &http::header::PROXY_AUTHORIZATION,
+            &tokens
+        ));
+        let alt_svc = http::HeaderName::from_static("alt-svc");
+        assert!(should_strip_bootstrap_response_header(&alt_svc, &tokens));
+        let keep_alive = http::HeaderName::from_static("keep-alive");
+        assert!(should_strip_bootstrap_response_header(&keep_alive, &tokens));
+    }
+
+    #[test]
+    fn bootstrap_response_filter_strips_connection_nominated_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONNECTION,
+            HeaderValue::from_static("x-hop-token, x-alt"),
+        );
+        let tokens = connection_header_tokens(&headers);
+        let nominated = http::HeaderName::from_static("x-hop-token");
+        assert!(should_strip_bootstrap_response_header(&nominated, &tokens));
+    }
+
+    #[test]
+    fn bootstrap_response_filter_keeps_end_to_end_headers() {
+        let tokens = HashSet::new();
+        assert!(!should_strip_bootstrap_response_header(
+            &http::header::CACHE_CONTROL,
+            &tokens
+        ));
+    }
+
+    #[test]
     fn response_size_cap_enforced_as_running_total() {
         let mut received = 0usize;
         assert!(!response_size_exceeded_after_chunk(&mut received, 4, 10));
@@ -5103,6 +6940,52 @@ mod tests {
         assert_eq!(received, 10);
         assert!(response_size_exceeded_after_chunk(&mut received, 1, 10));
         assert_eq!(received, 11);
+    }
+
+    #[test]
+    fn connect_tunnel_response_detected_only_for_success_status() {
+        assert!(is_connect_tunnel_response("CONNECT", StatusCode::OK));
+        assert!(is_connect_tunnel_response(
+            "connect",
+            StatusCode::NO_CONTENT
+        ));
+        assert!(!is_connect_tunnel_response(
+            "CONNECT",
+            StatusCode::BAD_GATEWAY
+        ));
+        assert!(!is_connect_tunnel_response("GET", StatusCode::OK));
+    }
+
+    #[test]
+    fn bodyless_request_mode_only_applies_to_empty_get_and_head() {
+        assert!(is_bodyless_request_mode("GET", None));
+        assert!(is_bodyless_request_mode("HEAD", Some(0)));
+        assert!(!is_bodyless_request_mode("GET", Some(1)));
+        assert!(!is_bodyless_request_mode("POST", Some(0)));
+        assert!(!is_bodyless_request_mode("HEAD", Some(1)));
+    }
+
+    #[test]
+    fn connect_can_poll_upstream_before_request_fin() {
+        let (_tx, rx) = oneshot::channel::<crate::UpstreamResult>();
+        let mut req = make_envelope(StreamPhase::ReceivingRequest);
+        req.method = "CONNECT".to_string();
+        req.request_fin_received = false;
+        req.upstream_result_rx = Some(rx);
+        assert!(can_poll_upstream_result(&req));
+    }
+
+    #[test]
+    fn non_connect_requires_request_completion_before_upstream_poll() {
+        let (_tx, rx) = oneshot::channel::<crate::UpstreamResult>();
+        let mut req = make_envelope(StreamPhase::AwaitingUpstream);
+        req.method = "GET".to_string();
+        req.request_fin_received = false;
+        req.upstream_result_rx = Some(rx);
+        assert!(!can_poll_upstream_result(&req));
+
+        req.request_fin_received = true;
+        assert!(can_poll_upstream_result(&req));
     }
 
     #[test]

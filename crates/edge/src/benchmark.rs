@@ -29,6 +29,9 @@ fn build_benchmark_upstream(host: Option<String>, path_prefix: String) -> Upstre
             lb_type: "round-robin".to_string(),
             key: None,
         },
+        host_policy: Default::default(),
+        forwarded_headers: Default::default(),
+        tls: None,
         route: RouteMatch {
             host,
             path_prefix: Some(path_prefix),

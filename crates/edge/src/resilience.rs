@@ -441,12 +441,15 @@ pub struct RuntimeResilience {
     pub max_headers_count: usize,
     pub max_headers_bytes: usize,
     pub enforce_authority_host_match: bool,
+    pub allow_connect: bool,
     pub hedging_enabled: bool,
     pub hedging_delay: Duration,
     hedge_safe_methods: HashSet<String>,
     early_data_safe_methods: HashSet<String>,
     allowed_methods: HashSet<String>,
     denied_path_prefixes: Vec<String>,
+    connect_allowed_ports: HashSet<u16>,
+    connect_allowed_authorities: HashSet<String>,
     route_allowlist: HashSet<String>,
 }
 
@@ -510,6 +513,18 @@ impl RuntimeResilience {
             .iter()
             .cloned()
             .collect::<HashSet<_>>();
+        let connect_allowed_ports = config
+            .protocol
+            .connect_allowed_ports
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let connect_allowed_authorities = config
+            .protocol
+            .connect_allowed_authorities
+            .iter()
+            .filter_map(|authority| normalize_connect_authority(authority))
+            .collect::<HashSet<_>>();
 
         Self {
             adaptive_admission: admission,
@@ -522,12 +537,15 @@ impl RuntimeResilience {
             max_headers_count: config.protocol.max_headers_count.max(1),
             max_headers_bytes: config.protocol.max_headers_bytes.max(1),
             enforce_authority_host_match: config.protocol.enforce_authority_host_match,
+            allow_connect: config.protocol.allow_connect,
             hedging_enabled: config.hedging.enabled,
             hedging_delay: Duration::from_millis(config.hedging.delay_ms),
             hedge_safe_methods,
             early_data_safe_methods,
             allowed_methods,
             denied_path_prefixes: config.protocol.denied_path_prefixes.clone(),
+            connect_allowed_ports,
+            connect_allowed_authorities,
             route_allowlist,
         }
     }
@@ -562,6 +580,73 @@ impl RuntimeResilience {
             .iter()
             .any(|prefix| path.starts_with(prefix))
     }
+
+    pub fn connect_allowed(&self, authority: &str) -> bool {
+        if !self.allow_connect {
+            return false;
+        }
+        let Some(normalized_authority) = normalize_connect_authority(authority) else {
+            return false;
+        };
+        let Some(port) = connect_authority_port(&normalized_authority) else {
+            return false;
+        };
+        if !self.connect_allowed_ports.is_empty() && !self.connect_allowed_ports.contains(&port) {
+            return false;
+        }
+        if self.connect_allowed_authorities.is_empty() {
+            return true;
+        }
+        self.connect_allowed_authorities
+            .contains(&normalized_authority)
+    }
+}
+
+fn normalize_connect_authority(authority: &str) -> Option<String> {
+    let trimmed = authority.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_whitespace) {
+        return None;
+    }
+
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        let end = rest.find(']')?;
+        let host = &rest[..end];
+        if host.is_empty() {
+            return None;
+        }
+        let suffix = &rest[end + 1..];
+        if !suffix.starts_with(':') || suffix.len() <= 1 {
+            return None;
+        }
+        let port = suffix[1..].parse::<u16>().ok().filter(|value| *value > 0)?;
+        return Some(format!(
+            "[{}]:{}",
+            host.trim_end_matches('.').to_ascii_lowercase(),
+            port
+        ));
+    }
+
+    let (host, port) = trimmed.rsplit_once(':')?;
+    if host.is_empty() || host.contains(':') {
+        return None;
+    }
+    let port = port.parse::<u16>().ok().filter(|value| *value > 0)?;
+    Some(format!(
+        "{}:{}",
+        host.trim_end_matches('.').to_ascii_lowercase(),
+        port
+    ))
+}
+
+fn connect_authority_port(normalized_authority: &str) -> Option<u16> {
+    if normalized_authority.starts_with('[') {
+        let end = normalized_authority.find(']')?;
+        let suffix = normalized_authority.get(end + 1..)?;
+        return suffix.strip_prefix(':')?.parse::<u16>().ok();
+    }
+    normalized_authority
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
 }
 
 #[cfg(test)]
@@ -641,6 +726,9 @@ mod tests {
         cfg.protocol.denied_path_prefixes = vec!["/admin".to_string()];
         cfg.protocol.allow_0rtt = true;
         cfg.protocol.early_data_safe_methods = vec!["GET".to_string()];
+        cfg.protocol.allow_connect = true;
+        cfg.protocol.connect_allowed_ports = vec![443];
+        cfg.protocol.connect_allowed_authorities = vec!["proxy.example.com:443".to_string()];
 
         let runtime = RuntimeResilience::from_config(&cfg, 64);
         assert!(runtime.method_allowed("GET"));
@@ -649,5 +737,8 @@ mod tests {
         assert!(!runtime.path_denied("/api"));
         assert!(runtime.early_data_allowed_for("GET"));
         assert!(!runtime.early_data_allowed_for("POST"));
+        assert!(runtime.connect_allowed("proxy.example.com:443"));
+        assert!(!runtime.connect_allowed("proxy.example.com:8443"));
+        assert!(!runtime.connect_allowed("other.example.com:443"));
     }
 }

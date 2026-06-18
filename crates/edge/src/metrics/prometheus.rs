@@ -488,6 +488,167 @@ impl Metrics {
             self.health_failure_tls.load(Ordering::Relaxed)
         ));
         out.push_str(
+            "# HELP spooky_downstream_tls_handshake_success_total Successful downstream TLS handshakes.\n",
+        );
+        out.push_str("# TYPE spooky_downstream_tls_handshake_success_total counter\n");
+        out.push_str(&format!(
+            "spooky_downstream_tls_handshake_success_total {}\n",
+            self.downstream_tls_handshake_success
+                .load(Ordering::Relaxed)
+        ));
+        out.push_str(
+            "# HELP spooky_downstream_tls_handshake_failure_total Downstream TLS handshake failures grouped by listener and reason.\n",
+        );
+        out.push_str("# TYPE spooky_downstream_tls_handshake_failure_total counter\n");
+        for (key, value) in self.snapshot_downstream_tls_handshake_failures() {
+            out.push_str(&format!(
+                "spooky_downstream_tls_handshake_failure_total{{listener=\"{}\",reason=\"{}\"}} {}\n",
+                escape_prometheus_label(&key.listener),
+                escape_prometheus_label(&key.reason),
+                value
+            ));
+        }
+        out.push_str(
+            "# HELP spooky_downstream_tls_certificate_selection_total Downstream TLS certificate selection outcomes grouped by listener.\n",
+        );
+        out.push_str("# TYPE spooky_downstream_tls_certificate_selection_total counter\n");
+        for (key, value) in self.snapshot_downstream_tls_cert_selections() {
+            out.push_str(&format!(
+                "spooky_downstream_tls_certificate_selection_total{{listener=\"{}\",selection=\"{}\"}} {}\n",
+                escape_prometheus_label(&key.listener),
+                escape_prometheus_label(&key.selection),
+                value
+            ));
+        }
+        out.push_str(
+            "# HELP spooky_downstream_tls_alpn_total Negotiated downstream ALPN protocols grouped by listener.\n",
+        );
+        out.push_str("# TYPE spooky_downstream_tls_alpn_total counter\n");
+        for (key, value) in self.snapshot_downstream_tls_alpn() {
+            out.push_str(&format!(
+                "spooky_downstream_tls_alpn_total{{listener=\"{}\",protocol=\"{}\"}} {}\n",
+                escape_prometheus_label(&key.listener),
+                escape_prometheus_label(&key.protocol),
+                value
+            ));
+        }
+        out.push_str(
+            "# HELP spooky_downstream_tls_certificate_not_after_seconds Downstream certificate expiration timestamps grouped by listener and server name.\n",
+        );
+        out.push_str("# TYPE spooky_downstream_tls_certificate_not_after_seconds gauge\n");
+        out.push_str(
+            "# HELP spooky_downstream_tls_certificate_days_remaining Estimated whole days remaining before certificate expiration.\n",
+        );
+        out.push_str("# TYPE spooky_downstream_tls_certificate_days_remaining gauge\n");
+        let now_unix_seconds = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or_default();
+        for (key, value) in self.snapshot_downstream_tls_cert_expiry() {
+            out.push_str(&format!(
+                "spooky_downstream_tls_certificate_not_after_seconds{{listener=\"{}\",server_name=\"{}\"}} {}\n",
+                escape_prometheus_label(&key.listener),
+                escape_prometheus_label(&key.server_name),
+                value
+            ));
+            let days_remaining = ((value - now_unix_seconds).max(0) as f64) / 86_400.0;
+            out.push_str(&format!(
+                "spooky_downstream_tls_certificate_days_remaining{{listener=\"{}\",server_name=\"{}\"}} {:.6}\n",
+                escape_prometheus_label(&key.listener),
+                escape_prometheus_label(&key.server_name),
+                days_remaining
+            ));
+        }
+        out.push_str(
+            "# HELP spooky_upstream_tls_failure_total Upstream TLS failures grouped by backend, request phase, and reason.\n",
+        );
+        out.push_str("# TYPE spooky_upstream_tls_failure_total counter\n");
+        for (key, value) in self.snapshot_upstream_tls_failures() {
+            out.push_str(&format!(
+                "spooky_upstream_tls_failure_total{{backend=\"{}\",phase=\"{}\",reason=\"{}\"}} {}\n",
+                escape_prometheus_label(&key.backend),
+                escape_prometheus_label(&key.phase),
+                escape_prometheus_label(&key.reason),
+                value
+            ));
+        }
+        out.push_str(
+            "# HELP spooky_backend_dns_refresh_success_total Total successful backend DNS refreshes.\n",
+        );
+        out.push_str("# TYPE spooky_backend_dns_refresh_success_total counter\n");
+        out.push_str(&format!(
+            "spooky_backend_dns_refresh_success_total {}\n",
+            self.backend_dns_refresh_success.load(Ordering::Relaxed)
+        ));
+        out.push_str(
+            "# HELP spooky_backend_dns_refresh_failure_total Total failed backend DNS refreshes.\n",
+        );
+        out.push_str("# TYPE spooky_backend_dns_refresh_failure_total counter\n");
+        out.push_str(&format!(
+            "spooky_backend_dns_refresh_failure_total {}\n",
+            self.backend_dns_refresh_failure.load(Ordering::Relaxed)
+        ));
+        out.push_str(
+            "# HELP spooky_backend_dns_address_set_changes_total Total successful backend DNS refreshes that changed the resolved address set.\n",
+        );
+        out.push_str("# TYPE spooky_backend_dns_address_set_changes_total counter\n");
+        out.push_str(&format!(
+            "spooky_backend_dns_address_set_changes_total {}\n",
+            self.backend_dns_refresh_address_changes
+                .load(Ordering::Relaxed)
+        ));
+        out.push_str(
+            "# HELP spooky_backend_client_rotations_total Total backend client rotations triggered by DNS address-set changes.\n",
+        );
+        out.push_str("# TYPE spooky_backend_client_rotations_total counter\n");
+        out.push_str(&format!(
+            "spooky_backend_client_rotations_total {}\n",
+            self.backend_client_rotations.load(Ordering::Relaxed)
+        ));
+        out.push_str(
+            "# HELP spooky_backend_dns_last_refresh_success_seconds Unix timestamp of the last successful backend DNS refresh.\n",
+        );
+        out.push_str("# TYPE spooky_backend_dns_last_refresh_success_seconds gauge\n");
+        out.push_str(
+            "# HELP spooky_backend_dns_resolved_addresses Current number of resolved addresses retained for a backend identity.\n",
+        );
+        out.push_str("# TYPE spooky_backend_dns_resolved_addresses gauge\n");
+        out.push_str(
+            "# HELP spooky_backend_client_rotations Per-backend client rotation count triggered by DNS changes.\n",
+        );
+        out.push_str("# TYPE spooky_backend_client_rotations counter\n");
+        out.push_str(
+            "# HELP spooky_backend_connect_attempt_total Observed backend send attempts grouped by backend identity, hostname, and retained resolved address.\n",
+        );
+        out.push_str("# TYPE spooky_backend_connect_attempt_total counter\n");
+        for (backend, state) in self.snapshot_backend_dns_state() {
+            let backend = escape_prometheus_label(&backend);
+            out.push_str(&format!(
+                "spooky_backend_dns_last_refresh_success_seconds{{backend=\"{}\"}} {}\n",
+                backend, state.last_success_unix_seconds
+            ));
+            out.push_str(&format!(
+                "spooky_backend_dns_resolved_addresses{{backend=\"{}\"}} {}\n",
+                backend, state.resolved_address_count
+            ));
+        }
+        for (backend, state) in self.snapshot_backend_rotation_state() {
+            let backend = escape_prometheus_label(&backend);
+            out.push_str(&format!(
+                "spooky_backend_client_rotations{{backend=\"{}\"}} {}\n",
+                backend, state.rotations
+            ));
+        }
+        for (key, count) in self.snapshot_backend_connect_attempts() {
+            let backend = escape_prometheus_label(&key.backend);
+            let hostname = escape_prometheus_label(&key.hostname);
+            let resolved_addr = escape_prometheus_label(&key.resolved_addr);
+            out.push_str(&format!(
+                "spooky_backend_connect_attempt_total{{backend=\"{}\",hostname=\"{}\",resolved_addr=\"{}\"}} {}\n",
+                backend, hostname, resolved_addr, count
+            ));
+        }
+        out.push_str(
             "# HELP spooky_route_latency_sample_every Route latency histogram sampling interval (1 = every request).\n",
         );
         out.push_str("# TYPE spooky_route_latency_sample_every gauge\n");

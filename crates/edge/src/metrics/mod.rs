@@ -2,8 +2,11 @@ use std::{
     cell::Cell,
     collections::HashMap,
     env,
-    sync::atomic::{AtomicU64, Ordering},
-    time::Duration,
+    sync::{
+        RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 pub use spooky_lb::HealthFailureReason;
@@ -76,6 +79,11 @@ pub struct Metrics {
     pub health_failure_timeout: AtomicU64,
     pub health_failure_transport: AtomicU64,
     pub health_failure_tls: AtomicU64,
+    pub downstream_tls_handshake_success: AtomicU64,
+    pub backend_dns_refresh_success: AtomicU64,
+    pub backend_dns_refresh_failure: AtomicU64,
+    pub backend_dns_refresh_address_changes: AtomicU64,
+    pub backend_client_rotations: AtomicU64,
     route_latency_sample_every: u64,
     route_latency_sample_counter: AtomicU64,
     route_labels: Vec<String>,
@@ -84,6 +92,63 @@ pub struct Metrics {
     unrouted_route_id: usize,
     worker_labels: Vec<String>,
     worker_stats: Vec<WorkerStatsAtomic>,
+    backend_dns_state: RwLock<HashMap<String, BackendDnsState>>,
+    backend_rotation_state: RwLock<HashMap<String, BackendRotationState>>,
+    backend_connect_attempts: RwLock<HashMap<BackendConnectAttemptKey, u64>>,
+    downstream_tls_handshake_failures: RwLock<HashMap<DownstreamTlsHandshakeFailureKey, u64>>,
+    downstream_tls_cert_selections: RwLock<HashMap<DownstreamTlsCertSelectionKey, u64>>,
+    downstream_tls_alpn_negotiated: RwLock<HashMap<DownstreamTlsAlpnKey, u64>>,
+    downstream_tls_cert_expiry: RwLock<HashMap<DownstreamTlsCertExpiryKey, i64>>,
+    upstream_tls_failures: RwLock<HashMap<UpstreamTlsFailureKey, u64>>,
+}
+
+#[derive(Default, Clone)]
+pub(crate) struct BackendDnsState {
+    pub(crate) last_success_unix_seconds: u64,
+    pub(crate) resolved_address_count: u64,
+}
+
+#[derive(Default, Clone)]
+pub(crate) struct BackendRotationState {
+    pub(crate) rotations: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct BackendConnectAttemptKey {
+    pub(crate) backend: String,
+    pub(crate) hostname: String,
+    pub(crate) resolved_addr: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct DownstreamTlsHandshakeFailureKey {
+    pub(crate) listener: String,
+    pub(crate) reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct DownstreamTlsCertSelectionKey {
+    pub(crate) listener: String,
+    pub(crate) selection: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct DownstreamTlsAlpnKey {
+    pub(crate) listener: String,
+    pub(crate) protocol: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct UpstreamTlsFailureKey {
+    pub(crate) backend: String,
+    pub(crate) phase: String,
+    pub(crate) reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct DownstreamTlsCertExpiryKey {
+    pub(crate) listener: String,
+    pub(crate) server_name: String,
 }
 
 const LATENCY_BUCKETS_MS: [u64; 14] = [
@@ -338,6 +403,11 @@ impl Metrics {
             health_failure_timeout: AtomicU64::new(0),
             health_failure_transport: AtomicU64::new(0),
             health_failure_tls: AtomicU64::new(0),
+            downstream_tls_handshake_success: AtomicU64::new(0),
+            backend_dns_refresh_success: AtomicU64::new(0),
+            backend_dns_refresh_failure: AtomicU64::new(0),
+            backend_dns_refresh_address_changes: AtomicU64::new(0),
+            backend_client_rotations: AtomicU64::new(0),
             route_latency_sample_every,
             route_latency_sample_counter: AtomicU64::new(0),
             route_labels: route_labels_dedup,
@@ -346,6 +416,14 @@ impl Metrics {
             unrouted_route_id,
             worker_labels,
             worker_stats,
+            backend_dns_state: RwLock::new(HashMap::new()),
+            backend_rotation_state: RwLock::new(HashMap::new()),
+            backend_connect_attempts: RwLock::new(HashMap::new()),
+            downstream_tls_handshake_failures: RwLock::new(HashMap::new()),
+            downstream_tls_cert_selections: RwLock::new(HashMap::new()),
+            downstream_tls_alpn_negotiated: RwLock::new(HashMap::new()),
+            downstream_tls_cert_expiry: RwLock::new(HashMap::new()),
+            upstream_tls_failures: RwLock::new(HashMap::new()),
         }
     }
 
@@ -549,6 +627,218 @@ impl Metrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_backend_dns_refresh_success(
+        &self,
+        backend: &str,
+        refreshed_at: SystemTime,
+        resolved_address_count: usize,
+        changed: bool,
+    ) {
+        self.backend_dns_refresh_success
+            .fetch_add(1, Ordering::Relaxed);
+        if changed {
+            self.backend_dns_refresh_address_changes
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
+        let last_success_unix_seconds = refreshed_at
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default();
+        if let Ok(mut guard) = self.backend_dns_state.write() {
+            guard.insert(
+                backend.to_string(),
+                BackendDnsState {
+                    last_success_unix_seconds,
+                    resolved_address_count: resolved_address_count as u64,
+                },
+            );
+        }
+    }
+
+    pub fn inc_backend_dns_refresh_failure(&self) {
+        self.backend_dns_refresh_failure
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_backend_client_rotation(&self, backend: &str) {
+        self.backend_client_rotations
+            .fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut guard) = self.backend_rotation_state.write() {
+            guard.entry(backend.to_string()).or_default().rotations += 1;
+        }
+    }
+
+    pub fn record_backend_connect_attempt(
+        &self,
+        backend: &str,
+        hostname: &str,
+        resolved_addrs: &[std::net::SocketAddr],
+    ) {
+        let labels = if resolved_addrs.is_empty() {
+            vec!["unresolved".to_string()]
+        } else {
+            resolved_addrs.iter().map(ToString::to_string).collect()
+        };
+
+        if let Ok(mut guard) = self.backend_connect_attempts.write() {
+            for resolved_addr in labels {
+                *guard
+                    .entry(BackendConnectAttemptKey {
+                        backend: backend.to_string(),
+                        hostname: hostname.to_string(),
+                        resolved_addr,
+                    })
+                    .or_default() += 1;
+            }
+        }
+    }
+
+    pub(crate) fn snapshot_backend_dns_state(&self) -> Vec<(String, BackendDnsState)> {
+        self.backend_dns_state
+            .read()
+            .map(|guard| {
+                let mut entries = guard
+                    .iter()
+                    .map(|(backend, state)| (backend.clone(), state.clone()))
+                    .collect::<Vec<_>>();
+                entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+                entries
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn snapshot_backend_rotation_state(&self) -> Vec<(String, BackendRotationState)> {
+        self.backend_rotation_state
+            .read()
+            .map(|guard| {
+                let mut entries = guard
+                    .iter()
+                    .map(|(backend, state)| (backend.clone(), state.clone()))
+                    .collect::<Vec<_>>();
+                entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+                entries
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn snapshot_backend_connect_attempts(&self) -> Vec<(BackendConnectAttemptKey, u64)> {
+        self.backend_connect_attempts
+            .read()
+            .map(|guard| {
+                let mut entries = guard
+                    .iter()
+                    .map(|(key, value)| (key.clone(), *value))
+                    .collect::<Vec<_>>();
+                entries.sort_by(|(left, _), (right, _)| {
+                    left.backend
+                        .cmp(&right.backend)
+                        .then_with(|| left.hostname.cmp(&right.hostname))
+                        .then_with(|| left.resolved_addr.cmp(&right.resolved_addr))
+                });
+                entries
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn snapshot_downstream_tls_handshake_failures(
+        &self,
+    ) -> Vec<(DownstreamTlsHandshakeFailureKey, u64)> {
+        self.downstream_tls_handshake_failures
+            .read()
+            .map(|guard| {
+                let mut entries = guard
+                    .iter()
+                    .map(|(key, value)| (key.clone(), *value))
+                    .collect::<Vec<_>>();
+                entries.sort_by(|(left, _), (right, _)| {
+                    left.listener
+                        .cmp(&right.listener)
+                        .then_with(|| left.reason.cmp(&right.reason))
+                });
+                entries
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn snapshot_downstream_tls_cert_selections(
+        &self,
+    ) -> Vec<(DownstreamTlsCertSelectionKey, u64)> {
+        self.downstream_tls_cert_selections
+            .read()
+            .map(|guard| {
+                let mut entries = guard
+                    .iter()
+                    .map(|(key, value)| (key.clone(), *value))
+                    .collect::<Vec<_>>();
+                entries.sort_by(|(left, _), (right, _)| {
+                    left.listener
+                        .cmp(&right.listener)
+                        .then_with(|| left.selection.cmp(&right.selection))
+                });
+                entries
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn snapshot_downstream_tls_alpn(&self) -> Vec<(DownstreamTlsAlpnKey, u64)> {
+        self.downstream_tls_alpn_negotiated
+            .read()
+            .map(|guard| {
+                let mut entries = guard
+                    .iter()
+                    .map(|(key, value)| (key.clone(), *value))
+                    .collect::<Vec<_>>();
+                entries.sort_by(|(left, _), (right, _)| {
+                    left.listener
+                        .cmp(&right.listener)
+                        .then_with(|| left.protocol.cmp(&right.protocol))
+                });
+                entries
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn snapshot_upstream_tls_failures(&self) -> Vec<(UpstreamTlsFailureKey, u64)> {
+        self.upstream_tls_failures
+            .read()
+            .map(|guard| {
+                let mut entries = guard
+                    .iter()
+                    .map(|(key, value)| (key.clone(), *value))
+                    .collect::<Vec<_>>();
+                entries.sort_by(|(left, _), (right, _)| {
+                    left.backend
+                        .cmp(&right.backend)
+                        .then_with(|| left.phase.cmp(&right.phase))
+                        .then_with(|| left.reason.cmp(&right.reason))
+                });
+                entries
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn snapshot_downstream_tls_cert_expiry(
+        &self,
+    ) -> Vec<(DownstreamTlsCertExpiryKey, i64)> {
+        self.downstream_tls_cert_expiry
+            .read()
+            .map(|guard| {
+                let mut entries = guard
+                    .iter()
+                    .map(|(key, value)| (key.clone(), *value))
+                    .collect::<Vec<_>>();
+                entries.sort_by(|(left, _), (right, _)| {
+                    left.listener
+                        .cmp(&right.listener)
+                        .then_with(|| left.server_name.cmp(&right.server_name))
+                });
+                entries
+            })
+            .unwrap_or_default()
+    }
+
     fn current_worker_stats(&self) -> Option<&WorkerStatsAtomic> {
         let idx = WORKER_METRICS_SLOT.with(|current| current.get());
         self.worker_stats
@@ -736,6 +1026,74 @@ impl Metrics {
                 self.health_failure_tls.fetch_add(1, Ordering::Relaxed);
             }
             HealthFailureReason::CircuitOpen => {}
+        }
+    }
+
+    pub fn inc_downstream_tls_handshake_success(&self) {
+        self.downstream_tls_handshake_success
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_downstream_tls_handshake_failure(&self, listener: &str, reason: &str) {
+        if let Ok(mut guard) = self.downstream_tls_handshake_failures.write() {
+            *guard
+                .entry(DownstreamTlsHandshakeFailureKey {
+                    listener: listener.to_string(),
+                    reason: reason.to_string(),
+                })
+                .or_default() += 1;
+        }
+    }
+
+    pub fn record_downstream_tls_cert_selection(&self, listener: &str, selection: &str) {
+        if let Ok(mut guard) = self.downstream_tls_cert_selections.write() {
+            *guard
+                .entry(DownstreamTlsCertSelectionKey {
+                    listener: listener.to_string(),
+                    selection: selection.to_string(),
+                })
+                .or_default() += 1;
+        }
+    }
+
+    pub fn record_downstream_tls_alpn(&self, listener: &str, protocol: &str) {
+        if let Ok(mut guard) = self.downstream_tls_alpn_negotiated.write() {
+            *guard
+                .entry(DownstreamTlsAlpnKey {
+                    listener: listener.to_string(),
+                    protocol: protocol.to_string(),
+                })
+                .or_default() += 1;
+        }
+    }
+
+    pub fn record_upstream_tls_failure(&self, backend: &str, phase: &str, reason: &str) {
+        if let Ok(mut guard) = self.upstream_tls_failures.write() {
+            *guard
+                .entry(UpstreamTlsFailureKey {
+                    backend: backend.to_string(),
+                    phase: phase.to_string(),
+                    reason: reason.to_string(),
+                })
+                .or_default() += 1;
+        }
+    }
+
+    pub fn replace_downstream_tls_cert_expiry<I>(&self, listener: &str, certs: I)
+    where
+        I: IntoIterator<Item = (String, i64)>,
+    {
+        if let Ok(mut guard) = self.downstream_tls_cert_expiry.write() {
+            guard.retain(|key, _| key.listener != listener);
+            for (server_name, not_after_unix_seconds) in certs {
+                guard.insert(
+                    DownstreamTlsCertExpiryKey {
+                        listener: listener.to_string(),
+                        server_name,
+                    },
+                    not_after_unix_seconds,
+                );
+            }
         }
     }
 

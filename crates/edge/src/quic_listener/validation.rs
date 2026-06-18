@@ -32,6 +32,7 @@ pub(super) fn validate_request_headers(
     let mut authority = None::<String>;
     let mut host = None::<String>;
     let mut scheme_seen = false;
+    let mut h3_upgrade_requested = false;
 
     for header in list {
         header_bytes = header_bytes.saturating_add(header.name().len() + header.value().len());
@@ -96,6 +97,19 @@ pub(super) fn validate_request_headers(
                     b"invalid host header\n",
                 )?);
             }
+            b"connection" => {
+                let value = strict_header_value(header.value(), b"invalid connection header\n")?;
+                if value
+                    .split(',')
+                    .any(|part| part.trim().eq_ignore_ascii_case("upgrade"))
+                {
+                    h3_upgrade_requested = true;
+                }
+            }
+            b"upgrade" => {
+                let _ = strict_header_value(header.value(), b"invalid upgrade header\n")?;
+                h3_upgrade_requested = true;
+            }
             b":scheme" => {
                 if scheme_seen {
                     return Err((
@@ -117,6 +131,14 @@ pub(super) fn validate_request_headers(
         }
     }
 
+    if h3_upgrade_requested {
+        return Err((
+            http::StatusCode::BAD_REQUEST,
+            b"HTTP/3 does not support Upgrade requests\n",
+            false,
+        ));
+    }
+
     let content_length = parse_h3_content_length(list)?;
 
     let method = match method {
@@ -129,9 +151,25 @@ pub(super) fn validate_request_headers(
             ));
         }
     };
-    let path = match path {
-        Some(path) => path,
-        None => {
+    let is_connect = method.eq_ignore_ascii_case("CONNECT");
+    let path = match (is_connect, path) {
+        (true, Some(path)) if path.is_empty() => {
+            return Err((
+                http::StatusCode::BAD_REQUEST,
+                b"invalid CONNECT :path header\n",
+                false,
+            ));
+        }
+        (true, Some(_)) => {
+            return Err((
+                http::StatusCode::BAD_REQUEST,
+                b"invalid CONNECT :path header\n",
+                false,
+            ));
+        }
+        (true, None) => "/".to_string(),
+        (false, Some(path)) => path,
+        (false, None) => {
             return Err((
                 http::StatusCode::BAD_REQUEST,
                 b"missing :path header\n",
@@ -150,7 +188,11 @@ pub(super) fn validate_request_headers(
         RequestPartErrors {
             invalid_method: b"invalid :method header\n",
             invalid_path: b"invalid :path header\n",
+            invalid_authority: b"invalid :authority header\n",
+            invalid_host: b"invalid host header\n",
             authority_mismatch: b":authority and host headers must match\n",
+            connect_path_not_allowed: b"invalid CONNECT :path header\n",
+            connect_authority_required: b"CONNECT requires authority host:port\n",
         },
     )
 }
@@ -220,7 +262,11 @@ pub(super) fn validate_http_request(
         RequestPartErrors {
             invalid_method: b"invalid method header\n",
             invalid_path: b"invalid path header\n",
+            invalid_authority: b"invalid authority\n",
+            invalid_host: b"invalid host header\n",
             authority_mismatch: b"authority and host headers must match\n",
+            connect_path_not_allowed: b"invalid CONNECT path\n",
+            connect_authority_required: b"CONNECT requires authority host:port\n",
         },
     )
 }
@@ -234,10 +280,52 @@ fn strict_header_value(
         .map_err(|_| (http::StatusCode::BAD_REQUEST, invalid_error, false))
 }
 
+fn parse_authority_value(value: &str) -> Option<NormalizedAuthority> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed != value
+        || trimmed.contains('@')
+        || trimmed.chars().any(char::is_whitespace)
+    {
+        return None;
+    }
+
+    let parsed: http::uri::Authority = trimmed.parse().ok()?;
+    let host = parsed.host().trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+
+    Some(NormalizedAuthority {
+        original: trimmed.to_string(),
+        host,
+        port: parsed.port_u16(),
+    })
+}
+
+fn authorities_match(authority: &NormalizedAuthority, host: &NormalizedAuthority) -> bool {
+    authority.host == host.host
+        && match (authority.port, host.port) {
+            (Some(left), Some(right)) => left == right,
+            _ => true,
+        }
+}
+
 struct RequestPartErrors {
     invalid_method: &'static [u8],
     invalid_path: &'static [u8],
+    invalid_authority: &'static [u8],
+    invalid_host: &'static [u8],
     authority_mismatch: &'static [u8],
+    connect_path_not_allowed: &'static [u8],
+    connect_authority_required: &'static [u8],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedAuthority {
+    original: String,
+    host: String,
+    port: Option<u16>,
 }
 
 fn validate_request_parts(
@@ -249,28 +337,50 @@ fn validate_request_parts(
     resilience: &RuntimeResilience,
     errors: RequestPartErrors,
 ) -> Result<RequestValidationResult, (http::StatusCode, &'static [u8], bool)> {
+    let is_connect = method.eq_ignore_ascii_case("CONNECT");
     if method.trim().is_empty() || method.as_bytes().iter().any(|b| b.is_ascii_whitespace()) {
         return Err((http::StatusCode::BAD_REQUEST, errors.invalid_method, false));
     }
 
-    if path.is_empty() || !path.starts_with('/') {
-        return Err((http::StatusCode::BAD_REQUEST, errors.invalid_path, false));
-    }
-
-    if resilience.enforce_authority_host_match
-        && let (Some(authority_value), Some(host_value)) = (authority.as_deref(), host.as_deref())
-    {
-        let normalized_authority = normalize_host_for_routing(authority_value)
-            .unwrap_or_else(|| authority_value.to_ascii_lowercase());
-        let normalized_host = normalize_host_for_routing(host_value)
-            .unwrap_or_else(|| host_value.to_ascii_lowercase());
-        if normalized_authority != normalized_host {
+    if is_connect {
+        if !path.is_empty() && path != "/" {
             return Err((
                 http::StatusCode::BAD_REQUEST,
-                errors.authority_mismatch,
+                errors.connect_path_not_allowed,
                 false,
             ));
         }
+    } else if path.is_empty() || !path.starts_with('/') {
+        return Err((http::StatusCode::BAD_REQUEST, errors.invalid_path, false));
+    }
+
+    let parsed_authority = match authority.as_deref() {
+        Some(value) => Some(parse_authority_value(value).ok_or((
+            http::StatusCode::BAD_REQUEST,
+            errors.invalid_authority,
+            false,
+        ))?),
+        None => None,
+    };
+    let parsed_host = match host.as_deref() {
+        Some(value) => Some(parse_authority_value(value).ok_or((
+            http::StatusCode::BAD_REQUEST,
+            errors.invalid_host,
+            false,
+        ))?),
+        None => None,
+    };
+
+    if resilience.enforce_authority_host_match
+        && let (Some(authority_value), Some(host_value)) =
+            (parsed_authority.as_ref(), parsed_host.as_ref())
+        && !authorities_match(authority_value, host_value)
+    {
+        return Err((
+            http::StatusCode::BAD_REQUEST,
+            errors.authority_mismatch,
+            false,
+        ));
     }
 
     if !resilience.method_allowed(&method) {
@@ -281,7 +391,27 @@ fn validate_request_parts(
         ));
     }
 
-    if resilience.path_denied(&path) {
+    if is_connect {
+        let connect_authority = parsed_authority.as_ref().or(parsed_host.as_ref()).ok_or((
+            http::StatusCode::BAD_REQUEST,
+            errors.connect_authority_required,
+            false,
+        ))?;
+        if connect_authority.port.is_none() {
+            return Err((
+                http::StatusCode::BAD_REQUEST,
+                errors.connect_authority_required,
+                false,
+            ));
+        }
+        if !resilience.connect_allowed(&connect_authority.original) {
+            return Err((
+                http::StatusCode::FORBIDDEN,
+                b"CONNECT target denied by policy\n",
+                true,
+            ));
+        }
+    } else if resilience.path_denied(&path) {
         return Err((
             http::StatusCode::FORBIDDEN,
             b"request path blocked by policy\n",
@@ -494,6 +624,56 @@ mod tests {
     }
 
     #[test]
+    fn rejects_malformed_authority_header() {
+        let resilience = runtime_resilience();
+        let headers = vec![
+            h3_header(b":method", b"GET"),
+            h3_header(b":path", b"/"),
+            h3_header(b":authority", b"example.com invalid"),
+        ];
+
+        let err = validate_request_headers(&headers, &resilience)
+            .expect_err("malformed authority must be rejected");
+        assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.1, b"invalid :authority header\n");
+        assert!(!err.2);
+    }
+
+    #[test]
+    fn rejects_malformed_host_header() {
+        let resilience = runtime_resilience();
+        let headers = vec![
+            h3_header(b":method", b"GET"),
+            h3_header(b":path", b"/"),
+            h3_header(b"host", b"example.com/path"),
+        ];
+
+        let err =
+            validate_request_headers(&headers, &resilience).expect_err("malformed host rejected");
+        assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.1, b"invalid host header\n");
+        assert!(!err.2);
+    }
+
+    #[test]
+    fn rejects_http3_connection_upgrade_requests() {
+        let resilience = runtime_resilience();
+        let headers = vec![
+            h3_header(b":method", b"GET"),
+            h3_header(b":path", b"/"),
+            h3_header(b":authority", b"example.com"),
+            h3_header(b"connection", b"keep-alive, Upgrade"),
+            h3_header(b"upgrade", b"websocket"),
+        ];
+
+        let err = validate_request_headers(&headers, &resilience)
+            .expect_err("HTTP/3 Upgrade requests must be rejected");
+        assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.1, b"HTTP/3 does not support Upgrade requests\n");
+        assert!(!err.2);
+    }
+
+    #[test]
     fn accepts_consistent_duplicate_content_length_headers() {
         let resilience = runtime_resilience();
         let headers = vec![
@@ -561,5 +741,114 @@ mod tests {
         assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
         assert_eq!(err.1, b"conflicting content-length header\n");
         assert!(!err.2);
+    }
+
+    #[test]
+    fn authority_host_match_allows_omitted_default_port() {
+        let mut cfg = Resilience::default();
+        cfg.protocol.enforce_authority_host_match = true;
+        let resilience = RuntimeResilience::from_config(&cfg, 1024);
+        let headers = vec![
+            h3_header(b":method", b"GET"),
+            h3_header(b":path", b"/"),
+            h3_header(b":authority", b"api.example.com:443"),
+            h3_header(b"host", b"api.example.com"),
+        ];
+
+        let request = validate_request_headers(&headers, &resilience)
+            .expect("default port omission should still match");
+        assert_eq!(request.authority.as_deref(), Some("api.example.com:443"));
+    }
+
+    #[test]
+    fn authority_host_match_rejects_explicit_port_mismatch() {
+        let mut cfg = Resilience::default();
+        cfg.protocol.enforce_authority_host_match = true;
+        let resilience = RuntimeResilience::from_config(&cfg, 1024);
+        let headers = vec![
+            h3_header(b":method", b"GET"),
+            h3_header(b":path", b"/"),
+            h3_header(b":authority", b"api.example.com:443"),
+            h3_header(b"host", b"api.example.com:8443"),
+        ];
+
+        let err = validate_request_headers(&headers, &resilience)
+            .expect_err("explicitly different authority and host ports must be rejected");
+        assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.1, b":authority and host headers must match\n");
+        assert!(!err.2);
+    }
+
+    #[test]
+    fn connect_without_path_is_accepted_when_policy_allows_target() {
+        let mut cfg = Resilience::default();
+        cfg.protocol.allow_connect = true;
+        cfg.protocol.connect_allowed_authorities = vec!["proxy.example.com:443".to_string()];
+        let resilience = RuntimeResilience::from_config(&cfg, 1024);
+        let headers = vec![
+            h3_header(b":method", b"CONNECT"),
+            h3_header(b":authority", b"proxy.example.com:443"),
+        ];
+
+        let request =
+            validate_request_headers(&headers, &resilience).expect("CONNECT request should pass");
+        assert_eq!(request.method, "CONNECT");
+        assert_eq!(request.path, "/");
+        assert_eq!(request.authority.as_deref(), Some("proxy.example.com:443"));
+    }
+
+    #[test]
+    fn connect_missing_authority_is_rejected() {
+        let mut cfg = Resilience::default();
+        cfg.protocol.allow_connect = true;
+        let resilience = RuntimeResilience::from_config(&cfg, 1024);
+        let headers = vec![h3_header(b":method", b"CONNECT")];
+
+        let err = validate_request_headers(&headers, &resilience)
+            .expect_err("CONNECT without authority must be rejected");
+        assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.1, b"CONNECT requires authority host:port\n");
+        assert!(!err.2);
+    }
+
+    #[test]
+    fn connect_missing_port_is_rejected() {
+        let mut cfg = Resilience::default();
+        cfg.protocol.allow_connect = true;
+        let resilience = RuntimeResilience::from_config(&cfg, 1024);
+        let headers = vec![
+            h3_header(b":method", b"CONNECT"),
+            h3_header(b":authority", b"proxy.example.com"),
+        ];
+
+        let err = validate_request_headers(&headers, &resilience)
+            .expect_err("CONNECT authority without port must be rejected");
+        assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.1, b"CONNECT requires authority host:port\n");
+        assert!(!err.2);
+    }
+
+    #[test]
+    fn connect_is_denied_when_policy_disables_or_blocks_target() {
+        let resilience = runtime_resilience();
+        let headers = vec![
+            h3_header(b":method", b"CONNECT"),
+            h3_header(b":authority", b"proxy.example.com:443"),
+        ];
+        let err = validate_request_headers(&headers, &resilience)
+            .expect_err("CONNECT should be denied by default policy");
+        assert_eq!(err.0, http::StatusCode::FORBIDDEN);
+        assert_eq!(err.1, b"CONNECT target denied by policy\n");
+        assert!(err.2);
+
+        let mut cfg = Resilience::default();
+        cfg.protocol.allow_connect = true;
+        cfg.protocol.connect_allowed_ports = vec![8443];
+        let resilience = RuntimeResilience::from_config(&cfg, 1024);
+        let err = validate_request_headers(&headers, &resilience)
+            .expect_err("CONNECT should be denied when port is not allowlisted");
+        assert_eq!(err.0, http::StatusCode::FORBIDDEN);
+        assert_eq!(err.1, b"CONNECT target denied by policy\n");
+        assert!(err.2);
     }
 }

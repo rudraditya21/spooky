@@ -7,8 +7,10 @@ license.workspace = true
 [dependencies]
 log.workspace = true
 serde.workspace = true
-serde_yml.workspace = true
-rustls-pemfile.workspace = true
+serde_yaml.workspace = true
+rustls-pki-types.workspace = true
+idna = "1"
+http.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,3 +1,5 @@
+use std::net::IpAddr;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendScheme {
     Http,
@@ -66,6 +68,22 @@ impl BackendEndpoint {
         &self.authority
     }
 
+    pub fn authority_host(&self) -> &str {
+        split_authority(&self.authority)
+            .map(|(host, _)| host)
+            .unwrap_or_default()
+    }
+
+    pub fn authority_port(&self) -> u16 {
+        split_authority(&self.authority)
+            .and_then(|(_, port)| port.parse::<u16>().ok())
+            .unwrap_or_default()
+    }
+
+    pub fn authority_is_ip_literal(&self) -> bool {
+        self.authority_host().parse::<IpAddr>().is_ok()
+    }
+
     pub fn origin(&self) -> String {
         format!("{}://{}", self.scheme.as_str(), self.authority)
     }
@@ -96,6 +114,63 @@ fn normalize_authority(authority: &str, scheme: BackendScheme) -> String {
         return format!("{}:{}", authority, default_port);
     }
     authority.to_string()
+}
+
+fn split_authority(authority: &str) -> Option<(&str, &str)> {
+    if authority.starts_with('[') {
+        let bracket_end = authority.find(']')?;
+        let host = authority.get(1..bracket_end)?;
+        let suffix = authority.get(bracket_end + 1..)?;
+        let port = suffix.strip_prefix(':')?;
+        Some((host, port))
+    } else {
+        authority.rsplit_once(':')
+    }
+}
+
+fn validate_dns_hostname(host: &str) -> Result<(), String> {
+    let trimmed = host.trim();
+    if trimmed.is_empty() {
+        return Err("backend host is empty".to_string());
+    }
+
+    // Fast-path valid IP literals and localhost aliases.
+    if trimmed.eq_ignore_ascii_case("localhost") || trimmed.parse::<IpAddr>().is_ok() {
+        return Ok(());
+    }
+
+    let without_trailing_dot = trimmed.trim_end_matches('.');
+    if without_trailing_dot.is_empty() {
+        return Err("backend host is invalid".to_string());
+    }
+
+    // Enforce IDNA/UTS#46 conversion and reject malformed Unicode hostnames.
+    let ascii = idna::domain_to_ascii(without_trailing_dot)
+        .map_err(|_| "backend host is not a valid IDNA/DNS hostname".to_string())?;
+
+    if ascii.len() > 253 {
+        return Err("backend host exceeds maximum length (253)".to_string());
+    }
+
+    for label in ascii.split('.') {
+        if label.is_empty() {
+            return Err("backend host contains empty DNS label".to_string());
+        }
+        if label.len() > 63 {
+            return Err("backend host contains DNS label longer than 63 characters".to_string());
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err("backend host DNS labels must not start or end with '-'".to_string());
+        }
+        if !label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err("backend host contains invalid DNS label characters".to_string());
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_authority(authority: &str) -> Result<(), String> {
@@ -133,6 +208,8 @@ fn validate_authority(authority: &str) -> Result<(), String> {
     if host.is_empty() {
         return Err("backend host is empty".to_string());
     }
+
+    validate_dns_hostname(host)?;
 
     if port_str.is_empty() {
         return Err("backend port is empty".to_string());
@@ -191,6 +268,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_rejects_malformed_dns_hostnames() {
+        assert!(BackendEndpoint::parse("bad_host:443").is_err());
+        assert!(BackendEndpoint::parse("-bad.example.com:443").is_err());
+        assert!(BackendEndpoint::parse("bad-.example.com:443").is_err());
+        assert!(BackendEndpoint::parse("a..b.example.com:443").is_err());
+    }
+
+    #[test]
+    fn parse_accepts_idna_hostname() {
+        let endpoint = BackendEndpoint::parse("bücher.example:443").expect("idna host");
+        assert_eq!(endpoint.scheme(), BackendScheme::Https);
+        assert_eq!(endpoint.authority(), "bücher.example:443");
+    }
+
+    #[test]
     fn parse_defaults_port_from_scheme() {
         let ep = BackendEndpoint::parse("https://wearebackbenchers.info").expect("https no port");
         assert_eq!(ep.scheme(), BackendScheme::Https);
@@ -218,5 +310,21 @@ mod tests {
             endpoint.uri_for_path("health"),
             "https://backend.local:443/health"
         );
+    }
+
+    #[test]
+    fn authority_helpers_extract_hostname_and_port() {
+        let endpoint = BackendEndpoint::parse("https://example.com").expect("endpoint");
+        assert_eq!(endpoint.authority_host(), "example.com");
+        assert_eq!(endpoint.authority_port(), 443);
+        assert!(!endpoint.authority_is_ip_literal());
+    }
+
+    #[test]
+    fn authority_helpers_extract_ipv6_literal_host_and_port() {
+        let endpoint = BackendEndpoint::parse("https://[::1]:8443").expect("endpoint");
+        assert_eq!(endpoint.authority_host(), "::1");
+        assert_eq!(endpoint.authority_port(), 8443);
+        assert!(endpoint.authority_is_ip_literal());
     }
 }

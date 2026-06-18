@@ -197,6 +197,117 @@ mod tests {
     }
 
     #[test]
+    fn metrics_render_includes_backend_dns_refresh_telemetry() {
+        let metrics = Metrics::default();
+        metrics.record_backend_dns_refresh_success(
+            "backend.internal:443",
+            std::time::UNIX_EPOCH + Duration::from_secs(42),
+            2,
+            true,
+        );
+        metrics.inc_backend_dns_refresh_failure();
+        metrics.inc_backend_client_rotation("backend.internal:443");
+        metrics.record_backend_connect_attempt(
+            "backend.internal:443",
+            "backend.internal",
+            &[
+                "10.0.0.10:443".parse().expect("addr one"),
+                "10.0.0.11:443".parse().expect("addr two"),
+            ],
+        );
+
+        let output = metrics.render_prometheus();
+        assert!(output.contains("spooky_backend_dns_refresh_success_total 1"));
+        assert!(output.contains("spooky_backend_dns_refresh_failure_total 1"));
+        assert!(output.contains("spooky_backend_dns_address_set_changes_total 1"));
+        assert!(output.contains("spooky_backend_client_rotations_total 1"));
+        assert!(output.contains(
+            "spooky_backend_dns_last_refresh_success_seconds{backend=\"backend.internal:443\"} 42"
+        ));
+        assert!(
+            output.contains(
+                "spooky_backend_dns_resolved_addresses{backend=\"backend.internal:443\"} 2"
+            )
+        );
+        assert!(
+            output.contains("spooky_backend_client_rotations{backend=\"backend.internal:443\"} 1")
+        );
+        assert!(
+            output.contains(
+                "spooky_backend_connect_attempt_total{backend=\"backend.internal:443\",hostname=\"backend.internal\",resolved_addr=\"10.0.0.10:443\"} 1"
+            )
+        );
+        assert!(
+            output.contains(
+                "spooky_backend_connect_attempt_total{backend=\"backend.internal:443\",hostname=\"backend.internal\",resolved_addr=\"10.0.0.11:443\"} 1"
+            )
+        );
+    }
+
+    #[test]
+    fn metrics_render_includes_downstream_tls_telemetry() {
+        let metrics = Metrics::default();
+        metrics.inc_downstream_tls_handshake_success();
+        metrics.record_downstream_tls_handshake_failure("127.0.0.1:9889", "missing_client_cert");
+        metrics.record_downstream_tls_cert_selection("127.0.0.1:9889", "exact_sni");
+        metrics.record_downstream_tls_alpn("127.0.0.1:9889", "h2");
+
+        let output = metrics.render_prometheus();
+        assert!(output.contains("spooky_downstream_tls_handshake_success_total 1"));
+        assert!(output.contains(
+            "spooky_downstream_tls_handshake_failure_total{listener=\"127.0.0.1:9889\",reason=\"missing_client_cert\"} 1"
+        ));
+        assert!(output.contains(
+            "spooky_downstream_tls_certificate_selection_total{listener=\"127.0.0.1:9889\",selection=\"exact_sni\"} 1"
+        ));
+        assert!(output.contains(
+            "spooky_downstream_tls_alpn_total{listener=\"127.0.0.1:9889\",protocol=\"h2\"} 1"
+        ));
+    }
+
+    #[test]
+    fn metrics_render_includes_upstream_tls_telemetry() {
+        let metrics = Metrics::default();
+        metrics.record_upstream_tls_failure("backend.internal:443", "data_plane", "unknown_issuer");
+        metrics.record_upstream_tls_failure(
+            "backend.internal:443",
+            "health_check",
+            "hostname_mismatch",
+        );
+
+        let output = metrics.render_prometheus();
+        assert!(output.contains(
+            "spooky_upstream_tls_failure_total{backend=\"backend.internal:443\",phase=\"data_plane\",reason=\"unknown_issuer\"} 1"
+        ));
+        assert!(output.contains(
+            "spooky_upstream_tls_failure_total{backend=\"backend.internal:443\",phase=\"health_check\",reason=\"hostname_mismatch\"} 1"
+        ));
+    }
+
+    #[test]
+    fn metrics_render_includes_downstream_tls_certificate_expiry() {
+        let metrics = Metrics::default();
+        metrics.replace_downstream_tls_cert_expiry(
+            "127.0.0.1:9889",
+            [
+                ("__default__".to_string(), 2_000_000_000),
+                ("api.example.com".to_string(), 2_100_000_000),
+            ],
+        );
+
+        let output = metrics.render_prometheus();
+        assert!(output.contains(
+            "spooky_downstream_tls_certificate_not_after_seconds{listener=\"127.0.0.1:9889\",server_name=\"__default__\"} 2000000000"
+        ));
+        assert!(output.contains(
+            "spooky_downstream_tls_certificate_not_after_seconds{listener=\"127.0.0.1:9889\",server_name=\"api.example.com\"} 2100000000"
+        ));
+        assert!(output.contains(
+            "spooky_downstream_tls_certificate_days_remaining{listener=\"127.0.0.1:9889\",server_name=\"api.example.com\"}"
+        ));
+    }
+
+    #[test]
     fn stable_hash64_is_deterministic() {
         let first = stable_hash64(b"/api/orders");
         let second = stable_hash64(b"/api/orders");

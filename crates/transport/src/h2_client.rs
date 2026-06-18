@@ -1,22 +1,36 @@
 use std::convert::Infallible;
 use std::ffi::OsStr;
-use std::fs::File;
 use std::future::Future;
-use std::io::BufReader;
+use std::io;
+use std::net::SocketAddr;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::Duration;
+use std::{
+    collections::HashMap,
+    task::{Context, Poll},
+};
 
 use http_body_util::combinators::BoxBody;
 use hyper::body::Bytes;
 use hyper::{Request, rt::Executor};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
-use hyper_util::client::legacy::{Client, connect::HttpConnector};
+use hyper_util::client::legacy::{
+    Client,
+    connect::{
+        HttpConnector,
+        dns::{GaiResolver, Name},
+    },
+};
 
 use log::warn;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
+use rustls_pki_types::pem::PemObject;
+use tower_service::Service;
 
 #[derive(Debug, Clone)]
 pub struct TlsClientConfig {
@@ -37,8 +51,149 @@ impl Default for TlsClientConfig {
     }
 }
 
+type ResolverResponse = std::vec::IntoIter<SocketAddr>;
+type ResolverFuture =
+    Pin<Box<dyn Future<Output = Result<ResolverResponse, io::Error>> + Send + 'static>>;
+
+const DEFAULT_MAX_IDLE_PER_HOST: usize = 64;
+const DEFAULT_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsCacheUpdate {
+    pub host: String,
+    pub previous_addrs: Vec<SocketAddr>,
+    pub current_addrs: Vec<SocketAddr>,
+}
+
+impl DnsCacheUpdate {
+    pub fn changed(&self) -> bool {
+        self.previous_addrs != self.current_addrs
+    }
+
+    pub fn cleared(&self) -> bool {
+        self.current_addrs.is_empty()
+    }
+}
+
+#[derive(Clone)]
+pub struct SharedDnsResolver {
+    cache: Arc<RwLock<HashMap<String, Vec<SocketAddr>>>>,
+    fallback: GaiResolver,
+}
+
+impl SharedDnsResolver {
+    pub fn new() -> Self {
+        Self {
+            cache: Arc::new(RwLock::new(HashMap::new())),
+            fallback: GaiResolver::new(),
+        }
+    }
+
+    pub fn set_host_addrs<I>(&self, host: &str, addrs: I)
+    where
+        I: IntoIterator<Item = SocketAddr>,
+    {
+        let _ = self.replace_host_addrs(host, addrs);
+    }
+
+    pub fn replace_host_addrs<I>(&self, host: &str, addrs: I) -> DnsCacheUpdate
+    where
+        I: IntoIterator<Item = SocketAddr>,
+    {
+        let normalized = normalize_dns_cache_host(host);
+        let addrs = canonicalize_socket_addrs(addrs);
+        let previous_addrs = if let Ok(mut guard) = self.cache.write() {
+            if addrs.is_empty() {
+                guard.remove(&normalized).unwrap_or_default()
+            } else {
+                guard
+                    .insert(normalized.clone(), addrs.clone())
+                    .unwrap_or_default()
+            }
+        } else {
+            Vec::new()
+        };
+
+        DnsCacheUpdate {
+            host: normalized,
+            previous_addrs,
+            current_addrs: addrs,
+        }
+    }
+
+    pub fn remove_host(&self, host: &str) -> DnsCacheUpdate {
+        self.replace_host_addrs(host, Vec::<SocketAddr>::new())
+    }
+
+    pub fn cached_addrs(&self, host: &str) -> Option<Vec<SocketAddr>> {
+        self.cache
+            .read()
+            .ok()
+            .and_then(|guard| guard.get(&normalize_dns_cache_host(host)).cloned())
+    }
+
+    pub fn snapshot(&self) -> HashMap<String, Vec<SocketAddr>> {
+        self.cache
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+}
+
+impl Default for SharedDnsResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Service<Name> for SharedDnsResolver {
+    type Response = ResolverResponse;
+    type Error = io::Error;
+    type Future = ResolverFuture;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.fallback.poll_ready(cx)
+    }
+
+    fn call(&mut self, name: Name) -> Self::Future {
+        if let Some(addrs) = self.cached_addrs(name.as_str()) {
+            return Box::pin(async move { Ok(addrs.into_iter()) });
+        }
+
+        let mut fallback = self.fallback.clone();
+        Box::pin(async move {
+            let resolved = fallback.call(name).await?;
+            Ok(resolved.collect::<Vec<_>>().into_iter())
+        })
+    }
+}
+
 pub struct H2Client {
-    client: Client<HttpsConnector<HttpConnector>, BoxBody<Bytes, Infallible>>,
+    client: Client<HttpsConnector<HttpConnector<SharedDnsResolver>>, BoxBody<Bytes, Infallible>>,
+}
+
+impl Default for H2Client {
+    fn default() -> Self {
+        let dns_resolver = SharedDnsResolver::new();
+        let mut http = HttpConnector::new_with_resolver(dns_resolver);
+        http.enforce_http(false);
+        http.set_connect_timeout(Some(DEFAULT_CONNECT_TIMEOUT));
+
+        let https = HttpsConnectorBuilder::new()
+            .with_tls_config(default_tls_config())
+            .https_or_http()
+            .enable_http2()
+            .wrap_connector(http);
+
+        let client = Client::builder(TokioExecutor)
+            .http2_only(true)
+            .pool_max_idle_per_host(DEFAULT_MAX_IDLE_PER_HOST)
+            .pool_idle_timeout(DEFAULT_POOL_IDLE_TIMEOUT)
+            .build(https);
+
+        Self { client }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -60,8 +215,9 @@ impl H2Client {
         pool_idle_timeout: Duration,
         connect_timeout: Duration,
         tls: TlsClientConfig,
+        dns_resolver: SharedDnsResolver,
     ) -> Result<Self, String> {
-        let mut http = HttpConnector::new();
+        let mut http = HttpConnector::new_with_resolver(dns_resolver);
         http.enforce_http(false);
         http.set_connect_timeout(Some(connect_timeout));
 
@@ -90,12 +246,38 @@ impl H2Client {
 
     pub fn try_default() -> Result<Self, String> {
         Self::new(
-            64,
-            Duration::from_secs(30),
-            Duration::from_secs(2),
+            DEFAULT_MAX_IDLE_PER_HOST,
+            DEFAULT_POOL_IDLE_TIMEOUT,
+            DEFAULT_CONNECT_TIMEOUT,
             TlsClientConfig::default(),
+            SharedDnsResolver::new(),
         )
     }
+}
+
+fn normalize_dns_cache_host(host: &str) -> String {
+    host.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn canonicalize_socket_addrs<I>(addrs: I) -> Vec<SocketAddr>
+where
+    I: IntoIterator<Item = SocketAddr>,
+{
+    let mut addrs: Vec<_> = addrs.into_iter().collect();
+    addrs.sort_unstable();
+    addrs.dedup();
+    addrs
+}
+
+fn default_tls_config() -> ClientConfig {
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    let mut cfg = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    cfg.enable_sni = true;
+    cfg
 }
 
 fn build_tls_config(tls: &TlsClientConfig) -> Result<ClientConfig, String> {
@@ -146,15 +328,14 @@ fn build_tls_config(tls: &TlsClientConfig) -> Result<ClientConfig, String> {
 }
 
 fn read_pem_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
-    let file = File::open(path).map_err(|err| {
-        format!(
-            "failed to open certificate file '{}': {}",
-            path.display(),
-            err
-        )
-    })?;
-    let mut reader = BufReader::new(file);
-    let certs = rustls_pemfile::certs(&mut reader)
+    let certs = CertificateDer::pem_file_iter(path)
+        .map_err(|err| {
+            format!(
+                "failed to open certificate file '{}': {}",
+                path.display(),
+                err
+            )
+        })?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|err| {
             format!(
@@ -267,8 +448,15 @@ impl ServerCertVerifier for InsecureServerCertVerifier {
 
 #[cfg(test)]
 mod tests {
-    use super::{H2Client, TlsClientConfig};
-    use std::time::Duration;
+    use super::{DnsCacheUpdate, H2Client, SharedDnsResolver, TlsClientConfig};
+    use hyper_util::client::legacy::connect::dns::Name;
+    use std::{net::SocketAddr, str::FromStr, time::Duration};
+    use tower_service::Service;
+
+    #[test]
+    fn default_h2_client_does_not_panic() {
+        let _client = H2Client::default();
+    }
 
     #[test]
     fn default_tls_client_config_builds_h2_client() {
@@ -298,6 +486,7 @@ mod tests {
                 ca_file: Some(path.to_string_lossy().to_string()),
                 ca_dir: None,
             },
+            SharedDnsResolver::new(),
         );
         assert!(client.is_err());
 
@@ -316,7 +505,92 @@ mod tests {
                 ca_file: None,
                 ca_dir: None,
             },
+            SharedDnsResolver::new(),
         );
         assert!(client.is_ok());
+    }
+
+    #[tokio::test]
+    async fn shared_dns_resolver_returns_cached_addresses_case_insensitively() {
+        let resolver = SharedDnsResolver::new();
+        resolver.set_host_addrs(
+            "api.example.com",
+            [
+                SocketAddr::from(([127, 0, 0, 10], 0)),
+                SocketAddr::from(([127, 0, 0, 11], 0)),
+            ],
+        );
+
+        let mut service = resolver.clone();
+        let addrs: Vec<_> = service
+            .call(Name::from_str("API.EXAMPLE.COM").expect("name"))
+            .await
+            .expect("resolve")
+            .collect();
+
+        assert_eq!(
+            addrs,
+            vec![
+                SocketAddr::from(([127, 0, 0, 10], 0)),
+                SocketAddr::from(([127, 0, 0, 11], 0))
+            ]
+        );
+    }
+
+    #[test]
+    fn replace_host_addrs_reports_previous_and_current_values() {
+        let resolver = SharedDnsResolver::new();
+        let first = resolver.replace_host_addrs(
+            "api.example.com",
+            [SocketAddr::from(([127, 0, 0, 10], 443))],
+        );
+        assert_eq!(
+            first,
+            DnsCacheUpdate {
+                host: "api.example.com".to_string(),
+                previous_addrs: Vec::new(),
+                current_addrs: vec![SocketAddr::from(([127, 0, 0, 10], 443))],
+            }
+        );
+        assert!(first.changed());
+
+        let second = resolver.replace_host_addrs(
+            "API.EXAMPLE.COM.",
+            [
+                SocketAddr::from(([127, 0, 0, 11], 443)),
+                SocketAddr::from(([127, 0, 0, 12], 443)),
+            ],
+        );
+        assert_eq!(second.host, "api.example.com");
+        assert_eq!(
+            second.previous_addrs,
+            vec![SocketAddr::from(([127, 0, 0, 10], 443))]
+        );
+        assert_eq!(
+            second.current_addrs,
+            vec![
+                SocketAddr::from(([127, 0, 0, 11], 443)),
+                SocketAddr::from(([127, 0, 0, 12], 443))
+            ]
+        );
+        assert!(second.changed());
+    }
+
+    #[test]
+    fn remove_host_clears_case_insensitive_cache_entry() {
+        let resolver = SharedDnsResolver::new();
+        resolver.set_host_addrs(
+            "api.example.com",
+            [SocketAddr::from(([127, 0, 0, 10], 443))],
+        );
+
+        let cleared = resolver.remove_host("API.EXAMPLE.COM");
+        assert!(cleared.changed());
+        assert!(cleared.cleared());
+        assert_eq!(
+            cleared.previous_addrs,
+            vec![SocketAddr::from(([127, 0, 0, 10], 443))]
+        );
+        assert!(resolver.cached_addrs("api.example.com").is_none());
     }
 }

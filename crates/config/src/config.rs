@@ -10,15 +10,17 @@ use crate::default::{
     observe_default_address, observe_default_control_api_address,
     observe_default_control_api_connection_timeout_ms, observe_default_control_api_health_path,
     observe_default_control_api_max_connections, observe_default_control_api_port,
-    observe_default_control_api_ready_path, observe_default_control_api_restart_path,
-    observe_default_control_api_runtime_path, observe_default_metrics_connection_timeout_ms,
-    observe_default_metrics_max_connections, observe_default_metrics_path, observe_default_port,
+    observe_default_control_api_ready_path, observe_default_control_api_reload_certs_path,
+    observe_default_control_api_restart_path, observe_default_control_api_runtime_path,
+    observe_default_metrics_connection_timeout_ms, observe_default_metrics_max_connections,
+    observe_default_metrics_path, observe_default_port,
     observe_default_routing_transparency_enabled,
     observe_default_routing_transparency_expose_header,
     observe_default_routing_transparency_header_name,
     observe_default_routing_transparency_include_reason, observe_default_tracing_sample_ratio,
     observe_default_tracing_service_name, perf_default_backend_body_idle_timeout_ms,
     perf_default_backend_body_total_timeout_ms, perf_default_backend_connect_timeout_ms,
+    perf_default_backend_dns_refresh_enabled, perf_default_backend_dns_refresh_interval_ms,
     perf_default_backend_timeout_ms, perf_default_backend_total_request_timeout_ms,
     perf_default_client_body_idle_timeout_ms, perf_default_control_plane_threads,
     perf_default_global_inflight_limit, perf_default_h2_pool_idle_timeout_ms,
@@ -42,6 +44,7 @@ use crate::default::{
     resilience_default_cb_failure_threshold, resilience_default_cb_half_open_max_probes,
     resilience_default_cb_open_ms, resilience_default_hedging_delay_ms,
     resilience_default_hedging_enabled, resilience_default_protocol_allow_0rtt,
+    resilience_default_protocol_allow_connect,
     resilience_default_protocol_enforce_authority_host_match,
     resilience_default_protocol_max_headers_bytes, resilience_default_protocol_max_headers_count,
     resilience_default_retry_budget_enabled, resilience_default_retry_budget_ratio_percent,
@@ -68,6 +71,9 @@ pub struct Config {
     pub version: u32,
 
     pub listen: Listen,
+
+    #[serde(default)]
+    pub listeners: Vec<Listen>,
 
     pub upstream: HashMap<String, Upstream>,
 
@@ -121,6 +127,14 @@ impl Default for PrivilegeDrop {
     }
 }
 
+pub fn effective_listens(config: &Config) -> Vec<Listen> {
+    if config.listeners.is_empty() {
+        vec![config.listen.clone()]
+    } else {
+        config.listeners.clone()
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Listen {
@@ -138,10 +152,22 @@ pub struct Listen {
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Tls {
+    #[serde(default)]
     pub cert: String, // "/path/to/cert"
-    pub key: String,  // "/path/to/key"
+    #[serde(default)]
+    pub key: String, // "/path/to/key"
+    #[serde(default)]
+    pub certificates: Vec<TlsCertificate>, // SNI keyed certificate set
     #[serde(default)]
     pub client_auth: ClientAuth,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub struct TlsCertificate {
+    pub server_name: String, // "api.example.com"
+    pub cert: String,        // "/path/to/cert"
+    pub key: String,         // "/path/to/key"
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -185,9 +211,59 @@ pub struct Upstream {
     #[serde(default = "get_default_load_balancing")]
     pub load_balancing: LoadBalancing,
 
+    #[serde(default)]
+    pub host_policy: UpstreamHostPolicy,
+
+    #[serde(default)]
+    pub forwarded_headers: ForwardedHeaderPolicy,
+
+    #[serde(default)]
+    pub tls: Option<UpstreamTls>,
+
     pub route: RouteMatch, // Route matching criteria for this upstream
 
     pub backends: Vec<Backend>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamHostPolicyMode {
+    #[default]
+    #[serde(alias = "pass-through")]
+    PassThrough,
+    Rewrite,
+    #[serde(
+        alias = "static_upstream",
+        alias = "static-upstream",
+        alias = "upstream-host"
+    )]
+    Upstream,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ForwardedHeaderPolicyMode {
+    #[default]
+    #[serde(alias = "overwrite")]
+    Overwrite,
+    Append,
+    Preserve,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ForwardedHeaderPolicy {
+    #[serde(default)]
+    pub mode: ForwardedHeaderPolicyMode,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamHostPolicy {
+    #[serde(default)]
+    pub mode: UpstreamHostPolicyMode,
+    #[serde(default)]
+    pub host: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -358,6 +434,14 @@ pub struct Performance {
     #[serde(default = "perf_default_h2_pool_idle_timeout_ms")]
     pub h2_pool_idle_timeout_ms: u64,
 
+    /// Enables periodic DNS refresh for hostname-based upstream backends.
+    #[serde(default = "perf_default_backend_dns_refresh_enabled")]
+    pub backend_dns_refresh_enabled: bool,
+
+    /// Control-plane interval for refreshing hostname-based backend DNS records.
+    #[serde(default = "perf_default_backend_dns_refresh_interval_ms")]
+    pub backend_dns_refresh_interval_ms: u64,
+
     #[serde(default = "perf_default_per_backend_inflight_limit")]
     pub per_backend_inflight_limit: usize,
 
@@ -446,6 +530,8 @@ impl Default for Performance {
             udp_send_buffer_bytes: perf_default_udp_send_buffer_bytes(),
             h2_pool_max_idle_per_backend: perf_default_h2_pool_max_idle_per_backend(),
             h2_pool_idle_timeout_ms: perf_default_h2_pool_idle_timeout_ms(),
+            backend_dns_refresh_enabled: perf_default_backend_dns_refresh_enabled(),
+            backend_dns_refresh_interval_ms: perf_default_backend_dns_refresh_interval_ms(),
             per_backend_inflight_limit: perf_default_per_backend_inflight_limit(),
             new_connections_per_sec: perf_default_new_connections_per_sec(),
             new_connections_burst: perf_default_new_connections_burst(),
@@ -583,6 +669,8 @@ impl Default for RouteQueue {
 pub struct ProtocolPolicy {
     #[serde(default = "resilience_default_protocol_allow_0rtt")]
     pub allow_0rtt: bool,
+    #[serde(default = "resilience_default_protocol_allow_connect")]
+    pub allow_connect: bool,
     #[serde(default)]
     pub early_data_safe_methods: Vec<String>,
     #[serde(default = "resilience_default_protocol_max_headers_count")]
@@ -595,12 +683,17 @@ pub struct ProtocolPolicy {
     pub allowed_methods: Vec<String>,
     #[serde(default)]
     pub denied_path_prefixes: Vec<String>,
+    #[serde(default)]
+    pub connect_allowed_ports: Vec<u16>,
+    #[serde(default)]
+    pub connect_allowed_authorities: Vec<String>,
 }
 
 impl Default for ProtocolPolicy {
     fn default() -> Self {
         Self {
             allow_0rtt: resilience_default_protocol_allow_0rtt(),
+            allow_connect: resilience_default_protocol_allow_connect(),
             early_data_safe_methods: vec!["GET".to_string(), "HEAD".to_string()],
             max_headers_count: resilience_default_protocol_max_headers_count(),
             max_headers_bytes: resilience_default_protocol_max_headers_bytes(),
@@ -608,6 +701,8 @@ impl Default for ProtocolPolicy {
             ),
             allowed_methods: Vec::new(),
             denied_path_prefixes: Vec::new(),
+            connect_allowed_ports: Vec::new(),
+            connect_allowed_authorities: Vec::new(),
         }
     }
 }
@@ -838,6 +933,9 @@ pub struct ControlApi {
     #[serde(default = "observe_default_control_api_restart_path")]
     pub restart_path: String,
 
+    #[serde(default = "observe_default_control_api_reload_certs_path")]
+    pub reload_certs_path: String,
+
     #[serde(default)]
     pub auth_token: Option<String>,
 
@@ -859,6 +957,7 @@ impl Default for ControlApi {
             ready_path: observe_default_control_api_ready_path(),
             runtime_path: observe_default_control_api_runtime_path(),
             restart_path: observe_default_control_api_restart_path(),
+            reload_certs_path: observe_default_control_api_reload_certs_path(),
             auth_token: None,
             max_connections: observe_default_control_api_max_connections(),
             connection_timeout_ms: observe_default_control_api_connection_timeout_ms(),

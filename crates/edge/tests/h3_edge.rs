@@ -59,6 +59,9 @@ fn make_config(port: u32, cert: String, key: String, backend_address: String) ->
                 lb_type: "random".to_string(),
                 key: None,
             },
+            host_policy: Default::default(),
+            forwarded_headers: Default::default(),
+            tls: None,
             route: RouteMatch {
                 path_prefix: Some("/".to_string()),
                 ..Default::default()
@@ -88,9 +91,11 @@ fn make_config(port: u32, cert: String, key: String, backend_address: String) ->
             tls: Tls {
                 cert,
                 key,
+                certificates: vec![],
                 client_auth: ClientAuth::default(),
             },
         },
+        listeners: vec![],
         upstream,
         load_balancing: Some(LoadBalancing {
             lb_type: "random".to_string(),
@@ -523,7 +528,7 @@ fn invalid_backend_scheme_is_rejected_at_startup() {
         Ok(_) => panic!("invalid backend scheme should fail startup"),
         Err(err) => {
             assert!(
-                err.to_string().contains("invalid backend address"),
+                err.to_string().contains("backend_address_invalid"),
                 "unexpected startup error: {err}"
             );
         }
@@ -797,6 +802,9 @@ fn make_config_with_rate_limit(
                 lb_type: "random".to_string(),
                 key: None,
             },
+            host_policy: Default::default(),
+            forwarded_headers: Default::default(),
+            tls: None,
             route: RouteMatch {
                 path_prefix: Some("/".to_string()),
                 ..Default::default()
@@ -826,9 +834,11 @@ fn make_config_with_rate_limit(
             tls: Tls {
                 cert,
                 key,
+                certificates: vec![],
                 client_auth: ClientAuth::default(),
             },
         },
+        listeners: vec![],
         upstream,
         load_balancing: Some(LoadBalancing {
             lb_type: "random".to_string(),

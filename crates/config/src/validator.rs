@@ -1,8 +1,11 @@
 use crate::backend_endpoint::{BackendEndpoint, BackendScheme};
-use crate::config::{CURRENT_CONFIG_VERSION, Config, SUPPORTED_CONFIG_VERSIONS};
+use crate::config::{
+    CURRENT_CONFIG_VERSION, Config, Listen, SUPPORTED_CONFIG_VERSIONS, UpstreamHostPolicyMode,
+    UpstreamTls,
+};
 use log::{error, info, warn};
-use std::fs::File;
-use std::io::BufReader;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+use std::collections::HashMap;
 use std::net::IpAddr;
 
 pub const VALID_LOG_LEVELS: &[&str] = &[
@@ -41,16 +44,14 @@ pub const VALID_LB_TYPES: &[&str] = &[
 ];
 
 fn validate_pem_certificates(path: &str, field_name: &str) -> bool {
-    let file = match File::open(path) {
-        Ok(file) => file,
+    let certs = match CertificateDer::pem_file_iter(path) {
+        Ok(iter) => iter.collect::<Result<Vec<_>, _>>(),
         Err(err) => {
             error!("Cannot open {} '{}': {}", field_name, path, err);
             return false;
         }
     };
-
-    let mut reader = BufReader::new(file);
-    let certs = match rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>() {
+    let certs = match certs {
         Ok(certs) => certs,
         Err(err) => {
             error!(
@@ -73,24 +74,8 @@ fn validate_pem_certificates(path: &str, field_name: &str) -> bool {
 }
 
 fn validate_pem_private_key(path: &str, field_name: &str) -> bool {
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(err) => {
-            error!("Cannot open {} '{}': {}", field_name, path, err);
-            return false;
-        }
-    };
-
-    let mut reader = BufReader::new(file);
-    match rustls_pemfile::private_key(&mut reader) {
-        Ok(Some(_)) => true,
-        Ok(None) => {
-            error!(
-                "{} '{}' does not contain a PEM private key",
-                field_name, path
-            );
-            false
-        }
+    match PrivateKeyDer::from_pem_file(path) {
+        Ok(_) => true,
         Err(err) => {
             error!(
                 "Cannot parse PEM private key from {} '{}': {}",
@@ -99,6 +84,166 @@ fn validate_pem_private_key(path: &str, field_name: &str) -> bool {
             false
         }
     }
+}
+
+fn validate_upstream_tls(field_prefix: &str, tls: &UpstreamTls) -> bool {
+    if !tls.verify_certificates {
+        warn!(
+            "{}.verify_certificates=false: upstream TLS certificate verification is disabled; only use in trusted/development environments",
+            field_prefix
+        );
+    }
+
+    if let Some(ca_file) = tls.ca_file.as_ref() {
+        if ca_file.trim().is_empty() {
+            error!("{}.ca_file cannot be empty when provided", field_prefix);
+            return false;
+        }
+        if !validate_pem_certificates(ca_file, &format!("{}.ca_file", field_prefix)) {
+            return false;
+        }
+    }
+
+    if let Some(ca_dir) = tls.ca_dir.as_ref() {
+        if ca_dir.trim().is_empty() {
+            error!("{}.ca_dir cannot be empty when provided", field_prefix);
+            return false;
+        }
+        let metadata = match std::fs::metadata(ca_dir) {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                error!("Cannot stat {}.ca_dir '{}': {}", field_prefix, ca_dir, err);
+                return false;
+            }
+        };
+        if !metadata.is_dir() {
+            error!("{}.ca_dir must be a directory: {}", field_prefix, ca_dir);
+            return false;
+        }
+    }
+
+    true
+}
+
+fn validate_listen_config(listen: &Listen, field_prefix: &str) -> bool {
+    if listen.protocol != "http3" {
+        error!(
+            "{} protocol: expected 'http3', found '{}'",
+            field_prefix, listen.protocol
+        );
+        return false;
+    }
+
+    if listen.address.is_empty() {
+        error!("{} address is empty", field_prefix);
+        return false;
+    }
+
+    if listen.port == 0 {
+        error!(
+            "Invalid {} port: {} (must be between 1 and 65535)",
+            field_prefix, listen.port
+        );
+        return false;
+    }
+
+    let tls_prefix = format!("{}.tls", field_prefix);
+    let legacy_cert = listen.tls.cert.trim();
+    let legacy_key = listen.tls.key.trim();
+    let has_legacy_cert_pair = !legacy_cert.is_empty() || !legacy_key.is_empty();
+    let has_sni_certificates = !listen.tls.certificates.is_empty();
+
+    if !has_legacy_cert_pair && !has_sni_certificates {
+        error!(
+            "{} requires either cert/key or certificates entries",
+            tls_prefix
+        );
+        return false;
+    }
+
+    if has_legacy_cert_pair {
+        if legacy_cert.is_empty() || legacy_key.is_empty() {
+            error!(
+                "{}.cert and {}.key must both be set when either is provided",
+                tls_prefix, tls_prefix
+            );
+            return false;
+        }
+        if !validate_pem_certificates(legacy_cert, &format!("{}.cert", tls_prefix)) {
+            return false;
+        }
+        if !validate_pem_private_key(legacy_key, &format!("{}.key", tls_prefix)) {
+            return false;
+        }
+    }
+
+    let mut seen_sni_names: HashMap<String, usize> = HashMap::new();
+    for (idx, entry) in listen.tls.certificates.iter().enumerate() {
+        let field_prefix = format!("{}.certificates[{idx}]", tls_prefix);
+        let sni_name = match normalize_sni_server_name(&entry.server_name) {
+            Some(sni) => sni,
+            None => {
+                error!(
+                    "{}.server_name '{}' is not a valid DNS hostname",
+                    field_prefix, entry.server_name
+                );
+                return false;
+            }
+        };
+
+        if let Some(first_idx) = seen_sni_names.insert(sni_name.clone(), idx) {
+            error!(
+                "{}.server_name '{}' duplicates {}.certificates[{}].server_name",
+                field_prefix, entry.server_name, tls_prefix, first_idx
+            );
+            return false;
+        }
+
+        let cert = entry.cert.trim();
+        if cert.is_empty() {
+            error!("{}.cert cannot be empty", field_prefix);
+            return false;
+        }
+        if !validate_pem_certificates(cert, &format!("{}.cert", field_prefix)) {
+            return false;
+        }
+
+        let key = entry.key.trim();
+        if key.is_empty() {
+            error!("{}.key cannot be empty", field_prefix);
+            return false;
+        }
+        if !validate_pem_private_key(key, &format!("{}.key", field_prefix)) {
+            return false;
+        }
+    }
+
+    if listen.tls.client_auth.require_client_cert && !listen.tls.client_auth.enabled {
+        error!(
+            "{}.client_auth.require_client_cert requires client_auth.enabled=true",
+            tls_prefix
+        );
+        return false;
+    }
+
+    if listen.tls.client_auth.enabled {
+        let Some(ca_file) = listen.tls.client_auth.ca_file.as_ref() else {
+            error!(
+                "{}.client_auth.ca_file is required when client_auth.enabled=true",
+                tls_prefix
+            );
+            return false;
+        };
+        if ca_file.trim().is_empty() {
+            error!("{}.client_auth.ca_file cannot be empty", tls_prefix);
+            return false;
+        }
+        if !validate_pem_certificates(ca_file, &format!("{}.client_auth.ca_file", tls_prefix)) {
+            return false;
+        }
+    }
+
+    true
 }
 
 fn is_loopback_bind_address(raw: &str) -> bool {
@@ -139,6 +284,96 @@ fn is_valid_http_token(value: &str) -> bool {
         })
 }
 
+fn is_valid_connect_authority(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_whitespace) {
+        return false;
+    }
+
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        let Some(end) = rest.find(']') else {
+            return false;
+        };
+        let host = &rest[..end];
+        if host.is_empty() {
+            return false;
+        }
+        let suffix = &rest[end + 1..];
+        if !suffix.starts_with(':') || suffix.len() <= 1 {
+            return false;
+        }
+        return suffix[1..].parse::<u16>().ok().is_some_and(|port| port > 0);
+    }
+
+    let Some((host, port)) = trimmed.rsplit_once(':') else {
+        return false;
+    };
+    if host.is_empty() || host.contains(':') {
+        return false;
+    }
+    port.parse::<u16>().ok().is_some_and(|value| value > 0)
+}
+
+fn normalize_route_host(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let host = if let Some(rest) = trimmed.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            &rest[..end]
+        } else {
+            trimmed
+        }
+    } else if let Some((candidate_host, candidate_port)) = trimmed.rsplit_once(':') {
+        if !candidate_host.contains(':') && candidate_port.chars().all(|c| c.is_ascii_digit()) {
+            candidate_host
+        } else {
+            trimmed
+        }
+    } else {
+        trimmed
+    };
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn normalized_route_method(method: Option<&str>) -> Option<String> {
+    method
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_uppercase())
+}
+
+fn valid_static_host_header(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty()
+        && trimmed == value
+        && !trimmed.chars().any(|ch| ch.is_ascii_whitespace())
+        && !trimmed.contains('/')
+        && !trimmed.contains('?')
+        && !trimmed.contains('#')
+        && http::HeaderValue::from_str(trimmed).is_ok()
+}
+
+fn normalize_sni_server_name(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.contains(':')
+        || trimmed.contains('*')
+        || trimmed.chars().any(char::is_whitespace)
+    {
+        return None;
+    }
+    let without_trailing_dot = trimmed.trim_end_matches('.');
+    if without_trailing_dot.is_empty() {
+        return None;
+    }
+    let ascii = idna::domain_to_ascii(without_trailing_dot).ok()?;
+    if ascii.parse::<IpAddr>().is_ok() {
+        return None;
+    }
+    Some(ascii.to_ascii_lowercase())
+}
+
+type RouteMatcherKey = (Option<String>, Option<String>, Option<String>);
+
 pub fn validate(config: &Config) -> bool {
     info!("Starting configuration validation...");
 
@@ -162,13 +397,41 @@ pub fn validate(config: &Config) -> bool {
         );
     }
 
-    // --- Validate protocol ---
-    if config.listen.protocol != "http3" {
-        error!(
-            "Invalid protocol: expected 'http3', found '{}'",
-            config.listen.protocol
-        );
-        return false;
+    // --- Validate effective listen blocks ---
+    if config.listeners.is_empty() {
+        if !validate_listen_config(&config.listen, "listen") {
+            return false;
+        }
+    } else {
+        for (idx, listen) in config.listeners.iter().enumerate() {
+            if !validate_listen_config(listen, &format!("listeners[{idx}]")) {
+                return false;
+            }
+        }
+    }
+
+    let effective_listeners: Vec<(String, &crate::config::Listen)> = if config.listeners.is_empty()
+    {
+        vec![("listen".to_string(), &config.listen)]
+    } else {
+        config
+            .listeners
+            .iter()
+            .enumerate()
+            .map(|(idx, listen)| (format!("listeners[{idx}]"), listen))
+            .collect()
+    };
+
+    let mut seen_listener_bindings: HashMap<(String, u16), String> = HashMap::new();
+    for (label, listen) in effective_listeners {
+        let key = (listen.address.clone(), listen.port);
+        if let Some(existing) = seen_listener_bindings.insert(key, label.clone()) {
+            error!(
+                "listener binding conflict: {} duplicates {} on {}:{}",
+                label, existing, listen.address, listen.port
+            );
+            return false;
+        }
     }
 
     // --- Validate log level ---
@@ -187,21 +450,6 @@ pub fn validate(config: &Config) -> bool {
             .any(|lb_type| lb_type.eq_ignore_ascii_case(&lb.lb_type))
     {
         error!("Invalid global load balancing type: {}", lb.lb_type);
-        return false;
-    }
-
-    // --- Validate listen address ---
-    if config.listen.address.is_empty() {
-        error!("Listen address is empty");
-        return false;
-    }
-
-    // --- Validate listen port ---
-    if config.listen.port == 0 {
-        error!(
-            "Invalid listen port: {} (must be between 1 and 65535)",
-            config.listen.port
-        );
         return false;
     }
 
@@ -300,6 +548,11 @@ pub fn validate(config: &Config) -> bool {
 
     if config.performance.h2_pool_idle_timeout_ms == 0 {
         error!("performance.h2_pool_idle_timeout_ms must be greater than 0");
+        return false;
+    }
+
+    if config.performance.backend_dns_refresh_interval_ms == 0 {
+        error!("performance.backend_dns_refresh_interval_ms must be greater than 0");
         return false;
     }
 
@@ -556,6 +809,43 @@ pub fn validate(config: &Config) -> bool {
         return false;
     }
 
+    if !config.resilience.protocol.allow_connect
+        && (!config.resilience.protocol.connect_allowed_ports.is_empty()
+            || !config
+                .resilience
+                .protocol
+                .connect_allowed_authorities
+                .is_empty())
+    {
+        error!(
+            "resilience.protocol.connect_allowed_ports/connect_allowed_authorities require allow_connect=true"
+        );
+        return false;
+    }
+
+    if config
+        .resilience
+        .protocol
+        .connect_allowed_ports
+        .contains(&0)
+    {
+        error!("resilience.protocol.connect_allowed_ports must contain ports in range 1-65535");
+        return false;
+    }
+
+    if config
+        .resilience
+        .protocol
+        .connect_allowed_authorities
+        .iter()
+        .any(|authority| !is_valid_connect_authority(authority))
+    {
+        error!(
+            "resilience.protocol.connect_allowed_authorities must contain authority-form host:port targets"
+        );
+        return false;
+    }
+
     if config.resilience.protocol.allow_0rtt
         && config
             .resilience
@@ -733,6 +1023,10 @@ pub fn validate(config: &Config) -> bool {
                 "observability.control_api.restart_path",
                 config.observability.control_api.restart_path.as_str(),
             ),
+            (
+                "observability.control_api.reload_certs_path",
+                config.observability.control_api.reload_certs_path.as_str(),
+            ),
         ];
         for (name, path) in paths {
             if !path.starts_with('/') {
@@ -802,72 +1096,19 @@ pub fn validate(config: &Config) -> bool {
         }
     }
 
-    // --- Validate TLS certs ---
-    if !validate_pem_certificates(&config.listen.tls.cert, "listen.tls.cert") {
-        return false;
-    }
-
-    if !validate_pem_private_key(&config.listen.tls.key, "listen.tls.key") {
-        return false;
-    }
-
-    // --- Validate optional downstream client-auth (mTLS) ---
-    if config.listen.tls.client_auth.require_client_cert && !config.listen.tls.client_auth.enabled {
-        error!("listen.tls.client_auth.require_client_cert requires client_auth.enabled=true");
-        return false;
-    }
-
-    if config.listen.tls.client_auth.enabled {
-        let Some(ca_file) = config.listen.tls.client_auth.ca_file.as_ref() else {
-            error!("listen.tls.client_auth.ca_file is required when client_auth.enabled=true");
-            return false;
-        };
-        if ca_file.trim().is_empty() {
-            error!("listen.tls.client_auth.ca_file cannot be empty");
-            return false;
-        }
-        if !validate_pem_certificates(ca_file, "listen.tls.client_auth.ca_file") {
-            return false;
-        }
-    }
-
     // --- Validate upstream TLS trust-store configuration ---
-    if !config.upstream_tls.verify_certificates {
-        warn!(
-            "upstream_tls.verify_certificates=false: upstream TLS certificate verification is disabled; only use in trusted/development environments"
-        );
-    }
-
-    if let Some(ca_file) = config.upstream_tls.ca_file.as_ref() {
-        if ca_file.trim().is_empty() {
-            error!("upstream_tls.ca_file cannot be empty when provided");
-            return false;
-        }
-        if !validate_pem_certificates(ca_file, "upstream_tls.ca_file") {
-            return false;
-        }
-    }
-
-    if let Some(ca_dir) = config.upstream_tls.ca_dir.as_ref() {
-        if ca_dir.trim().is_empty() {
-            error!("upstream_tls.ca_dir cannot be empty when provided");
-            return false;
-        }
-        let metadata = match std::fs::metadata(ca_dir) {
-            Ok(metadata) => metadata,
-            Err(err) => {
-                error!("Cannot stat upstream_tls.ca_dir '{}': {}", ca_dir, err);
-                return false;
-            }
-        };
-        if !metadata.is_dir() {
-            error!("upstream_tls.ca_dir must be a directory: {}", ca_dir);
-            return false;
-        }
+    if !validate_upstream_tls("upstream_tls", &config.upstream_tls) {
+        return false;
     }
 
     // --- Validate upstream routes ---
     for (upstream_name, upstream) in &config.upstream {
+        if let Some(tls) = upstream.tls.as_ref()
+            && !validate_upstream_tls(&format!("upstream['{}'].tls", upstream_name), tls)
+        {
+            return false;
+        }
+
         // Validate route matcher has at least one condition
         let has_host = upstream.route.host.is_some();
         let has_path = upstream.route.path_prefix.is_some();
@@ -897,6 +1138,28 @@ pub fn validate(config: &Config) -> bool {
                 return false;
             }
         }
+
+        match upstream.host_policy.mode {
+            UpstreamHostPolicyMode::PassThrough | UpstreamHostPolicyMode::Upstream => {
+                if upstream.host_policy.host.is_some() {
+                    error!(
+                        "upstream {}.host_policy.host is invalid unless mode is rewrite",
+                        upstream_name
+                    );
+                    return false;
+                }
+            }
+            UpstreamHostPolicyMode::Rewrite => match upstream.host_policy.host.as_deref() {
+                Some(host) if valid_static_host_header(host) => {}
+                _ => {
+                    error!(
+                        "upstream {}.host_policy.mode=rewrite requires a valid non-empty host_policy.host",
+                        upstream_name
+                    );
+                    return false;
+                }
+            },
+        }
     }
 
     // --- Validate upstreams ---
@@ -905,8 +1168,27 @@ pub fn validate(config: &Config) -> bool {
         return false;
     }
 
-    let mut seen_backend_origins: std::collections::HashMap<String, (String, String)> =
-        std::collections::HashMap::new();
+    let mut seen_route_matchers: HashMap<RouteMatcherKey, String> = HashMap::new();
+
+    for (upstream_name, upstream) in &config.upstream {
+        let route_key = (
+            upstream.route.host.as_deref().map(normalize_route_host),
+            upstream.route.path_prefix.clone(),
+            normalized_route_method(upstream.route.method.as_deref()),
+        );
+
+        if let Some(existing_upstream) =
+            seen_route_matchers.insert(route_key.clone(), upstream_name.clone())
+        {
+            error!(
+                "Ambiguous route matcher detected: upstream '{}' conflicts with upstream '{}' for host={:?} path_prefix={:?} method={:?}",
+                upstream_name, existing_upstream, route_key.0, route_key.1, route_key.2
+            );
+            return false;
+        }
+    }
+
+    let mut seen_backend_origins: HashMap<String, (String, String)> = HashMap::new();
 
     for (upstream_name, upstream) in &config.upstream {
         if upstream_name.is_empty() {
@@ -1040,7 +1322,7 @@ mod tests {
     use crate::config::{
         Backend, ClientAuth, Config, ControlApi, HealthCheck, Listen, LoadBalancing, Log,
         LogFormat, MetricsEndpoint, Observability, Performance, Resilience, RouteMatch, Security,
-        Tls, Tracing, Upstream, UpstreamTls,
+        Tls, TlsCertificate, Tracing, Upstream, UpstreamTls,
     };
     use rcgen::{Certificate, CertificateParams, SanType};
     use std::collections::HashMap;
@@ -1072,6 +1354,9 @@ mod tests {
                     lb_type: "round-robin".to_string(),
                     key: None,
                 },
+                host_policy: Default::default(),
+                forwarded_headers: Default::default(),
+                tls: None,
                 route: RouteMatch {
                     host: None,
                     path_prefix: Some("/".to_string()),
@@ -1102,9 +1387,11 @@ mod tests {
                 tls: Tls {
                     cert: cert.to_string(),
                     key: key.to_string(),
+                    certificates: vec![],
                     client_auth: ClientAuth::default(),
                 },
             },
+            listeners: vec![],
             upstream,
             load_balancing: Some(LoadBalancing {
                 lb_type: "random".to_string(),
@@ -1154,7 +1441,7 @@ upstream:
             key.display()
         );
 
-        let cfg: Config = serde_yml::from_str(&yaml).expect("parse");
+        let cfg: Config = serde_yaml::from_str(&yaml).expect("parse");
         assert_eq!(cfg.performance.worker_threads, 1);
         assert_eq!(cfg.performance.control_plane_threads, 2);
         assert_eq!(cfg.performance.packet_shards_per_worker, 1);
@@ -1177,6 +1464,8 @@ upstream:
         assert_eq!(cfg.performance.udp_send_buffer_bytes, 8 * 1024 * 1024);
         assert_eq!(cfg.performance.h2_pool_max_idle_per_backend, 256);
         assert_eq!(cfg.performance.h2_pool_idle_timeout_ms, 90_000);
+        assert!(!cfg.performance.backend_dns_refresh_enabled);
+        assert_eq!(cfg.performance.backend_dns_refresh_interval_ms, 30_000);
         assert_eq!(cfg.performance.per_backend_inflight_limit, 64);
         assert_eq!(cfg.performance.max_active_connections, 20_000);
         assert_eq!(cfg.performance.max_request_body_bytes, 1_000_000);
@@ -1204,9 +1493,17 @@ upstream:
         assert_eq!(cfg.resilience.route_queue.global_cap, 2048);
         assert_eq!(cfg.resilience.route_queue.shed_retry_after_seconds, 1);
         assert!(!cfg.resilience.protocol.allow_0rtt);
+        assert!(!cfg.resilience.protocol.allow_connect);
         assert_eq!(cfg.resilience.protocol.max_headers_count, 128);
         assert_eq!(cfg.resilience.protocol.max_headers_bytes, 16 * 1024);
         assert!(cfg.resilience.protocol.enforce_authority_host_match);
+        assert!(cfg.resilience.protocol.connect_allowed_ports.is_empty());
+        assert!(
+            cfg.resilience
+                .protocol
+                .connect_allowed_authorities
+                .is_empty()
+        );
         assert!(!cfg.resilience.watchdog.enabled);
         assert_eq!(cfg.resilience.watchdog.check_interval_ms, 1_000);
         assert_eq!(cfg.observability.control_api.max_connections, 256);
@@ -1272,6 +1569,10 @@ upstream:
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.performance.h2_pool_idle_timeout_ms = 0;
+        assert!(!validate(&cfg));
+
+        cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        cfg.performance.backend_dns_refresh_interval_ms = 0;
         assert!(!validate(&cfg));
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
@@ -1399,6 +1700,26 @@ upstream:
         assert!(!validate(&cfg));
 
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        cfg.resilience.protocol.connect_allowed_ports = vec![443];
+        assert!(!validate(&cfg));
+
+        cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        cfg.resilience.protocol.allow_connect = true;
+        cfg.resilience.protocol.connect_allowed_ports = vec![0];
+        assert!(!validate(&cfg));
+
+        cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        cfg.resilience.protocol.allow_connect = true;
+        cfg.resilience.protocol.connect_allowed_authorities = vec!["example.com".to_string()];
+        assert!(!validate(&cfg));
+
+        cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        cfg.resilience.protocol.allow_connect = true;
+        cfg.resilience.protocol.connect_allowed_authorities = vec!["example.com:443".to_string()];
+        cfg.resilience.protocol.connect_allowed_ports = vec![443];
+        assert!(validate(&cfg));
+
+        cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.resilience.protocol.allowed_methods = vec!["".to_string()];
         assert!(!validate(&cfg));
 
@@ -1506,6 +1827,60 @@ upstream:
         std::fs::write(&key, "not-a-pem-key").expect("write key");
 
         let cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        assert!(!validate(&cfg));
+    }
+
+    #[test]
+    fn accepts_sni_certificates_without_legacy_cert_pair() {
+        let dir = tempdir().expect("tempdir");
+        let (cert, key) = write_test_certs(dir.path());
+
+        let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        cfg.listen.tls.cert = String::new();
+        cfg.listen.tls.key = String::new();
+        cfg.listen.tls.certificates = vec![TlsCertificate {
+            server_name: "api.example.com".to_string(),
+            cert: cert.to_string_lossy().to_string(),
+            key: key.to_string_lossy().to_string(),
+        }];
+
+        assert!(validate(&cfg));
+    }
+
+    #[test]
+    fn rejects_duplicate_sni_certificate_server_names() {
+        let dir = tempdir().expect("tempdir");
+        let (cert, key) = write_test_certs(dir.path());
+
+        let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        cfg.listen.tls.certificates = vec![
+            TlsCertificate {
+                server_name: "api.example.com".to_string(),
+                cert: cert.to_string_lossy().to_string(),
+                key: key.to_string_lossy().to_string(),
+            },
+            TlsCertificate {
+                server_name: "API.EXAMPLE.COM".to_string(),
+                cert: cert.to_string_lossy().to_string(),
+                key: key.to_string_lossy().to_string(),
+            },
+        ];
+
+        assert!(!validate(&cfg));
+    }
+
+    #[test]
+    fn rejects_invalid_sni_certificate_server_name() {
+        let dir = tempdir().expect("tempdir");
+        let (cert, key) = write_test_certs(dir.path());
+
+        let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        cfg.listen.tls.certificates = vec![TlsCertificate {
+            server_name: "not a hostname".to_string(),
+            cert: cert.to_string_lossy().to_string(),
+            key: key.to_string_lossy().to_string(),
+        }];
+
         assert!(!validate(&cfg));
     }
 
@@ -1696,6 +2071,128 @@ upstream:
         cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
         cfg.security.privileges.enabled = true;
         cfg.security.privileges.group = " ".to_string();
+        assert!(!validate(&cfg));
+    }
+
+    #[test]
+    fn rejects_ambiguous_route_matchers_with_same_host_path_and_method() {
+        let dir = tempdir().expect("tempdir");
+        let (cert, key) = write_test_certs(dir.path());
+
+        let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        {
+            let upstream = cfg.upstream.get_mut("test_upstream").expect("upstream");
+            upstream.route.host = Some("API.EXAMPLE.COM:443".to_string());
+            upstream.route.path_prefix = Some("/api".to_string());
+            upstream.route.method = Some("get".to_string());
+            upstream.backends[0].address = "127.0.0.1:9001".to_string();
+        }
+
+        let duplicate = Upstream {
+            load_balancing: LoadBalancing {
+                lb_type: "round-robin".to_string(),
+                key: None,
+            },
+            host_policy: Default::default(),
+            forwarded_headers: Default::default(),
+            tls: None,
+            route: RouteMatch {
+                host: Some("api.example.com".to_string()),
+                path_prefix: Some("/api".to_string()),
+                method: Some("GET".to_string()),
+            },
+            backends: vec![Backend {
+                id: "backend-2".to_string(),
+                address: "127.0.0.1:9002".to_string(),
+                weight: 1,
+                health_check: None,
+            }],
+        };
+        cfg.upstream
+            .insert("test_upstream_2".to_string(), duplicate);
+
+        assert!(!validate(&cfg));
+    }
+
+    #[test]
+    fn allows_same_host_and_path_when_methods_differ() {
+        let dir = tempdir().expect("tempdir");
+        let (cert, key) = write_test_certs(dir.path());
+
+        let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        {
+            let upstream = cfg.upstream.get_mut("test_upstream").expect("upstream");
+            upstream.route.host = Some("api.example.com".to_string());
+            upstream.route.path_prefix = Some("/api".to_string());
+            upstream.route.method = Some("GET".to_string());
+            upstream.backends[0].address = "127.0.0.1:9001".to_string();
+        }
+
+        let post_route = Upstream {
+            load_balancing: LoadBalancing {
+                lb_type: "round-robin".to_string(),
+                key: None,
+            },
+            host_policy: Default::default(),
+            forwarded_headers: Default::default(),
+            tls: None,
+            route: RouteMatch {
+                host: Some("api.example.com".to_string()),
+                path_prefix: Some("/api".to_string()),
+                method: Some("POST".to_string()),
+            },
+            backends: vec![Backend {
+                id: "backend-2".to_string(),
+                address: "127.0.0.1:9002".to_string(),
+                weight: 1,
+                health_check: None,
+            }],
+        };
+        cfg.upstream
+            .insert("test_upstream_2".to_string(), post_route);
+
+        assert!(validate(&cfg));
+    }
+
+    #[test]
+    fn listeners_override_invalid_legacy_listen_block() {
+        let dir = tempdir().expect("tempdir");
+        let (legacy_cert, legacy_key) = write_test_certs(dir.path());
+        let (listener_cert, listener_key) = write_test_certs(dir.path());
+
+        let mut cfg = base_config(
+            &legacy_cert.to_string_lossy(),
+            &legacy_key.to_string_lossy(),
+        );
+        cfg.listen.tls.cert.clear();
+        cfg.listen.tls.key.clear();
+        cfg.listeners = vec![Listen {
+            protocol: "http3".to_string(),
+            port: 9443,
+            address: "127.0.0.1".to_string(),
+            tls: Tls {
+                cert: listener_cert.to_string_lossy().to_string(),
+                key: listener_key.to_string_lossy().to_string(),
+                certificates: vec![],
+                client_auth: ClientAuth::default(),
+            },
+        }];
+
+        assert!(validate(&cfg));
+    }
+
+    #[test]
+    fn rejects_host_policy_host_when_mode_is_not_rewrite() {
+        let dir = tempdir().expect("tempdir");
+        let (cert, key) = write_test_certs(dir.path());
+
+        let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        cfg.upstream
+            .get_mut("test_upstream")
+            .expect("upstream")
+            .host_policy
+            .host = Some("ignored.example.com".to_string());
+
         assert!(!validate(&cfg));
     }
 }

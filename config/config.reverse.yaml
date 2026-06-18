@@ -1,0 +1,198 @@
+version: 1
+
+listen:
+    protocol: http3
+    address: "0.0.0.0"
+    port: 443
+    tls:
+        cert: "/etc/spooky/certs/fullchain.pem"
+        key: "/etc/spooky/certs/privkey.pem"
+        client_auth:
+            enabled: false
+            require_client_cert: false
+            ca_file: null
+
+upstream_tls:
+    verify_certificates: false
+    strict_sni: true
+    ca_file: null
+    ca_dir: null
+
+upstream:    
+    web_pool:
+        load_balancing: 
+            type: round-robin
+
+        route:
+            host: "example.com"
+            path_prefix: "/"
+
+        host_policy:
+            mode: pass-through
+
+        forwarded_headers:
+            mode: append
+
+        backends:
+            - id: "backend1"
+              address: "https://127.0.0.1:5174"
+              weight: 100
+        
+    api_pool:
+        load_balancing:
+            type: round-robin
+
+        route:
+            host: "example.com"
+            path_prefix: "/api"
+
+        host_policy:
+            mode: pass-through
+
+        forwarded_headers:
+            mode: append
+
+        backends:
+            - id: "backend1"
+              address: "https://127.0.0.1:7001"
+              weight: 100
+              health_check:
+                  path: "/health"
+                  interval: 5000
+
+            - id: "backend2"
+              address: "https://127.0.0.1:7002"
+              weight: 50
+              health_check:
+                  path: "/health"
+                  interval: 10000
+
+log:
+    level: info
+    format: json
+    file:
+        enabled: true
+        path: /var/log/spooky/spooky.log
+
+performance:
+    worker_threads: 4
+    control_plane_threads: 2
+    packet_shards_per_worker: 2
+    packet_shard_queue_capacity: 4096
+    packet_shard_queue_max_bytes: 67108864
+    reuseport: true
+    pin_workers: false
+    global_inflight_limit: 8192
+    per_upstream_inflight_limit: 2048
+    per_backend_inflight_limit: 128
+    backend_timeout_ms: 5000
+    backend_connect_timeout_ms: 1000
+    backend_body_idle_timeout_ms: 5000
+    backend_body_total_timeout_ms: 60000
+    backend_total_request_timeout_ms: 65000
+    shutdown_drain_timeout_ms: 10000
+    udp_recv_buffer_bytes: 8388608
+    udp_send_buffer_bytes: 8388608
+    h2_pool_max_idle_per_backend: 256
+    h2_pool_idle_timeout_ms: 90000
+    backend_dns_refresh_enabled: true
+    backend_dns_refresh_interval_ms: 30000
+    new_connections_per_sec: 2000
+    new_connections_burst: 500
+    max_active_connections: 20000
+    quic_max_idle_timeout_ms: 10000
+    quic_initial_max_data: 10485760
+    quic_initial_max_stream_data: 10485760
+    quic_initial_max_streams_bidi: 100
+    quic_initial_max_streams_uni: 100
+    max_request_body_bytes: 10485760
+    max_response_body_bytes: 104857600
+    request_buffer_global_cap_bytes: 67108864
+    unknown_length_response_prebuffer_bytes: 2097152
+    client_body_idle_timeout_ms: 15000
+
+observability:
+    metrics:
+        enabled: true
+        required: false
+        address: "127.0.0.1"
+        port: 9901
+        path: "/metrics"
+        max_connections: 512
+        connection_timeout_ms: 30000
+    control_api:
+        enabled: true
+        required: false
+        address: "127.0.0.1"
+        port: 9902
+        health_path: "/health"
+        ready_path: "/ready"
+        runtime_path: "/admin/runtime"
+        restart_path: "/admin/runtime/restart"
+        auth_token: "replace-with-a-strong-random-token"
+        max_connections: 256
+        connection_timeout_ms: 30000
+    tracing:
+        enabled: false
+        service_name: "spooky"
+        otlp_endpoint: null
+        sample_ratio: 0.1
+
+resilience:
+    adaptive_admission:
+        enabled: true
+        min_limit: 128
+        max_limit: 8192
+        decrease_step: 16
+        increase_step: 8
+        high_latency_ms: 250
+    route_queue:
+        default_cap: 512
+        global_cap: 4096
+        shed_retry_after_seconds: 1
+        caps: {}
+    protocol:
+        allow_0rtt: false
+        allow_connect: false
+        early_data_safe_methods: ["GET", "HEAD"]
+        max_headers_count: 128
+        max_headers_bytes: 16384
+        enforce_authority_host_match: true
+        allowed_methods: []
+        denied_path_prefixes: []
+    circuit_breaker:
+        enabled: true
+        failure_threshold: 5
+        open_ms: 15000
+        half_open_max_probes: 2
+    hedging:
+        enabled: false
+        delay_ms: 75
+        safe_methods: ["GET", "HEAD"]
+        route_allowlist: []
+    retry_budget:
+        enabled: true
+        ratio_percent: 10
+        per_route_ratio_percent: {}
+    brownout:
+        enabled: true
+        trigger_inflight_percent: 90
+        recover_inflight_percent: 60
+        core_routes: []
+    watchdog:
+        enabled: false
+        check_interval_ms: 1000
+        poll_stall_timeout_ms: 5000
+        timeout_error_rate_percent: 60
+        min_requests_per_window: 20
+        overload_inflight_percent: 95
+        unhealthy_consecutive_windows: 3
+        drain_grace_ms: 8000
+        restart_cooldown_ms: 120000
+        restart_command: []
+
+security:
+    privileges:
+        enabled: true
+        user: "spooky"
+        group: "spooky"

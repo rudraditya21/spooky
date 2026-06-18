@@ -5,18 +5,48 @@ listen:
     address: "0.0.0.0"
     port: 9889
     tls:
-        cert: certs/proxy-fullchain.pem # path to cert
-        key: certs/proxy-key-pkcs8.pem # path to key
+        cert: certs/proxy-fullchain.pem # default/fallback cert (used when SNI is absent or unmatched)
+        key: certs/proxy-key-pkcs8.pem # default/fallback key
+        certificates:                  # optional SNI certificate mappings
+            - server_name: "api.example.com"
+              cert: certs/api-fullchain.pem
+              key: certs/api-key-pkcs8.pem
+            - server_name: "www.example.com"
+              cert: certs/www-fullchain.pem
+              key: certs/www-key-pkcs8.pem
         client_auth:
             enabled: false              # set true to request/verify client certificates (mTLS)
             require_client_cert: false  # when true, close connections that complete handshake without a client cert
             ca_file: null               # PEM CA bundle used to verify client certificates when enabled=true
 
+# listeners: optional multi-listener block; when set, it is the only effective listener set.
+# The top-level listen block remains for backward compatibility but is ignored for runtime
+# listener selection and listener validation when listeners[] is non-empty.
+# Each entry is an independent listener with its own address, port, and TLS identity.
+# listeners:
+#   - protocol: http3
+#     address: "0.0.0.0"
+#     port: 9889
+#     tls:
+#       cert: certs/public-fullchain.pem
+#       key: certs/public-key-pkcs8.pem
+#   - protocol: http3
+#     address: "10.0.0.1"
+#     port: 9890
+#     tls:
+#       cert: certs/internal-fullchain.pem
+#       key: certs/internal-key-pkcs8.pem
+
 upstream_tls:
     verify_certificates: true  # safe-by-default for HTTPS upstreams
-    strict_sni: true           # send backend host as SNI for HTTPS upstream connections
+    strict_sni: true           # send backend authority host as SNI for HTTPS upstream connections
     ca_file: null              # optional PEM CA bundle for private PKI
     ca_dir: null               # optional directory of PEM CA bundles for private PKI
+    # Verification semantics:
+    # - hostname backends: verify SAN/CN against the configured backend host
+    # - IP literal backends: verify against the configured IP identity
+    # - strict_sni=false: keep certificate verification on, but do not send SNI
+    # - verify_certificates=false: disables upstream certificate validation entirely
 
 upstream:
   api_pool:
@@ -25,6 +55,21 @@ upstream:
 
     route:
       path_prefix: "/api"
+
+    host_policy:
+      mode: pass-through   # pass-through | rewrite | upstream
+      # host: "api.example.com"  # required when mode: rewrite; rejected for other modes
+
+    forwarded_headers:
+      mode: append         # append | preserve | overwrite
+
+    # tls: optional per-upstream TLS override; inherits from upstream_tls when omitted.
+    # Runtime precedence is: upstream.<name>.tls -> upstream_tls.
+    # tls:
+    #   verify_certificates: true
+    #   strict_sni: true
+    #   ca_file: certs/private-ca.pem  # optional custom CA bundle for this upstream only
+    #   ca_dir: null
 
     backends:
       - id: "backend1"
@@ -86,6 +131,8 @@ performance:
     udp_send_buffer_bytes: 8388608
     h2_pool_max_idle_per_backend: 256
     h2_pool_idle_timeout_ms: 90000
+    backend_dns_refresh_enabled: false        # periodically refresh hostname-based backend DNS in the control plane
+    backend_dns_refresh_interval_ms: 30000   # refresh cadence for hostname-based backends (ms)
     per_backend_inflight_limit: 64
     new_connections_per_sec: 2000   # max new QUIC connections accepted per second (token-bucket refill rate)
     new_connections_burst: 500      # burst capacity above the steady-state rate; must be >= 1
@@ -119,6 +166,7 @@ observability:
         ready_path: "/ready"
         runtime_path: "/admin/runtime"
         restart_path: "/admin/runtime/restart"
+        reload_certs_path: "/admin/runtime/reload-certs"  # hot-reload listener cert/key material for new handshakes
         auth_token: "replace-with-strong-token"
         max_connections: 256
         connection_timeout_ms: 30000
@@ -147,6 +195,9 @@ resilience:
         max_headers_count: 128
         max_headers_bytes: 16384
         enforce_authority_host_match: true
+        allow_connect: false
+        connect_allowed_ports: []
+        connect_allowed_authorities: []
         allowed_methods: []
         denied_path_prefixes: []
     circuit_breaker:

@@ -163,6 +163,14 @@ pub fn perf_default_h2_pool_idle_timeout_ms() -> u64 {
     90_000
 }
 
+pub fn perf_default_backend_dns_refresh_enabled() -> bool {
+    false
+}
+
+pub fn perf_default_backend_dns_refresh_interval_ms() -> u64 {
+    30_000
+}
+
 pub fn perf_default_per_backend_inflight_limit() -> usize {
     64
 }
@@ -265,6 +273,10 @@ pub fn resilience_default_protocol_max_headers_bytes() -> usize {
 
 pub fn resilience_default_protocol_enforce_authority_host_match() -> bool {
     true
+}
+
+pub fn resilience_default_protocol_allow_connect() -> bool {
+    false
 }
 
 pub fn resilience_default_cb_enabled() -> bool {
@@ -389,6 +401,10 @@ pub fn observe_default_control_api_runtime_path() -> String {
 
 pub fn observe_default_control_api_restart_path() -> String {
     String::from("/admin/runtime/restart")
+}
+
+pub fn observe_default_control_api_reload_certs_path() -> String {
+    String::from("/admin/runtime/reload-certs")
 }
 
 pub fn observe_default_control_api_max_connections() -> usize {

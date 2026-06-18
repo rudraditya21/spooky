@@ -1,4 +1,5 @@
 #[cfg(unix)]
+#[allow(dead_code)]
 pub fn drop_privileges(user: &str, group: &str) -> Result<(), String> {
     use std::{ffi::CString, io};
 
@@ -135,6 +136,7 @@ pub fn drop_privileges(user: &str, group: &str) -> Result<(), String> {
 }
 
 #[cfg(not(unix))]
+#[allow(dead_code)]
 pub fn drop_privileges(_user: &str, _group: &str) -> Result<(), String> {
     Ok(())
 }

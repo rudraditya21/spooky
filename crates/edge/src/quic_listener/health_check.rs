@@ -3,13 +3,17 @@ use super::*;
 impl QUICListener {
     pub(super) fn spawn_health_checks(
         upstream_pools: HashMap<String, Arc<RwLock<UpstreamPool>>>,
-        health_client: Arc<H2Client>,
+        h2_pool: Arc<H2Pool>,
+        backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
+        backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
         metrics: Arc<Metrics>,
     ) {
         struct HealthCheckJob {
             upstream_pool: Arc<RwLock<UpstreamPool>>,
             index: usize,
-            address: String,
+            // Stable configured backend identity. DNS refresh changes connect targets
+            // underneath this identity without changing health ownership.
+            backend_identity: String,
             health_uri: String,
             timeout: Duration,
             base_interval_ms: u64,
@@ -34,12 +38,12 @@ impl QUICListener {
                 } else {
                     &health.path
                 };
-                let endpoint = match BackendEndpoint::parse(&address) {
-                    Ok(endpoint) => endpoint,
-                    Err(err) => {
+                let endpoint = match backend_endpoints.get(&address) {
+                    Some(endpoint) => endpoint,
+                    None => {
                         error!(
-                            "disabling health checks for backend '{}' due to invalid endpoint: {}",
-                            address, err
+                            "disabling health checks for backend '{}' due to missing canonical endpoint",
+                            address
                         );
                         continue;
                     }
@@ -54,7 +58,7 @@ impl QUICListener {
                 let job = HealthCheckJob {
                     upstream_pool: Arc::clone(upstream_pool),
                     index,
-                    address,
+                    backend_identity: address,
                     health_uri: endpoint.uri_for_path(path),
                     timeout: Duration::from_millis(health.timeout_ms.max(1)),
                     base_interval_ms,
@@ -78,7 +82,8 @@ impl QUICListener {
         };
 
         for (base_interval_ms, mut jobs) in grouped_jobs {
-            let health_client = Arc::clone(&health_client);
+            let h2_pool = Arc::clone(&h2_pool);
+            let backend_resolution_store = Arc::clone(&backend_resolution_store);
             let task_metrics = Arc::clone(&metrics);
             let handle = handle.clone();
             let supervise_metrics = Arc::clone(&task_metrics);
@@ -109,15 +114,47 @@ impl QUICListener {
                                 Err(_) => continue,
                             };
 
-                            let result =
-                                tokio::time::timeout(job.timeout, health_client.send(request))
-                                    .await;
+                            Self::record_backend_connect_attempt(
+                                &task_metrics,
+                                &backend_resolution_store,
+                                &job.backend_identity,
+                            );
+                            let result = tokio::time::timeout(
+                                job.timeout,
+                                h2_pool.send(&job.backend_identity, request),
+                            )
+                            .await;
 
                             let outcome = match result {
                                 Ok(Ok(response)) => {
                                     classify_active_health_check_response(response.status())
                                 }
-                                _ => HealthClassification::Failure,
+                                Ok(Err(PoolError::Send(send_err))) => {
+                                    let send_err_detail = Self::format_error_chain(&send_err);
+                                    let (failure_reason, tls_reason) =
+                                        Self::send_error_health_failure_reason(&send_err);
+                                    if failure_reason == HealthFailureReason::Tls {
+                                        task_metrics.record_upstream_tls_failure(
+                                            &job.backend_identity,
+                                            "health_check",
+                                            tls_reason,
+                                        );
+                                        error!(
+                                            "Health check upstream TLS failure for {} (tls_reason={}): {}",
+                                            job.backend_identity, tls_reason, send_err_detail
+                                        );
+                                    }
+                                    task_metrics.inc_health_failure(failure_reason);
+                                    HealthClassification::Failure
+                                }
+                                Ok(Err(_)) => {
+                                    task_metrics.inc_health_failure(HealthFailureReason::Transport);
+                                    HealthClassification::Failure
+                                }
+                                Err(_) => {
+                                    task_metrics.inc_health_failure(HealthFailureReason::Timeout);
+                                    HealthClassification::Failure
+                                }
                             };
 
                             let transition = match job.upstream_pool.write() {
@@ -146,7 +183,7 @@ impl QUICListener {
                             job.next_due_at = Instant::now() + Duration::from_millis(delay_ms);
 
                             if let Some(transition) = transition {
-                                Self::log_health_transition(&job.address, transition);
+                                Self::log_health_transition(&job.backend_identity, transition);
                             }
                         }
                     }

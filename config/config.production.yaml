@@ -8,6 +8,22 @@ listen:
     cert: "/etc/spooky/certs/fullchain.pem"
     key: "/etc/spooky/certs/privkey.pem"
 
+# listeners: optional multi-listener block; overrides the top-level listen block when set.
+# Use this to bind multiple independent listeners with separate TLS identities.
+# listeners:
+#   - protocol: http3
+#     address: "0.0.0.0"
+#     port: 9889
+#     tls:
+#       cert: "/etc/spooky/certs/public-fullchain.pem"
+#       key: "/etc/spooky/certs/public-privkey.pem"
+#   - protocol: http3
+#     address: "10.0.0.1"
+#     port: 9890
+#     tls:
+#       cert: "/etc/spooky/certs/internal-fullchain.pem"
+#       key: "/etc/spooky/certs/internal-privkey.pem"
+
 upstream_tls:
   verify_certificates: true
   strict_sni: true
@@ -18,6 +34,11 @@ upstream:
       type: round-robin
     route:
       path_prefix: "/"
+    host_policy:
+      mode: pass-through   # pass-through | rewrite | upstream
+      # host: "origin.example.com"  # required when mode: rewrite
+    forwarded_headers:
+      mode: append         # append | preserve | overwrite
     backends:
       - id: "backend1"
         address: "backend.internal.example:8443" # verified HTTPS by default (no scheme needed)
