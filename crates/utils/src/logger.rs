@@ -100,9 +100,8 @@ fn configure_and_init_logger(
             && let Err(err) = create_dir_all(parent)
         {
             eprintln!(
-                "Failed to create log directory '{}': {}. Falling back to stderr logging.",
-                parent.display(),
-                err
+                "{}",
+                build_create_log_dir_error(log_file, parent, &err)
             );
             return try_init_builder(builder);
         }
@@ -110,10 +109,7 @@ fn configure_and_init_logger(
         let file = match OpenOptions::new().create(true).append(true).open(log_file) {
             Ok(file) => file,
             Err(err) => {
-                eprintln!(
-                    "Failed to open log file '{}': {}. Falling back to stderr logging.",
-                    log_file, err
-                );
+                eprintln!("{}", build_open_log_file_error(log_file, &err));
                 return try_init_builder(builder);
             }
         };
@@ -132,6 +128,23 @@ fn try_init_builder(mut builder: Builder) -> LoggerInitStatus {
     }
 }
 
+fn build_create_log_dir_error(log_file: &str, parent: &Path, err: &std::io::Error) -> String {
+    format!(
+        "Failed to create log directory '{}' for log file '{}': {}. Falling back to stderr logging.",
+        parent.display(),
+        log_file,
+        err
+    )
+}
+
+fn build_open_log_file_error(log_file: &str, err: &std::io::Error) -> String {
+    format!(
+        "Failed to open log file '{}': {}. Falling back to stderr logging.",
+        log_file,
+        err
+    )
+}
+
 fn build_json_payload(ts: &str, level: &str, target: &str, message: &str) -> serde_json::Value {
     json!({
         "ts": ts,
@@ -143,8 +156,13 @@ fn build_json_payload(ts: &str, level: &str, target: &str, message: &str) -> ser
 
 #[cfg(test)]
 mod tests {
-    use super::{LoggerInitStatus, build_json_payload, try_init_logger};
+    use super::{
+        LoggerInitStatus, build_create_log_dir_error, build_json_payload,
+        build_open_log_file_error, try_init_logger,
+    };
     use serde_json::json;
+    use std::io;
+    use std::path::Path;
 
     #[test]
     fn logger_init_is_idempotent() {
@@ -152,6 +170,29 @@ mod tests {
 
         let second = try_init_logger("debug", true, "/tmp/ignored.log", true);
         assert_eq!(second, LoggerInitStatus::AlreadyInitialized);
+    }
+
+    #[test]
+    fn create_log_dir_error_includes_directory_and_file_path() {
+        let err = io::Error::new(io::ErrorKind::PermissionDenied, "permission denied");
+        let msg = build_create_log_dir_error(
+            "/var/log/spooky/spooky.log",
+            Path::new("/var/log/spooky"),
+            &err,
+        );
+
+        assert!(msg.contains("/var/log/spooky"));
+        assert!(msg.contains("/var/log/spooky/spooky.log"));
+        assert!(msg.contains("permission denied"));
+    }
+
+    #[test]
+    fn open_log_file_error_includes_file_path() {
+        let err = io::Error::new(io::ErrorKind::PermissionDenied, "permission denied");
+        let msg = build_open_log_file_error("/var/log/spooky/spooky.log", &err);
+
+        assert!(msg.contains("/var/log/spooky/spooky.log"));
+        assert!(msg.contains("permission denied"));
     }
 
     #[test]
