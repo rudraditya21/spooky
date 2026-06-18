@@ -54,6 +54,10 @@ type ResolverResponse = std::vec::IntoIter<SocketAddr>;
 type ResolverFuture =
     Pin<Box<dyn Future<Output = Result<ResolverResponse, io::Error>> + Send + 'static>>;
 
+const DEFAULT_MAX_IDLE_PER_HOST: usize = 64;
+const DEFAULT_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsCacheUpdate {
     pub host: String,
@@ -168,6 +172,29 @@ pub struct H2Client {
     client: Client<HttpsConnector<HttpConnector<SharedDnsResolver>>, BoxBody<Bytes, Infallible>>,
 }
 
+impl Default for H2Client {
+    fn default() -> Self {
+        let dns_resolver = SharedDnsResolver::new();
+        let mut http = HttpConnector::new_with_resolver(dns_resolver);
+        http.enforce_http(false);
+        http.set_connect_timeout(Some(DEFAULT_CONNECT_TIMEOUT));
+
+        let https = HttpsConnectorBuilder::new()
+            .with_tls_config(default_tls_config())
+            .https_or_http()
+            .enable_http2()
+            .wrap_connector(http);
+
+        let client = Client::builder(TokioExecutor)
+            .http2_only(true)
+            .pool_max_idle_per_host(DEFAULT_MAX_IDLE_PER_HOST)
+            .pool_idle_timeout(DEFAULT_POOL_IDLE_TIMEOUT)
+            .build(https);
+
+        Self { client }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct TokioExecutor;
 
@@ -218,9 +245,9 @@ impl H2Client {
 
     pub fn try_default() -> Result<Self, String> {
         Self::new(
-            64,
-            Duration::from_secs(30),
-            Duration::from_secs(2),
+            DEFAULT_MAX_IDLE_PER_HOST,
+            DEFAULT_POOL_IDLE_TIMEOUT,
+            DEFAULT_CONNECT_TIMEOUT,
             TlsClientConfig::default(),
             SharedDnsResolver::new(),
         )
@@ -239,6 +266,17 @@ where
     addrs.sort_unstable();
     addrs.dedup();
     addrs
+}
+
+fn default_tls_config() -> ClientConfig {
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    let mut cfg = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    cfg.enable_sni = true;
+    cfg
 }
 
 fn build_tls_config(tls: &TlsClientConfig) -> Result<ClientConfig, String> {
@@ -413,6 +451,11 @@ mod tests {
     use hyper_util::client::legacy::connect::dns::Name;
     use std::{net::SocketAddr, str::FromStr, time::Duration};
     use tower_service::Service;
+
+    #[test]
+    fn default_h2_client_does_not_panic() {
+        let _client = H2Client::default();
+    }
 
     #[test]
     fn default_tls_client_config_builds_h2_client() {
