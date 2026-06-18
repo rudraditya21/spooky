@@ -81,12 +81,12 @@ fn configure_and_init_logger(
     if json {
         builder.format(|buf, record| {
             let message = record.args().to_string();
-            let payload = json!({
-                "ts": buf.timestamp_seconds().to_string(),
-                "level": record.level().as_str().to_ascii_lowercase(),
-                "target": record.target(),
-                "msg": message,
-            });
+            let payload = build_json_payload(
+                &buf.timestamp_seconds().to_string(),
+                &record.level().as_str().to_ascii_lowercase(),
+                record.target(),
+                &message,
+            );
 
             writeln!(buf, "{payload}")
         });
@@ -132,9 +132,19 @@ fn try_init_builder(mut builder: Builder) -> LoggerInitStatus {
     }
 }
 
+fn build_json_payload(ts: &str, level: &str, target: &str, message: &str) -> serde_json::Value {
+    json!({
+        "ts": ts,
+        "level": level,
+        "target": target,
+        "msg": message,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{LoggerInitStatus, try_init_logger};
+    use super::{LoggerInitStatus, build_json_payload, try_init_logger};
+    use serde_json::json;
 
     #[test]
     fn logger_init_is_idempotent() {
@@ -142,5 +152,60 @@ mod tests {
 
         let second = try_init_logger("debug", true, "/tmp/ignored.log", true);
         assert_eq!(second, LoggerInitStatus::AlreadyInitialized);
+    }
+
+    #[test]
+    fn json_payload_preserves_plain_message_verbatim() {
+        let payload = build_json_payload("123", "info", "spooky", "request_id=42 status=200");
+
+        assert_eq!(
+            payload,
+            json!({
+                "ts": "123",
+                "level": "info",
+                "target": "spooky",
+                "msg": "request_id=42 status=200",
+            })
+        );
+    }
+
+    #[test]
+    fn json_payload_preserves_malformed_kv_like_message_verbatim() {
+        let payload = build_json_payload(
+            "123",
+            "warn",
+            "spooky_edge",
+            r#"request_id= status="" path=, trace_id==broken"#,
+        );
+
+        assert_eq!(
+            payload,
+            json!({
+                "ts": "123",
+                "level": "warn",
+                "target": "spooky_edge",
+                "msg": r#"request_id= status="" path=, trace_id==broken"#,
+            })
+        );
+    }
+
+    #[test]
+    fn json_payload_preserves_embedded_quotes_and_whitespace() {
+        let payload = build_json_payload(
+            "123",
+            "error",
+            "spooky_edge::quic_listener::forwarding",
+            r#"msg="backend failed" path="/api v1" detail="x=y, z""#,
+        );
+
+        assert_eq!(
+            payload,
+            json!({
+                "ts": "123",
+                "level": "error",
+                "target": "spooky_edge::quic_listener::forwarding",
+                "msg": r#"msg="backend failed" path="/api v1" detail="x=y, z""#,
+            })
+        );
     }
 }
