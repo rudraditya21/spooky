@@ -118,11 +118,7 @@ fn main() {
 
     // Validate Configurations
     if let Err(err) = validate_config(&config_yaml) {
-        fatal_startup_error(
-            &format!("Configuration validation failed: {err}"),
-            true,
-            1,
-        );
+        fatal_startup_error(&format!("Configuration validation failed: {err}"), true, 1);
     }
 
     let runtime_config = match RuntimeConfig::from_config(&config_yaml) {
