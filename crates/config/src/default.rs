@@ -55,7 +55,7 @@ pub fn get_default_log_file_path() -> String {
 
 pub fn get_default_load_balancing() -> LoadBalancing {
     LoadBalancing {
-        lb_type: String::from("round_robin"),
+        lb_type: String::from("round-robin"),
         key: None,
     }
 }
@@ -65,7 +65,7 @@ pub fn get_default_log() -> Log {
         level: String::from("info"),
         file: LogFile {
             enabled: false,
-            path: String::from(""),
+            path: get_default_log_file_path(),
         },
         format: LogFormat::Plain,
     }
