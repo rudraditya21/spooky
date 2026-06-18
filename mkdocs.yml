@@ -60,6 +60,11 @@ nav:
       - Production Deployment: deployment/production.md
       - Validation: deployment/validation.md
       - Migration: deployment/migration.md
+      - Runbook: operations/runbook.md
+      - Sizing And Capacity: operations/sizing-and-capacity.md
+      - Host Tuning: operations/host-tuning.md
+      - Deployment Patterns: operations/deployment-patterns.md
+      - Failure Modes: operations/failure-modes.md
       - Troubleshooting: troubleshooting/common-issues.md
   - Development:
       - Overview: development/overview.md
