@@ -48,6 +48,7 @@ nav:
       - Overview: reference/overview.md
       - Feature Matrix: reference/feature-matrix.md
       - Limitations: reference/limitations.md
+      - Terminology: reference/terminology.md
       - Configuration Reference: configuration/reference.md
       - Configuration Examples: configuration/examples.md
       - TLS Setup: configuration/tls.md
