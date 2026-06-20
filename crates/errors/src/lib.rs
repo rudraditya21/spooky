@@ -41,7 +41,7 @@ pub enum ProxyError {
     #[error("bridge error: {0}")]
     Bridge(#[from] BridgeError),
 
-    #[error("transport error: {0}")]
+    #[error("pool error: {0}")]
     Pool(#[from] PoolError),
 
     #[error("transport error: {0}")]
@@ -64,5 +64,26 @@ pub fn is_retryable(err: &ProxyError) -> bool {
         ProxyError::Pool(PoolError::Send(_)) => false,
         ProxyError::Pool(_) => true,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PoolError, ProxyError};
+
+    #[test]
+    fn pool_and_transport_errors_have_distinct_display_text() {
+        let pool = ProxyError::Pool(PoolError::UnknownBackend("api-a".to_string()));
+        let transport = ProxyError::Transport("api-a".to_string());
+
+        assert_eq!(pool.to_string(), "pool error: unknown backend: api-a");
+        assert_eq!(transport.to_string(), "transport error: api-a");
+    }
+
+    #[test]
+    fn overloaded_pool_error_keeps_pool_specific_prefix() {
+        let err = ProxyError::Pool(PoolError::BackendOverloaded("api-b".to_string()));
+
+        assert_eq!(err.to_string(), "pool error: backend overloaded: api-b");
     }
 }
