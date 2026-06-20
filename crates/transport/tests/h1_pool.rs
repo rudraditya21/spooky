@@ -189,3 +189,25 @@ async fn pool_reports_overload_when_inflight_is_exhausted() {
 
     let _ = handle.await.expect("request task join");
 }
+
+#[test]
+fn pool_rotates_known_backend_client_and_ignores_unknown_backend() {
+    let pool = H1Pool::new(
+        vec!["127.0.0.1:12345".to_string()],
+        1,
+        64,
+        Duration::from_secs(30),
+        Duration::from_secs(2),
+        SharedDnsResolver::new(),
+    );
+
+    assert!(
+        pool.rotate_backend_client("127.0.0.1:12345")
+            .expect("known backend")
+    );
+    assert!(
+        !pool
+            .rotate_backend_client("127.0.0.1:9999")
+            .expect("unknown backend should be ignored")
+    );
+}
