@@ -96,7 +96,10 @@ fn resolve_otlp_endpoint<F>(
 where
     F: FnMut(&str) -> Option<String>,
 {
-    if let Some(endpoint) = otlp_endpoint.map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(endpoint) = otlp_endpoint
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         return (endpoint.to_string(), OtlpEndpointSource::Config);
     }
 
@@ -128,9 +131,7 @@ mod tests {
     fn config_endpoint_overrides_environment() {
         let (endpoint, source) =
             resolve_otlp_endpoint(Some(" http://cfg-collector:4317 "), |key| match key {
-                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT" => {
-                    Some("http://env-traces:4317".to_string())
-                }
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT" => Some("http://env-traces:4317".to_string()),
                 "OTEL_EXPORTER_OTLP_ENDPOINT" => Some("http://env-generic:4317".to_string()),
                 _ => None,
             });
