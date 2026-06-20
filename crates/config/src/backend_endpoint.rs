@@ -8,6 +8,7 @@ pub enum BackendScheme {
 }
 
 impl BackendScheme {
+    /// Returns the lowercase URI scheme token used in origins and absolute URIs.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Http => "http",
@@ -35,6 +36,12 @@ impl BackendEndpoint {
     /// - `host:port` => defaults to `https://host:port`
     /// - `https://host:port`
     /// - `http://host:port` (explicit insecure opt-out)
+    ///
+    /// Returns a normalized endpoint whose authority always includes an explicit port.
+    /// Host-only inputs inherit the scheme default port: `443` for HTTPS and `80` for HTTP.
+    ///
+    /// Returns an error when the input is empty, uses an unsupported scheme, includes a
+    /// path/query/fragment, or does not form a valid `host:port` authority.
     pub fn parse(raw: &str) -> Result<Self, String> {
         let raw = raw.trim();
         if raw.is_empty() {
@@ -67,34 +74,55 @@ impl BackendEndpoint {
         Ok(Self { scheme, authority })
     }
 
+    /// Returns the effective backend transport scheme.
     pub fn scheme(&self) -> BackendScheme {
         self.scheme
     }
 
+    /// Returns the normalized authority in `host:port` form.
+    ///
+    /// IPv6 literals are returned in bracketed form, for example `[::1]:443`.
     pub fn authority(&self) -> &str {
         &self.authority
     }
 
+    /// Returns just the host portion of the normalized authority.
+    ///
+    /// For bracketed IPv6 authorities, the surrounding `[` and `]` are removed.
     pub fn authority_host(&self) -> &str {
         split_authority(&self.authority)
             .map(|(host, _)| host)
             .unwrap_or_default()
     }
 
+    /// Returns the parsed port portion of the normalized authority.
+    ///
+    /// Because [`BackendEndpoint::parse`] validates the authority, successful endpoints always
+    /// return a non-zero port here.
     pub fn authority_port(&self) -> u16 {
         split_authority(&self.authority)
             .and_then(|(_, port)| port.parse::<u16>().ok())
             .unwrap_or_default()
     }
 
+    /// Returns `true` when the authority host is an IPv4 or IPv6 literal.
     pub fn authority_is_ip_literal(&self) -> bool {
         self.authority_host().parse::<IpAddr>().is_ok()
     }
 
+    /// Returns the backend origin in `<scheme>://<authority>` form.
+    ///
+    /// Example: `https://api.example.com:443`.
     pub fn origin(&self) -> String {
         format!("{}://{}", self.scheme.as_str(), self.authority)
     }
 
+    /// Builds an absolute backend URI for the provided request path.
+    ///
+    /// Behavior:
+    /// - empty input becomes `/`
+    /// - inputs starting with `/` are appended as-is
+    /// - other inputs are treated as relative path text and joined with a single `/`
     pub fn uri_for_path(&self, path: &str) -> String {
         let normalized = if path.is_empty() {
             "/"
