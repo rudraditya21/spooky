@@ -9,7 +9,7 @@ use http::{HeaderName, HeaderValue, Method, Request, Uri};
 use http_body_util::combinators::BoxBody;
 use quiche::h3::NameValue;
 use spooky_config::{
-    backend_endpoint::BackendEndpoint,
+    backend_endpoint::{BackendEndpoint, BackendScheme},
     config::{
         ForwardedHeaderPolicy, ForwardedHeaderPolicyMode, UpstreamHostPolicy,
         UpstreamHostPolicyMode,
@@ -211,6 +211,10 @@ pub fn build_h2_request_for_endpoint_with_host_policy(
     }
     if let Some(value) = forwarded_values.x_forwarded_host {
         builder = builder.header(HeaderName::from_static("x-forwarded-host"), value);
+    }
+
+    if endpoint.scheme() == BackendScheme::Http && !is_connect {
+        builder = builder.header(http::header::TE, "trailers");
     }
 
     builder.body(body).map_err(BridgeError::Build)

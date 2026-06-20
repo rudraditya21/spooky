@@ -1225,19 +1225,8 @@ fn validate_inner(config: &Config) -> bool {
         }
     }
 
-    // --- Validate upstream TLS trust-store configuration ---
-    if !validate_upstream_tls("upstream_tls", &config.upstream_tls) {
-        return false;
-    }
-
     // --- Validate upstream routes ---
     for (upstream_name, upstream) in &config.upstream {
-        if let Some(tls) = upstream.tls.as_ref()
-            && !validate_upstream_tls(&format!("upstream['{}'].tls", upstream_name), tls)
-        {
-            return false;
-        }
-
         // Validate route matcher has at least one condition
         let has_host = upstream.route.host.is_some();
         let has_path = upstream.route.path_prefix.is_some();
@@ -1323,6 +1312,7 @@ fn validate_inner(config: &Config) -> bool {
     }
 
     let mut seen_backend_origins: HashMap<String, (String, String)> = HashMap::new();
+    let mut validate_global_upstream_tls = false;
 
     for (upstream_name, upstream) in &config.upstream {
         if upstream_name.is_empty() {
@@ -1349,6 +1339,7 @@ fn validate_inner(config: &Config) -> bool {
             return false;
         }
 
+        let mut upstream_uses_https_backends = false;
         for backend in &upstream.backends {
             // Validate backend ID
             if backend.id.is_empty() {
@@ -1383,6 +1374,8 @@ fn validate_inner(config: &Config) -> bool {
                     "Backend '{}' in upstream '{}' uses explicit insecure cleartext transport ({})",
                     backend.id, upstream_name, backend.address
                 );
+            } else {
+                upstream_uses_https_backends = true;
             }
 
             let origin = endpoint.origin();
@@ -1459,6 +1452,21 @@ fn validate_inner(config: &Config) -> bool {
                 }
             }
         }
+
+        if upstream_uses_https_backends {
+            if let Some(tls) = upstream.tls.as_ref() {
+                if !validate_upstream_tls(&format!("upstream['{}'].tls", upstream_name), tls) {
+                    return false;
+                }
+            } else {
+                validate_global_upstream_tls = true;
+            }
+        }
+    }
+
+    if validate_global_upstream_tls && !validate_upstream_tls("upstream_tls", &config.upstream_tls)
+    {
+        return false;
     }
 
     info!("Configuration validation passed successfully\n");
@@ -2096,6 +2104,44 @@ upstream:
             tracing: Tracing::default(),
             routing: crate::config::RoutingTransparency::default(),
         };
+
+        assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn skips_unused_global_upstream_tls_validation_for_http_only_backends() {
+        let dir = tempdir().expect("tempdir");
+        let (cert, key) = write_test_certs(dir.path());
+
+        let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        cfg.upstream_tls.ca_file = Some("/path/does/not/exist.pem".to_string());
+        cfg.upstream_tls.ca_dir = Some("/path/does/not/exist".to_string());
+        cfg.upstream
+            .get_mut("test_upstream")
+            .expect("upstream")
+            .backends[0]
+            .address = "http://127.0.0.1:8080".to_string();
+
+        assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn skips_unused_per_upstream_tls_validation_for_http_only_backends() {
+        let dir = tempdir().expect("tempdir");
+        let (cert, key) = write_test_certs(dir.path());
+
+        let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+        cfg.upstream.get_mut("test_upstream").expect("upstream").tls = Some(UpstreamTls {
+            verify_certificates: true,
+            strict_sni: true,
+            ca_file: Some("/path/does/not/exist.pem".to_string()),
+            ca_dir: Some("/path/does/not/exist".to_string()),
+        });
+        cfg.upstream
+            .get_mut("test_upstream")
+            .expect("upstream")
+            .backends[0]
+            .address = "http://127.0.0.1:8080".to_string();
 
         assert!(validate(&cfg).is_ok());
     }

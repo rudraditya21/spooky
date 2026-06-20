@@ -481,7 +481,7 @@ fn normalize_upstreams(
 
         let runtime_upstream =
             RuntimeUpstream::from_config(config, upstream_name.as_str(), upstream);
-        validate_runtime_upstream_tls(upstream_name, &runtime_upstream.effective_tls)?;
+        let mut upstream_uses_https_backends = false;
 
         for backend in &runtime_upstream.backends {
             if backend.backend.id.trim().is_empty() {
@@ -504,6 +504,9 @@ fn normalize_upstreams(
                     reason: err,
                 }
             })?;
+            if endpoint.scheme() == crate::backend_endpoint::BackendScheme::Https {
+                upstream_uses_https_backends = true;
+            }
 
             let origin = endpoint.origin();
             if let Some((existing_upstream, existing_backend)) = seen_backend_origins.insert(
@@ -520,6 +523,10 @@ fn normalize_upstreams(
                     ),
                 });
             }
+        }
+
+        if upstream_uses_https_backends {
+            validate_runtime_upstream_tls(upstream_name, &runtime_upstream.effective_tls)?;
         }
 
         normalized.insert(upstream_name.clone(), runtime_upstream);
@@ -915,6 +922,57 @@ mod tests {
         assert_eq!(
             upstream.policy.forwarded_headers.0.mode,
             ForwardedHeaderPolicyMode::Append
+        );
+    }
+
+    #[test]
+    fn runtime_http_only_upstream_skips_unused_global_tls_validation() {
+        let mut config = sample_config();
+        config.upstream.get_mut("api").expect("upstream").backends[0].address =
+            "http://127.0.0.1:8080".to_string();
+        config.upstream_tls.ca_file = Some("   ".to_string());
+        config.upstream_tls.ca_dir = Some("   ".to_string());
+
+        let runtime = RuntimeConfig::from_config(&config).expect("runtime config");
+        let upstream = runtime.upstreams.get("api").expect("runtime upstream");
+
+        assert_eq!(
+            upstream.backends[0].backend.address,
+            "http://127.0.0.1:8080"
+        );
+    }
+
+    #[test]
+    fn runtime_http_only_upstream_skips_unused_per_upstream_tls_validation() {
+        let mut config = sample_config();
+        config.upstream.get_mut("api").expect("upstream").backends[0].address =
+            "http://127.0.0.1:8080".to_string();
+        config.upstream.get_mut("api").expect("upstream").tls = Some(UpstreamTls {
+            verify_certificates: true,
+            strict_sni: true,
+            ca_file: Some("   ".to_string()),
+            ca_dir: Some("   ".to_string()),
+        });
+
+        let runtime = RuntimeConfig::from_config(&config).expect("runtime config");
+        let upstream = runtime.upstreams.get("api").expect("runtime upstream");
+
+        assert_eq!(
+            upstream.backends[0].backend.address,
+            "http://127.0.0.1:8080"
+        );
+    }
+
+    #[test]
+    fn runtime_https_upstream_still_requires_non_empty_effective_tls_fields() {
+        let mut config = sample_config();
+        config.upstream_tls.ca_file = Some("   ".to_string());
+
+        let err = RuntimeConfig::from_config(&config).expect_err("https upstream must validate");
+        assert_eq!(err.category(), "tls_material_invalid");
+        assert!(
+            err.to_string()
+                .contains("upstream 'api' has an empty effective upstream_tls.ca_file")
         );
     }
 

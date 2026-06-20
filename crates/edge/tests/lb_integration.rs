@@ -10,7 +10,7 @@ use std::{
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::{Request, Response, body::Incoming, service::service_fn};
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::TokioIo;
 use rand::RngCore;
 use rcgen::{Certificate, CertificateParams, SanType};
 use tempfile::{TempDir, tempdir};
@@ -62,7 +62,7 @@ async fn start_h2_backend(body: &'static str) -> SocketAddr {
             });
 
             tokio::spawn(async move {
-                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                let _ = hyper::server::conn::http1::Builder::new()
                     .serve_connection(io, service)
                     .await;
             });

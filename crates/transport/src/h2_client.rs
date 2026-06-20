@@ -55,9 +55,9 @@ type ResolverResponse = std::vec::IntoIter<SocketAddr>;
 type ResolverFuture =
     Pin<Box<dyn Future<Output = Result<ResolverResponse, io::Error>> + Send + 'static>>;
 
-const DEFAULT_MAX_IDLE_PER_HOST: usize = 64;
-const DEFAULT_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const DEFAULT_MAX_IDLE_PER_HOST: usize = 64;
+pub(crate) const DEFAULT_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsCacheUpdate {
@@ -197,7 +197,7 @@ impl Default for H2Client {
 }
 
 #[derive(Clone, Copy)]
-struct TokioExecutor;
+pub(crate) struct TokioExecutor;
 
 impl<F> Executor<F> for TokioExecutor
 where

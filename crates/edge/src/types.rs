@@ -9,7 +9,7 @@ use spooky_config::{
 };
 use spooky_errors::ProxyError;
 use spooky_lb::UpstreamPool;
-use spooky_transport::{h2_client::SharedDnsResolver, h2_pool::H2Pool};
+use spooky_transport::{h2_client::SharedDnsResolver, transport_pool::UpstreamTransportPool};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::UdpSocket,
@@ -30,7 +30,7 @@ use crate::watchdog::WatchdogCoordinator;
 pub struct SharedRuntimeState {
     pub(crate) listener_runtime_configs: Arc<HashMap<String, ListenerRuntimeConfig>>,
     pub(crate) listener_tls_store: Arc<ListenerTlsReloadStore>,
-    pub(crate) h2_pool: Arc<H2Pool>,
+    pub(crate) transport_pool: Arc<UpstreamTransportPool>,
     pub(crate) backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
     pub(crate) backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
     pub(crate) backend_dns_resolver: SharedDnsResolver,
@@ -88,7 +88,7 @@ pub struct QUICListener {
     pub tls_reload_generation: u64,
     pub quic_config: quiche::Config,
     pub h3_config: Arc<quiche::h3::Config>,
-    pub h2_pool: Arc<H2Pool>,
+    pub transport_pool: Arc<UpstreamTransportPool>,
     pub backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
     pub backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
     pub backend_dns_resolver: SharedDnsResolver,

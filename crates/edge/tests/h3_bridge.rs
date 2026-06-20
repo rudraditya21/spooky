@@ -285,7 +285,7 @@ async fn start_h2_backend() -> SocketAddr {
                     Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from("backend ok\n"))))
                 });
 
-                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                let _ = hyper::server::conn::http1::Builder::new()
                     .serve_connection(io, service)
                     .await;
             });
@@ -316,7 +316,7 @@ async fn start_h2_backend_draining() -> SocketAddr {
                         Full::new(Bytes::from_static(b"ok\n")).boxed(),
                     ))
                 });
-                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                let _ = hyper::server::conn::http1::Builder::new()
                     .serve_connection(io, service)
                     .await;
             });
@@ -1246,12 +1246,13 @@ async fn start_h2_backend_with_trailers() -> SocketAddr {
                     Ok::<_, hyper::Error>(
                         Response::builder()
                             .header("content-type", "application/grpc")
+                            .header(http::header::TRAILER, "grpc-status, grpc-message")
                             .body(body)
                             .expect("response"),
                     )
                 });
 
-                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                let _ = hyper::server::conn::http1::Builder::new()
                     .serve_connection(io, service)
                     .await;
             });
@@ -1287,6 +1288,7 @@ async fn start_h2_backend_with_grpc_routes() -> SocketAddr {
                             );
                             Response::builder()
                                 .header("content-type", "application/grpc")
+                                .header(http::header::TRAILER, "grpc-status, grpc-message")
                                 .body(
                                     TrailerThenEndBody::new(
                                         Bytes::from_static(b"\x00\x00\x00\x00\x00"),
@@ -1308,6 +1310,7 @@ async fn start_h2_backend_with_grpc_routes() -> SocketAddr {
                             );
                             Response::builder()
                                 .header("content-type", "application/grpc")
+                                .header(http::header::TRAILER, "grpc-status, grpc-message")
                                 .body(TrailerThenEndBody::new(Bytes::new(), trailers).boxed())
                                 .expect("grpc error response")
                         }
@@ -1324,7 +1327,7 @@ async fn start_h2_backend_with_grpc_routes() -> SocketAddr {
                     Ok::<_, hyper::Error>(response)
                 });
 
-                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                let _ = hyper::server::conn::http1::Builder::new()
                     .serve_connection(io, service)
                     .await;
             });
@@ -2156,7 +2159,7 @@ async fn start_h2_backend_with_regression_routes() -> SocketAddr {
             });
 
             tokio::spawn(async move {
-                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                let _ = hyper::server::conn::http1::Builder::new()
                     .serve_connection(io, service)
                     .await;
             });
@@ -2196,7 +2199,7 @@ async fn start_h2_backend_with_drain_probe(inflight_seen: Arc<AtomicBool>) -> So
             });
 
             tokio::spawn(async move {
-                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                let _ = hyper::server::conn::http1::Builder::new()
                     .serve_connection(io, service)
                     .await;
             });
@@ -2259,7 +2262,7 @@ async fn start_h2_backend_with_chaos_routes() -> SocketAddr {
             });
 
             tokio::spawn(async move {
-                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                let _ = hyper::server::conn::http1::Builder::new()
                     .serve_connection(io, service)
                     .await;
             });
@@ -4343,7 +4346,7 @@ fn response_body_cap_returns_503_on_declared_length_breach() {
                         Ok::<_, hyper::Error>(response)
                     }
                 });
-                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                let _ = hyper::server::conn::http1::Builder::new()
                     .serve_connection(io, service)
                     .await;
             });
@@ -4529,7 +4532,7 @@ fn response_body_cap_returns_503_on_unknown_length_breach() {
                     });
                     Ok::<_, hyper::Error>(Response::new(body.boxed()))
                 });
-                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                let _ = hyper::server::conn::http1::Builder::new()
                     .serve_connection(io, service)
                     .await;
             });
