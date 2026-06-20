@@ -3,7 +3,7 @@ use super::*;
 impl QUICListener {
     pub(super) fn spawn_health_checks(
         upstream_pools: HashMap<String, Arc<RwLock<UpstreamPool>>>,
-        h2_pool: Arc<H2Pool>,
+        transport_pool: Arc<UpstreamTransportPool>,
         backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
         backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
         metrics: Arc<Metrics>,
@@ -82,7 +82,7 @@ impl QUICListener {
         };
 
         for (base_interval_ms, mut jobs) in grouped_jobs {
-            let h2_pool = Arc::clone(&h2_pool);
+            let transport_pool = Arc::clone(&transport_pool);
             let backend_resolution_store = Arc::clone(&backend_resolution_store);
             let task_metrics = Arc::clone(&metrics);
             let handle = handle.clone();
@@ -121,7 +121,7 @@ impl QUICListener {
                             );
                             let result = tokio::time::timeout(
                                 job.timeout,
-                                h2_pool.send(&job.backend_identity, request),
+                                transport_pool.send(&job.backend_identity, request),
                             )
                             .await;
 

@@ -49,7 +49,7 @@ use spooky_bridge::h3_to_h2::{
 use spooky_errors::{PoolError, ProxyError, is_retryable};
 use spooky_lb::{HealthFailureReason, HealthTransition, UpstreamPool};
 use spooky_transport::h2_client::{SharedDnsResolver, TlsClientConfig};
-use spooky_transport::h2_pool::H2Pool;
+use spooky_transport::transport_pool::{BackendTransportKind, UpstreamTransportPool};
 use tokio::runtime::Handle;
 use tokio::sync::{
     Semaphore, mpsc,
@@ -554,7 +554,7 @@ impl QUICListener {
             .collect::<HashMap<_, _>>();
         let listener_tls_store = Arc::new(Self::build_listener_tls_reload_store(config)?);
 
-        let mut backend_addresses = Vec::new();
+        let mut backend_transports = Vec::new();
         let mut backend_resolutions = Vec::new();
         let mut seen_backend_origins: HashMap<String, (String, String)> = HashMap::new();
         let mut backend_tls_configs: HashMap<String, TlsClientConfig> = HashMap::new();
@@ -578,7 +578,7 @@ impl QUICListener {
                     (upstream_name.clone(), backend.backend.id.clone()),
                 ) {
                     return Err(ProxyError::Transport(format!(
-                        "duplicate backend address '{}' detected while building H2 pool: upstream '{}' backend '{}' conflicts with upstream '{}' backend '{}'",
+                        "duplicate backend address '{}' detected while building upstream transport pool: upstream '{}' backend '{}' conflicts with upstream '{}' backend '{}'",
                         origin,
                         upstream_name,
                         backend.backend.id,
@@ -586,7 +586,13 @@ impl QUICListener {
                         existing_backend
                     )));
                 }
-                backend_addresses.push(backend.backend.address.clone());
+                backend_transports.push((
+                    backend.backend.address.clone(),
+                    match endpoint.scheme() {
+                        BackendScheme::Http => BackendTransportKind::Http1,
+                        BackendScheme::Https => BackendTransportKind::H2,
+                    },
+                ));
                 let authority_host = endpoint.authority_host().to_string();
                 let authority_port = endpoint.authority_port();
                 let resolution = if endpoint.authority_is_ip_literal() {
@@ -625,17 +631,19 @@ impl QUICListener {
                     upstream_tls_client.ca_dir,
                     authority_kind
                 );
-                backend_tls_configs
-                    .insert(backend.backend.address.clone(), upstream_tls_client.clone());
+                if endpoint.scheme() == BackendScheme::Https {
+                    backend_tls_configs
+                        .insert(backend.backend.address.clone(), upstream_tls_client.clone());
+                }
             }
         }
 
         let backend_dns_resolver = SharedDnsResolver::new();
         let backend_resolution_store =
             Arc::new(RuntimeBackendResolutionStore::new(backend_resolutions));
-        let h2_pool = Arc::new(
-            H2Pool::new(
-                backend_addresses,
+        let transport_pool = Arc::new(
+            UpstreamTransportPool::new(
+                backend_transports,
                 backend_tls_configs,
                 max_inflight_per_backend,
                 config.performance.h2_pool_max_idle_per_backend,
@@ -707,7 +715,7 @@ impl QUICListener {
         Ok(SharedRuntimeState {
             listener_runtime_configs: Arc::new(listener_runtime_configs),
             listener_tls_store,
-            h2_pool,
+            transport_pool,
             backend_endpoints: Arc::new(
                 config
                     .upstreams
@@ -749,14 +757,14 @@ impl QUICListener {
             .set_expected_workers(worker_count.max(1));
         Self::spawn_backend_dns_refresh(
             config,
-            Arc::clone(&shared_state.h2_pool),
+            Arc::clone(&shared_state.transport_pool),
             Arc::clone(&shared_state.backend_resolution_store),
             shared_state.backend_dns_resolver.clone(),
             Arc::clone(&shared_state.metrics),
         );
         Self::spawn_health_checks(
             shared_state.upstream_pools.clone(),
-            Arc::clone(&shared_state.h2_pool),
+            Arc::clone(&shared_state.transport_pool),
             Arc::clone(&shared_state.backend_endpoints),
             Arc::clone(&shared_state.backend_resolution_store),
             Arc::clone(&shared_state.metrics),
@@ -869,7 +877,7 @@ impl QUICListener {
             tls_reload_generation,
             quic_config,
             h3_config,
-            h2_pool: Arc::clone(&shared_state.h2_pool),
+            transport_pool: Arc::clone(&shared_state.transport_pool),
             backend_endpoints: Arc::clone(&shared_state.backend_endpoints),
             backend_resolution_store: Arc::clone(&shared_state.backend_resolution_store),
             backend_dns_resolver: shared_state.backend_dns_resolver.clone(),
@@ -1674,7 +1682,7 @@ impl QUICListener {
             return;
         }
 
-        let h2_pool = self.h2_pool.clone();
+        let transport_pool = self.transport_pool.clone();
 
         // First, try to find existing connection by DCID
         debug!("Looking up connection with DCID: {:?}", hex::encode(dcid));
@@ -1848,7 +1856,7 @@ impl QUICListener {
             && (connection.quic.is_established() || connection.quic.is_in_early_data())
             && let Err(e) = Self::handle_h3(
                 &mut connection,
-                Arc::clone(&h2_pool),
+                Arc::clone(&transport_pool),
                 Arc::clone(&self.backend_endpoints),
                 Arc::clone(&self.backend_resolution_store),
                 Arc::clone(&self.upstream_policies),
@@ -2119,7 +2127,7 @@ impl QUICListener {
     #[allow(clippy::too_many_arguments)]
     fn handle_h3(
         connection: &mut QuicConnection,
-        h2_pool: Arc<H2Pool>,
+        transport_pool: Arc<UpstreamTransportPool>,
         backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
         backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
         upstream_policies: Arc<HashMap<String, RuntimeUpstreamPolicy>>,
@@ -2572,7 +2580,7 @@ impl QUICListener {
                                 }
                             };
 
-                            let h2 = h2_pool.clone();
+                            let transport = transport_pool.clone();
                             let fwd_addr = addr.clone();
                             let cb = Arc::clone(&resilience.circuit_breakers);
                             let retry_budget = Arc::clone(&resilience.retry_budget);
@@ -2617,7 +2625,7 @@ impl QUICListener {
                                             BoxBody<Bytes, std::convert::Infallible>,
                                         >,
                                          cb: Arc<crate::resilience::CircuitBreakers>,
-                                         h2: Arc<H2Pool>,
+                                         transport: Arc<UpstreamTransportPool>,
                                          metrics: Arc<Metrics>,
                                          backend_resolutions: Arc<RuntimeBackendResolutionStore>| async move {
                                             if !cb.allow_request(&backend) {
@@ -2632,7 +2640,7 @@ impl QUICListener {
                                             );
                                             let send_result = tokio::time::timeout(
                                                 backend_timeout,
-                                                h2.send(&backend, req),
+                                                transport.send(&backend, req),
                                             )
                                             .await
                                             .map_err(|_| ProxyError::Timeout);
@@ -2663,7 +2671,7 @@ impl QUICListener {
                                                 primary_backend,
                                                 request,
                                                 Arc::clone(&cb),
-                                                Arc::clone(&h2),
+                                                Arc::clone(&transport),
                                                 Arc::clone(&send_metrics),
                                                 Arc::clone(&backend_resolutions),
                                             );
@@ -2682,7 +2690,7 @@ impl QUICListener {
                                                     hedge_backend,
                                                     hedge_request,
                                                     Arc::clone(&cb),
-                                                    Arc::clone(&h2),
+                                                    Arc::clone(&transport),
                                                     Arc::clone(&send_metrics),
                                                     Arc::clone(&backend_resolutions),
                                                 );
@@ -2709,7 +2717,7 @@ impl QUICListener {
                                                 fwd_addr.clone(),
                                                 request,
                                                 Arc::clone(&cb),
-                                                Arc::clone(&h2),
+                                                Arc::clone(&transport),
                                                 Arc::clone(&send_metrics),
                                                 Arc::clone(&backend_resolutions),
                                             )
@@ -2720,7 +2728,7 @@ impl QUICListener {
                                             fwd_addr.clone(),
                                             request,
                                             Arc::clone(&cb),
-                                            Arc::clone(&h2),
+                                            Arc::clone(&transport),
                                             Arc::clone(&send_metrics),
                                             Arc::clone(&backend_resolutions),
                                         )
@@ -2762,7 +2770,7 @@ impl QUICListener {
                                                         retry_backend,
                                                         retry_request,
                                                         Arc::clone(&cb),
-                                                        Arc::clone(&h2),
+                                                        Arc::clone(&transport),
                                                         Arc::clone(&send_metrics),
                                                         Arc::clone(&backend_resolutions),
                                                     )
@@ -4960,7 +4968,7 @@ impl QUICListener {
                 ))
             })?;
 
-        let h2_pool = Arc::clone(&shared_state.h2_pool);
+        let transport_pool = Arc::clone(&shared_state.transport_pool);
         let backend_endpoints = Arc::clone(&shared_state.backend_endpoints);
         let backend_resolution_store = Arc::clone(&shared_state.backend_resolution_store);
         let upstream_policies = Arc::clone(&shared_state.upstream_policies);
@@ -5032,7 +5040,7 @@ impl QUICListener {
                 };
 
                 let alt_svc = alt_svc_value.clone();
-                let h2_pool = Arc::clone(&h2_pool);
+                let transport_pool = Arc::clone(&transport_pool);
                 let backend_endpoints = Arc::clone(&backend_endpoints);
                 let backend_resolution_store = Arc::clone(&backend_resolution_store);
                 let upstream_policies = Arc::clone(&upstream_policies);
@@ -5116,7 +5124,7 @@ impl QUICListener {
                     let svc = service_fn(
                         move |mut req: Request<Incoming>| -> BootstrapServiceFuture {
                             let alt = alt_svc_conn.clone();
-                            let h2_pool = Arc::clone(&h2_pool);
+                            let transport_pool = Arc::clone(&transport_pool);
                             let backend_endpoints = Arc::clone(&backend_endpoints);
                             let backend_resolution_store = Arc::clone(&backend_resolution_store);
                             let upstream_policies = Arc::clone(&upstream_policies);
@@ -5607,7 +5615,7 @@ impl QUICListener {
                                     );
                                     match tokio::time::timeout(
                                         backend_timeout,
-                                        h2_pool.send(&backend_addr, upstream_req),
+                                        transport_pool.send(&backend_addr, upstream_req),
                                     )
                                     .await
                                     {

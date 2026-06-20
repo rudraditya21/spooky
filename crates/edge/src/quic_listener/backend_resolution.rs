@@ -39,7 +39,7 @@ enum BackendDnsRefreshOutcome {
 impl QUICListener {
     pub(super) fn spawn_backend_dns_refresh(
         config: &RuntimeConfig,
-        h2_pool: Arc<H2Pool>,
+        transport_pool: Arc<UpstreamTransportPool>,
         backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
         backend_dns_resolver: SharedDnsResolver,
         metrics: Arc<Metrics>,
@@ -72,7 +72,7 @@ impl QUICListener {
                 for backend in backend_resolution_store.hostname_entries() {
                     match refresh_backend_hostname(
                         &backend,
-                        &h2_pool,
+                        &transport_pool,
                         &backend_resolution_store,
                         &backend_dns_resolver,
                     )
@@ -162,7 +162,7 @@ impl QUICListener {
 
 async fn refresh_backend_hostname(
     backend: &RuntimeBackendResolution,
-    h2_pool: &H2Pool,
+    transport_pool: &UpstreamTransportPool,
     backend_resolution_store: &RuntimeBackendResolutionStore,
     backend_dns_resolver: &SharedDnsResolver,
 ) -> BackendDnsRefreshOutcome {
@@ -211,8 +211,8 @@ async fn refresh_backend_hostname(
 
     let client_rotated = if update.changed() {
         matches!(
-            h2_pool.rotate_backend_client(&update.backend_addr),
-            Ok(Some(_))
+            transport_pool.rotate_backend_client(&update.backend_addr),
+            Ok(true)
         )
     } else {
         false
