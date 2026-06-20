@@ -403,6 +403,10 @@ pub fn observe_default_control_api_restart_path() -> String {
     String::from("/admin/runtime/restart")
 }
 
+pub fn observe_default_control_api_reload_path() -> String {
+    String::from("/admin/runtime/reload")
+}
+
 pub fn observe_default_control_api_reload_certs_path() -> String {
     String::from("/admin/runtime/reload-certs")
 }

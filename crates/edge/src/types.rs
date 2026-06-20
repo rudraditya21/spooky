@@ -4,7 +4,8 @@ use rustls::ServerConfig as RustlsServerConfig;
 use spooky_config::{
     backend_endpoint::BackendEndpoint,
     runtime::{
-        ListenerRuntimeConfig, RuntimeListenerTls, RuntimeTlsIdentity, RuntimeUpstreamPolicy,
+        ListenerRuntimeConfig, RuntimeConfig, RuntimeListenerTls, RuntimeTlsIdentity,
+        RuntimeUpstreamPolicy,
     },
 };
 use spooky_errors::ProxyError;
@@ -86,6 +87,8 @@ pub struct QUICListener {
     pub listener_label: String,
     pub listener_tls_store: Arc<ListenerTlsReloadStore>,
     pub tls_reload_generation: u64,
+    pub runtime_bundle: Option<Arc<RuntimeBundleHandle>>,
+    pub runtime_generation: u64,
     pub quic_config: quiche::Config,
     pub h3_config: Arc<quiche::h3::Config>,
     pub transport_pool: Arc<UpstreamTransportPool>,
@@ -126,6 +129,53 @@ pub struct QUICListener {
     pub(crate) peer_routes: HashMap<SocketAddr, Arc<[u8]>>, // KEY: peer address, VALUE: primary SCID
     pub(crate) cid_radix: CidRadix,
     pub(crate) conn_rate_limiter: crate::quic_listener::TokenBucket,
+}
+
+#[derive(Clone)]
+pub struct RuntimeBundle {
+    pub generation: u64,
+    pub config_path: String,
+    pub runtime_config: RuntimeConfig,
+    pub shared_state: Arc<SharedRuntimeState>,
+}
+
+impl RuntimeBundle {
+    pub fn listener_runtime_config(&self, label: &str) -> Option<ListenerRuntimeConfig> {
+        self.shared_state.listener_runtime_configs.get(label).cloned()
+    }
+}
+
+#[derive(Clone)]
+pub struct RuntimeBundleHandle {
+    inner: Arc<RwLock<Arc<RuntimeBundle>>>,
+}
+
+impl RuntimeBundleHandle {
+    pub fn new(bundle: RuntimeBundle) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(Arc::new(bundle))),
+        }
+    }
+
+    pub fn current(&self) -> Arc<RuntimeBundle> {
+        self.inner
+            .read()
+            .map(|bundle| Arc::clone(&*bundle))
+            .unwrap_or_else(|_| panic!("runtime bundle lock poisoned"))
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.current().generation
+    }
+
+    pub fn replace(&self, bundle: RuntimeBundle) -> Result<u64, ProxyError> {
+        let generation = bundle.generation;
+        let mut guard = self.inner.write().map_err(|_| {
+            ProxyError::Transport("runtime bundle lock poisoned".to_string())
+        })?;
+        *guard = Arc::new(bundle);
+        Ok(generation)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1,5 +1,7 @@
 use super::*;
 use std::ffi::OsString;
+use spooky_config::loader::read_config;
+use spooky_config::runtime::RuntimeConfig;
 use subtle::ConstantTimeEq;
 
 #[derive(Clone)]
@@ -8,6 +10,7 @@ pub(super) struct ControlApiPaths {
     pub(super) ready_path: String,
     pub(super) runtime_path: String,
     pub(super) restart_path: String,
+    pub(super) reload_path: String,
     pub(super) reload_certs_path: String,
 }
 
@@ -23,10 +26,30 @@ pub(super) struct ControlApiState {
     pub(super) expected_workers: usize,
     pub(super) started_at: Instant,
     pub(super) auth_token: Option<String>,
+    pub(super) runtime_bundle: Option<Arc<RuntimeBundleHandle>>,
 }
 
 impl ControlApiState {
+    fn current_runtime(&self) -> Option<Arc<RuntimeBundle>> {
+        self.runtime_bundle.as_ref().map(|handle| handle.current())
+    }
+
     pub(super) fn snapshot_backend_health(&self) -> (usize, usize) {
+        if let Some(runtime) = self.current_runtime() {
+            let mut healthy = 0usize;
+            let mut total = 0usize;
+            for pool in runtime.shared_state.upstream_pools.values() {
+                let guard = match pool.read() {
+                    Ok(guard) => guard,
+                    Err(_) => continue,
+                };
+                let pool_total = guard.pool.len();
+                total = total.saturating_add(pool_total);
+                healthy = healthy.saturating_add(guard.pool.healthy_len().min(pool_total));
+            }
+            return (healthy, total);
+        }
+
         let mut healthy = 0usize;
         let mut total = 0usize;
         for pool in self.upstream_pools.values() {
@@ -75,6 +98,7 @@ impl QUICListener {
     pub(super) fn spawn_control_api_endpoint(
         config: &RuntimeConfig,
         shared_state: &SharedRuntimeState,
+        runtime_bundle: Option<Arc<RuntimeBundleHandle>>,
         worker_count: usize,
     ) -> Result<(), ProxyError> {
         let endpoint = &config.observability.control_api;
@@ -110,6 +134,7 @@ impl QUICListener {
             ready_path: endpoint.ready_path.clone(),
             runtime_path: endpoint.runtime_path.clone(),
             restart_path: endpoint.restart_path.clone(),
+            reload_path: endpoint.reload_path.clone(),
             reload_certs_path: endpoint.reload_certs_path.clone(),
         };
         let state = ControlApiState {
@@ -123,6 +148,7 @@ impl QUICListener {
             expected_workers: worker_count.max(1),
             started_at: Instant::now(),
             auth_token: endpoint.auth_token.clone(),
+            runtime_bundle,
         };
 
         let handle = match runtime_handle() {
@@ -289,6 +315,9 @@ impl QUICListener {
         paths: &ControlApiPaths,
         state: &ControlApiState,
     ) -> Response<Full<Bytes>> {
+        if state.runtime_bundle.is_some() {
+            return Self::handle_runtime_control_api_request(req, paths, state);
+        }
         let path = req.uri().path();
 
         if req.method() == http::Method::GET && path == paths.health_path {
@@ -498,6 +527,324 @@ impl QUICListener {
             Ok(resp) => resp,
             Err(_) => Response::new(Full::new(Bytes::from_static(b"not found\n"))),
         }
+    }
+
+    fn handle_runtime_control_api_request(
+        req: Request<Incoming>,
+        paths: &ControlApiPaths,
+        state: &ControlApiState,
+    ) -> Response<Full<Bytes>> {
+        let path = req.uri().path();
+        let Some(runtime_bundle_handle) = state.runtime_bundle.as_ref() else {
+            return Self::json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({
+                    "error": "runtime bundle missing",
+                }),
+            );
+        };
+        let runtime = runtime_bundle_handle.current();
+        let shared_state = &runtime.shared_state;
+
+        if req.method() == http::Method::GET && path == paths.health_path {
+            let response = json!({
+                "status": "ok",
+                "uptime_ms": state.started_at.elapsed().as_millis() as u64,
+                "watchdog": {
+                    "enabled": shared_state.watchdog.enabled(),
+                    "degraded": shared_state.watchdog.is_degraded(),
+                    "restart_requested": shared_state.watchdog.restart_requested(),
+                },
+            });
+            return Self::json_response(StatusCode::OK, response);
+        }
+
+        if req.method() == http::Method::GET && path == paths.ready_path {
+            let (healthy_backends, total_backends) = state.snapshot_backend_health();
+            let restart_requested = shared_state.watchdog.restart_requested();
+            let ready = !restart_requested && (total_backends == 0 || healthy_backends > 0);
+            let response = json!({
+                "ready": ready,
+                "healthy_backends": healthy_backends,
+                "total_backends": total_backends,
+                "restart_requested": restart_requested,
+            });
+            return Self::json_response(
+                if ready {
+                    StatusCode::OK
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                },
+                response,
+            );
+        }
+
+        if req.method() == http::Method::GET && path == paths.runtime_path {
+            if !Self::control_api_is_authorized(&req, state) {
+                return Self::json_response(
+                    StatusCode::UNAUTHORIZED,
+                    json!({
+                        "error": "unauthorized",
+                    }),
+                );
+            }
+            let (healthy_backends, total_backends) = state.snapshot_backend_health();
+            let tls_listeners = shared_state
+                .listener_tls_store
+                .snapshot()
+                .into_iter()
+                .map(|(listener, inventory)| {
+                    (
+                        listener.clone(),
+                        json!({
+                            "default_cert": inventory.default_identity.identity.cert_path,
+                            "default_key": inventory.default_identity.identity.key_path,
+                            "default_cert_not_after_unix_seconds": inventory.default_identity.metadata.not_after_unix_seconds,
+                            "sni_names": inventory.sni_identities.keys().cloned().collect::<Vec<_>>(),
+                            "client_auth_enabled": inventory.listener_tls.client_auth.enabled,
+                            "require_client_cert": inventory.listener_tls.client_auth.require_client_cert,
+                            "generation": shared_state.listener_tls_store.generation(&listener).unwrap_or(0),
+                        }),
+                    )
+                })
+                .collect::<serde_json::Map<String, serde_json::Value>>();
+            let response = json!({
+                "uptime_ms": state.started_at.elapsed().as_millis() as u64,
+                "workers": {
+                    "expected": state.expected_workers,
+                },
+                "watchdog": {
+                    "enabled": shared_state.watchdog.enabled(),
+                    "degraded": shared_state.watchdog.is_degraded(),
+                    "restart_requested": shared_state.watchdog.restart_requested(),
+                    "restart_reason": shared_state.watchdog.restart_reason(),
+                    "restart_requested_at_ms": shared_state.watchdog.restart_requested_at_ms(),
+                },
+                "adaptive_admission": {
+                    "enabled": shared_state.resilience.adaptive_admission.enabled(),
+                    "current_limit": shared_state.resilience.adaptive_admission.current_limit(),
+                    "inflight_percent": shared_state.resilience.adaptive_admission.inflight_percent(),
+                },
+                "backends": {
+                    "healthy": healthy_backends,
+                    "total": total_backends,
+                },
+                "metrics": {
+                    "requests_total": shared_state.metrics.requests_total.load(Ordering::Relaxed),
+                    "requests_success": shared_state.metrics.requests_success.load(Ordering::Relaxed),
+                    "requests_failure": shared_state.metrics.requests_failure.load(Ordering::Relaxed),
+                    "active_connections": shared_state.metrics.active_connections.load(Ordering::Relaxed),
+                    "backend_timeouts": shared_state.metrics.backend_timeouts.load(Ordering::Relaxed),
+                    "backend_errors": shared_state.metrics.backend_errors.load(Ordering::Relaxed),
+                },
+                "tls": {
+                    "listeners": tls_listeners,
+                },
+                "runtime": {
+                    "generation": runtime.generation,
+                    "config_path": runtime.config_path,
+                },
+                "extension_model": {
+                    "status": "non_goal",
+                    "details": "No plugin/middleware ABI is exposed in-process today; extension support remains a deliberate non-goal until a safe isolation model is designed.",
+                },
+            });
+            return Self::json_response(StatusCode::OK, response);
+        }
+
+        if req.method() == http::Method::POST
+            && (path == paths.reload_certs_path || path == paths.reload_path)
+        {
+            if !Self::control_api_is_authorized(&req, state) {
+                return Self::json_response(
+                    StatusCode::UNAUTHORIZED,
+                    json!({
+                        "reloaded": false,
+                        "error": "unauthorized",
+                    }),
+                );
+            }
+
+            let config_path = runtime.config_path.clone();
+            let config = match read_config(&config_path) {
+                Ok(config) => config,
+                Err(err) => {
+                    return Self::json_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        json!({
+                            "reloaded": false,
+                            "error": err,
+                        }),
+                    );
+                }
+            };
+            if let Err(err) = spooky_config::validator::validate(&config) {
+                return Self::json_response(
+                    StatusCode::BAD_REQUEST,
+                    json!({
+                        "reloaded": false,
+                        "error": format!("Configuration validation failed: {err}"),
+                    }),
+                );
+            }
+            let runtime_config = match RuntimeConfig::from_config(&config) {
+                Ok(runtime_config) => runtime_config,
+                Err(err) => {
+                    return Self::json_response(
+                        StatusCode::BAD_REQUEST,
+                        json!({
+                            "reloaded": false,
+                            "error": format!("Runtime configuration normalization failed: {err}"),
+                        }),
+                    );
+                }
+            };
+            let next_shared_state = match QUICListener::build_shared_state(&runtime_config) {
+                Ok(shared_state) => Arc::new(shared_state),
+                Err(err) => {
+                    return Self::json_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        json!({
+                            "reloaded": false,
+                            "error": err.to_string(),
+                        }),
+                    );
+                }
+            };
+            let next_runtime = RuntimeBundle {
+                generation: runtime.generation.saturating_add(1),
+                config_path,
+                runtime_config,
+                shared_state: next_shared_state,
+            };
+            if let Some((missing, existing)) = Self::validate_runtime_reload_compatibility(
+                &runtime,
+                &next_runtime,
+            ) {
+                return Self::json_response(
+                    StatusCode::CONFLICT,
+                    json!({
+                        "reloaded": false,
+                        "error": format!(
+                            "runtime reload rejected: listener set changed (missing={missing:?}, extra={existing:?})"
+                        ),
+                    }),
+                );
+            }
+            let generation = match runtime_bundle_handle.replace(next_runtime) {
+                Ok(generation) => generation,
+                Err(err) => {
+                    return Self::json_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        json!({
+                            "reloaded": false,
+                            "error": err.to_string(),
+                        }),
+                    );
+                }
+            };
+            return Self::json_response(
+                StatusCode::ACCEPTED,
+                json!({
+                    "reloaded": true,
+                    "generation": generation,
+                    "path": path,
+                }),
+            );
+        }
+
+        if req.method() == http::Method::POST && path == paths.restart_path {
+            if !Self::control_api_is_authorized(&req, state) {
+                return Self::json_response(
+                    StatusCode::UNAUTHORIZED,
+                    json!({
+                        "accepted": false,
+                        "error": "unauthorized",
+                    }),
+                );
+            }
+            if !shared_state.watchdog.enabled() {
+                return Self::json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    json!({
+                        "accepted": false,
+                        "error": "watchdog disabled",
+                    }),
+                );
+            }
+
+            let accepted = shared_state.watchdog.request_restart("admin_runtime_api");
+            return Self::json_response(
+                if accepted {
+                    StatusCode::ACCEPTED
+                } else {
+                    StatusCode::CONFLICT
+                },
+                json!({
+                    "accepted": accepted,
+                    "restart_requested": shared_state.watchdog.restart_requested(),
+                    "reason": if accepted { "admin_runtime_api" } else { "restart pending or cooldown active" },
+                }),
+            );
+        }
+
+        match Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Full::new(Bytes::from_static(b"not found
+")))
+        {
+            Ok(resp) => resp,
+            Err(_) => Response::new(Full::new(Bytes::from_static(b"not found
+"))),
+        }
+    }
+
+    fn validate_runtime_reload_compatibility(
+        current: &RuntimeBundle,
+        next: &RuntimeBundle,
+    ) -> Option<(Vec<String>, Vec<String>)> {
+        let current_labels = current
+            .shared_state
+            .listener_runtime_configs
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let next_labels = next
+            .shared_state
+            .listener_runtime_configs
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        if current_labels.len() != next_labels.len() {
+            let missing = current_labels
+                .iter()
+                .filter(|label| !next.shared_state.listener_runtime_configs.contains_key(*label))
+                .cloned()
+                .collect::<Vec<_>>();
+            let extra = next_labels
+                .iter()
+                .filter(|label| !current.shared_state.listener_runtime_configs.contains_key(*label))
+                .cloned()
+                .collect::<Vec<_>>();
+            return Some((missing, extra));
+        }
+        if current_labels
+            .iter()
+            .any(|label| !next.shared_state.listener_runtime_configs.contains_key(label))
+        {
+            let missing = current_labels
+                .iter()
+                .filter(|label| !next.shared_state.listener_runtime_configs.contains_key(*label))
+                .cloned()
+                .collect::<Vec<_>>();
+            let extra = next_labels
+                .iter()
+                .filter(|label| !current.shared_state.listener_runtime_configs.contains_key(*label))
+                .cloned()
+                .collect::<Vec<_>>();
+            return Some((missing, extra));
+        }
+        None
     }
 
     pub(super) fn control_api_is_authorized(

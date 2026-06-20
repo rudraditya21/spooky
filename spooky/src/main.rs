@@ -18,9 +18,10 @@ use log::{error, info, warn};
 
 use spooky_config::validator::validate as validate_config;
 use spooky_edge::{
-    QUICListener, SharedRuntimeState, configure_async_runtime, constants::MAX_DATAGRAM_SIZE_BYTES,
-    stable_hash_socket_addr,
+    QUICListener, SharedRuntimeState, configure_async_runtime,
+    constants::MAX_DATAGRAM_SIZE_BYTES, stable_hash_socket_addr,
 };
+use spooky_edge::types::RuntimeBundleHandle;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -167,24 +168,27 @@ fn main() {
         }
     };
 
-    runtime.block_on(run(runtime_config, uid));
+    runtime.block_on(run(runtime_config, uid, config_path));
 }
 
-async fn run(runtime_config: RuntimeConfig, uid: libc::uid_t) {
-    let shared_state = match QUICListener::build_shared_state(&runtime_config) {
-        Ok(shared_state) => Arc::new(shared_state),
+async fn run(runtime_config: RuntimeConfig, uid: libc::uid_t, config_path: String) {
+    let runtime_bundle = match QUICListener::build_runtime_bundle(config_path, &runtime_config) {
+        Ok(bundle) => bundle,
         Err(e) => {
             error!("Failed to initialize shared runtime state: {}", e);
             std::process::exit(1);
         }
     };
+    let shared_state = Arc::clone(&runtime_bundle.shared_state);
+    let runtime_bundle = Arc::new(RuntimeBundleHandle::new(runtime_bundle));
 
     let worker_count = runtime_config.performance.worker_threads.max(1);
     let shard_count = runtime_config.performance.packet_shards_per_worker.max(1);
     let effective_worker_count = worker_count.saturating_mul(shard_count);
-    if let Err(err) = QUICListener::spawn_control_plane_tasks(
+    if let Err(err) = QUICListener::spawn_control_plane_tasks_with_runtime_bundle(
         &runtime_config,
         &shared_state,
+        Arc::clone(&runtime_bundle),
         effective_worker_count,
     ) {
         error!("Failed to initialize control-plane tasks: {}", err);
@@ -223,9 +227,11 @@ async fn run(runtime_config: RuntimeConfig, uid: libc::uid_t) {
     let mut worker_index_base = 0usize;
 
     for listener_config in runtime_config.listener_runtime_configs() {
-        if let Err(err) =
-            QUICListener::spawn_bootstrap_tls_listener(&listener_config, &shared_state)
-        {
+        if let Err(err) = QUICListener::spawn_bootstrap_tls_listener(
+            &listener_config,
+            &shared_state,
+            Some(Arc::clone(&runtime_bundle)),
+        ) {
             error!(
                 "Failed to initialize bootstrap TLS listener {} ({}:{}): {}",
                 listener_config.listen.index,
@@ -244,6 +250,7 @@ async fn run(runtime_config: RuntimeConfig, uid: libc::uid_t) {
             shard_queue_max_bytes,
             pin_workers,
             Arc::clone(&shared_state),
+            Arc::clone(&runtime_bundle),
             Arc::clone(&shutdown),
             worker_index_base,
         ) {
@@ -335,6 +342,7 @@ fn spawn_listener_worker_group(
     shard_queue_max_bytes: usize,
     pin_workers: bool,
     worker_shared: Arc<SharedRuntimeState>,
+    runtime_bundle: Arc<RuntimeBundleHandle>,
     worker_shutdown: Arc<AtomicBool>,
     worker_index_base: usize,
 ) -> Result<Vec<thread::JoinHandle<Result<(), String>>>, String> {
@@ -356,6 +364,7 @@ fn spawn_listener_worker_group(
         let worker_config = listener_config.clone();
         let worker_shutdown = Arc::clone(&worker_shutdown);
         let worker_shared = Arc::clone(&worker_shared);
+        let worker_runtime_bundle = Arc::clone(&runtime_bundle);
         let thread_name = format!("spooky-data-plane-{}", worker_idx);
         let handle =
             thread::Builder::new()
@@ -368,6 +377,7 @@ fn spawn_listener_worker_group(
                             worker_config,
                             socket,
                             worker_shared,
+                            Arc::clone(&worker_runtime_bundle),
                             worker_shutdown,
                         );
                     }
@@ -381,6 +391,7 @@ fn spawn_listener_worker_group(
                         worker_config,
                         socket,
                         worker_shared,
+                        Arc::clone(&worker_runtime_bundle),
                         worker_shutdown,
                     )
                 });
@@ -409,6 +420,7 @@ fn run_sharded_listener_worker(
     worker_config: ListenerRuntimeConfig,
     socket: std::net::UdpSocket,
     worker_shared: Arc<SharedRuntimeState>,
+    runtime_bundle: Arc<RuntimeBundleHandle>,
     worker_shutdown: Arc<AtomicBool>,
 ) -> Result<(), String> {
     maybe_pin_worker(worker_idx, pin_workers);
@@ -441,6 +453,7 @@ fn run_sharded_listener_worker(
 
         let (tx, rx) = mpsc::sync_channel::<IngressPacket>(shard_queue_capacity);
         shard_txs.push(tx);
+        let shard_runtime_bundle = Arc::clone(&runtime_bundle);
 
         let shard_name = format!("spooky-data-plane-{}-shard-{}", worker_idx, shard_idx);
         let shard_handle = thread::Builder::new()
@@ -458,7 +471,8 @@ fn run_sharded_listener_worker(
                         "worker {} shard {} listener init failed: {}",
                         worker_idx, shard_idx, err
                     )
-                })?;
+                })?
+                .with_runtime_bundle(Arc::clone(&shard_runtime_bundle));
 
                 let idle_timeout = Duration::from_millis(10);
                 while !shard_shutdown.load(Ordering::Relaxed) {
@@ -601,13 +615,18 @@ fn run_single_listener_worker(
     worker_config: ListenerRuntimeConfig,
     socket: std::net::UdpSocket,
     worker_shared: Arc<SharedRuntimeState>,
+    runtime_bundle: Arc<RuntimeBundleHandle>,
     worker_shutdown: Arc<AtomicBool>,
 ) -> Result<(), String> {
     maybe_pin_worker(worker_idx, pin_workers);
     worker_shared.bind_metrics_worker_slot(worker_idx);
-    let mut listener =
-        QUICListener::new_with_socket_and_shared_state(worker_config, socket, worker_shared)
-            .map_err(|err| format!("worker {} listener init failed: {}", worker_idx, err))?;
+    let mut listener = QUICListener::new_with_socket_and_shared_state(
+        worker_config,
+        socket,
+        worker_shared,
+    )
+    .map_err(|err| format!("worker {} listener init failed: {}", worker_idx, err))?
+    .with_runtime_bundle(Arc::clone(&runtime_bundle));
 
     while !worker_shutdown.load(Ordering::Relaxed) {
         listener.poll();

@@ -262,7 +262,7 @@ fn make_listener_with_bootstrap(config: Config) -> QUICListener {
         Arc::new(QUICListener::build_shared_state(&runtime_config).expect("shared runtime state"));
     QUICListener::spawn_control_plane_tasks(&runtime_config, &shared_state, 1)
         .expect("control plane tasks");
-    QUICListener::spawn_bootstrap_tls_listener(&listener_config, &shared_state)
+    QUICListener::spawn_bootstrap_tls_listener(&listener_config, &shared_state, None)
         .expect("bootstrap tls listener");
     let socket = QUICListener::bind_socket(&listener_config, false).expect("bind socket");
     QUICListener::new_with_socket_and_shared_state(listener_config, socket, shared_state)
