@@ -6315,6 +6315,7 @@ mod tests {
         collections::HashMap,
         path::Path,
         sync::{Arc, RwLock},
+        time::Duration,
     };
 
     use rcgen::{Certificate, CertificateParams, SanType};
@@ -6720,6 +6721,93 @@ mod tests {
             .expect("reloaded generation"),
             Some(1)
         );
+    }
+
+    #[test]
+    fn bootstrap_connection_state_prefers_reloaded_runtime_settings() {
+        let dir = tempdir().expect("tempdir");
+        let (cert, key) = write_test_cert_for_name(dir.path(), "server", "api.example.com");
+        let startup = tls_test_config(cert.clone(), key.clone(), Vec::new());
+        let startup_runtime = RuntimeConfig::from_config(&startup).expect("startup runtime");
+        let startup_listener_config = startup_runtime
+            .primary_listener_runtime_config()
+            .expect("startup listener config");
+        let startup_shared =
+            Arc::new(super::QUICListener::build_shared_state(&startup_runtime).expect("shared"));
+        let listener_label = super::QUICListener::listener_label(&startup_listener_config);
+
+        let mut reloaded = startup.clone();
+        reloaded.performance.backend_timeout_ms = 4321;
+        reloaded.performance.max_request_body_bytes = 65_537;
+        reloaded.performance.max_response_body_bytes = 98_765;
+        reloaded.performance.max_active_connections = 37;
+        reloaded.performance.client_body_idle_timeout_ms = 7654;
+
+        let reloaded_runtime = RuntimeConfig::from_config(&reloaded).expect("reloaded runtime");
+        let reloaded_bundle = super::QUICListener::build_runtime_bundle(
+            "reloaded.yaml".to_string(),
+            &reloaded_runtime,
+        )
+        .expect("reloaded bundle");
+        let runtime_handle = Arc::new(super::RuntimeBundleHandle::new(reloaded_bundle));
+
+        let state = super::QUICListener::bootstrap_connection_state(
+            &listener_label,
+            &startup_listener_config,
+            Some(&runtime_handle),
+            Arc::clone(&startup_shared.listener_tls_store),
+            Arc::clone(&startup_shared.transport_pool),
+            Arc::clone(&startup_shared.backend_endpoints),
+            Arc::clone(&startup_shared.backend_resolution_store),
+            Arc::clone(&startup_shared.upstream_policies),
+            Arc::clone(&startup_shared.metrics),
+            Arc::clone(&startup_shared.resilience),
+            startup_shared.upstream_pools.clone(),
+            Arc::clone(&startup_shared.routing_index),
+        )
+        .expect("bootstrap state");
+
+        assert_eq!(state.backend_timeout, Duration::from_millis(4321));
+        assert_eq!(state.max_request_body_bytes, 65_537);
+        assert_eq!(state.max_response_body_bytes, 98_765);
+        assert_eq!(state.max_connections, 37);
+        assert_eq!(state.connection_timeout, Duration::from_millis(7654));
+    }
+
+    #[test]
+    fn metrics_endpoint_state_prefers_reloaded_runtime_settings() {
+        let dir = tempdir().expect("tempdir");
+        let (cert, key) = write_test_cert_for_name(dir.path(), "server", "api.example.com");
+        let startup = tls_test_config(cert.clone(), key.clone(), Vec::new());
+        let startup_runtime = RuntimeConfig::from_config(&startup).expect("startup runtime");
+        let startup_shared =
+            Arc::new(super::QUICListener::build_shared_state(&startup_runtime).expect("shared"));
+
+        let mut reloaded = startup.clone();
+        reloaded.observability.metrics.enabled = true;
+        reloaded.observability.metrics.path = "/metrics-live".to_string();
+        reloaded.observability.metrics.max_connections = 29;
+        reloaded.observability.metrics.connection_timeout_ms = 3456;
+
+        let reloaded_runtime = RuntimeConfig::from_config(&reloaded).expect("reloaded runtime");
+        let reloaded_bundle = super::QUICListener::build_runtime_bundle(
+            "reloaded.yaml".to_string(),
+            &reloaded_runtime,
+        )
+        .expect("reloaded bundle");
+        let runtime_handle = Arc::new(super::RuntimeBundleHandle::new(reloaded_bundle));
+
+        let state = super::QUICListener::metrics_endpoint_state(
+            Some(&runtime_handle),
+            "/metrics-startup".to_string(),
+            5,
+            Duration::from_millis(500),
+            Arc::clone(&startup_shared.metrics),
+        );
+
+        assert_eq!(state.metrics_path, "/metrics-live");
+        assert_eq!(state.max_connections, 29);
+        assert_eq!(state.connection_timeout, Duration::from_millis(3456));
     }
 
     #[test]
