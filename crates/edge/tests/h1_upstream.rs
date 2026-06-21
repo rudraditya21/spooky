@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    net::{SocketAddr, UdpSocket},
+    net::{SocketAddr, TcpListener as StdTcpListener, UdpSocket},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -138,13 +138,19 @@ fn make_backend(id: &str, address: String) -> Backend {
     }
 }
 
+fn bind_tcp_listener() -> TcpListener {
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind test backend listener");
+    listener
+        .set_nonblocking(true)
+        .expect("set test backend listener nonblocking");
+    TcpListener::from_std(listener).expect("register test backend listener")
+}
+
 async fn start_h1_backend<F>(handler: F) -> SocketAddr
 where
     F: Fn(Request<Incoming>) -> Response<Full<Bytes>> + Clone + Send + 'static,
 {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind h1 backend");
+    let listener = bind_tcp_listener();
     let addr = listener.local_addr().expect("h1 local addr");
 
     tokio::spawn(async move {
@@ -171,9 +177,7 @@ where
 }
 
 async fn start_h1_delayed_backend(body: &'static str, delay: Duration) -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind delayed h1 backend");
+    let listener = bind_tcp_listener();
     let addr = listener.local_addr().expect("delayed h1 local addr");
 
     tokio::spawn(async move {
@@ -211,9 +215,7 @@ where
     tls_config.alpn_protocols = vec![b"h2".to_vec()];
     let acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind h2 backend");
+    let listener = bind_tcp_listener();
     let addr = listener.local_addr().expect("h2 local addr");
 
     tokio::spawn(async move {
