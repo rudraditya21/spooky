@@ -408,6 +408,19 @@ struct BootstrapConnectionState {
     routing_index: Arc<RouteIndex>,
 }
 
+struct BootstrapStartupState {
+    listener_config: ListenerRuntimeConfig,
+    listener_tls_store: Arc<ListenerTlsReloadStore>,
+    transport_pool: Arc<UpstreamTransportPool>,
+    backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
+    backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
+    upstream_policies: Arc<HashMap<String, RuntimeUpstreamPolicy>>,
+    metrics: Arc<Metrics>,
+    resilience: Arc<RuntimeResilience>,
+    upstream_pools: HashMap<String, Arc<RwLock<UpstreamPool>>>,
+    routing_index: Arc<RouteIndex>,
+}
+
 struct MetricsEndpointState {
     metrics_path: String,
     max_connections: usize,
@@ -5229,8 +5242,18 @@ impl QUICListener {
             })?
         };
 
-        let routing_index = Arc::clone(&shared_state.routing_index);
-        let startup_listener_config = config.clone();
+        let startup_state = BootstrapStartupState {
+            listener_config: config.clone(),
+            listener_tls_store: Arc::clone(&listener_tls_store),
+            transport_pool: Arc::clone(&transport_pool),
+            backend_endpoints: Arc::clone(&backend_endpoints),
+            backend_resolution_store: Arc::clone(&backend_resolution_store),
+            upstream_policies: Arc::clone(&upstream_policies),
+            metrics: Arc::clone(&metrics),
+            resilience: Arc::clone(&resilience),
+            upstream_pools: upstream_pools.clone(),
+            routing_index: Arc::clone(&shared_state.routing_index),
+        };
 
         spawn_supervised_async_task(&handle, "bootstrap-tls-listener", None, async move {
             info!(
@@ -5251,17 +5274,8 @@ impl QUICListener {
                 };
                 let Some(runtime_state) = Self::bootstrap_connection_state(
                     &listener_label,
-                    &startup_listener_config,
                     runtime_bundle.as_ref(),
-                    Arc::clone(&listener_tls_store),
-                    Arc::clone(&transport_pool),
-                    Arc::clone(&backend_endpoints),
-                    Arc::clone(&backend_resolution_store),
-                    Arc::clone(&upstream_policies),
-                    Arc::clone(&metrics),
-                    Arc::clone(&resilience),
-                    upstream_pools.clone(),
-                    Arc::clone(&routing_index),
+                    &startup_state,
                 ) else {
                     error!(
                         "Bootstrap TLS listener missing live runtime state for listener {}",
@@ -6031,17 +6045,8 @@ impl QUICListener {
 
     fn bootstrap_connection_state(
         listener_label: &str,
-        startup_listener_config: &ListenerRuntimeConfig,
         runtime_bundle: Option<&Arc<RuntimeBundleHandle>>,
-        startup_listener_tls_store: Arc<ListenerTlsReloadStore>,
-        startup_transport_pool: Arc<UpstreamTransportPool>,
-        startup_backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
-        startup_backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
-        startup_upstream_policies: Arc<HashMap<String, RuntimeUpstreamPolicy>>,
-        startup_metrics: Arc<Metrics>,
-        startup_resilience: Arc<RuntimeResilience>,
-        startup_upstream_pools: HashMap<String, Arc<RwLock<UpstreamPool>>>,
-        startup_routing_index: Arc<RouteIndex>,
+        startup: &BootstrapStartupState,
     ) -> Option<BootstrapConnectionState> {
         let (
             listener_config,
@@ -6070,16 +6075,16 @@ impl QUICListener {
             )
         } else {
             (
-                startup_listener_config.clone(),
-                startup_listener_tls_store,
-                startup_transport_pool,
-                startup_backend_endpoints,
-                startup_backend_resolution_store,
-                startup_upstream_policies,
-                startup_metrics,
-                startup_resilience,
-                startup_upstream_pools,
-                startup_routing_index,
+                startup.listener_config.clone(),
+                Arc::clone(&startup.listener_tls_store),
+                Arc::clone(&startup.transport_pool),
+                Arc::clone(&startup.backend_endpoints),
+                Arc::clone(&startup.backend_resolution_store),
+                Arc::clone(&startup.upstream_policies),
+                Arc::clone(&startup.metrics),
+                Arc::clone(&startup.resilience),
+                startup.upstream_pools.clone(),
+                Arc::clone(&startup.routing_index),
             )
         };
 
@@ -6735,6 +6740,18 @@ mod tests {
         let startup_shared =
             Arc::new(super::QUICListener::build_shared_state(&startup_runtime).expect("shared"));
         let listener_label = super::QUICListener::listener_label(&startup_listener_config);
+        let startup_state = super::BootstrapStartupState {
+            listener_config: startup_listener_config.clone(),
+            listener_tls_store: Arc::clone(&startup_shared.listener_tls_store),
+            transport_pool: Arc::clone(&startup_shared.transport_pool),
+            backend_endpoints: Arc::clone(&startup_shared.backend_endpoints),
+            backend_resolution_store: Arc::clone(&startup_shared.backend_resolution_store),
+            upstream_policies: Arc::clone(&startup_shared.upstream_policies),
+            metrics: Arc::clone(&startup_shared.metrics),
+            resilience: Arc::clone(&startup_shared.resilience),
+            upstream_pools: startup_shared.upstream_pools.clone(),
+            routing_index: Arc::clone(&startup_shared.routing_index),
+        };
 
         let mut reloaded = startup.clone();
         reloaded.performance.backend_timeout_ms = 4321;
@@ -6753,17 +6770,8 @@ mod tests {
 
         let state = super::QUICListener::bootstrap_connection_state(
             &listener_label,
-            &startup_listener_config,
             Some(&runtime_handle),
-            Arc::clone(&startup_shared.listener_tls_store),
-            Arc::clone(&startup_shared.transport_pool),
-            Arc::clone(&startup_shared.backend_endpoints),
-            Arc::clone(&startup_shared.backend_resolution_store),
-            Arc::clone(&startup_shared.upstream_policies),
-            Arc::clone(&startup_shared.metrics),
-            Arc::clone(&startup_shared.resilience),
-            startup_shared.upstream_pools.clone(),
-            Arc::clone(&startup_shared.routing_index),
+            &startup_state,
         )
         .expect("bootstrap state");
 
