@@ -19,3 +19,10 @@ upstream:
 performance:
   packet_shards_per_worker: 1
   packet_shard_queue_capacity: 2048
+
+observability:
+  control_api:
+    enabled: true
+    address: "127.0.0.1"
+    port: 9890
+    auth_token: "change-me"

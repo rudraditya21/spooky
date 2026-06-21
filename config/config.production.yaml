@@ -55,6 +55,13 @@ log:
   level: info
   format: json
 
+observability:
+  control_api:
+    enabled: true
+    address: "127.0.0.1"
+    port: 9890
+    auth_token: "change-me"
+
 security:
   privileges:
     enabled: true

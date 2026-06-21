@@ -43,6 +43,7 @@ impl QUICListener {
         backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
         backend_dns_resolver: SharedDnsResolver,
         metrics: Arc<Metrics>,
+        task_registry: Arc<RuntimeTaskRegistry>,
     ) {
         if !config.performance.backend_dns_refresh_enabled {
             return;
@@ -63,100 +64,106 @@ impl QUICListener {
         };
 
         let task_metrics = Arc::clone(&metrics);
-        spawn_supervised_async_task(&handle, "backend-dns-refresh", Some(metrics), async move {
-            let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms));
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let registration = spawn_supervised_async_task(
+            &handle,
+            "backend-dns-refresh",
+            Some(metrics),
+            async move {
+                let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-            loop {
-                ticker.tick().await;
-                for backend in backend_resolution_store.hostname_entries() {
-                    match refresh_backend_hostname(
-                        &backend,
-                        &transport_pool,
-                        &backend_resolution_store,
-                        &backend_dns_resolver,
-                    )
-                    .await
-                    {
-                        BackendDnsRefreshOutcome::Updated {
-                            backend_addr,
-                            authority_host,
-                            previous_addrs,
-                            current_addrs,
-                            generation,
-                            refreshed_at,
-                            client_rotated,
-                        } => {
-                            task_metrics.record_backend_dns_refresh_success(
-                                &backend_addr,
+                loop {
+                    ticker.tick().await;
+                    for backend in backend_resolution_store.hostname_entries() {
+                        match refresh_backend_hostname(
+                            &backend,
+                            &transport_pool,
+                            &backend_resolution_store,
+                            &backend_dns_resolver,
+                        )
+                        .await
+                        {
+                            BackendDnsRefreshOutcome::Updated {
+                                backend_addr,
+                                authority_host,
+                                previous_addrs,
+                                current_addrs,
+                                generation,
                                 refreshed_at,
-                                current_addrs.len(),
-                                true,
-                            );
-                            if client_rotated {
-                                task_metrics.inc_backend_client_rotation(&backend_addr);
+                                client_rotated,
+                            } => {
+                                task_metrics.record_backend_dns_refresh_success(
+                                    &backend_addr,
+                                    refreshed_at,
+                                    current_addrs.len(),
+                                    true,
+                                );
+                                if client_rotated {
+                                    task_metrics.inc_backend_client_rotation(&backend_addr);
+                                }
+                                if previous_addrs.is_empty() {
+                                    info!(
+                                        "backend DNS refresh populated '{}' (backend '{}') with {:?} generation={}",
+                                        authority_host, backend_addr, current_addrs, generation
+                                    );
+                                } else {
+                                    info!(
+                                        "backend DNS refresh updated '{}' (backend '{}'): {:?} -> {:?} generation={} stale_pooled_connections=possible_until_idle_timeout",
+                                        authority_host,
+                                        backend_addr,
+                                        previous_addrs,
+                                        current_addrs,
+                                        generation
+                                    );
+                                }
                             }
-                            if previous_addrs.is_empty() {
-                                info!(
-                                    "backend DNS refresh populated '{}' (backend '{}') with {:?} generation={}",
+                            BackendDnsRefreshOutcome::Unchanged {
+                                backend_addr,
+                                authority_host,
+                                current_addrs,
+                                generation,
+                                refreshed_at,
+                            } => {
+                                task_metrics.record_backend_dns_refresh_success(
+                                    &backend_addr,
+                                    refreshed_at,
+                                    current_addrs.len(),
+                                    false,
+                                );
+                                debug!(
+                                    "backend DNS refresh unchanged for '{}' (backend '{}') addrs={:?} generation={}",
                                     authority_host, backend_addr, current_addrs, generation
                                 );
-                            } else {
-                                info!(
-                                    "backend DNS refresh updated '{}' (backend '{}'): {:?} -> {:?} generation={} stale_pooled_connections=possible_until_idle_timeout",
-                                    authority_host,
-                                    backend_addr,
-                                    previous_addrs,
-                                    current_addrs,
-                                    generation
+                            }
+                            BackendDnsRefreshOutcome::EmptyAnswerRetained {
+                                backend_addr,
+                                authority_host,
+                                retained_addrs,
+                            } => {
+                                task_metrics.inc_backend_dns_refresh_failure();
+                                warn!(
+                                    "backend DNS refresh returned no addresses for '{}' (backend '{}'); retaining {:?}",
+                                    authority_host, backend_addr, retained_addrs
                                 );
                             }
-                        }
-                        BackendDnsRefreshOutcome::Unchanged {
-                            backend_addr,
-                            authority_host,
-                            current_addrs,
-                            generation,
-                            refreshed_at,
-                        } => {
-                            task_metrics.record_backend_dns_refresh_success(
-                                &backend_addr,
-                                refreshed_at,
-                                current_addrs.len(),
-                                false,
-                            );
-                            debug!(
-                                "backend DNS refresh unchanged for '{}' (backend '{}') addrs={:?} generation={}",
-                                authority_host, backend_addr, current_addrs, generation
-                            );
-                        }
-                        BackendDnsRefreshOutcome::EmptyAnswerRetained {
-                            backend_addr,
-                            authority_host,
-                            retained_addrs,
-                        } => {
-                            task_metrics.inc_backend_dns_refresh_failure();
-                            warn!(
-                                "backend DNS refresh returned no addresses for '{}' (backend '{}'); retaining {:?}",
-                                authority_host, backend_addr, retained_addrs
-                            );
-                        }
-                        BackendDnsRefreshOutcome::LookupFailed {
-                            backend_addr,
-                            authority_host,
-                            retained_addrs,
-                            error,
-                        } => {
-                            task_metrics.inc_backend_dns_refresh_failure();
-                            warn!(
-                                "backend DNS refresh failed for '{}' (backend '{}'): {}; retaining {:?}",
-                                authority_host, backend_addr, error, retained_addrs
-                            );
+                            BackendDnsRefreshOutcome::LookupFailed {
+                                backend_addr,
+                                authority_host,
+                                retained_addrs,
+                                error,
+                            } => {
+                                task_metrics.inc_backend_dns_refresh_failure();
+                                warn!(
+                                    "backend DNS refresh failed for '{}' (backend '{}'): {}; retaining {:?}",
+                                    authority_host, backend_addr, error, retained_addrs
+                                );
+                            }
                         }
                     }
                 }
-            }
-        });
+            },
+        );
+        task_registry.register(registration);
     }
 }
 

@@ -7,6 +7,7 @@ impl QUICListener {
         backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
         backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
         metrics: Arc<Metrics>,
+        task_registry: Arc<RuntimeTaskRegistry>,
     ) {
         struct HealthCheckJob {
             upstream_pool: Arc<RwLock<UpstreamPool>>,
@@ -87,7 +88,7 @@ impl QUICListener {
             let task_metrics = Arc::clone(&metrics);
             let handle = handle.clone();
             let supervise_metrics = Arc::clone(&task_metrics);
-            spawn_supervised_async_task(
+            let registration = spawn_supervised_async_task(
                 &handle,
                 "health-check-group",
                 Some(supervise_metrics),
@@ -189,6 +190,7 @@ impl QUICListener {
                     }
                 },
             );
+            task_registry.register(registration);
         }
     }
 }

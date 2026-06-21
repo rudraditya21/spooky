@@ -1143,6 +1143,10 @@ fn validate_inner(config: &Config) -> bool {
                 config.observability.control_api.restart_path.as_str(),
             ),
             (
+                "observability.control_api.reload_path",
+                config.observability.control_api.reload_path.as_str(),
+            ),
+            (
                 "observability.control_api.reload_certs_path",
                 config.observability.control_api.reload_certs_path.as_str(),
             ),

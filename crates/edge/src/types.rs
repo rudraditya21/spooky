@@ -1,10 +1,12 @@
 use bytes::Bytes;
 use core::net::SocketAddr;
+use log::warn;
 use rustls::ServerConfig as RustlsServerConfig;
 use spooky_config::{
     backend_endpoint::BackendEndpoint,
     runtime::{
-        ListenerRuntimeConfig, RuntimeListenerTls, RuntimeTlsIdentity, RuntimeUpstreamPolicy,
+        ListenerRuntimeConfig, RuntimeConfig, RuntimeListenerTls, RuntimeTlsIdentity,
+        RuntimeUpstreamPolicy,
     },
 };
 use spooky_errors::ProxyError;
@@ -13,10 +15,13 @@ use spooky_transport::{h2_client::SharedDnsResolver, transport_pool::UpstreamTra
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::UdpSocket,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant, SystemTime},
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
+    task::AbortHandle,
+};
 use tracing::Span;
 
 use crate::Metrics;
@@ -42,6 +47,7 @@ pub struct SharedRuntimeState {
     pub(crate) metrics: Arc<Metrics>,
     pub(crate) resilience: Arc<RuntimeResilience>,
     pub(crate) watchdog: Arc<WatchdogCoordinator>,
+    pub(crate) generation_tasks: Arc<RuntimeTaskRegistry>,
 }
 
 impl SharedRuntimeState {
@@ -79,6 +85,101 @@ impl SharedRuntimeState {
     }
 }
 
+pub(crate) struct RuntimeTaskRegistration {
+    abort: AbortHandle,
+    completion: oneshot::Receiver<()>,
+}
+
+impl RuntimeTaskRegistration {
+    pub(crate) fn new(abort: AbortHandle, completion: oneshot::Receiver<()>) -> Self {
+        Self { abort, completion }
+    }
+}
+
+pub struct RuntimeTaskRegistry {
+    state: Mutex<RuntimeTaskRegistryState>,
+}
+
+struct RuntimeTaskRegistryState {
+    retired: bool,
+    tasks: Vec<RuntimeTaskRegistration>,
+}
+
+impl RuntimeTaskRegistry {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Mutex::new(RuntimeTaskRegistryState {
+                retired: false,
+                tasks: Vec::new(),
+            }),
+        }
+    }
+
+    pub(crate) fn register(&self, task: RuntimeTaskRegistration) {
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if state.retired {
+            task.abort.abort();
+        } else {
+            state.tasks.push(task);
+        }
+    }
+
+    fn retire_now(&self) -> Vec<oneshot::Receiver<()>> {
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if state.retired {
+            return Vec::new();
+        }
+        state.retired = true;
+        state
+            .tasks
+            .drain(..)
+            .map(|task| {
+                task.abort.abort();
+                task.completion
+            })
+            .collect()
+    }
+
+    pub(crate) fn abort_all(&self) {
+        let _ = self.retire_now();
+    }
+
+    pub(crate) async fn retire_with_timeout(&self, timeout: Duration) {
+        let completions = self.retire_now();
+        if completions.is_empty() {
+            return;
+        }
+
+        let wait_for_completion = async {
+            for completion in completions {
+                let _ = completion.await;
+            }
+        };
+
+        if tokio::time::timeout(timeout, wait_for_completion)
+            .await
+            .is_err()
+        {
+            warn!(
+                "generation background tasks did not stop within {:?}; continuing reload",
+                timeout
+            );
+        }
+    }
+}
+
+impl Drop for RuntimeTaskRegistry {
+    fn drop(&mut self) {
+        self.abort_all();
+    }
+}
+
 pub struct QUICListener {
     pub socket: UdpSocket,
     pub local_addr: SocketAddr,
@@ -86,6 +187,8 @@ pub struct QUICListener {
     pub listener_label: String,
     pub listener_tls_store: Arc<ListenerTlsReloadStore>,
     pub tls_reload_generation: u64,
+    pub runtime_bundle: Option<Arc<RuntimeBundleHandle>>,
+    pub runtime_generation: u64,
     pub quic_config: quiche::Config,
     pub h3_config: Arc<quiche::h3::Config>,
     pub transport_pool: Arc<UpstreamTransportPool>,
@@ -126,6 +229,69 @@ pub struct QUICListener {
     pub(crate) peer_routes: HashMap<SocketAddr, Arc<[u8]>>, // KEY: peer address, VALUE: primary SCID
     pub(crate) cid_radix: CidRadix,
     pub(crate) conn_rate_limiter: crate::quic_listener::TokenBucket,
+}
+
+#[derive(Clone)]
+pub struct RuntimeBundle {
+    pub generation: u64,
+    pub config_path: String,
+    pub runtime_config: RuntimeConfig,
+    pub shared_state: Arc<SharedRuntimeState>,
+}
+
+impl RuntimeBundle {
+    pub fn listener_runtime_config(&self, label: &str) -> Option<ListenerRuntimeConfig> {
+        self.shared_state
+            .listener_runtime_configs
+            .get(label)
+            .cloned()
+    }
+}
+
+#[derive(Clone)]
+pub struct RuntimeBundleHandle {
+    inner: Arc<RwLock<Arc<RuntimeBundle>>>,
+}
+
+impl RuntimeBundleHandle {
+    pub fn new(bundle: RuntimeBundle) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(Arc::new(bundle))),
+        }
+    }
+
+    pub fn current(&self) -> Arc<RuntimeBundle> {
+        self.inner
+            .read()
+            .map(|bundle| Arc::clone(&*bundle))
+            .unwrap_or_else(|_| panic!("runtime bundle lock poisoned"))
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.current().generation
+    }
+
+    pub fn replace(
+        &self,
+        bundle: RuntimeBundle,
+    ) -> Result<(u64, Arc<RuntimeTaskRegistry>), ProxyError> {
+        let generation = bundle.generation;
+        let next_tasks = Arc::clone(&bundle.shared_state.generation_tasks);
+        let previous = {
+            let mut guard = match self.inner.write() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    next_tasks.abort_all();
+                    return Err(ProxyError::Transport(
+                        "runtime bundle lock poisoned".to_string(),
+                    ));
+                }
+            };
+            std::mem::replace(&mut *guard, Arc::new(bundle))
+        };
+        let retired_tasks = Arc::clone(&previous.shared_state.generation_tasks);
+        Ok((generation, retired_tasks))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

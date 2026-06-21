@@ -115,7 +115,7 @@ observability:
     ready_path: "/ready"
     runtime_path: "/admin/runtime"
     restart_path: "/admin/runtime/restart"
-    auth_token: null
+    auth_token: "change-me"
     max_connections: 256
     connection_timeout_ms: 30000
   tracing:
