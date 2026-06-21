@@ -390,6 +390,40 @@ type BootstrapServiceFuture = std::pin::Pin<
 
 type LbHeaderLookup<'a> = dyn Fn(&str) -> Option<String> + 'a;
 
+struct BootstrapConnectionState {
+    alt_svc_value: String,
+    backend_timeout: Duration,
+    max_request_body_bytes: usize,
+    max_response_body_bytes: usize,
+    max_connections: usize,
+    connection_timeout: Duration,
+    listener_tls_store: Arc<ListenerTlsReloadStore>,
+    transport_pool: Arc<UpstreamTransportPool>,
+    backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
+    backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
+    upstream_policies: Arc<HashMap<String, RuntimeUpstreamPolicy>>,
+    metrics: Arc<Metrics>,
+    resilience: Arc<RuntimeResilience>,
+    upstream_pools: HashMap<String, Arc<RwLock<UpstreamPool>>>,
+    routing_index: Arc<RouteIndex>,
+}
+
+struct RuntimeConnectionSlotGuard {
+    active_connections: Arc<AtomicUsize>,
+}
+
+impl RuntimeConnectionSlotGuard {
+    fn new(active_connections: Arc<AtomicUsize>) -> Self {
+        Self { active_connections }
+    }
+}
+
+impl Drop for RuntimeConnectionSlotGuard {
+    fn drop(&mut self) {
+        self.active_connections.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 struct BootstrapStreamingBody {
     inner: Incoming,
     max_bytes: Option<usize>,
@@ -5106,9 +5140,6 @@ impl QUICListener {
             config.listen.listen.address, config.listen.listen.port
         );
         let alt_svc_value = format!("h3=\":{}\"; ma=86400", config.listen.listen.port);
-        let backend_timeout = Duration::from_millis(config.performance.backend_timeout_ms);
-        let max_request_body_bytes = config.performance.max_request_body_bytes;
-        let max_response_body_bytes = config.performance.max_response_body_bytes;
         let max_connections = config.performance.max_active_connections.max(1);
         let connection_timeout =
             Duration::from_millis(config.performance.client_body_idle_timeout_ms.max(1));
@@ -5165,6 +5196,7 @@ impl QUICListener {
         };
 
         let routing_index = Arc::clone(&shared_state.routing_index);
+        let startup_listener_config = config.clone();
 
         spawn_supervised_async_task(&handle, "bootstrap-tls-listener", None, async move {
             info!(
@@ -5174,7 +5206,7 @@ impl QUICListener {
                 max_connections,
                 connection_timeout.as_millis()
             );
-            let connection_limiter = Arc::new(Semaphore::new(max_connections));
+            let active_connections = Arc::new(AtomicUsize::new(0));
             loop {
                 let (stream, peer) = match listener.accept().await {
                     Ok(v) => v,
@@ -5183,84 +5215,57 @@ impl QUICListener {
                         continue;
                     }
                 };
-                let permit = match Arc::clone(&connection_limiter).try_acquire_owned() {
-                    Ok(permit) => permit,
-                    Err(_) => {
-                        metrics.inc_connection_cap_reject();
-                        debug!(
-                            "Bootstrap TLS listener dropped connection from {}: max_connections reached",
-                            peer
-                        );
-                        continue;
-                    }
+                let Some(runtime_state) = Self::bootstrap_connection_state(
+                    &listener_label,
+                    &startup_listener_config,
+                    runtime_bundle.as_ref(),
+                    Arc::clone(&listener_tls_store),
+                    Arc::clone(&transport_pool),
+                    Arc::clone(&backend_endpoints),
+                    Arc::clone(&backend_resolution_store),
+                    Arc::clone(&upstream_policies),
+                    Arc::clone(&metrics),
+                    Arc::clone(&resilience),
+                    upstream_pools.clone(),
+                    Arc::clone(&routing_index),
+                ) else {
+                    error!(
+                        "Bootstrap TLS listener missing live runtime state for listener {}",
+                        listener_label
+                    );
+                    continue;
                 };
+                let active_connections = Arc::clone(&active_connections);
+                if !Self::try_claim_runtime_connection_slot(
+                    &active_connections,
+                    runtime_state.max_connections,
+                ) {
+                    runtime_state.metrics.inc_connection_cap_reject();
+                    debug!(
+                        "Bootstrap TLS listener dropped connection from {}: max_connections reached",
+                        peer
+                    );
+                    continue;
+                }
 
-                let alt_svc = alt_svc_value.clone();
-                let runtime_bundle = runtime_bundle.clone();
-                let transport_pool = Arc::clone(&transport_pool);
-                let backend_endpoints = Arc::clone(&backend_endpoints);
-                let backend_resolution_store = Arc::clone(&backend_resolution_store);
-                let upstream_policies = Arc::clone(&upstream_policies);
-                let metrics = Arc::clone(&metrics);
-                let resilience = Arc::clone(&resilience);
-                let upstream_pools = upstream_pools.clone();
-                let routing_index = Arc::clone(&routing_index);
-                let max_request_body_bytes = max_request_body_bytes;
-                let max_response_body_bytes = max_response_body_bytes;
-                let timeout = connection_timeout;
+                let alt_svc = runtime_state.alt_svc_value.clone();
+                let transport_pool = Arc::clone(&runtime_state.transport_pool);
+                let backend_endpoints = Arc::clone(&runtime_state.backend_endpoints);
+                let backend_resolution_store = Arc::clone(&runtime_state.backend_resolution_store);
+                let upstream_policies = Arc::clone(&runtime_state.upstream_policies);
+                let metrics = Arc::clone(&runtime_state.metrics);
+                let resilience = Arc::clone(&runtime_state.resilience);
+                let upstream_pools = runtime_state.upstream_pools.clone();
+                let routing_index = Arc::clone(&runtime_state.routing_index);
+                let max_request_body_bytes = runtime_state.max_request_body_bytes;
+                let max_response_body_bytes = runtime_state.max_response_body_bytes;
+                let backend_timeout = runtime_state.backend_timeout;
+                let timeout = runtime_state.connection_timeout;
                 let listener_label = listener_label.clone();
-                let listener_tls_store = if let Some(handle) = runtime_bundle.as_ref() {
-                    handle.current().shared_state.listener_tls_store.clone()
-                } else {
-                    Arc::clone(&listener_tls_store)
-                };
-                let transport_pool = if let Some(handle) = runtime_bundle.as_ref() {
-                    handle.current().shared_state.transport_pool.clone()
-                } else {
-                    transport_pool
-                };
-                let backend_endpoints = if let Some(handle) = runtime_bundle.as_ref() {
-                    handle.current().shared_state.backend_endpoints.clone()
-                } else {
-                    backend_endpoints
-                };
-                let backend_resolution_store = if let Some(handle) = runtime_bundle.as_ref() {
-                    handle
-                        .current()
-                        .shared_state
-                        .backend_resolution_store
-                        .clone()
-                } else {
-                    backend_resolution_store
-                };
-                let upstream_policies = if let Some(handle) = runtime_bundle.as_ref() {
-                    handle.current().shared_state.upstream_policies.clone()
-                } else {
-                    upstream_policies
-                };
-                let metrics = if let Some(handle) = runtime_bundle.as_ref() {
-                    handle.current().shared_state.metrics.clone()
-                } else {
-                    metrics
-                };
-                let resilience = if let Some(handle) = runtime_bundle.as_ref() {
-                    handle.current().shared_state.resilience.clone()
-                } else {
-                    resilience
-                };
-                let upstream_pools = if let Some(handle) = runtime_bundle.as_ref() {
-                    handle.current().shared_state.upstream_pools.clone()
-                } else {
-                    upstream_pools
-                };
-                let routing_index = if let Some(handle) = runtime_bundle.as_ref() {
-                    handle.current().shared_state.routing_index.clone()
-                } else {
-                    routing_index
-                };
+                let listener_tls_store = Arc::clone(&runtime_state.listener_tls_store);
 
                 tokio::spawn(async move {
-                    let _permit = permit;
+                    let _connection_guard = RuntimeConnectionSlotGuard::new(active_connections);
                     let Some(server_config) =
                         listener_tls_store.bootstrap_server_config(&listener_label)
                     else {
@@ -5988,6 +5993,107 @@ impl QUICListener {
         });
 
         Ok(())
+    }
+
+    fn bootstrap_connection_state(
+        listener_label: &str,
+        startup_listener_config: &ListenerRuntimeConfig,
+        runtime_bundle: Option<&Arc<RuntimeBundleHandle>>,
+        startup_listener_tls_store: Arc<ListenerTlsReloadStore>,
+        startup_transport_pool: Arc<UpstreamTransportPool>,
+        startup_backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
+        startup_backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
+        startup_upstream_policies: Arc<HashMap<String, RuntimeUpstreamPolicy>>,
+        startup_metrics: Arc<Metrics>,
+        startup_resilience: Arc<RuntimeResilience>,
+        startup_upstream_pools: HashMap<String, Arc<RwLock<UpstreamPool>>>,
+        startup_routing_index: Arc<RouteIndex>,
+    ) -> Option<BootstrapConnectionState> {
+        let (
+            listener_config,
+            listener_tls_store,
+            transport_pool,
+            backend_endpoints,
+            backend_resolution_store,
+            upstream_policies,
+            metrics,
+            resilience,
+            upstream_pools,
+            routing_index,
+        ) = if let Some(handle) = runtime_bundle {
+            let runtime = handle.current();
+            (
+                runtime.listener_runtime_config(listener_label)?,
+                runtime.shared_state.listener_tls_store.clone(),
+                runtime.shared_state.transport_pool.clone(),
+                runtime.shared_state.backend_endpoints.clone(),
+                runtime.shared_state.backend_resolution_store.clone(),
+                runtime.shared_state.upstream_policies.clone(),
+                runtime.shared_state.metrics.clone(),
+                runtime.shared_state.resilience.clone(),
+                runtime.shared_state.upstream_pools.clone(),
+                runtime.shared_state.routing_index.clone(),
+            )
+        } else {
+            (
+                startup_listener_config.clone(),
+                startup_listener_tls_store,
+                startup_transport_pool,
+                startup_backend_endpoints,
+                startup_backend_resolution_store,
+                startup_upstream_policies,
+                startup_metrics,
+                startup_resilience,
+                startup_upstream_pools,
+                startup_routing_index,
+            )
+        };
+
+        Some(BootstrapConnectionState {
+            alt_svc_value: format!("h3=\":{}\"; ma=86400", listener_config.listen.listen.port),
+            backend_timeout: Duration::from_millis(listener_config.performance.backend_timeout_ms),
+            max_request_body_bytes: listener_config.performance.max_request_body_bytes,
+            max_response_body_bytes: listener_config.performance.max_response_body_bytes,
+            max_connections: listener_config.performance.max_active_connections.max(1),
+            connection_timeout: Duration::from_millis(
+                listener_config
+                    .performance
+                    .client_body_idle_timeout_ms
+                    .max(1),
+            ),
+            listener_tls_store,
+            transport_pool,
+            backend_endpoints,
+            backend_resolution_store,
+            upstream_policies,
+            metrics,
+            resilience,
+            upstream_pools,
+            routing_index,
+        })
+    }
+
+    fn try_claim_runtime_connection_slot(
+        active_connections: &Arc<AtomicUsize>,
+        max_connections: usize,
+    ) -> bool {
+        loop {
+            let current = active_connections.load(Ordering::Relaxed);
+            if current >= max_connections {
+                return false;
+            }
+            if active_connections
+                .compare_exchange(
+                    current,
+                    current.saturating_add(1),
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                return true;
+            }
+        }
     }
 
     fn handle_metrics_request(
