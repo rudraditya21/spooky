@@ -51,6 +51,15 @@ impl TokenBucket {
             false
         }
     }
+
+    pub(super) fn reconfigure(&mut self, rate_per_sec: u32, burst: u32) {
+        let burst = burst.max(1) as f64;
+        let rate_per_sec = rate_per_sec.max(1) as f64;
+        self.burst = burst;
+        self.rate_per_sec = rate_per_sec;
+        self.tokens = self.tokens.min(self.burst);
+        self.last_refill = Instant::now();
+    }
 }
 
 #[cfg(test)]
@@ -73,6 +82,18 @@ mod tests {
 
         assert!(tb.try_consume(), "long idle should refill bucket");
         assert!(tb.tokens.is_finite());
+        assert!(tb.tokens <= tb.burst);
+    }
+
+    #[test]
+    fn reconfigure_clamps_tokens_to_new_burst() {
+        let mut tb = TokenBucket::new(100, 5);
+        assert!(tb.try_consume());
+        assert!(tb.try_consume());
+        tb.reconfigure(200, 2);
+
+        assert_eq!(tb.burst, 2.0);
+        assert_eq!(tb.rate_per_sec, 200.0);
         assert!(tb.tokens <= tb.burst);
     }
 }

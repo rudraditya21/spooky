@@ -4,6 +4,7 @@ use log::warn;
 use rustls::ServerConfig as RustlsServerConfig;
 use spooky_config::{
     backend_endpoint::BackendEndpoint,
+    config::Log,
     runtime::{
         ListenerRuntimeConfig, RuntimeConfig, RuntimeListenerTls, RuntimeTlsIdentity,
         RuntimeUpstreamPolicy,
@@ -235,6 +236,7 @@ pub struct QUICListener {
 pub struct RuntimeBundle {
     pub generation: u64,
     pub config_path: String,
+    pub log_config: Log,
     pub runtime_config: RuntimeConfig,
     pub shared_state: Arc<SharedRuntimeState>,
 }

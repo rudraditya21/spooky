@@ -805,12 +805,14 @@ impl QUICListener {
 
     pub fn build_runtime_bundle(
         config_path: String,
+        log_config: spooky_config::config::Log,
         runtime_config: &RuntimeConfig,
     ) -> Result<RuntimeBundle, ProxyError> {
         let shared_state = Arc::new(Self::build_shared_state(runtime_config)?);
         Ok(RuntimeBundle {
             generation: 0,
             config_path,
+            log_config,
             runtime_config: runtime_config.clone(),
             shared_state,
         })
@@ -1431,6 +1433,8 @@ impl QUICListener {
             Duration::from_millis(self.config.performance.backend_total_request_timeout_ms);
         self.inflight_acquire_wait =
             Duration::from_millis(self.config.performance.inflight_acquire_wait_ms);
+        self.drain_timeout =
+            Duration::from_millis(self.config.performance.shutdown_drain_timeout_ms);
         self.max_active_connections = self.config.performance.max_active_connections.max(1);
         self.max_streams_per_connection =
             usize::try_from(self.config.performance.quic_initial_max_streams_bidi)
@@ -1447,6 +1451,10 @@ impl QUICListener {
         self.require_client_cert = Self::runtime_listener_tls(&self.config)?
             .client_auth
             .require_client_cert;
+        self.conn_rate_limiter.reconfigure(
+            self.config.performance.new_connections_per_sec,
+            self.config.performance.new_connections_burst,
+        );
         self.quic_config = Self::build_quic_config(&self.config)?;
         self.runtime_generation = runtime.generation;
         self.tls_reload_generation = current_tls_generation;
@@ -6763,6 +6771,7 @@ mod tests {
         let reloaded_runtime = RuntimeConfig::from_config(&reloaded).expect("reloaded runtime");
         let reloaded_bundle = super::QUICListener::build_runtime_bundle(
             "reloaded.yaml".to_string(),
+            reloaded.log.clone(),
             &reloaded_runtime,
         )
         .expect("reloaded bundle");
@@ -6800,6 +6809,7 @@ mod tests {
         let reloaded_runtime = RuntimeConfig::from_config(&reloaded).expect("reloaded runtime");
         let reloaded_bundle = super::QUICListener::build_runtime_bundle(
             "reloaded.yaml".to_string(),
+            reloaded.log.clone(),
             &reloaded_runtime,
         )
         .expect("reloaded bundle");
@@ -6816,6 +6826,68 @@ mod tests {
         assert_eq!(state.metrics_path, "/metrics-live");
         assert_eq!(state.max_connections, 29);
         assert_eq!(state.connection_timeout, Duration::from_millis(3456));
+    }
+
+    #[test]
+    fn quic_listener_syncs_drain_timeout_and_connection_rate_limiter_after_reload() {
+        let dir = tempdir().expect("tempdir");
+        let (cert, key) = write_test_cert_for_name(dir.path(), "server", "api.example.com");
+        let mut startup = tls_test_config(cert.clone(), key.clone(), Vec::new());
+        startup.listen.port = 0;
+        startup.performance.shutdown_drain_timeout_ms = 5_000;
+        startup.performance.new_connections_per_sec = 100;
+        startup.performance.new_connections_burst = 5;
+
+        let startup_runtime = RuntimeConfig::from_config(&startup).expect("startup runtime");
+        let startup_bundle = super::QUICListener::build_runtime_bundle(
+            "startup.yaml".to_string(),
+            startup.log.clone(),
+            &startup_runtime,
+        )
+        .expect("startup bundle");
+        let runtime_handle = Arc::new(super::RuntimeBundleHandle::new(startup_bundle.clone()));
+        let listener_config = startup_bundle
+            .runtime_config
+            .primary_listener_runtime_config()
+            .expect("listener runtime config");
+        let socket =
+            super::QUICListener::bind_socket(&listener_config, false).expect("bind socket");
+        let mut listener = super::QUICListener::new_with_socket_and_shared_state(
+            listener_config,
+            socket,
+            Arc::clone(&startup_bundle.shared_state),
+        )
+        .expect("listener")
+        .with_runtime_bundle(Arc::clone(&runtime_handle));
+
+        let mut reloaded = startup.clone();
+        reloaded.performance.shutdown_drain_timeout_ms = 1_234;
+        reloaded.performance.new_connections_per_sec = 50;
+        reloaded.performance.new_connections_burst = 2;
+
+        let reloaded_runtime = RuntimeConfig::from_config(&reloaded).expect("reloaded runtime");
+        let mut reloaded_bundle = super::QUICListener::build_runtime_bundle(
+            "reloaded.yaml".to_string(),
+            reloaded.log.clone(),
+            &reloaded_runtime,
+        )
+        .expect("reloaded bundle");
+        reloaded_bundle.generation = 1;
+        runtime_handle
+            .replace(reloaded_bundle)
+            .expect("replace runtime bundle");
+
+        listener
+            .sync_runtime_bundle_if_needed()
+            .expect("sync runtime bundle");
+
+        assert_eq!(listener.drain_timeout, Duration::from_millis(1_234));
+        assert!(listener.conn_rate_limiter.try_consume());
+        assert!(listener.conn_rate_limiter.try_consume());
+        assert!(
+            !listener.conn_rate_limiter.try_consume(),
+            "reconfigured burst should clamp immediate capacity to the new limit"
+        );
     }
 
     #[test]

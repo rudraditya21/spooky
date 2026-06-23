@@ -765,6 +765,7 @@ impl QUICListener {
             let next_runtime = RuntimeBundle {
                 generation: runtime.generation.saturating_add(1),
                 config_path,
+                log_config: config.log.clone(),
                 runtime_config,
                 shared_state: Arc::clone(&next_shared_state),
             };
@@ -799,6 +800,17 @@ impl QUICListener {
                     json!({
                         "reloaded": false,
                         "error": err,
+                    }),
+                );
+            }
+            let startup_owned_issues =
+                Self::validate_startup_owned_reload_compatibility(&runtime, &next_runtime);
+            if !startup_owned_issues.is_empty() {
+                return Self::json_response(
+                    StatusCode::CONFLICT,
+                    json!({
+                        "reloaded": false,
+                        "error": startup_owned_issues.join("; "),
                     }),
                 );
             }
@@ -1014,6 +1026,135 @@ impl QUICListener {
             ));
         }
         None
+    }
+
+    fn note_restart_required_change<T>(issues: &mut Vec<String>, field: &str, current: &T, next: &T)
+    where
+        T: PartialEq + std::fmt::Debug,
+    {
+        if current != next {
+            issues.push(format!(
+                "runtime reload rejected: {field} changed from {current:?} to {next:?}; restart required"
+            ));
+        }
+    }
+
+    fn validate_startup_owned_reload_compatibility(
+        current: &RuntimeBundle,
+        next: &RuntimeBundle,
+    ) -> Vec<String> {
+        let mut issues = Vec::new();
+
+        Self::note_restart_required_change(
+            &mut issues,
+            "log.level",
+            &current.log_config.level,
+            &next.log_config.level,
+        );
+        Self::note_restart_required_change(
+            &mut issues,
+            "log.file.enabled",
+            &current.log_config.file.enabled,
+            &next.log_config.file.enabled,
+        );
+        Self::note_restart_required_change(
+            &mut issues,
+            "log.file.path",
+            &current.log_config.file.path,
+            &next.log_config.file.path,
+        );
+        Self::note_restart_required_change(
+            &mut issues,
+            "log.format",
+            &current.log_config.format,
+            &next.log_config.format,
+        );
+
+        let current_tracing = &current.runtime_config.observability.tracing;
+        let next_tracing = &next.runtime_config.observability.tracing;
+        Self::note_restart_required_change(
+            &mut issues,
+            "observability.tracing.enabled",
+            &current_tracing.enabled,
+            &next_tracing.enabled,
+        );
+        Self::note_restart_required_change(
+            &mut issues,
+            "observability.tracing.service_name",
+            &current_tracing.service_name,
+            &next_tracing.service_name,
+        );
+        Self::note_restart_required_change(
+            &mut issues,
+            "observability.tracing.otlp_endpoint",
+            &current_tracing.otlp_endpoint,
+            &next_tracing.otlp_endpoint,
+        );
+        Self::note_restart_required_change(
+            &mut issues,
+            "observability.tracing.sample_ratio",
+            &current_tracing.sample_ratio,
+            &next_tracing.sample_ratio,
+        );
+
+        let current_perf = &current.runtime_config.performance;
+        let next_perf = &next.runtime_config.performance;
+        Self::note_restart_required_change(
+            &mut issues,
+            "performance.control_plane_threads",
+            &current_perf.control_plane_threads,
+            &next_perf.control_plane_threads,
+        );
+        Self::note_restart_required_change(
+            &mut issues,
+            "performance.worker_threads",
+            &current_perf.worker_threads,
+            &next_perf.worker_threads,
+        );
+        Self::note_restart_required_change(
+            &mut issues,
+            "performance.packet_shards_per_worker",
+            &current_perf.packet_shards_per_worker,
+            &next_perf.packet_shards_per_worker,
+        );
+        Self::note_restart_required_change(
+            &mut issues,
+            "performance.packet_shard_queue_capacity",
+            &current_perf.packet_shard_queue_capacity,
+            &next_perf.packet_shard_queue_capacity,
+        );
+        Self::note_restart_required_change(
+            &mut issues,
+            "performance.packet_shard_queue_max_bytes",
+            &current_perf.packet_shard_queue_max_bytes,
+            &next_perf.packet_shard_queue_max_bytes,
+        );
+        Self::note_restart_required_change(
+            &mut issues,
+            "performance.reuseport",
+            &current_perf.reuseport,
+            &next_perf.reuseport,
+        );
+        Self::note_restart_required_change(
+            &mut issues,
+            "performance.pin_workers",
+            &current_perf.pin_workers,
+            &next_perf.pin_workers,
+        );
+        Self::note_restart_required_change(
+            &mut issues,
+            "performance.udp_recv_buffer_bytes",
+            &current_perf.udp_recv_buffer_bytes,
+            &next_perf.udp_recv_buffer_bytes,
+        );
+        Self::note_restart_required_change(
+            &mut issues,
+            "performance.udp_send_buffer_bytes",
+            &current_perf.udp_send_buffer_bytes,
+            &next_perf.udp_send_buffer_bytes,
+        );
+
+        issues
     }
 
     pub(super) fn control_api_is_authorized(
@@ -1322,8 +1463,12 @@ mod tests {
 
     fn runtime_bundle_from_config(config_path: &str, config: &SpookyConfigConfig) -> RuntimeBundle {
         let runtime_config = RuntimeConfig::from_config(config).expect("runtime config");
-        QUICListener::build_runtime_bundle(config_path.to_string(), &runtime_config)
-            .expect("runtime bundle")
+        QUICListener::build_runtime_bundle(
+            config_path.to_string(),
+            config.log.clone(),
+            &runtime_config,
+        )
+        .expect("runtime bundle")
     }
 
     fn control_api_state_with_runtime_bundle(
@@ -1486,5 +1631,57 @@ mod tests {
                 .expect("bind change should be rejected");
 
         assert!(err.contains("observability.metrics bind changed"));
+    }
+
+    #[test]
+    fn validate_startup_owned_reload_compatibility_rejects_log_change() {
+        let dir = tempdir().expect("tempdir");
+        let (cert, key) = write_test_cert_for_name(dir.path(), "server", "api.example.com");
+        let current = test_config(cert.clone(), key.clone());
+
+        let mut next = current.clone();
+        next.log.level = "debug".to_string();
+
+        let current_bundle = runtime_bundle_from_config("current.yaml", &current);
+        let next_bundle = runtime_bundle_from_config("next.yaml", &next);
+        let issues = QUICListener::validate_startup_owned_reload_compatibility(
+            &current_bundle,
+            &next_bundle,
+        );
+
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("log.level") && issue.contains("restart required"))
+        );
+    }
+
+    #[test]
+    fn validate_startup_owned_reload_compatibility_rejects_worker_topology_change() {
+        let dir = tempdir().expect("tempdir");
+        let (cert, key) = write_test_cert_for_name(dir.path(), "server", "api.example.com");
+        let current = test_config(cert.clone(), key.clone());
+
+        let mut next = current.clone();
+        next.performance.worker_threads = 4;
+        next.performance.packet_shards_per_worker = 2;
+
+        let current_bundle = runtime_bundle_from_config("current.yaml", &current);
+        let next_bundle = runtime_bundle_from_config("next.yaml", &next);
+        let issues = QUICListener::validate_startup_owned_reload_compatibility(
+            &current_bundle,
+            &next_bundle,
+        );
+
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("performance.worker_threads"))
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("performance.packet_shards_per_worker"))
+        );
     }
 }

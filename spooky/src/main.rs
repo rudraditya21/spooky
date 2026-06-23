@@ -168,17 +168,28 @@ fn main() {
         }
     };
 
-    runtime.block_on(run(runtime_config, uid, config_path));
+    runtime.block_on(run(
+        runtime_config,
+        config_yaml.log.clone(),
+        uid,
+        config_path,
+    ));
 }
 
-async fn run(runtime_config: RuntimeConfig, uid: libc::uid_t, config_path: String) {
-    let runtime_bundle = match QUICListener::build_runtime_bundle(config_path, &runtime_config) {
-        Ok(bundle) => bundle,
-        Err(e) => {
-            error!("Failed to initialize shared runtime state: {}", e);
-            std::process::exit(1);
-        }
-    };
+async fn run(
+    runtime_config: RuntimeConfig,
+    log_config: spooky_config::config::Log,
+    uid: libc::uid_t,
+    config_path: String,
+) {
+    let runtime_bundle =
+        match QUICListener::build_runtime_bundle(config_path, log_config, &runtime_config) {
+            Ok(bundle) => bundle,
+            Err(e) => {
+                error!("Failed to initialize shared runtime state: {}", e);
+                std::process::exit(1);
+            }
+        };
     let shared_state = Arc::clone(&runtime_bundle.shared_state);
     let runtime_bundle = Arc::new(RuntimeBundleHandle::new(runtime_bundle));
 
