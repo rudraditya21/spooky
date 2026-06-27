@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1-beta] - 2026-06-27
+
+### Added
+
+- Full config hot reload via `POST /admin/runtime/reload` — atomically swaps the runtime bundle without restarting the process or dropping connections.
+- Listener group reconciliation on reload — new listener groups are started and removed groups are retired gracefully per the incoming config.
+- Live admin endpoint rebinding — control API and metrics endpoint addresses are updated in place on reload without requiring a restart.
+- `RuntimeTaskRegistry` — generation-aware background task tracking; retired tasks drain on a configurable timeout when a new generation is activated.
+
+### Fixed
+
+- Hot reload now correctly rejects configs that remove a listener or change its bind address, returning `409 Conflict`.
+- Hot reload now correctly rejects changes to startup-owned settings (log level, thread counts, listen address), returning `409 Conflict`.
+- Control API and cert reload endpoints now target the live runtime bundle after a hot reload instead of the original startup bundle.
+- Metrics endpoint, bootstrap listener, and control API settings are now refreshed from the live runtime bundle on each reload.
+
+### Changed
+
+- Large runtime modules split into focused submodules: `quic_listener/mod.rs` → `bootstrap_tls`, `control_api/`, `forwarding`, `metrics_endpoint`, `tls_runtime`; `spooky/main.rs` → `app`, `listener_group`; `config/validator.rs` → `helpers`; `config/runtime.rs` → `listeners`, `upstreams`.
+- Integration tests extracted into per-subsystem modules (`h3_edge/`, `h3_bridge/protocol`, `lb/tests`, `control_api/tests`).
+
 ## [0.3.0-beta] - 2026-06-20
 
 ### Added
