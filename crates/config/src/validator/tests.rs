@@ -1,0 +1,925 @@
+use super::validate;
+use crate::config::{
+    Backend, ClientAuth, Config, ControlApi, HealthCheck, Listen, LoadBalancing, Log, LogFormat,
+    MetricsEndpoint, Observability, Performance, Resilience, RouteMatch, Security, Tls,
+    TlsCertificate, Tracing, Upstream, UpstreamTls,
+};
+use rcgen::{Certificate, CertificateParams, SanType};
+use std::collections::HashMap;
+use tempfile::tempdir;
+
+fn write_test_certs(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let mut params = CertificateParams::new(vec!["localhost".into()]);
+    params
+        .subject_alt_names
+        .push(SanType::IpAddress("127.0.0.1".parse().expect("ip")));
+    let cert = Certificate::from_params(params).expect("failed to build cert");
+
+    let cert_path = dir.join("cert.pem");
+    let key_path = dir.join("key.pem");
+
+    std::fs::write(&cert_path, cert.serialize_pem().expect("serialize cert")).expect("write cert");
+    std::fs::write(&key_path, cert.serialize_private_key_pem()).expect("write key");
+
+    (cert_path, key_path)
+}
+
+fn base_config(cert: &str, key: &str) -> Config {
+    let mut upstream = HashMap::new();
+    upstream.insert(
+        "test_upstream".to_string(),
+        Upstream {
+            load_balancing: LoadBalancing {
+                lb_type: "round-robin".to_string(),
+                key: None,
+            },
+            host_policy: Default::default(),
+            forwarded_headers: Default::default(),
+            tls: None,
+            route: RouteMatch {
+                host: None,
+                path_prefix: Some("/".to_string()),
+                method: None,
+            },
+            backends: vec![Backend {
+                id: "backend-1".to_string(),
+                address: "127.0.0.1:8080".to_string(),
+                weight: 1,
+                health_check: Some(HealthCheck {
+                    path: "/health".to_string(),
+                    interval: 1000,
+                    timeout_ms: 1000,
+                    failure_threshold: 3,
+                    success_threshold: 1,
+                    cooldown_ms: 1000,
+                }),
+            }],
+        },
+    );
+
+    Config {
+        version: 1,
+        listen: Listen {
+            protocol: "http3".to_string(),
+            port: 9889,
+            address: "127.0.0.1".to_string(),
+            tls: Tls {
+                cert: cert.to_string(),
+                key: key.to_string(),
+                certificates: vec![],
+                client_auth: ClientAuth::default(),
+            },
+        },
+        listeners: vec![],
+        upstream,
+        load_balancing: Some(LoadBalancing {
+            lb_type: "random".to_string(),
+            key: None,
+        }),
+        upstream_tls: UpstreamTls::default(),
+        log: Log {
+            level: "info".to_string(),
+            file: Default::default(),
+            format: LogFormat::Plain,
+        },
+        performance: Performance::default(),
+        observability: Observability::default(),
+        resilience: Resilience::default(),
+        security: Security::default(),
+    }
+}
+
+#[test]
+fn yaml_parse_applies_performance_and_observability_defaults() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let yaml = format!(
+        r#"
+version: 1
+listen:
+  protocol: http3
+  address: "127.0.0.1"
+  port: 9889
+  tls:
+    cert: "{}"
+    key: "{}"
+upstream:
+  test_upstream:
+    load_balancing:
+      type: round-robin
+    route:
+      path_prefix: "/"
+    backends:
+      - id: "b1"
+        address: "127.0.0.1:8080"
+        weight: 1
+        health_check: {{}}
+"#,
+        cert.display(),
+        key.display()
+    );
+
+    let cfg: Config = serde_yaml::from_str(&yaml).expect("parse");
+    assert_eq!(cfg.performance.worker_threads, 1);
+    assert_eq!(cfg.performance.control_plane_threads, 2);
+    assert_eq!(cfg.performance.packet_shards_per_worker, 1);
+    assert_eq!(cfg.performance.packet_shard_queue_capacity, 2048);
+    assert_eq!(
+        cfg.performance.packet_shard_queue_max_bytes,
+        64 * 1024 * 1024
+    );
+    assert!(cfg.performance.reuseport);
+    assert!(!cfg.performance.pin_workers);
+    assert_eq!(cfg.performance.global_inflight_limit, 4096);
+    assert_eq!(cfg.performance.per_upstream_inflight_limit, 1024);
+    assert_eq!(cfg.performance.backend_timeout_ms, 2000);
+    assert_eq!(cfg.performance.backend_connect_timeout_ms, 500);
+    assert_eq!(cfg.performance.backend_body_idle_timeout_ms, 2000);
+    assert_eq!(cfg.performance.backend_body_total_timeout_ms, 30000);
+    assert_eq!(cfg.performance.backend_total_request_timeout_ms, 35_000);
+    assert_eq!(cfg.performance.shutdown_drain_timeout_ms, 5_000);
+    assert_eq!(cfg.performance.udp_recv_buffer_bytes, 8 * 1024 * 1024);
+    assert_eq!(cfg.performance.udp_send_buffer_bytes, 8 * 1024 * 1024);
+    assert_eq!(cfg.performance.h2_pool_max_idle_per_backend, 256);
+    assert_eq!(cfg.performance.h2_pool_idle_timeout_ms, 90_000);
+    assert!(!cfg.performance.backend_dns_refresh_enabled);
+    assert_eq!(cfg.performance.backend_dns_refresh_interval_ms, 30_000);
+    assert_eq!(cfg.performance.per_backend_inflight_limit, 64);
+    assert_eq!(cfg.performance.max_active_connections, 20_000);
+    assert_eq!(cfg.performance.max_request_body_bytes, 1_000_000);
+    assert_eq!(
+        cfg.performance.request_buffer_global_cap_bytes,
+        64 * 1024 * 1024
+    );
+    assert_eq!(
+        cfg.performance.unknown_length_response_prebuffer_bytes,
+        2 * 1024 * 1024
+    );
+    assert_eq!(cfg.performance.client_body_idle_timeout_ms, 10_000);
+    assert!(!cfg.observability.metrics.enabled);
+    assert_eq!(cfg.observability.metrics.path, "/metrics");
+    assert_eq!(cfg.observability.metrics.max_connections, 512);
+    assert_eq!(cfg.observability.metrics.connection_timeout_ms, 30_000);
+    assert!(cfg.upstream_tls.verify_certificates);
+    assert!(cfg.upstream_tls.strict_sni);
+    assert!(!cfg.listen.tls.client_auth.enabled);
+    assert!(!cfg.listen.tls.client_auth.require_client_cert);
+    assert!(cfg.listen.tls.client_auth.ca_file.is_none());
+    assert!(cfg.resilience.adaptive_admission.enabled);
+    assert!(cfg.resilience.adaptive_admission.max_limit.is_none());
+    assert_eq!(cfg.resilience.route_queue.default_cap, 512);
+    assert_eq!(cfg.resilience.route_queue.global_cap, 2048);
+    assert_eq!(cfg.resilience.route_queue.shed_retry_after_seconds, 1);
+    assert!(!cfg.resilience.protocol.allow_0rtt);
+    assert!(!cfg.resilience.protocol.allow_connect);
+    assert_eq!(cfg.resilience.protocol.max_headers_count, 128);
+    assert_eq!(cfg.resilience.protocol.max_headers_bytes, 16 * 1024);
+    assert!(cfg.resilience.protocol.enforce_authority_host_match);
+    assert!(cfg.resilience.protocol.connect_allowed_ports.is_empty());
+    assert!(
+        cfg.resilience
+            .protocol
+            .connect_allowed_authorities
+            .is_empty()
+    );
+    assert!(!cfg.resilience.watchdog.enabled);
+    assert_eq!(cfg.resilience.watchdog.check_interval_ms, 1_000);
+    assert_eq!(cfg.observability.control_api.max_connections, 256);
+    assert_eq!(cfg.observability.control_api.connection_timeout_ms, 30_000);
+}
+
+#[test]
+fn rejects_invalid_performance_and_observability_values() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.performance.worker_threads = 0;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.performance.worker_threads = 4;
+    cfg.performance.reuseport = false;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.performance.packet_shards_per_worker = 0;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.performance.packet_shard_queue_capacity = 0;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.performance.packet_shard_queue_max_bytes = 0;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.performance.backend_connect_timeout_ms = 2_001;
+    cfg.performance.backend_timeout_ms = 2_000;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.performance.backend_total_request_timeout_ms = 5_000;
+    cfg.performance.backend_body_total_timeout_ms = 6_000;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.performance.backend_body_total_timeout_ms = 100;
+    cfg.performance.backend_body_idle_timeout_ms = 200;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.performance.shutdown_drain_timeout_ms = 0;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.performance.udp_recv_buffer_bytes = 0;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.performance.udp_send_buffer_bytes = 0;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.performance.h2_pool_max_idle_per_backend = 0;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.performance.h2_pool_idle_timeout_ms = 0;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.performance.backend_dns_refresh_interval_ms = 0;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.performance.per_backend_inflight_limit = 0;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.performance.new_connections_per_sec = 0;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.performance.new_connections_burst = 0;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.performance.max_active_connections = 0;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.performance.quic_max_idle_timeout_ms = 0;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.performance.quic_initial_max_data = 0;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.performance.quic_initial_max_stream_data = 0;
+    assert!(validate(&cfg).is_err());
+
+    // stream limit exceeds connection limit — cross-field violation
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.performance.quic_initial_max_data = 1_000_000;
+    cfg.performance.quic_initial_max_stream_data = 2_000_000;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.performance.quic_initial_max_streams_bidi = 0;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.performance.quic_initial_max_streams_uni = 0;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.performance.max_response_body_bytes = 0;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.performance.max_request_body_bytes = 0;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.performance.request_buffer_global_cap_bytes = 0;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.performance.unknown_length_response_prebuffer_bytes = 0;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.performance.client_body_idle_timeout_ms = 0;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.performance.max_request_body_bytes =
+        (cfg.performance.quic_initial_max_stream_data as usize).saturating_add(1);
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.performance.request_buffer_global_cap_bytes =
+        cfg.performance.max_request_body_bytes.saturating_sub(1);
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.performance.unknown_length_response_prebuffer_bytes =
+        cfg.performance.max_response_body_bytes.saturating_add(1);
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.resilience.adaptive_admission.max_limit = Some(0);
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.resilience.adaptive_admission.max_limit = Some(
+        cfg.resilience
+            .adaptive_admission
+            .min_limit
+            .saturating_sub(1),
+    );
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.resilience.adaptive_admission.max_limit =
+        Some(cfg.performance.global_inflight_limit.saturating_add(1));
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.resilience.route_queue.default_cap = 0;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.resilience.route_queue.global_cap = 0;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.resilience.route_queue.shed_retry_after_seconds = 0;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.resilience.protocol.max_headers_count = 0;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.resilience.protocol.max_headers_bytes = 0;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.resilience.protocol.allow_0rtt = true;
+    cfg.resilience.protocol.early_data_safe_methods.clear();
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.resilience.protocol.denied_path_prefixes = vec!["admin".to_string()];
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.resilience.protocol.connect_allowed_ports = vec![443];
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.resilience.protocol.allow_connect = true;
+    cfg.resilience.protocol.connect_allowed_ports = vec![0];
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.resilience.protocol.allow_connect = true;
+    cfg.resilience.protocol.connect_allowed_authorities = vec!["example.com".to_string()];
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.resilience.protocol.allow_connect = true;
+    cfg.resilience.protocol.connect_allowed_authorities = vec!["example.com:443".to_string()];
+    cfg.resilience.protocol.connect_allowed_ports = vec![443];
+    assert!(validate(&cfg).is_ok());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.resilience.protocol.allowed_methods = vec!["".to_string()];
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.resilience.protocol.allowed_methods = vec!["GE T".to_string()];
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.resilience.protocol.allowed_methods = vec!["GET/".to_string()];
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.resilience.protocol.allowed_methods = vec!["GE\nT".to_string()];
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.resilience.retry_budget.ratio_percent = 101;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.resilience.brownout.trigger_inflight_percent = 50;
+    cfg.resilience.brownout.recover_inflight_percent = 50;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.resilience.watchdog.timeout_error_rate_percent = 101;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.resilience.watchdog.unhealthy_consecutive_windows = 0;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.listen.tls.client_auth.require_client_cert = true;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.listen.tls.client_auth.enabled = true;
+    cfg.listen.tls.client_auth.ca_file = None;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.upstream_tls.verify_certificates = false;
+    assert!(validate(&cfg).is_ok());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.upstream_tls.ca_file = Some("/path/does/not/exist.pem".to_string());
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.upstream_tls.ca_dir = Some("/path/does/not/exist".to_string());
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.observability = Observability {
+        metrics: MetricsEndpoint {
+            enabled: true,
+            required: false,
+            address: "127.0.0.1".to_string(),
+            port: 9901,
+            path: "metrics".to_string(),
+            max_connections: 128,
+            connection_timeout_ms: 10_000,
+        },
+        control_api: ControlApi::default(),
+        tracing: Tracing::default(),
+        routing: crate::config::RoutingTransparency::default(),
+    };
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.observability.metrics.enabled = true;
+    cfg.observability.metrics.max_connections = 0;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.observability.metrics.enabled = true;
+    cfg.observability.metrics.connection_timeout_ms = 0;
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.observability.control_api.enabled = true;
+    cfg.observability.control_api.max_connections = 0;
+    cfg.observability.control_api.auth_token = Some("token".to_string());
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.observability.control_api.enabled = true;
+    cfg.observability.control_api.connection_timeout_ms = 0;
+    cfg.observability.control_api.auth_token = Some("token".to_string());
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.observability.routing.expose_header = true;
+    cfg.observability.routing.header_name = "   ".to_string();
+    assert!(validate(&cfg).is_err());
+}
+
+#[test]
+fn rejects_unparseable_tls_material() {
+    let dir = tempdir().expect("tempdir");
+    let cert = dir.path().join("cert.pem");
+    let key = dir.path().join("key.pem");
+    std::fs::write(&cert, "not-a-pem-cert").expect("write cert");
+    std::fs::write(&key, "not-a-pem-key").expect("write key");
+
+    let cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    assert!(validate(&cfg).is_err());
+}
+
+#[test]
+fn accepts_sni_certificates_without_legacy_cert_pair() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.listen.tls.cert = String::new();
+    cfg.listen.tls.key = String::new();
+    cfg.listen.tls.certificates = vec![TlsCertificate {
+        server_name: "api.example.com".to_string(),
+        cert: cert.to_string_lossy().to_string(),
+        key: key.to_string_lossy().to_string(),
+    }];
+
+    assert!(validate(&cfg).is_ok());
+}
+
+#[test]
+fn rejects_duplicate_sni_certificate_server_names() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.listen.tls.certificates = vec![
+        TlsCertificate {
+            server_name: "api.example.com".to_string(),
+            cert: cert.to_string_lossy().to_string(),
+            key: key.to_string_lossy().to_string(),
+        },
+        TlsCertificate {
+            server_name: "API.EXAMPLE.COM".to_string(),
+            cert: cert.to_string_lossy().to_string(),
+            key: key.to_string_lossy().to_string(),
+        },
+    ];
+
+    assert!(validate(&cfg).is_err());
+}
+
+#[test]
+fn rejects_invalid_sni_certificate_server_name() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.listen.tls.certificates = vec![TlsCertificate {
+        server_name: "not a hostname".to_string(),
+        cert: cert.to_string_lossy().to_string(),
+        key: key.to_string_lossy().to_string(),
+    }];
+
+    assert!(validate(&cfg).is_err());
+}
+
+#[test]
+fn accepts_valid_metrics_and_performance_configuration() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.performance.worker_threads = 4;
+    cfg.performance.control_plane_threads = 2;
+    cfg.performance.packet_shards_per_worker = 2;
+    cfg.performance.packet_shard_queue_capacity = 1024;
+    cfg.performance.packet_shard_queue_max_bytes = 16 * 1024 * 1024;
+    cfg.performance.reuseport = true;
+    cfg.performance.pin_workers = true;
+    cfg.performance.global_inflight_limit = 10_000;
+    cfg.performance.per_upstream_inflight_limit = 2_000;
+    cfg.performance.backend_connect_timeout_ms = 300;
+    cfg.performance.backend_timeout_ms = 1500;
+    cfg.performance.backend_body_idle_timeout_ms = 2_500;
+    cfg.performance.backend_body_total_timeout_ms = 10_000;
+    cfg.performance.backend_total_request_timeout_ms = 15_000;
+    cfg.performance.shutdown_drain_timeout_ms = 7_500;
+    cfg.performance.udp_recv_buffer_bytes = 4 * 1024 * 1024;
+    cfg.performance.udp_send_buffer_bytes = 4 * 1024 * 1024;
+    cfg.performance.h2_pool_max_idle_per_backend = 128;
+    cfg.performance.h2_pool_idle_timeout_ms = 120_000;
+    cfg.performance.per_backend_inflight_limit = 32;
+    cfg.performance.max_active_connections = 50_000;
+    cfg.performance.max_request_body_bytes = 512 * 1024;
+    cfg.performance.request_buffer_global_cap_bytes = 8 * 1024 * 1024;
+    cfg.performance.unknown_length_response_prebuffer_bytes = 512 * 1024;
+    cfg.performance.client_body_idle_timeout_ms = 7_500;
+    cfg.resilience.adaptive_admission.max_limit = Some(1024);
+    cfg.resilience.route_queue.default_cap = 256;
+    cfg.resilience.route_queue.global_cap = 2048;
+    cfg.resilience.route_queue.shed_retry_after_seconds = 2;
+    cfg.resilience.protocol.allow_0rtt = true;
+    cfg.resilience.protocol.early_data_safe_methods = vec!["GET".to_string()];
+    cfg.resilience.protocol.max_headers_count = 64;
+    cfg.resilience.protocol.max_headers_bytes = 8 * 1024;
+    cfg.resilience.protocol.allowed_methods = vec!["GET".to_string(), "POST".to_string()];
+    cfg.resilience.protocol.denied_path_prefixes = vec!["/admin".to_string()];
+    cfg.resilience.retry_budget.ratio_percent = 30;
+    cfg.upstream_tls.verify_certificates = true;
+    cfg.upstream_tls.strict_sni = true;
+    cfg.upstream_tls.ca_file = Some(cert.to_string_lossy().to_string());
+    cfg.upstream_tls.ca_dir = Some(dir.path().to_string_lossy().to_string());
+    cfg.listen.tls.client_auth.enabled = true;
+    cfg.listen.tls.client_auth.require_client_cert = true;
+    cfg.listen.tls.client_auth.ca_file = Some(cert.to_string_lossy().to_string());
+    cfg.observability = Observability {
+        metrics: MetricsEndpoint {
+            enabled: true,
+            required: false,
+            address: "127.0.0.1".to_string(),
+            port: 9901,
+            path: "/metrics".to_string(),
+            max_connections: 128,
+            connection_timeout_ms: 10_000,
+        },
+        control_api: ControlApi::default(),
+        tracing: Tracing::default(),
+        routing: crate::config::RoutingTransparency::default(),
+    };
+
+    assert!(validate(&cfg).is_ok());
+}
+
+#[test]
+fn skips_unused_global_upstream_tls_validation_for_http_only_backends() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.upstream_tls.ca_file = Some("/path/does/not/exist.pem".to_string());
+    cfg.upstream_tls.ca_dir = Some("/path/does/not/exist".to_string());
+    cfg.upstream
+        .get_mut("test_upstream")
+        .expect("upstream")
+        .backends[0]
+        .address = "http://127.0.0.1:8080".to_string();
+
+    assert!(validate(&cfg).is_ok());
+}
+
+#[test]
+fn skips_unused_per_upstream_tls_validation_for_http_only_backends() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.upstream.get_mut("test_upstream").expect("upstream").tls = Some(UpstreamTls {
+        verify_certificates: true,
+        strict_sni: true,
+        ca_file: Some("/path/does/not/exist.pem".to_string()),
+        ca_dir: Some("/path/does/not/exist".to_string()),
+    });
+    cfg.upstream
+        .get_mut("test_upstream")
+        .expect("upstream")
+        .backends[0]
+        .address = "http://127.0.0.1:8080".to_string();
+
+    assert!(validate(&cfg).is_ok());
+}
+
+#[test]
+fn backend_address_validation_supports_secure_default_and_explicit_http() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    // Bare host:port defaults to HTTPS policy.
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.upstream
+        .get_mut("test_upstream")
+        .expect("upstream")
+        .backends[0]
+        .address = "api.example.internal:443".to_string();
+    assert!(validate(&cfg).is_ok());
+
+    // Explicit HTTP remains allowed as an opt-out.
+    cfg.upstream
+        .get_mut("test_upstream")
+        .expect("upstream")
+        .backends[0]
+        .address = "http://127.0.0.1:8080".to_string();
+    assert!(validate(&cfg).is_ok());
+}
+
+#[test]
+fn backend_address_validation_rejects_invalid_urls() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.upstream
+        .get_mut("test_upstream")
+        .expect("upstream")
+        .backends[0]
+        .address = "https://127.0.0.1:8443/path".to_string();
+    assert!(validate(&cfg).is_err());
+
+    cfg.upstream
+        .get_mut("test_upstream")
+        .expect("upstream")
+        .backends[0]
+        .address = "ftp://127.0.0.1:21".to_string();
+    assert!(validate(&cfg).is_err());
+}
+
+#[test]
+fn rejects_duplicate_backend_addresses_across_upstreams() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    let mut duplicate = cfg.upstream.get("test_upstream").expect("upstream").clone();
+    duplicate.backends[0].id = "backend-2".to_string();
+    duplicate.route.path_prefix = Some("/v2".to_string());
+    cfg.upstream
+        .insert("test_upstream_2".to_string(), duplicate);
+
+    assert!(validate(&cfg).is_err());
+}
+
+#[test]
+fn rejects_non_loopback_control_api_without_auth_token() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.observability.control_api.enabled = true;
+    cfg.observability.control_api.address = "0.0.0.0".to_string();
+    cfg.observability.control_api.auth_token = None;
+    assert!(validate(&cfg).is_err());
+}
+
+#[test]
+fn rejects_loopback_control_api_without_auth_token() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.observability.control_api.enabled = true;
+    cfg.observability.control_api.address = "127.0.0.1".to_string();
+    cfg.observability.control_api.auth_token = None;
+    assert!(validate(&cfg).is_err());
+}
+
+#[test]
+fn rejects_legacy_watchdog_restart_hook() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.resilience.watchdog.restart_hook = Some("echo legacy".to_string());
+    assert!(validate(&cfg).is_err());
+}
+
+#[test]
+fn rejects_any_provided_legacy_watchdog_restart_hook_value() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.resilience.watchdog.restart_hook = None;
+    assert!(validate(&cfg).is_ok());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.resilience.watchdog.restart_hook = Some(String::new());
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.resilience.watchdog.restart_hook = Some("   ".to_string());
+    assert!(validate(&cfg).is_err());
+}
+
+#[test]
+fn rejects_empty_privilege_drop_user_or_group() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.security.privileges.enabled = true;
+    cfg.security.privileges.user = " ".to_string();
+    assert!(validate(&cfg).is_err());
+
+    cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.security.privileges.enabled = true;
+    cfg.security.privileges.group = " ".to_string();
+    assert!(validate(&cfg).is_err());
+}
+
+#[test]
+fn rejects_ambiguous_route_matchers_with_same_host_path_and_method() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    {
+        let upstream = cfg.upstream.get_mut("test_upstream").expect("upstream");
+        upstream.route.host = Some("API.EXAMPLE.COM:443".to_string());
+        upstream.route.path_prefix = Some("/api".to_string());
+        upstream.route.method = Some("get".to_string());
+        upstream.backends[0].address = "127.0.0.1:9001".to_string();
+    }
+
+    let duplicate = Upstream {
+        load_balancing: LoadBalancing {
+            lb_type: "round-robin".to_string(),
+            key: None,
+        },
+        host_policy: Default::default(),
+        forwarded_headers: Default::default(),
+        tls: None,
+        route: RouteMatch {
+            host: Some("api.example.com".to_string()),
+            path_prefix: Some("/api".to_string()),
+            method: Some("GET".to_string()),
+        },
+        backends: vec![Backend {
+            id: "backend-2".to_string(),
+            address: "127.0.0.1:9002".to_string(),
+            weight: 1,
+            health_check: None,
+        }],
+    };
+    cfg.upstream
+        .insert("test_upstream_2".to_string(), duplicate);
+
+    assert!(validate(&cfg).is_err());
+}
+
+#[test]
+fn allows_same_host_and_path_when_methods_differ() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    {
+        let upstream = cfg.upstream.get_mut("test_upstream").expect("upstream");
+        upstream.route.host = Some("api.example.com".to_string());
+        upstream.route.path_prefix = Some("/api".to_string());
+        upstream.route.method = Some("GET".to_string());
+        upstream.backends[0].address = "127.0.0.1:9001".to_string();
+    }
+
+    let post_route = Upstream {
+        load_balancing: LoadBalancing {
+            lb_type: "round-robin".to_string(),
+            key: None,
+        },
+        host_policy: Default::default(),
+        forwarded_headers: Default::default(),
+        tls: None,
+        route: RouteMatch {
+            host: Some("api.example.com".to_string()),
+            path_prefix: Some("/api".to_string()),
+            method: Some("POST".to_string()),
+        },
+        backends: vec![Backend {
+            id: "backend-2".to_string(),
+            address: "127.0.0.1:9002".to_string(),
+            weight: 1,
+            health_check: None,
+        }],
+    };
+    cfg.upstream
+        .insert("test_upstream_2".to_string(), post_route);
+
+    assert!(validate(&cfg).is_ok());
+}
+
+#[test]
+fn listeners_override_invalid_legacy_listen_block() {
+    let dir = tempdir().expect("tempdir");
+    let (legacy_cert, legacy_key) = write_test_certs(dir.path());
+    let (listener_cert, listener_key) = write_test_certs(dir.path());
+
+    let mut cfg = base_config(
+        &legacy_cert.to_string_lossy(),
+        &legacy_key.to_string_lossy(),
+    );
+    cfg.listen.tls.cert.clear();
+    cfg.listen.tls.key.clear();
+    cfg.listeners = vec![Listen {
+        protocol: "http3".to_string(),
+        port: 9443,
+        address: "127.0.0.1".to_string(),
+        tls: Tls {
+            cert: listener_cert.to_string_lossy().to_string(),
+            key: listener_key.to_string_lossy().to_string(),
+            certificates: vec![],
+            client_auth: ClientAuth::default(),
+        },
+    }];
+
+    assert!(validate(&cfg).is_ok());
+}
+
+#[test]
+fn validate_returns_actionable_error_message() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.log.level = "debug-verbose".to_string();
+
+    let err = validate(&cfg).expect_err("invalid config should return structured error");
+    assert_eq!(err.message, "Invalid log level: debug-verbose");
+}
+
+#[test]
+fn rejects_host_policy_host_when_mode_is_not_rewrite() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.upstream
+        .get_mut("test_upstream")
+        .expect("upstream")
+        .host_policy
+        .host = Some("ignored.example.com".to_string());
+
+    assert!(validate(&cfg).is_err());
+}

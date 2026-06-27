@@ -565,6 +565,2153 @@ impl QUICListener {
     }
 }
 
+impl QUICListener {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn handle_h3(
+        connection: &mut QuicConnection,
+        transport_pool: Arc<UpstreamTransportPool>,
+        backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
+        backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
+        upstream_policies: Arc<HashMap<String, RuntimeUpstreamPolicy>>,
+        upstream_pools: &HashMap<String, Arc<RwLock<UpstreamPool>>>,
+        upstream_inflight: &HashMap<String, Arc<Semaphore>>,
+        global_inflight: Arc<Semaphore>,
+        backend_timeout: Duration,
+        backend_body_idle_timeout: Duration,
+        backend_body_total_timeout: Duration,
+        backend_total_request_timeout: Duration,
+        routing_index: &RouteIndex,
+        metrics: Arc<Metrics>,
+        resilience: &RuntimeResilience,
+        max_request_body_bytes: usize,
+        max_response_body_bytes: usize,
+        request_buffer_global_cap_bytes: usize,
+        unknown_length_response_prebuffer_bytes: usize,
+        client_body_idle_timeout: Duration,
+        inflight_acquire_wait: Duration,
+        tracing_enabled: bool,
+        routing_transparency_enabled: bool,
+        routing_transparency_include_reason: bool,
+        listen_port: u16,
+        max_streams_per_connection: usize,
+    ) -> Result<(), quiche::h3::Error> {
+        let mut body_buf = [0u8; MAX_DATAGRAM_SIZE_BYTES];
+
+        if connection.h3.is_none() {
+            connection.h3 = Some(quiche::h3::Connection::with_transport(
+                &mut connection.quic,
+                &connection.h3_config,
+            )?);
+        }
+
+        let h3 = match connection.h3.as_mut() {
+            Some(h3) => h3,
+            None => return Ok(()),
+        };
+
+        loop {
+            match h3.poll(&mut connection.quic) {
+                Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
+                    let request = match validate_request_headers(&list, resilience) {
+                        Ok(request) => request,
+                        Err((status, body, is_policy)) => {
+                            metrics.inc_failure();
+                            metrics.inc_request_validation_reject();
+                            if is_policy {
+                                metrics.inc_policy_denied();
+                            }
+                            metrics.record_route(
+                                "unrouted",
+                                Duration::from_millis(0),
+                                RouteOutcome::Failure,
+                            );
+                            let _ = Self::send_simple_response(
+                                h3,
+                                &mut connection.quic,
+                                stream_id,
+                                status,
+                                body,
+                            );
+                            continue;
+                        }
+                    };
+                    let method = request.method;
+                    let path = request.path;
+                    let authority = request.authority;
+                    let content_length = request.content_length;
+
+                    metrics.inc_total();
+                    let request_start = Instant::now();
+
+                    if connection.quic.is_in_early_data() {
+                        if resilience.early_data_allowed_for(&method) {
+                            metrics.inc_early_data_accepted();
+                        } else {
+                            metrics.inc_failure();
+                            metrics.inc_early_data_rejected();
+                            metrics.inc_policy_denied();
+                            metrics.record_route(
+                                "unrouted",
+                                request_start.elapsed(),
+                                RouteOutcome::Failure,
+                            );
+                            Self::send_simple_response(
+                                h3,
+                                &mut connection.quic,
+                                stream_id,
+                                http::StatusCode::TOO_EARLY,
+                                b"request blocked by early-data policy\n",
+                            )?;
+                            continue;
+                        }
+                    }
+
+                    // Route lookup — needed to start the H2 request immediately.
+                    let sticky_cid_key = hex::encode(connection.primary_scid.as_ref());
+                    let lb_header_lookup = |name: &str| {
+                        list.iter()
+                            .find(|header| header.name().eq_ignore_ascii_case(name.as_bytes()))
+                            .and_then(|header| std::str::from_utf8(header.value()).ok())
+                            .map(str::to_string)
+                    };
+                    let resolved = Self::resolve_backend(
+                        &method,
+                        &path,
+                        authority.as_deref(),
+                        Some(sticky_cid_key.as_str()),
+                        upstream_pools,
+                        routing_index,
+                        Some(&lb_header_lookup),
+                    );
+
+                    let (
+                        body_tx,
+                        upstream_result_rx,
+                        backend_addr,
+                        backend_index,
+                        upstream_name,
+                        backend_lb,
+                        route_path_len,
+                        route_host_specific,
+                        route_reason,
+                        upstream_pool,
+                        global_inflight_permit,
+                        upstream_inflight_permit,
+                        adaptive_admission_permit,
+                        route_queue_permit,
+                        request_fin_received,
+                        bodyless_mode,
+                        trace_id,
+                        span_id,
+                        traceparent,
+                        trace_span,
+                        request_id,
+                    ) = match resolved {
+                        Ok(ResolvedBackend {
+                            upstream_name,
+                            backend_addr: addr,
+                            backend_index: idx,
+                            upstream_pool,
+                            backend_lb,
+                            route_path_len,
+                            route_host_specific,
+                            route_reason,
+                        }) => {
+                            resilience.brownout.observe_admission_pressure(
+                                resilience.adaptive_admission.inflight_percent(),
+                            );
+                            metrics.set_brownout_active(resilience.brownout.is_active());
+                            if !resilience.brownout.route_allowed(&upstream_name) {
+                                metrics.inc_failure();
+                                metrics.inc_overload_shed_reason(OverloadShedReason::Brownout);
+                                metrics.record_route(
+                                    &upstream_name,
+                                    request_start.elapsed(),
+                                    RouteOutcome::OverloadShed,
+                                );
+                                Self::send_overload_response(
+                                    h3,
+                                    &mut connection.quic,
+                                    stream_id,
+                                    b"brownout active, non-core route shed\n",
+                                    resilience.shed_retry_after_seconds,
+                                )?;
+                                resilience
+                                    .adaptive_admission
+                                    .observe(request_start.elapsed(), true);
+                                continue;
+                            }
+
+                            let adaptive_permit = match resilience.adaptive_admission.try_acquire()
+                            {
+                                Some(permit) => permit,
+                                None => {
+                                    metrics.inc_failure();
+                                    metrics.inc_overload_shed_reason(
+                                        OverloadShedReason::AdaptiveAdmission,
+                                    );
+                                    metrics.record_route(
+                                        &upstream_name,
+                                        request_start.elapsed(),
+                                        RouteOutcome::OverloadShed,
+                                    );
+                                    Self::send_overload_response(
+                                        h3,
+                                        &mut connection.quic,
+                                        stream_id,
+                                        b"adaptive admission overload\n",
+                                        resilience.shed_retry_after_seconds,
+                                    )?;
+                                    resilience
+                                        .adaptive_admission
+                                        .observe(request_start.elapsed(), true);
+                                    continue;
+                                }
+                            };
+
+                            let route_queue_permit =
+                                match resilience.route_queue.try_acquire(&upstream_name) {
+                                    Ok(permit) => permit,
+                                    Err(RouteQueueRejection::RouteCap) => {
+                                        metrics.inc_failure();
+                                        metrics
+                                            .inc_overload_shed_reason(OverloadShedReason::RouteCap);
+                                        metrics.record_route(
+                                            &upstream_name,
+                                            request_start.elapsed(),
+                                            RouteOutcome::OverloadShed,
+                                        );
+                                        Self::send_overload_response(
+                                            h3,
+                                            &mut connection.quic,
+                                            stream_id,
+                                            b"route queue cap exceeded\n",
+                                            resilience.shed_retry_after_seconds,
+                                        )?;
+                                        resilience
+                                            .adaptive_admission
+                                            .observe(request_start.elapsed(), true);
+                                        continue;
+                                    }
+                                    Err(RouteQueueRejection::GlobalCap) => {
+                                        metrics.inc_failure();
+                                        metrics.inc_overload_shed_reason(
+                                            OverloadShedReason::RouteGlobalCap,
+                                        );
+                                        metrics.record_route(
+                                            &upstream_name,
+                                            request_start.elapsed(),
+                                            RouteOutcome::OverloadShed,
+                                        );
+                                        Self::send_overload_response(
+                                            h3,
+                                            &mut connection.quic,
+                                            stream_id,
+                                            b"global queue cap exceeded\n",
+                                            resilience.shed_retry_after_seconds,
+                                        )?;
+                                        resilience
+                                            .adaptive_admission
+                                            .observe(request_start.elapsed(), true);
+                                        continue;
+                                    }
+                                };
+
+                            let global_permit = match Self::try_acquire_owned_with_micro_wait(
+                                Arc::clone(&global_inflight),
+                                inflight_acquire_wait,
+                            ) {
+                                Ok((permit, waited)) => {
+                                    if waited {
+                                        metrics.inc_inflight_wait_admit_global();
+                                    }
+                                    permit
+                                }
+                                Err(_) => {
+                                    metrics.inc_failure();
+                                    metrics.inc_overload_shed_reason(
+                                        OverloadShedReason::GlobalInflight,
+                                    );
+                                    metrics.record_route(
+                                        &upstream_name,
+                                        request_start.elapsed(),
+                                        RouteOutcome::OverloadShed,
+                                    );
+                                    Self::send_overload_response(
+                                        h3,
+                                        &mut connection.quic,
+                                        stream_id,
+                                        b"overloaded, retry later\n",
+                                        resilience.shed_retry_after_seconds,
+                                    )?;
+                                    resilience
+                                        .adaptive_admission
+                                        .observe(request_start.elapsed(), true);
+                                    continue;
+                                }
+                            };
+
+                            let upstream_permit = match upstream_inflight
+                                .get(&upstream_name)
+                                .cloned()
+                            {
+                                Some(semaphore) => match Self::try_acquire_owned_with_micro_wait(
+                                    semaphore,
+                                    inflight_acquire_wait,
+                                ) {
+                                    Ok((permit, waited)) => {
+                                        if waited {
+                                            metrics.inc_inflight_wait_admit_upstream();
+                                        }
+                                        permit
+                                    }
+                                    Err(_) => {
+                                        drop(global_permit);
+                                        metrics.inc_failure();
+                                        metrics.inc_overload_shed_reason(
+                                            OverloadShedReason::UpstreamInflight,
+                                        );
+                                        metrics.record_route(
+                                            &upstream_name,
+                                            request_start.elapsed(),
+                                            RouteOutcome::OverloadShed,
+                                        );
+                                        Self::send_overload_response(
+                                            h3,
+                                            &mut connection.quic,
+                                            stream_id,
+                                            b"upstream overloaded, retry later\n",
+                                            resilience.shed_retry_after_seconds,
+                                        )?;
+                                        resilience
+                                            .adaptive_admission
+                                            .observe(request_start.elapsed(), true);
+                                        continue;
+                                    }
+                                },
+                                None => {
+                                    drop(global_permit);
+                                    metrics.inc_failure();
+                                    metrics.inc_overload_shed_reason(
+                                        OverloadShedReason::UpstreamInflight,
+                                    );
+                                    metrics.record_route(
+                                        &upstream_name,
+                                        request_start.elapsed(),
+                                        RouteOutcome::OverloadShed,
+                                    );
+                                    Self::send_simple_response(
+                                        h3,
+                                        &mut connection.quic,
+                                        stream_id,
+                                        http::StatusCode::SERVICE_UNAVAILABLE,
+                                        b"upstream admission limiter unavailable\n",
+                                    )?;
+                                    resilience
+                                        .adaptive_admission
+                                        .observe(request_start.elapsed(), true);
+                                    continue;
+                                }
+                            };
+
+                            let request_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+                            let incoming_traceparent = extract_header_value(&list, b"traceparent")
+                                .and_then(parse_traceparent);
+                            let trace_id = incoming_traceparent
+                                .as_ref()
+                                .map(|(trace_id, _)| trace_id.clone())
+                                .or_else(|| {
+                                    tracing_enabled.then(|| {
+                                        generated_trace_id(connection.quic.trace_id(), request_id)
+                                    })
+                                });
+                            let span_id = trace_id.as_ref().map(|_| generated_span_id(request_id));
+                            let traceparent = trace_id
+                                .as_ref()
+                                .zip(span_id.as_ref())
+                                .map(|(trace_id, span_id)| format!("00-{trace_id}-{span_id}-01"));
+                            let trace_span = trace_id.as_ref().zip(span_id.as_ref()).map(
+                                |(trace_id, span_id)| {
+                                    info_span!(
+                                        "spooky.request",
+                                        request_id = request_id,
+                                        trace_id = %trace_id,
+                                        span_id = %span_id,
+                                        method = %method,
+                                        path = %path
+                                    )
+                                },
+                            );
+                            let bodyless_mode = is_bodyless_request_mode(&method, content_length);
+                            let (tx, boxed, request_fin_received) = if bodyless_mode {
+                                (None, BoxBody::new(Full::new(Bytes::new())), true)
+                            } else {
+                                // Create a channel body so quiche Data chunks stream
+                                // directly into the in-flight H2 request.
+                                let (tx, channel_body) =
+                                    ChannelBody::channel(REQUEST_CHUNK_CHANNEL_CAPACITY);
+                                (Some(tx), channel_body.boxed(), false)
+                            };
+                            let backend_endpoint = match backend_endpoints.get(&addr).cloned() {
+                                Some(endpoint) => endpoint,
+                                None => {
+                                    drop(upstream_permit);
+                                    drop(global_permit);
+                                    metrics.inc_failure();
+                                    metrics.record_route(
+                                        &upstream_name,
+                                        request_start.elapsed(),
+                                        RouteOutcome::Failure,
+                                    );
+                                    Self::send_simple_response(
+                                        h3,
+                                        &mut connection.quic,
+                                        stream_id,
+                                        http::StatusCode::BAD_GATEWAY,
+                                        b"unknown backend endpoint\n",
+                                    )?;
+                                    error!("missing parsed backend endpoint for {}", addr);
+                                    resilience
+                                        .adaptive_admission
+                                        .observe(request_start.elapsed(), true);
+                                    continue;
+                                }
+                            };
+                            let upstream_policy = upstream_policies
+                                .get(&upstream_name)
+                                .cloned()
+                                .unwrap_or_default();
+                            let request = match build_h2_request_for_endpoint_with_host_policy(
+                                &backend_endpoint,
+                                &upstream_policy.host.0,
+                                &upstream_policy.forwarded_headers.0,
+                                &method,
+                                &path,
+                                &list,
+                                boxed,
+                                None,
+                                ForwardedContext {
+                                    client_addr: connection.peer_address,
+                                    request_authority: authority.as_deref(),
+                                    request_id,
+                                    traceparent: traceparent.as_deref(),
+                                },
+                            ) {
+                                Ok(request) => request,
+                                Err(err) => {
+                                    drop(upstream_permit);
+                                    drop(global_permit);
+                                    metrics.inc_failure();
+                                    metrics.record_route(
+                                        &upstream_name,
+                                        request_start.elapsed(),
+                                        RouteOutcome::Failure,
+                                    );
+                                    Self::send_simple_response(
+                                        h3,
+                                        &mut connection.quic,
+                                        stream_id,
+                                        http::StatusCode::BAD_REQUEST,
+                                        b"invalid request\n",
+                                    )?;
+                                    error!("failed to build upstream request: {}", err);
+                                    resilience
+                                        .adaptive_admission
+                                        .observe(request_start.elapsed(), true);
+                                    continue;
+                                }
+                            };
+
+                            let transport = transport_pool.clone();
+                            let fwd_addr = addr.clone();
+                            let cb = Arc::clone(&resilience.circuit_breakers);
+                            let retry_budget = Arc::clone(&resilience.retry_budget);
+                            let route_name = upstream_name.clone();
+                            let backend_endpoints = Arc::clone(&backend_endpoints);
+                            let backend_resolutions = Arc::clone(&backend_resolution_store);
+                            let send_metrics = Arc::clone(&metrics);
+                            let allow_hedge = bodyless_mode
+                                && resilience.hedging_allowed_for(&method, &upstream_name, true);
+                            let hedge_delay = resilience.hedging_delay;
+                            let alternate_backend =
+                                Self::pick_alternate_backend(&upstream_pool, idx);
+                            let forward_meta = bodyless_mode.then(|| {
+                                Arc::new(ForwardRequestMeta {
+                                    method: Arc::<str>::from(method.as_str()),
+                                    path: Arc::<str>::from(path.as_str()),
+                                    authority: authority.as_deref().map(Arc::<str>::from),
+                                    headers: Arc::new(list.clone()),
+                                    client_addr: connection.peer_address,
+                                    request_id,
+                                    traceparent: traceparent.as_deref().map(Arc::<str>::from),
+                                    host_policy: upstream_policy.host.0.clone(),
+                                    forwarded_header_policy: upstream_policy
+                                        .forwarded_headers
+                                        .0
+                                        .clone(),
+                                })
+                            });
+                            let trace_span_for_upstream = trace_span.clone();
+                            let (result_tx, result_rx) = oneshot::channel::<UpstreamResult>();
+                            let fut = async move {
+                                let mut hedge_telemetry = crate::HedgeTelemetry::default();
+                                let mut retry_count: u8 = 0;
+                                let mut retry_attempt_reason: Option<RetryReason> = None;
+                                let mut retry_denial_reason: Option<RetryReason> = None;
+                                let result: ForwardResult = async {
+                                    retry_budget.mark_primary(&route_name);
+
+                                    let send_once =
+                                        |backend: String,
+                                         req: http::Request<
+                                            BoxBody<Bytes, std::convert::Infallible>,
+                                        >,
+                                         cb: Arc<crate::resilience::CircuitBreakers>,
+                                         transport: Arc<UpstreamTransportPool>,
+                                         metrics: Arc<Metrics>,
+                                         backend_resolutions: Arc<RuntimeBackendResolutionStore>| async move {
+                                            if !cb.allow_request(&backend) {
+                                                return Err(ProxyError::Pool(
+                                                    PoolError::CircuitOpen(backend),
+                                                ));
+                                            }
+                                            Self::record_backend_connect_attempt(
+                                                &metrics,
+                                                &backend_resolutions,
+                                                &backend,
+                                            );
+                                            let send_result = tokio::time::timeout(
+                                                backend_timeout,
+                                                transport.send(&backend, req),
+                                            )
+                                            .await
+                                            .map_err(|_| ProxyError::Timeout);
+                                            match &send_result {
+                                                Ok(Ok(_)) => cb.record_success(&backend),
+                                                _ => cb.record_failure(&backend),
+                                            }
+                                            Ok(send_result??)
+                                        };
+
+                                    let response: Response<Incoming> = if allow_hedge {
+                                        let hedge_candidate = alternate_backend
+                                            .clone()
+                                            .and_then(|(backend, _idx)| {
+                                                let meta = forward_meta.as_ref()?;
+                                                let endpoint = backend_endpoints.get(&backend)?;
+                                                meta.build_bodyless_request(endpoint)
+                                                    .ok()
+                                                    .map(|req| (backend, req))
+                                            });
+
+                                        if let Some((hedge_backend, hedge_request)) =
+                                            hedge_candidate
+                                        {
+                                            let primary_started = Instant::now();
+                                            let primary_backend = fwd_addr.clone();
+                                            let primary_fut = send_once(
+                                                primary_backend,
+                                                request,
+                                                Arc::clone(&cb),
+                                                Arc::clone(&transport),
+                                                Arc::clone(&send_metrics),
+                                                Arc::clone(&backend_resolutions),
+                                            );
+                                            tokio::pin!(primary_fut);
+                                            let hedge_sleep = tokio::time::sleep(hedge_delay);
+                                            tokio::pin!(hedge_sleep);
+
+                                            if let Some(result) = tokio::select! {
+                                                result = &mut primary_fut => Some(result),
+                                                _ = &mut hedge_sleep => None,
+                                            } {
+                                                result?
+                                            } else if retry_budget.allow_retry(&route_name).is_ok() {
+                                                hedge_telemetry.launched = true;
+                                                let hedge_fut = send_once(
+                                                    hedge_backend,
+                                                    hedge_request,
+                                                    Arc::clone(&cb),
+                                                    Arc::clone(&transport),
+                                                    Arc::clone(&send_metrics),
+                                                    Arc::clone(&backend_resolutions),
+                                                );
+                                                tokio::pin!(hedge_fut);
+                                                tokio::select! {
+                                                    result = &mut primary_fut => {
+                                                        hedge_telemetry.primary_won_after_trigger = true;
+                                                        hedge_telemetry.hedge_wasted = true;
+                                                        result?
+                                                    },
+                                                    result = &mut hedge_fut => {
+                                                        hedge_telemetry.hedge_won = true;
+                                                        let elapsed_ms = primary_started.elapsed().as_millis() as u64;
+                                                        let delay_ms = hedge_delay.as_millis() as u64;
+                                                        hedge_telemetry.primary_late_ms = elapsed_ms.saturating_sub(delay_ms);
+                                                        result?
+                                                    },
+                                                }
+                                            } else {
+                                                primary_fut.await?
+                                            }
+                                        } else {
+                                            send_once(
+                                                fwd_addr.clone(),
+                                                request,
+                                                Arc::clone(&cb),
+                                                Arc::clone(&transport),
+                                                Arc::clone(&send_metrics),
+                                                Arc::clone(&backend_resolutions),
+                                            )
+                                            .await?
+                                        }
+                                    } else {
+                                        match send_once(
+                                            fwd_addr.clone(),
+                                            request,
+                                            Arc::clone(&cb),
+                                            Arc::clone(&transport),
+                                            Arc::clone(&send_metrics),
+                                            Arc::clone(&backend_resolutions),
+                                        )
+                                        .await
+                                        {
+                                            Ok(response) => response,
+                                            Err(primary_err) => {
+                                                let retry_reason = classify_retry_reason(&primary_err);
+                                                let is_retryable_err = is_retryable(&primary_err);
+                                                let budget_ok = retry_budget.allow_retry(&route_name).is_ok();
+                                                let can_retry = bodyless_mode
+                                                    && is_retryable_err
+                                                    && budget_ok
+                                                    && alternate_backend.is_some();
+                                                if !can_retry {
+                                                    if !bodyless_mode {
+                                                        retry_denial_reason = Some(RetryReason::NotBodylessMode);
+                                                    } else if !is_retryable_err || !budget_ok {
+                                                        retry_denial_reason = Some(RetryReason::BudgetDenied);
+                                                    } else {
+                                                        retry_denial_reason = Some(RetryReason::NoAlternateBackend);
+                                                    }
+                                                    return Err(primary_err);
+                                                } else if let Some((retry_backend, _)) =
+                                                        alternate_backend.clone()
+                                                    && let Some(meta) = forward_meta.as_ref()
+                                                    && let Some(endpoint) = backend_endpoints
+                                                        .get(&retry_backend)
+                                                    && let Ok(retry_request) =
+                                                        meta.build_bodyless_request(endpoint)
+                                                {
+                                                    retry_count = retry_count.saturating_add(1);
+                                                    retry_attempt_reason = Some(retry_reason);
+                                                    info!(
+                                                        "request_id={} retrying request on alternate backend: route={} reason={:?}",
+                                                        request_id, route_name, retry_reason
+                                                    );
+                                                    send_once(
+                                                        retry_backend,
+                                                        retry_request,
+                                                        Arc::clone(&cb),
+                                                        Arc::clone(&transport),
+                                                        Arc::clone(&send_metrics),
+                                                        Arc::clone(&backend_resolutions),
+                                                    )
+                                                    .await?
+                                                } else {
+                                                    return Err(primary_err);
+                                                }
+                                            }
+                                        }
+                                    };
+
+                                    let (parts, body) = response.into_parts();
+                                    Ok((parts.status, parts.headers, body))
+                                }
+                                .await;
+                                // Ignore send error: receiver dropped means the stream was reset.
+                                let _ = result_tx.send(UpstreamResult {
+                                    forward: result,
+                                    hedge: hedge_telemetry,
+                                    retry_count,
+                                    retry_attempt_reason,
+                                    retry_denial_reason,
+                                });
+                            };
+                            let spawned = match trace_span_for_upstream {
+                                Some(span) => spawn_async_task(fut.instrument(span), "upstream"),
+                                None => spawn_async_task(fut, "upstream"),
+                            };
+                            if !spawned {
+                                error!("dropping upstream task: no runtime available");
+                            }
+                            (
+                                tx,
+                                Some(result_rx),
+                                Some(addr),
+                                Some(idx),
+                                Some(upstream_name),
+                                Some(backend_lb),
+                                Some(route_path_len),
+                                Some(route_host_specific),
+                                Some(format!("{route_reason:?}")),
+                                Some(upstream_pool),
+                                Some(global_permit),
+                                Some(upstream_permit),
+                                Some(adaptive_permit),
+                                Some(route_queue_permit),
+                                request_fin_received,
+                                bodyless_mode,
+                                trace_id,
+                                span_id,
+                                traceparent,
+                                trace_span,
+                                request_id,
+                            )
+                        }
+                        Err(err) => {
+                            metrics.inc_failure();
+                            metrics.record_route(
+                                "unrouted",
+                                request_start.elapsed(),
+                                RouteOutcome::Failure,
+                            );
+                            let (status, body): (http::StatusCode, &[u8]) = match err {
+                                ProxyError::Transport(_) => (
+                                    http::StatusCode::SERVICE_UNAVAILABLE,
+                                    b"no upstream available\n",
+                                ),
+                                ProxyError::Bridge(_) => {
+                                    (http::StatusCode::BAD_REQUEST, b"invalid request\n")
+                                }
+                                _ => (
+                                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                                    b"internal proxy error\n",
+                                ),
+                            };
+                            Self::send_simple_response(
+                                h3,
+                                &mut connection.quic,
+                                stream_id,
+                                status,
+                                body,
+                            )?;
+                            resilience
+                                .adaptive_admission
+                                .observe(request_start.elapsed(), true);
+                            continue;
+                        }
+                    };
+
+                    // App-level stream count cap: mirrors the QUIC max_streams_bidi
+                    // limit so the streams HashMap can never grow beyond what the
+                    // transport layer allows even if a race or misconfiguration
+                    // delivers a stream-open event before the flow-control frame
+                    // reaches the client.
+                    if connection.streams.len() >= max_streams_per_connection {
+                        warn!(
+                            "stream limit reached ({} streams), rejecting stream {}",
+                            max_streams_per_connection, stream_id
+                        );
+                        // Dropping the permits and body_tx here releases inflight
+                        // semaphore slots and signals the upstream task to abort.
+                        drop(body_tx);
+                        drop(global_inflight_permit);
+                        drop(upstream_inflight_permit);
+                        drop(adaptive_admission_permit);
+                        drop(route_queue_permit);
+                        drop(upstream_result_rx);
+                        Self::send_simple_response(
+                            h3,
+                            &mut connection.quic,
+                            stream_id,
+                            http::StatusCode::SERVICE_UNAVAILABLE,
+                            b"too many concurrent streams\n",
+                        )?;
+                        continue;
+                    }
+
+                    connection.streams.insert(
+                        stream_id,
+                        RequestEnvelope {
+                            request_id,
+                            trace_id,
+                            span_id,
+                            traceparent,
+                            trace_span,
+                            method,
+                            path,
+                            authority,
+                            body_tx,
+                            body_buf: std::collections::VecDeque::new(),
+                            body_buf_bytes: 0,
+                            body_bytes_received: 0,
+                            last_body_activity: request_start,
+                            backend_addr,
+                            backend_index,
+                            upstream_name,
+                            route_reason,
+                            route_path_len,
+                            route_host_specific,
+                            backend_lb,
+                            upstream_pool,
+                            routing_transparency_enabled,
+                            routing_transparency_include_reason,
+                            response_status: None,
+                            backend_request_finished: false,
+                            global_inflight_permit,
+                            upstream_inflight_permit,
+                            adaptive_admission_permit,
+                            route_queue_permit,
+                            start: request_start,
+                            total_request_deadline: request_start + backend_total_request_timeout,
+                            bodyless_mode,
+                            retry_count: 0,
+                            error_kind: None,
+                            phase: StreamPhase::ReceivingRequest,
+                            request_fin_received,
+                            upstream_result_rx,
+                            response_chunk_rx: None,
+                            response_headers_sent: false,
+                            pending_chunk: None,
+                        },
+                    );
+                    if let Some(req) = connection.streams.get(&stream_id) {
+                        debug!(
+                            "request_id={} method={} path={} stream_id={}",
+                            req.request_id, req.method, req.path, stream_id
+                        );
+                    }
+                }
+                Ok((stream_id, quiche::h3::Event::Data)) => loop {
+                    match h3.recv_body(&mut connection.quic, stream_id, &mut body_buf) {
+                        Ok(read) => {
+                            let mut shed_due_to_buffer_pressure = false;
+                            let mut reject_body_for_bodyless = None::<(String, Duration)>;
+                            let mut payload_too_large = None::<(String, Duration)>;
+                            if let Some(req) = connection.streams.get_mut(&stream_id) {
+                                if read > 0 {
+                                    req.last_body_activity = Instant::now();
+                                }
+                                if req.bodyless_mode && read > 0 {
+                                    reject_body_for_bodyless = Some((
+                                        req.upstream_name
+                                            .clone()
+                                            .unwrap_or_else(|| "unrouted".to_string()),
+                                        req.start.elapsed(),
+                                    ));
+                                }
+                                if reject_body_for_bodyless.is_none() {
+                                    // Enforce cap on total bytes received for the stream,
+                                    // including chunks already forwarded to the H2 body channel.
+                                    let next_total = req.body_bytes_received.saturating_add(read);
+                                    let request_is_connect = is_connect_method(&req.method);
+                                    if !request_is_connect && next_total > max_request_body_bytes {
+                                        payload_too_large = Some((
+                                            req.upstream_name
+                                                .clone()
+                                                .unwrap_or_else(|| "unrouted".to_string()),
+                                            req.start.elapsed(),
+                                        ));
+                                    } else {
+                                        req.body_bytes_received = next_total;
+
+                                        for chunk_slice in
+                                            body_buf[..read].chunks(REQUEST_CHUNK_BYTES_LIMIT)
+                                        {
+                                            let chunk = Bytes::copy_from_slice(chunk_slice);
+                                            if let Err(err) = Self::enqueue_request_chunk(
+                                                req,
+                                                chunk,
+                                                &metrics,
+                                                max_request_body_bytes,
+                                                request_buffer_global_cap_bytes,
+                                            ) {
+                                                shed_due_to_buffer_pressure = true;
+                                                metrics.inc_request_buffer_limit_reject();
+                                                if err == RequestBufferError::GlobalCap {
+                                                    debug!("global request buffer cap reached");
+                                                }
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some((route_label, elapsed)) = reject_body_for_bodyless {
+                                metrics.inc_failure();
+                                metrics.record_route(&route_label, elapsed, RouteOutcome::Failure);
+                                Self::send_simple_response(
+                                    h3,
+                                    &mut connection.quic,
+                                    stream_id,
+                                    http::StatusCode::BAD_REQUEST,
+                                    b"request body not allowed for this request\n",
+                                )?;
+                                if let Some(req) = connection.streams.get_mut(&stream_id) {
+                                    abort_stream(req, &metrics);
+                                }
+                                connection.streams.remove(&stream_id);
+                                resilience.adaptive_admission.observe(elapsed, true);
+                                break;
+                            }
+                            if let Some((route_label, elapsed)) = payload_too_large {
+                                metrics.inc_failure();
+                                metrics.record_route(&route_label, elapsed, RouteOutcome::Failure);
+                                Self::send_simple_response(
+                                    h3,
+                                    &mut connection.quic,
+                                    stream_id,
+                                    http::StatusCode::PAYLOAD_TOO_LARGE,
+                                    b"request body too large\n",
+                                )?;
+                                if let Some(req) = connection.streams.get_mut(&stream_id) {
+                                    abort_stream(req, &metrics);
+                                }
+                                connection.streams.remove(&stream_id);
+                                resilience.adaptive_admission.observe(elapsed, true);
+                                break;
+                            }
+                            if shed_due_to_buffer_pressure
+                                && let Some(req) = connection.streams.get(&stream_id)
+                            {
+                                metrics.inc_failure();
+                                metrics
+                                    .inc_overload_shed_reason(OverloadShedReason::RequestBufferCap);
+                                let route_label =
+                                    req.upstream_name.as_deref().unwrap_or("unrouted");
+                                metrics.record_route(
+                                    route_label,
+                                    req.start.elapsed(),
+                                    RouteOutcome::OverloadShed,
+                                );
+                                Self::send_overload_response(
+                                    h3,
+                                    &mut connection.quic,
+                                    stream_id,
+                                    b"request body backpressure overload\n",
+                                    resilience.shed_retry_after_seconds,
+                                )?;
+                                resilience
+                                    .adaptive_admission
+                                    .observe(req.start.elapsed(), true);
+                                if let Some(req) = connection.streams.get_mut(&stream_id) {
+                                    abort_stream(req, &metrics);
+                                }
+                                connection.streams.remove(&stream_id);
+                                break;
+                            }
+                        }
+                        Err(quiche::h3::Error::Done) => break,
+                        Err(err) => {
+                            let rid = connection.streams.get(&stream_id).map(|r| r.request_id);
+                            error!(
+                                "request_id={} HTTP/3 recv_body protocol error on stream {}: {:?}",
+                                rid.map_or_else(|| "-".to_string(), |id| id.to_string()),
+                                stream_id,
+                                err
+                            );
+                            if let Some(req) = connection.streams.get(&stream_id) {
+                                metrics.inc_failure();
+                                let route_label =
+                                    req.upstream_name.as_deref().unwrap_or("unrouted");
+                                metrics.record_route(
+                                    route_label,
+                                    req.start.elapsed(),
+                                    RouteOutcome::Failure,
+                                );
+                                resilience
+                                    .adaptive_admission
+                                    .observe(req.start.elapsed(), true);
+                            }
+                            if let Some(req) = connection.streams.get_mut(&stream_id) {
+                                abort_stream(req, &metrics);
+                            }
+                            connection.streams.remove(&stream_id);
+                            let _ = Self::send_simple_response(
+                                h3,
+                                &mut connection.quic,
+                                stream_id,
+                                http::StatusCode::BAD_REQUEST,
+                                b"malformed request stream\n",
+                            );
+                            break;
+                        }
+                    }
+                },
+                Ok((stream_id, quiche::h3::Event::Finished)) => {
+                    if let Some(req) = connection.streams.get_mut(&stream_id) {
+                        req.request_fin_received = true;
+
+                        Self::flush_request_buffer(req, &metrics);
+                        // If buffer is now empty, drop body_tx to signal end-of-body.
+                        if req.body_buf.is_empty() {
+                            req.body_tx = None;
+                        }
+                        // Request body fully handed off — now waiting on upstream.
+                        req.phase = StreamPhase::AwaitingUpstream;
+                        // Upstream polling and response dispatch are handled entirely
+                        // by advance_streams_non_blocking, called unconditionally below.
+                    }
+                }
+                Ok((stream_id, quiche::h3::Event::Reset(error_code))) => {
+                    if let Some(req) = connection.streams.get_mut(&stream_id) {
+                        let phase = abort_stream(req, &metrics);
+                        debug!(
+                            "stream {} reset by client (error_code={}, phase={:?}): resources released",
+                            stream_id, error_code, phase
+                        );
+                    }
+                    connection.streams.remove(&stream_id);
+                }
+                Ok((_stream_id, quiche::h3::Event::PriorityUpdate)) => {}
+                Ok((_stream_id, quiche::h3::Event::GoAway)) => {}
+                Err(quiche::h3::Error::Done) => break,
+                Err(e) => return Err(e),
+            }
+        }
+
+        Self::advance_streams_non_blocking(
+            &mut connection.streams,
+            &mut connection.quic,
+            h3,
+            upstream_pools,
+            routing_index,
+            backend_body_idle_timeout,
+            backend_body_total_timeout,
+            &metrics,
+            backend_total_request_timeout,
+            resilience,
+            max_response_body_bytes,
+            unknown_length_response_prebuffer_bytes,
+            client_body_idle_timeout,
+            listen_port,
+        )?;
+
+        Ok(())
+    }
+
+    /// Advance all in-flight streams without blocking.
+    ///
+    /// Called after every packet-driven `handle_h3` pass and from
+    /// `handle_timeouts` so progress continues even when no new client
+    /// packets arrive.
+    ///
+    /// Per stream, in order:
+    /// 1. Drain request body buffer → body channel (`try_send`).
+    /// 2. Close body channel once FIN received and buffer empty.
+    /// 3. Poll `upstream_result_rx` (`try_recv`).
+    ///    - Error result  → send error response, mark terminal.
+    ///    - Ok result     → send H3 response headers, spawn body-pump task,
+    ///      store `response_chunk_rx`, transition to SendingResponse.
+    /// 4. Flush `response_chunk_rx` chunks into H3 (`try_recv` loop).
+    ///    - `Data`  → `h3.send_body(..., false)`
+    ///    - `Trailers` → `h3.send_additional_headers(..., true, false)`
+    ///    - `End`   → `h3.send_body(..., true)`, mark Completed
+    ///    - `Error` → send 502, mark Failed
+    /// 5. Remove streams in terminal phase (Completed / Failed).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn advance_streams_non_blocking(
+        streams: &mut HashMap<u64, RequestEnvelope>,
+        quic: &mut quiche::Connection,
+        h3: &mut quiche::h3::Connection,
+        upstream_pools: &HashMap<String, Arc<RwLock<UpstreamPool>>>,
+        routing_index: &RouteIndex,
+        backend_body_idle_timeout: Duration,
+        backend_body_total_timeout: Duration,
+        metrics: &Metrics,
+        _backend_total_request_timeout: Duration,
+        resilience: &RuntimeResilience,
+        max_response_body_bytes: usize,
+        unknown_length_response_prebuffer_bytes: usize,
+        client_body_idle_timeout: Duration,
+        listen_port: u16,
+    ) -> Result<(), quiche::h3::Error> {
+        let stream_ids: Vec<u64> = streams.keys().copied().collect();
+
+        for stream_id in stream_ids {
+            if let Some(req) = streams.get(&stream_id)
+                && Instant::now() >= req.total_request_deadline
+            {
+                if let Err(protocol_err) = Self::handle_forward_result(
+                    h3,
+                    quic,
+                    stream_id,
+                    req,
+                    Err(ProxyError::Timeout),
+                    upstream_pools,
+                    routing_index,
+                    metrics,
+                    resilience.shed_retry_after_seconds,
+                ) {
+                    error!(
+                        "failed to emit timeout response for stream {}: {:?}",
+                        stream_id, protocol_err
+                    );
+                }
+                resilience
+                    .adaptive_admission
+                    .observe(req.start.elapsed(), true);
+                if let Some(req) = streams.get_mut(&stream_id) {
+                    abort_stream(req, metrics);
+                }
+                streams.remove(&stream_id);
+                continue;
+            }
+
+            if let Some(req) = streams.get(&stream_id)
+                && req.phase == StreamPhase::ReceivingRequest
+                && !req.request_fin_received
+                && !req.bodyless_mode
+                && Instant::now().saturating_duration_since(req.last_body_activity)
+                    >= client_body_idle_timeout
+            {
+                metrics.inc_failure();
+                metrics.inc_timeout();
+                let route_label = req.upstream_name.as_deref().unwrap_or("unrouted");
+                metrics.record_route(route_label, req.start.elapsed(), RouteOutcome::Timeout);
+                let _ = Self::send_simple_response(
+                    h3,
+                    quic,
+                    stream_id,
+                    http::StatusCode::REQUEST_TIMEOUT,
+                    b"request body idle timeout\n",
+                );
+                resilience
+                    .adaptive_admission
+                    .observe(req.start.elapsed(), true);
+                if let Some(req) = streams.get_mut(&stream_id) {
+                    abort_stream(req, metrics);
+                }
+                streams.remove(&stream_id);
+                continue;
+            }
+
+            // ── 1 & 2: request body drain ────────────────────────────────────
+            if let Some(req) = streams.get_mut(&stream_id) {
+                Self::flush_request_buffer(req, metrics);
+                if req.request_fin_received && req.body_buf.is_empty() {
+                    req.body_tx = None; // signals EOF to the upstream H2 task
+                }
+            }
+
+            // ── 3: poll upstream oneshot ──────────────────────────────────────
+            // Only transition to response handling once request-body ingestion is
+            // complete. This preserves request-size enforcement semantics:
+            // oversized requests must still be able to terminate with 413 even if
+            // upstream produced an early response. CONNECT is the exception:
+            // successful CONNECT establishes a tunnel and must not wait for request FIN.
+            let can_poll_upstream = streams
+                .get(&stream_id)
+                .is_some_and(can_poll_upstream_result);
+
+            // upstream_ready: Option<UpstreamResult>
+            //   None          → oneshot not yet resolved (or not eligible), skip
+            //   Some(Ok(...)) → upstream responded successfully
+            //   Some(Err(.))  → upstream error (or sender dropped)
+            let upstream_ready: Option<UpstreamResult> = if can_poll_upstream {
+                streams
+                    .get_mut(&stream_id)
+                    .and_then(|req| req.upstream_result_rx.as_mut())
+                    .and_then(|rx| match rx.try_recv() {
+                        Ok(result) => Some(result),
+                        Err(oneshot::error::TryRecvError::Empty) => None,
+                        Err(oneshot::error::TryRecvError::Closed) => Some(UpstreamResult {
+                            forward: Err(ProxyError::Transport(
+                                "upstream task dropped sender".into(),
+                            )),
+                            hedge: crate::HedgeTelemetry::default(),
+                            retry_count: 0,
+                            retry_attempt_reason: None,
+                            retry_denial_reason: None,
+                        }),
+                    })
+            } else {
+                None
+            };
+
+            if let Some(forward_result) = upstream_ready {
+                if forward_result.hedge.launched {
+                    metrics.inc_hedge_triggered();
+                }
+                if forward_result.hedge.hedge_won {
+                    metrics.inc_hedge_won();
+                }
+                if forward_result.hedge.hedge_wasted {
+                    metrics.inc_hedge_wasted();
+                }
+                if forward_result.hedge.primary_won_after_trigger {
+                    metrics.inc_hedge_primary_won_after_trigger();
+                }
+                if forward_result.hedge.primary_late_ms > 0 {
+                    metrics.observe_hedge_primary_late_ms(forward_result.hedge.primary_late_ms);
+                }
+                if let Some(reason) = forward_result.retry_attempt_reason {
+                    metrics.inc_retry(reason);
+                }
+                if let Some(reason) = forward_result.retry_denial_reason {
+                    metrics.inc_retry(reason);
+                }
+
+                if let Some(req) = streams.get_mut(&stream_id) {
+                    req.upstream_result_rx = None;
+                    req.retry_count = forward_result.retry_count;
+                    req.error_kind = match &forward_result.forward {
+                        Err(ProxyError::Timeout) => Some("timeout"),
+                        Err(ProxyError::Tls(_)) => Some("tls"),
+                        Err(ProxyError::Transport(_)) => Some("transport"),
+                        Err(ProxyError::Pool(_)) => Some("pool"),
+                        Err(ProxyError::Protocol(_)) => Some("protocol"),
+                        Err(ProxyError::Bridge(_)) => Some("bridge"),
+                        Ok(_) => None,
+                    };
+                }
+                match forward_result.forward {
+                    Ok((status, resp_headers, body)) => {
+                        let suppress_downstream_body = streams
+                            .get(&stream_id)
+                            .is_some_and(|req| is_head_method(&req.method));
+                        let connect_tunnel = streams
+                            .get(&stream_id)
+                            .is_some_and(|req| is_connect_tunnel_response(&req.method, status));
+                        // If upstream advertised a response length beyond our hard cap,
+                        // fail fast with 503 before sending any downstream headers/body.
+                        let upstream_content_length = resp_headers
+                            .get(http::header::CONTENT_LENGTH)
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|v| v.parse::<usize>().ok());
+                        if !connect_tunnel
+                            && !suppress_downstream_body
+                            && upstream_content_length
+                                .is_some_and(|len| len > max_response_body_bytes)
+                        {
+                            if let Some(req) = streams.get(&stream_id) {
+                                metrics.inc_failure();
+                                metrics.inc_overload_shed_reason(
+                                    OverloadShedReason::ResponsePrebufferCap,
+                                );
+                                let route_label =
+                                    req.upstream_name.as_deref().unwrap_or("unrouted");
+                                metrics.record_route(
+                                    route_label,
+                                    req.start.elapsed(),
+                                    RouteOutcome::OverloadShed,
+                                );
+                                resilience
+                                    .adaptive_admission
+                                    .observe(req.start.elapsed(), true);
+                                warn!(
+                                    "request_id={} upstream declared content-length over cap ({} > {}) on stream {}",
+                                    req.request_id,
+                                    upstream_content_length.unwrap_or_default(),
+                                    max_response_body_bytes,
+                                    stream_id
+                                );
+                                let _ = Self::send_simple_response(
+                                    h3,
+                                    quic,
+                                    stream_id,
+                                    http::StatusCode::SERVICE_UNAVAILABLE,
+                                    b"upstream response body too large\n",
+                                );
+                            }
+                            if let Some(req) = streams.get_mut(&stream_id) {
+                                abort_stream(req, metrics);
+                            }
+                            streams.remove(&stream_id);
+                            continue;
+                        }
+
+                        let mut owned_h3_headers: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                        let response_connection_tokens = connection_header_tokens(&resp_headers);
+                        for (name, value) in resp_headers.iter() {
+                            if should_strip_h3_response_header(name, &response_connection_tokens) {
+                                continue;
+                            }
+                            owned_h3_headers.push((
+                                name.as_str().as_bytes().to_vec(),
+                                value.as_bytes().to_vec(),
+                            ));
+                        }
+                        owned_h3_headers.push((
+                            b"alt-svc".to_vec(),
+                            format!("h3=\":{}\"; ma=86400", listen_port).into_bytes(),
+                        ));
+
+                        let defer_headers_until_body_validated = upstream_content_length.is_none()
+                            && !connect_tunnel
+                            && !suppress_downstream_body;
+                        let immediate_end = suppress_downstream_body
+                            || (!connect_tunnel
+                                && (upstream_content_length == Some(0)
+                                    || status == http::StatusCode::NO_CONTENT
+                                    || status == http::StatusCode::NOT_MODIFIED));
+                        let mut immediate_terminal = false;
+
+                        if !defer_headers_until_body_validated {
+                            // For declared-length responses within cap, emit headers immediately
+                            // and stream body progressively.
+                            let mut h3_headers = Vec::with_capacity(owned_h3_headers.len() + 1);
+                            h3_headers.push(quiche::h3::Header::new(
+                                b":status",
+                                status.as_str().as_bytes(),
+                            ));
+                            for (name, value) in &owned_h3_headers {
+                                h3_headers.push(quiche::h3::Header::new(name, value));
+                            }
+                            if let Err(err) =
+                                h3.send_response(quic, stream_id, &h3_headers, immediate_end)
+                            {
+                                if let Some(req) = streams.get(&stream_id) {
+                                    let protocol = ProxyError::Protocol(format!(
+                                        "failed to send HTTP/3 response headers: {:?}",
+                                        err
+                                    ));
+                                    if let Err(protocol_err) = Self::handle_forward_result(
+                                        h3,
+                                        quic,
+                                        stream_id,
+                                        req,
+                                        Err(protocol),
+                                        upstream_pools,
+                                        routing_index,
+                                        metrics,
+                                        resilience.shed_retry_after_seconds,
+                                    ) {
+                                        error!(
+                                            "failed to emit protocol recovery response on stream {}: {:?}",
+                                            stream_id, protocol_err
+                                        );
+                                    }
+                                    resilience
+                                        .adaptive_admission
+                                        .observe(req.start.elapsed(), true);
+                                }
+                                if let Some(req) = streams.get_mut(&stream_id) {
+                                    abort_stream(req, metrics);
+                                }
+                                streams.remove(&stream_id);
+                                continue;
+                            }
+                        }
+
+                        if immediate_end {
+                            if defer_headers_until_body_validated {
+                                let mut h3_headers = Vec::with_capacity(owned_h3_headers.len() + 1);
+                                h3_headers.push(quiche::h3::Header::new(
+                                    b":status",
+                                    status.as_str().as_bytes(),
+                                ));
+                                for (name, value) in &owned_h3_headers {
+                                    h3_headers.push(quiche::h3::Header::new(name, value));
+                                }
+                                if let Err(err) =
+                                    h3.send_response(quic, stream_id, &h3_headers, true)
+                                {
+                                    if let Some(req) = streams.get(&stream_id) {
+                                        let protocol = ProxyError::Protocol(format!(
+                                            "failed to send HTTP/3 response headers: {:?}",
+                                            err
+                                        ));
+                                        if let Err(protocol_err) = Self::handle_forward_result(
+                                            h3,
+                                            quic,
+                                            stream_id,
+                                            req,
+                                            Err(protocol),
+                                            upstream_pools,
+                                            routing_index,
+                                            metrics,
+                                            resilience.shed_retry_after_seconds,
+                                        ) {
+                                            error!(
+                                                "failed to emit protocol recovery response on stream {}: {:?}",
+                                                stream_id, protocol_err
+                                            );
+                                        }
+                                        resilience
+                                            .adaptive_admission
+                                            .observe(req.start.elapsed(), true);
+                                    }
+                                    if let Some(req) = streams.get_mut(&stream_id) {
+                                        abort_stream(req, metrics);
+                                    }
+                                    streams.remove(&stream_id);
+                                    continue;
+                                }
+                            }
+                            if let Some(req) = streams.get_mut(&stream_id) {
+                                req.response_chunk_rx = None;
+                                req.response_headers_sent = true;
+                                req.phase = StreamPhase::Completed;
+                                req.response_status = Some(status.as_u16());
+                            }
+                            immediate_terminal = true;
+                        } else {
+                            // Spawn a task that pumps body frames into a ResponseChunk channel.
+                            // Enforces body deadlines and a hard running body-size cap. For
+                            // unknown-length responses it additionally prebuffers until size
+                            // validation completes before emitting headers.
+                            let (chunk_tx, chunk_rx) =
+                                mpsc::channel::<ResponseChunk>(RESPONSE_CHUNK_CHANNEL_CAPACITY);
+                            let fail_tx = chunk_tx.clone();
+                            // `backend_body_total_timeout` is used as a pre-first-byte guard:
+                            // once the upstream starts making body progress, the idle timeout
+                            // governs pacing and the stream may continue until request deadline.
+                            let first_byte_deadline =
+                                tokio::time::Instant::now() + backend_body_total_timeout;
+                            let deferred_status = status;
+                            let deferred_headers = owned_h3_headers.clone();
+                            let tunnel_mode = connect_tunnel;
+                            let fut = async move {
+                                use http_body_util::BodyExt;
+                                let mut body: hyper::body::Incoming = body;
+                                let mut response_bytes_received: usize = 0;
+                                let mut buffered_chunks: Vec<Bytes> = Vec::new();
+                                let mut buffered_trailers: Option<Vec<(Vec<u8>, Vec<u8>)>> = None;
+                                let mut saw_body_progress = false;
+                                loop {
+                                    let frame_fut = BodyExt::frame(&mut body);
+                                    let now = tokio::time::Instant::now();
+                                    if !saw_body_progress && now >= first_byte_deadline {
+                                        let _ = chunk_tx
+                                            .send(ResponseChunk::Error(ProxyError::Timeout))
+                                            .await;
+                                        return;
+                                    }
+                                    let wait_timeout = if saw_body_progress {
+                                        backend_body_idle_timeout
+                                    } else {
+                                        first_byte_deadline
+                                            .saturating_duration_since(now)
+                                            .min(backend_body_idle_timeout)
+                                    };
+                                    let result =
+                                        tokio::time::timeout(wait_timeout, frame_fut).await;
+                                    match result {
+                                        Err(_elapsed) => {
+                                            // Body read idle timeout — signal timeout to flush loop.
+                                            let _ = chunk_tx
+                                                .send(ResponseChunk::Error(ProxyError::Timeout))
+                                                .await;
+                                            return;
+                                        }
+                                        Ok(Some(Ok(f))) => match f.into_data() {
+                                            Ok(data) => {
+                                                if !data.is_empty() {
+                                                    saw_body_progress = true;
+                                                }
+                                                if !tunnel_mode
+                                                    && response_size_exceeded_after_chunk(
+                                                        &mut response_bytes_received,
+                                                        data.len(),
+                                                        max_response_body_bytes,
+                                                    )
+                                                {
+                                                    let _ = chunk_tx
+                                                        .send(ResponseChunk::Error(ProxyError::Pool(
+                                                            PoolError::BackendOverloaded(
+                                                                "upstream response body too large"
+                                                                    .into(),
+                                                            ),
+                                                        )))
+                                                        .await;
+                                                    return;
+                                                }
+                                                if defer_headers_until_body_validated {
+                                                    if response_bytes_received
+                                                        > unknown_length_response_prebuffer_bytes
+                                                    {
+                                                        let _ = chunk_tx
+                                                            .send(ResponseChunk::Error(ProxyError::Pool(
+                                                                PoolError::BackendOverloaded(
+                                                                    "unknown-length response prebuffer limit exceeded"
+                                                                        .into(),
+                                                                ),
+                                                            )))
+                                                            .await;
+                                                        return;
+                                                    }
+                                                    for start in (0..data.len())
+                                                        .step_by(RESPONSE_CHUNK_BYTES_LIMIT)
+                                                    {
+                                                        let end = (start
+                                                            + RESPONSE_CHUNK_BYTES_LIMIT)
+                                                            .min(data.len());
+                                                        buffered_chunks
+                                                            .push(data.slice(start..end));
+                                                    }
+                                                } else {
+                                                    for start in (0..data.len())
+                                                        .step_by(RESPONSE_CHUNK_BYTES_LIMIT)
+                                                    {
+                                                        let end = (start
+                                                            + RESPONSE_CHUNK_BYTES_LIMIT)
+                                                            .min(data.len());
+                                                        if chunk_tx
+                                                            .send(ResponseChunk::Data(
+                                                                data.slice(start..end),
+                                                            ))
+                                                            .await
+                                                            .is_err()
+                                                        {
+                                                            return;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            Err(frame) => {
+                                                if let Ok(trailers) = frame.into_trailers() {
+                                                    let trailer_headers =
+                                                        collect_h3_trailers(&trailers);
+                                                    if !trailer_headers.is_empty() {
+                                                        if defer_headers_until_body_validated {
+                                                            buffered_trailers =
+                                                                Some(trailer_headers);
+                                                        } else if chunk_tx
+                                                            .send(ResponseChunk::Trailers {
+                                                                headers: trailer_headers,
+                                                            })
+                                                            .await
+                                                            .is_err()
+                                                        {
+                                                            return;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        },
+                                        Ok(Some(Err(_))) => {
+                                            let _ = chunk_tx
+                                                .send(ResponseChunk::Error(ProxyError::Transport(
+                                                    "upstream body error".into(),
+                                                )))
+                                                .await;
+                                            return;
+                                        }
+                                        Ok(None) => {
+                                            if defer_headers_until_body_validated {
+                                                if chunk_tx
+                                                    .send(ResponseChunk::Start {
+                                                        status: deferred_status,
+                                                        headers: deferred_headers,
+                                                    })
+                                                    .await
+                                                    .is_err()
+                                                {
+                                                    return;
+                                                }
+                                                for chunk in buffered_chunks {
+                                                    if chunk_tx
+                                                        .send(ResponseChunk::Data(chunk))
+                                                        .await
+                                                        .is_err()
+                                                    {
+                                                        return;
+                                                    }
+                                                }
+                                            }
+                                            if let Some(headers) = buffered_trailers
+                                                && chunk_tx
+                                                    .send(ResponseChunk::Trailers { headers })
+                                                    .await
+                                                    .is_err()
+                                            {
+                                                return;
+                                            }
+                                            let _ = chunk_tx.send(ResponseChunk::End).await;
+                                            return;
+                                        }
+                                    }
+                                }
+                            };
+                            let request_span = streams
+                                .get(&stream_id)
+                                .and_then(|req| req.trace_span.clone());
+                            let spawned = match request_span {
+                                Some(span) => spawn_async_task(fut.instrument(span), "body-pump"),
+                                None => spawn_async_task(fut, "body-pump"),
+                            };
+                            if !spawned {
+                                let _ = fail_tx.try_send(ResponseChunk::Error(
+                                    ProxyError::Transport("runtime unavailable".into()),
+                                ));
+                            }
+
+                            if let Some(req) = streams.get_mut(&stream_id) {
+                                req.response_chunk_rx = Some(chunk_rx);
+                                req.response_headers_sent = !defer_headers_until_body_validated;
+                                req.phase = StreamPhase::SendingResponse;
+                                req.response_status = Some(status.as_u16());
+                            }
+                        }
+
+                        // Update health/metrics for successful upstream response.
+                        if let Some(req) = streams.get(&stream_id) {
+                            if let (Some(addr), Some(idx)) = (&req.backend_addr, req.backend_index)
+                                && let Some(pool) = req.upstream_pool.as_ref()
+                            {
+                                let transition = pool.write().ok().and_then(|mut p| {
+                                    match outcome_from_status(status) {
+                                        crate::HealthClassification::Success => {
+                                            p.pool.mark_success(idx)
+                                        }
+                                        crate::HealthClassification::Failure => {
+                                            p.pool.mark_request_failure(
+                                                idx,
+                                                HealthFailureReason::HttpStatus5xx,
+                                            )
+                                        }
+                                        crate::HealthClassification::Neutral => None,
+                                    }
+                                });
+                                if let Some(t) = transition {
+                                    Self::log_health_transition(addr, t);
+                                }
+                            }
+                            metrics.inc_success();
+                            let route_label = req.upstream_name.as_deref().unwrap_or("unrouted");
+                            metrics.record_route(
+                                route_label,
+                                req.start.elapsed(),
+                                RouteOutcome::Success,
+                            );
+                            resilience
+                                .adaptive_admission
+                                .observe(req.start.elapsed(), false);
+                            Self::log_access(req, status.as_u16());
+                        }
+                        if immediate_terminal {
+                            if let Some(req) = streams.get_mut(&stream_id) {
+                                abort_stream(req, metrics);
+                            }
+                            streams.remove(&stream_id);
+                            continue;
+                        }
+                    }
+                    Err(err) => {
+                        // Send error response first, then remove the stream so
+                        // cleanup only happens after the response has been emitted.
+                        if let Some(req) = streams.get(&stream_id) {
+                            if let Err(protocol_err) = Self::handle_forward_result(
+                                h3,
+                                quic,
+                                stream_id,
+                                req,
+                                Err(err),
+                                upstream_pools,
+                                routing_index,
+                                metrics,
+                                resilience.shed_retry_after_seconds,
+                            ) {
+                                error!(
+                                    "failed to emit recoverable forward error response on stream {}: {:?}",
+                                    stream_id, protocol_err
+                                );
+                            }
+                            resilience
+                                .adaptive_admission
+                                .observe(req.start.elapsed(), true);
+                        }
+                        if let Some(req) = streams.get_mut(&stream_id) {
+                            abort_stream(req, metrics);
+                        }
+                        streams.remove(&stream_id);
+                        continue;
+                    }
+                }
+            }
+
+            // ── 4: flush response chunks ──────────────────────────────────────
+            let mut terminal = false;
+            if let Some(req) = streams.get_mut(&stream_id)
+                && let Some(rx) = &mut req.response_chunk_rx
+            {
+                // Drain as many chunks as quiche will accept this iteration.
+                loop {
+                    // Retry any chunk that previously hit backpressure.
+                    let chunk = match req.pending_chunk.take() {
+                        Some(c) => c,
+                        None => match rx.try_recv() {
+                            Ok(c) => c,
+                            Err(TryRecvError::Empty) => break,
+                            Err(TryRecvError::Disconnected) => {
+                                req.phase = StreamPhase::Failed;
+                                terminal = true;
+                                break;
+                            }
+                        },
+                    };
+                    match chunk {
+                        ResponseChunk::Start { status, headers } => {
+                            let mut h3_headers = Vec::with_capacity(headers.len() + 1);
+                            h3_headers.push(quiche::h3::Header::new(
+                                b":status",
+                                status.as_str().as_bytes(),
+                            ));
+                            for (name, value) in &headers {
+                                h3_headers.push(quiche::h3::Header::new(name, value));
+                            }
+                            match h3.send_response(quic, stream_id, &h3_headers, false) {
+                                Ok(_) => {
+                                    req.response_headers_sent = true;
+                                }
+                                Err(quiche::h3::Error::StreamBlocked) => {
+                                    req.pending_chunk =
+                                        Some(ResponseChunk::Start { status, headers });
+                                    break;
+                                }
+                                Err(err) => {
+                                    error!(
+                                        "HTTP/3 send_response protocol error on stream {}: {:?}",
+                                        stream_id, err
+                                    );
+                                    req.phase = StreamPhase::Failed;
+                                    metrics.inc_failure();
+                                    metrics.inc_backend_error();
+                                    let route_label =
+                                        req.upstream_name.as_deref().unwrap_or("unrouted");
+                                    metrics.record_route(
+                                        route_label,
+                                        req.start.elapsed(),
+                                        RouteOutcome::BackendError,
+                                    );
+                                    resilience
+                                        .adaptive_admission
+                                        .observe(req.start.elapsed(), true);
+                                    terminal = true;
+                                    break;
+                                }
+                            }
+                        }
+                        ResponseChunk::Data(data) => {
+                            match h3.send_body(quic, stream_id, &data, false) {
+                                Ok(_) => {}
+                                Err(quiche::h3::Error::StreamBlocked) => {
+                                    // QUIC flow-control backpressure — retry next poll.
+                                    req.pending_chunk = Some(ResponseChunk::Data(data));
+                                    break;
+                                }
+                                Err(err) => {
+                                    error!(
+                                        "HTTP/3 send_body data protocol error on stream {}: {:?}",
+                                        stream_id, err
+                                    );
+                                    req.phase = StreamPhase::Failed;
+                                    metrics.inc_failure();
+                                    metrics.inc_backend_error();
+                                    let route_label =
+                                        req.upstream_name.as_deref().unwrap_or("unrouted");
+                                    metrics.record_route(
+                                        route_label,
+                                        req.start.elapsed(),
+                                        RouteOutcome::BackendError,
+                                    );
+                                    resilience
+                                        .adaptive_admission
+                                        .observe(req.start.elapsed(), true);
+                                    terminal = true;
+                                    break;
+                                }
+                            }
+                        }
+                        ResponseChunk::Trailers { headers } => {
+                            let mut h3_headers = Vec::with_capacity(headers.len());
+                            for (name, value) in &headers {
+                                h3_headers.push(quiche::h3::Header::new(name, value));
+                            }
+                            match h3.send_additional_headers(
+                                quic,
+                                stream_id,
+                                &h3_headers,
+                                false,
+                                false,
+                            ) {
+                                Ok(_) => {}
+                                Err(quiche::h3::Error::StreamBlocked) => {
+                                    req.pending_chunk = Some(ResponseChunk::Trailers { headers });
+                                    break;
+                                }
+                                Err(err) => {
+                                    error!(
+                                        "HTTP/3 send_additional_headers protocol error on stream {}: {:?}",
+                                        stream_id, err
+                                    );
+                                    req.phase = StreamPhase::Failed;
+                                    metrics.inc_failure();
+                                    metrics.inc_backend_error();
+                                    let route_label =
+                                        req.upstream_name.as_deref().unwrap_or("unrouted");
+                                    metrics.record_route(
+                                        route_label,
+                                        req.start.elapsed(),
+                                        RouteOutcome::BackendError,
+                                    );
+                                    resilience
+                                        .adaptive_admission
+                                        .observe(req.start.elapsed(), true);
+                                    terminal = true;
+                                    break;
+                                }
+                            }
+                        }
+                        ResponseChunk::End => match h3.send_body(quic, stream_id, b"", true) {
+                            Ok(_) => {
+                                req.phase = StreamPhase::Completed;
+                                terminal = true;
+                                break;
+                            }
+                            Err(quiche::h3::Error::StreamBlocked) => {
+                                req.pending_chunk = Some(ResponseChunk::End);
+                                break;
+                            }
+                            Err(err) => {
+                                error!(
+                                    "HTTP/3 send_body end protocol error on stream {}: {:?}",
+                                    stream_id, err
+                                );
+                                req.phase = StreamPhase::Failed;
+                                metrics.inc_failure();
+                                metrics.inc_backend_error();
+                                let route_label =
+                                    req.upstream_name.as_deref().unwrap_or("unrouted");
+                                metrics.record_route(
+                                    route_label,
+                                    req.start.elapsed(),
+                                    RouteOutcome::BackendError,
+                                );
+                                resilience
+                                    .adaptive_admission
+                                    .observe(req.start.elapsed(), true);
+                                terminal = true;
+                                break;
+                            }
+                        },
+                        ResponseChunk::Error(err) => {
+                            // If headers are not emitted yet, return a deterministic
+                            // HTTP error status instead of resetting or truncating.
+                            if !req.response_headers_sent {
+                                let (status, body): (http::StatusCode, &[u8]) = match &err {
+                                    ProxyError::Timeout => (
+                                        http::StatusCode::SERVICE_UNAVAILABLE,
+                                        b"upstream timeout\n",
+                                    ),
+                                    ProxyError::Pool(PoolError::BackendOverloaded(_)) => (
+                                        http::StatusCode::SERVICE_UNAVAILABLE,
+                                        b"upstream response body too large\n",
+                                    ),
+                                    _ => (http::StatusCode::BAD_GATEWAY, b"upstream error\n"),
+                                };
+                                let _ =
+                                    Self::send_simple_response(h3, quic, stream_id, status, body);
+                            } else {
+                                // Best-effort: close the stream.
+                                let _ = h3.send_body(quic, stream_id, b"", true);
+                            }
+                            req.phase = StreamPhase::Failed;
+                            // Mirror the health/metrics updates from the old
+                            // send_backend_response timeout/error paths.
+                            let upstream_name =
+                                routing_index.lookup(&req.path, req.authority.as_deref());
+                            if let (Some(idx), Some(pool)) = (
+                                req.backend_index,
+                                upstream_name.and_then(|n| upstream_pools.get(n)),
+                            ) && let Some(t) = pool.write().ok().and_then(|mut p| {
+                                p.pool
+                                    .mark_request_failure(idx, HealthFailureReason::HttpStatus5xx)
+                            }) && let Some(addr) = &req.backend_addr
+                            {
+                                Self::log_health_transition(addr, t);
+                            }
+                            match err {
+                                ProxyError::Timeout => {
+                                    metrics.inc_failure();
+                                    metrics.inc_timeout();
+                                    let route_label =
+                                        req.upstream_name.as_deref().unwrap_or("unrouted");
+                                    metrics.record_route(
+                                        route_label,
+                                        req.start.elapsed(),
+                                        RouteOutcome::Timeout,
+                                    );
+                                    resilience
+                                        .adaptive_admission
+                                        .observe(req.start.elapsed(), true);
+                                    debug!(
+                                        "Upstream {} body timeout latency_ms {}",
+                                        req.backend_addr.as_deref().unwrap_or("?"),
+                                        req.start.elapsed().as_millis()
+                                    );
+                                }
+                                ProxyError::Pool(PoolError::BackendOverloaded(reason)) => {
+                                    metrics.inc_failure();
+                                    if reason.contains(
+                                        "unknown-length response prebuffer limit exceeded",
+                                    ) {
+                                        metrics.inc_response_prebuffer_limit_reject();
+                                        metrics.inc_overload_shed_reason(
+                                            OverloadShedReason::ResponsePrebufferCap,
+                                        );
+                                    } else {
+                                        metrics.inc_overload_shed_reason(
+                                            OverloadShedReason::BackendInflight,
+                                        );
+                                    }
+                                    let route_label =
+                                        req.upstream_name.as_deref().unwrap_or("unrouted");
+                                    metrics.record_route(
+                                        route_label,
+                                        req.start.elapsed(),
+                                        RouteOutcome::OverloadShed,
+                                    );
+                                    resilience
+                                        .adaptive_admission
+                                        .observe(req.start.elapsed(), true);
+                                    error!(
+                                        "Upstream {} overload in response body path: {}",
+                                        req.backend_addr.as_deref().unwrap_or("?"),
+                                        reason
+                                    );
+                                }
+                                _ => {
+                                    metrics.inc_failure();
+                                    metrics.inc_backend_error();
+                                    let route_label =
+                                        req.upstream_name.as_deref().unwrap_or("unrouted");
+                                    metrics.record_route(
+                                        route_label,
+                                        req.start.elapsed(),
+                                        RouteOutcome::BackendError,
+                                    );
+                                    resilience
+                                        .adaptive_admission
+                                        .observe(req.start.elapsed(), true);
+                                    error!(
+                                        "Upstream {} body error: {:?}",
+                                        req.backend_addr.as_deref().unwrap_or("?"),
+                                        err
+                                    );
+                                }
+                            }
+                            terminal = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // ── 5: remove terminal streams ────────────────────────────────────
+            if terminal {
+                if let Some(req) = streams.get_mut(&stream_id) {
+                    abort_stream(req, metrics);
+                }
+                streams.remove(&stream_id);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Resolve routing + LB for a request, returning `(backend_addr, backend_index, pool)`.
+    pub(super) fn resolve_backend(
+        method: &str,
+        path: &str,
+        authority: Option<&str>,
+        cid_key: Option<&str>,
+        upstream_pools: &HashMap<String, Arc<RwLock<UpstreamPool>>>,
+        routing_index: &RouteIndex,
+        header_lookup: Option<&LbHeaderLookup<'_>>,
+    ) -> Result<ResolvedBackend, ProxyError> {
+        if method.is_empty() || path.is_empty() {
+            return Err(ProxyError::Transport("empty method or path".into()));
+        }
+
+        let route_decision = routing_index
+            .lookup_with_decision_for_method(path, authority, Some(method))
+            .ok_or_else(|| ProxyError::Transport(format!("no route for {path}")))?;
+        let upstream_name = route_decision.upstream;
+
+        let upstream_pool = upstream_pools
+            .get(upstream_name)
+            .ok_or_else(|| ProxyError::Transport(format!("pool not found: {upstream_name}")))?
+            .clone();
+
+        let (backend_index, lb_type, backend_addr) = {
+            let (read_lb_type, read_fast_selected) = {
+                let pool = upstream_pool
+                    .read()
+                    .map_err(|_| ProxyError::Transport("upstream pool lock poisoned".into()))?;
+                if pool.pool.is_empty() {
+                    return Err(ProxyError::Transport("no servers in upstream".into()));
+                }
+                let lb_type = pool.lb_name();
+                let key = Self::resolve_lb_request_key(
+                    lb_type,
+                    pool.lb_key(),
+                    method,
+                    path,
+                    authority,
+                    cid_key,
+                    header_lookup,
+                );
+                let fast_pick = pool
+                    .pick_readonly(key.as_str())
+                    .and_then(|idx| pool.pool.address(idx).map(|addr| (idx, addr.to_string())));
+                let fast_selected = fast_pick.and_then(|(idx, addr)| {
+                    pool.begin_request_if_healthy(idx).then_some((idx, addr))
+                });
+                (lb_type, fast_selected)
+            };
+
+            if let Some((idx, addr)) = read_fast_selected {
+                (idx, read_lb_type, addr)
+            } else {
+                let mut pool = upstream_pool
+                    .write()
+                    .map_err(|_| ProxyError::Transport("upstream pool lock poisoned".into()))?;
+                if pool.pool.is_empty() {
+                    return Err(ProxyError::Transport("no servers in upstream".into()));
+                }
+                let lb_type = pool.lb_name();
+                let key = Self::resolve_lb_request_key(
+                    lb_type,
+                    pool.lb_key(),
+                    method,
+                    path,
+                    authority,
+                    cid_key,
+                    header_lookup,
+                );
+
+                let idx = pool.pick(key.as_str()).ok_or_else(|| {
+                    let total = pool.pool.len();
+                    let healthy = pool.pool.healthy_len();
+                    error!(
+                        "no healthy backends available: {}/{} backends healthy",
+                        healthy, total
+                    );
+                    ProxyError::Transport("no healthy servers".into())
+                })?;
+                let backend_addr = pool
+                    .pool
+                    .address(idx)
+                    .map(str::to_string)
+                    .ok_or_else(|| ProxyError::Transport("invalid server address".into()))?;
+                (idx, lb_type, backend_addr)
+            }
+        };
+
+        debug!(
+            "Selected backend {} via {} route={} path_len={} host_specific={} reason={:?}",
+            backend_addr,
+            lb_type,
+            upstream_name,
+            route_decision.matched_path_len,
+            route_decision.host_specific,
+            route_decision.reason
+        );
+        Ok(ResolvedBackend {
+            upstream_name: upstream_name.to_string(),
+            backend_addr,
+            backend_index,
+            upstream_pool,
+            backend_lb: lb_type.to_string(),
+            route_path_len: route_decision.matched_path_len,
+            route_host_specific: route_decision.host_specific,
+            route_reason: route_decision.reason,
+        })
+    }
+
+    fn resolve_lb_key_from_spec(
+        lb_key_spec: &str,
+        method: &str,
+        path: &str,
+        authority: Option<&str>,
+        cid_key: Option<&str>,
+        header_lookup: Option<&LbHeaderLookup<'_>>,
+    ) -> Option<String> {
+        let spec = lb_key_spec.trim();
+        if spec.is_empty() {
+            return None;
+        }
+
+        if spec.eq_ignore_ascii_case("path") {
+            let path_only = path.split_once('?').map(|(p, _)| p).unwrap_or(path);
+            return Some(path_only.to_string());
+        }
+        if spec.eq_ignore_ascii_case("authority") {
+            return authority.map(str::to_string);
+        }
+        if spec.eq_ignore_ascii_case("method") {
+            return Some(method.to_string());
+        }
+        if spec.eq_ignore_ascii_case("cid") || spec.eq_ignore_ascii_case("sticky-cid") {
+            return cid_key.map(str::to_string);
+        }
+
+        let (source, key_name) = spec.split_once(':')?;
+        let key_name = key_name.trim();
+        if key_name.is_empty() {
+            return None;
+        }
+
+        if source.eq_ignore_ascii_case("header") {
+            return header_lookup.and_then(|lookup| lookup(key_name));
+        }
+
+        if source.eq_ignore_ascii_case("cookie") {
+            let cookie_header =
+                header_lookup.and_then(|lookup| lookup(http::header::COOKIE.as_str()))?;
+            return extract_cookie_value(cookie_header.as_str(), key_name);
+        }
+
+        if source.eq_ignore_ascii_case("query") {
+            return extract_query_param(path, key_name);
+        }
+
+        None
+    }
+
+    fn default_lb_request_key(method: &str, path: &str, authority: Option<&str>) -> String {
+        authority
+            .unwrap_or(if !path.is_empty() { path } else { method })
+            .to_string()
+    }
+
+    fn resolve_lb_request_key(
+        lb_type: &str,
+        lb_key_spec: Option<&str>,
+        method: &str,
+        path: &str,
+        authority: Option<&str>,
+        cid_key: Option<&str>,
+        header_lookup: Option<&LbHeaderLookup<'_>>,
+    ) -> String {
+        let default_key = Self::default_lb_request_key(method, path, authority);
+
+        if let Some(spec) = lb_key_spec
+            && let Some(value) = Self::resolve_lb_key_from_spec(
+                spec,
+                method,
+                path,
+                authority,
+                cid_key,
+                header_lookup,
+            )
+            && !value.is_empty()
+        {
+            return value;
+        }
+
+        if lb_type == "sticky-cid"
+            && let Some(cid_key) = cid_key
+        {
+            return cid_key.to_string();
+        }
+
+        default_key
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

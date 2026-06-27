@@ -146,6 +146,17 @@ fn bind_tcp_listener() -> TcpListener {
     TcpListener::from_std(listener).expect("register test backend listener")
 }
 
+fn local_tcp_bind_available() -> bool {
+    match StdTcpListener::bind("127.0.0.1:0") {
+        Ok(listener) => {
+            drop(listener);
+            true
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => false,
+        Err(_) => true,
+    }
+}
+
 async fn start_h1_backend<F>(handler: F) -> SocketAddr
 where
     F: Fn(Request<Incoming>) -> Response<Full<Bytes>> + Clone + Send + 'static,
@@ -439,6 +450,9 @@ fn reserve_unused_udp_port() -> u16 {
 
 #[test]
 fn http_only_upstream_starts_and_forwards_requests_end_to_end() {
+    if !local_tcp_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("tempdir");
     let (cert, key) = write_test_certs(&dir);
     let rt = tokio::runtime::Runtime::new().expect("runtime");
@@ -485,6 +499,9 @@ fn http_only_upstream_starts_and_forwards_requests_end_to_end() {
 
 #[test]
 fn http_only_upstream_normalizes_forwarding_headers() {
+    if !local_tcp_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("tempdir");
     let (cert, key) = write_test_certs(&dir);
     let rt = tokio::runtime::Runtime::new().expect("runtime");
@@ -554,6 +571,9 @@ fn http_only_upstream_normalizes_forwarding_headers() {
 
 #[test]
 fn http_only_upstream_retries_bodyless_requests_on_alternate_backend() {
+    if !local_tcp_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("tempdir");
     let (cert, key) = write_test_certs(&dir);
     let rt = tokio::runtime::Runtime::new().expect("runtime");
@@ -595,6 +615,9 @@ fn http_only_upstream_retries_bodyless_requests_on_alternate_backend() {
 
 #[test]
 fn mixed_http_and_https_upstreams_route_by_scheme() {
+    if !local_tcp_bind_available() {
+        return;
+    }
     let dir = tempdir().expect("tempdir");
     let (cert, key) = write_test_certs(&dir);
     let rt = tokio::runtime::Runtime::new().expect("runtime");

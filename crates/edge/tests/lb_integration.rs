@@ -16,6 +16,8 @@ use rcgen::{Certificate, CertificateParams, SanType};
 use tempfile::{TempDir, tempdir};
 use tokio::net::TcpListener;
 
+mod support;
+
 use spooky_config::config::{
     Backend, ClientAuth, Config, HealthCheck, Listen, LoadBalancing, Log, LogFormat, RouteMatch,
     Security, Tls, Upstream, UpstreamTls,
@@ -26,6 +28,7 @@ use spooky_edge::constants::{
     QUIC_INITIAL_MAX_STREAMS_BIDI, QUIC_INITIAL_MAX_STREAMS_UNI, QUIC_INITIAL_STREAM_DATA,
     REQUEST_TIMEOUT_SECS, UDP_READ_TIMEOUT_MS,
 };
+use support::net::local_listener_bind_available;
 
 fn write_test_certs(dir: &TempDir) -> (String, String) {
     let mut params = CertificateParams::new(vec!["localhost".into()]);
@@ -279,6 +282,10 @@ fn run_h3_client(addr: SocketAddr, authority: &str) -> Result<String, String> {
 
 #[test]
 fn round_robin_across_backends() {
+    if !local_listener_bind_available() {
+        return;
+    }
+
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
 
@@ -349,6 +356,10 @@ fn round_robin_across_backends() {
 
 #[test]
 fn consistent_hash_is_stable_per_authority() {
+    if !local_listener_bind_available() {
+        return;
+    }
+
     let dir = tempdir().expect("failed to create temp dir");
     let (cert, key) = write_test_certs(&dir);
 
