@@ -1171,6 +1171,7 @@ fn connect_can_poll_upstream_before_request_fin() {
     let (_tx, rx) = oneshot::channel::<crate::UpstreamResult>();
     let mut req = make_envelope(StreamPhase::ReceivingRequest);
     req.method = "CONNECT".to_string();
+    req.tunnel_mode = crate::types::TunnelMode::Connect;
     req.request_fin_received = false;
     req.upstream_result_rx = Some(rx);
     assert!(can_poll_upstream_result(&req));
@@ -1789,6 +1790,7 @@ fn make_envelope(phase: StreamPhase) -> RequestEnvelope {
         bodyless_mode: false,
         retry_count: 0,
         error_kind: None,
+        tunnel_mode: crate::types::TunnelMode::None,
         phase,
         request_fin_received: false,
         upstream_result_rx: None,
