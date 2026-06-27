@@ -592,12 +592,14 @@ fn http3_websocket_upgrade_tunnels_to_http1_upstream() {
     .expect("websocket request failed");
 
     assert_eq!(response.status, "200");
-    assert!(response.body.is_empty(), "websocket handshake should not emit an HTTP body");
     assert!(
-        response
-            .headers
-            .iter()
-            .any(|(name, value)| name.eq_ignore_ascii_case("sec-websocket-accept") && value == "test-accept"),
+        response.body.is_empty(),
+        "websocket handshake should not emit an HTTP body"
+    );
+    assert!(
+        response.headers.iter().any(|(name, value)| name
+            .eq_ignore_ascii_case("sec-websocket-accept")
+            && value == "test-accept"),
         "expected sec-websocket-accept header, got {:?}",
         response.headers
     );

@@ -1,15 +1,15 @@
 pub mod h3_to_h1;
 pub mod h3_to_h2;
 
-use std::{
-    collections::HashSet,
-    net::IpAddr,
-};
+use std::{collections::HashSet, net::IpAddr};
 
 use http::{HeaderName, HeaderValue};
 use spooky_config::{
     backend_endpoint::BackendEndpoint,
-    config::{ForwardedHeaderPolicy, ForwardedHeaderPolicyMode, UpstreamHostPolicy, UpstreamHostPolicyMode},
+    config::{
+        ForwardedHeaderPolicy, ForwardedHeaderPolicyMode, UpstreamHostPolicy,
+        UpstreamHostPolicyMode,
+    },
 };
 use std::net::SocketAddr;
 
@@ -124,9 +124,7 @@ pub(crate) fn should_strip_request_header(
     connection_tokens: &HashSet<String>,
     preserve_upgrade: bool,
 ) -> bool {
-    if preserve_upgrade
-        && (name == http::header::CONNECTION || name == http::header::UPGRADE)
-    {
+    if preserve_upgrade && (name == http::header::CONNECTION || name == http::header::UPGRADE) {
         return false;
     }
 

@@ -88,8 +88,8 @@ pub fn build_h1_request_for_endpoint_with_host_policy(
     )?;
 
     let request_path = if path.is_empty() { "/" } else { path };
-    let uri = Uri::try_from(endpoint.uri_for_path(request_path))
-        .map_err(|_| BridgeError::InvalidUri)?;
+    let uri =
+        Uri::try_from(endpoint.uri_for_path(request_path)).map_err(|_| BridgeError::InvalidUri)?;
     builder = builder.uri(uri).header(http::header::HOST, host_value);
 
     if let Some(len) = content_length
