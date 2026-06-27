@@ -16,6 +16,8 @@ use rcgen::{Certificate, CertificateParams, SanType};
 use tempfile::{TempDir, tempdir};
 use tokio::net::TcpListener;
 
+mod support;
+
 use spooky_config::config::{
     Backend, ClientAuth, Config, HealthCheck, Listen, LoadBalancing, Log, LogFormat, RouteMatch,
     Security, Tls, Upstream, UpstreamTls,
@@ -26,28 +28,7 @@ use spooky_edge::constants::{
     QUIC_INITIAL_MAX_STREAMS_BIDI, QUIC_INITIAL_MAX_STREAMS_UNI, QUIC_INITIAL_STREAM_DATA,
     REQUEST_TIMEOUT_SECS, UDP_READ_TIMEOUT_MS,
 };
-
-fn local_listener_bind_available() -> bool {
-    let tcp_available = match std::net::TcpListener::bind(("127.0.0.1", 0)) {
-        Ok(listener) => {
-            drop(listener);
-            true
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => false,
-        Err(_) => true,
-    };
-
-    let udp_available = match std::net::UdpSocket::bind(("127.0.0.1", 0)) {
-        Ok(socket) => {
-            drop(socket);
-            true
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => false,
-        Err(_) => true,
-    };
-
-    tcp_available && udp_available
-}
+use support::net::local_listener_bind_available;
 
 fn write_test_certs(dir: &TempDir) -> (String, String) {
     let mut params = CertificateParams::new(vec!["localhost".into()]);
