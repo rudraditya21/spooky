@@ -398,6 +398,7 @@ struct NormalizedAuthority {
     port: Option<u16>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_request_parts(
     method: String,
     path: String,

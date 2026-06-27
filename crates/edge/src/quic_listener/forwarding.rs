@@ -132,6 +132,7 @@ impl QUICListener {
         detail
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_http1_websocket_tunnel_request(
         endpoint: &BackendEndpoint,
         host_policy: &UpstreamHostPolicy,
@@ -182,6 +183,7 @@ impl QUICListener {
         Ok(request)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn forward_http1_websocket_tunnel(
         endpoint: BackendEndpoint,
         host_policy: UpstreamHostPolicy,
@@ -1286,9 +1288,11 @@ impl QUICListener {
                                         };
 
                                     let forward_success: ForwardSuccess = if websocket_h1_tunnel {
-                                        let body_rx = websocket_tunnel_body_rx.expect(
-                                            "websocket H1 tunnels require a downstream body channel",
-                                        );
+                                        let Some(body_rx) = websocket_tunnel_body_rx else {
+                                            return Err(ProxyError::Transport(
+                                                "websocket H1 tunnels require a downstream body channel".into(),
+                                            ));
+                                        };
                                         Self::forward_http1_websocket_tunnel(
                                             backend_endpoint.clone(),
                                             upstream_policy.host.0.clone(),
@@ -2203,9 +2207,14 @@ impl QUICListener {
                                 let tunnel_mode = tunnel_response;
                                 let fut = async move {
                                     use http_body_util::BodyExt;
-                                    let mut body: hyper::body::Incoming = response_body.expect(
-                                        "non-tunnel responses must carry an HTTP body stream",
-                                    );
+                                    let Some(mut body) = response_body else {
+                                        let _ = chunk_tx
+                                            .send(ResponseChunk::Error(ProxyError::Transport(
+                                                "non-tunnel responses must carry an HTTP body stream".into(),
+                                            )))
+                                            .await;
+                                        return;
+                                    };
                                     let mut response_bytes_received: usize = 0;
                                     let mut buffered_chunks: Vec<Bytes> = Vec::new();
                                     let mut buffered_trailers: Option<Vec<(Vec<u8>, Vec<u8>)>> =
