@@ -246,6 +246,8 @@ pub struct H2Client {
 
 impl Default for H2Client {
     fn default() -> Self {
+        // infallible: default TLS config uses well-known roots and no custom certs
+        #[allow(clippy::expect_used)]
         Self::new(
             DEFAULT_MAX_IDLE_PER_HOST,
             DEFAULT_POOL_IDLE_TIMEOUT,
