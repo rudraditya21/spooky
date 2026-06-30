@@ -273,7 +273,7 @@ impl QUICListener {
         }
     }
 
-    fn reload_listener_certs(
+    pub(super) fn reload_listener_certs(
         listener_runtime_configs: &HashMap<String, ListenerRuntimeConfig>,
         listener_tls_store: &ListenerTlsReloadStore,
         metrics: &Metrics,

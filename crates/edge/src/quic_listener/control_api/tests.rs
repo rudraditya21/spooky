@@ -1,5 +1,6 @@
 use super::state::ControlApiState;
 use super::*;
+use http_body_util::BodyExt;
 use spooky_config::{
     config::{
         Backend, ClientAuth, Config as SpookyConfigConfig, Listen, LoadBalancing, Log,
@@ -116,6 +117,30 @@ fn control_api_state_with_runtime_bundle(
         started_at: Instant::now(),
         runtime_bundle: Some(Arc::new(RuntimeBundleHandle::new(reloaded_bundle))),
     }
+}
+
+fn runtime_bundle_control_api_state(
+    bundle: RuntimeBundle,
+) -> (ControlApiState, Arc<RuntimeBundleHandle>) {
+    let listener_config = bundle
+        .runtime_config
+        .primary_listener_runtime_config()
+        .expect("listener runtime config");
+    let runtime_handle = Arc::new(RuntimeBundleHandle::new(bundle.clone()));
+    let state = ControlApiState {
+        control_api: bundle.runtime_config.observability.control_api.clone(),
+        metrics: Arc::clone(&bundle.shared_state.metrics),
+        resilience: Arc::clone(&bundle.shared_state.resilience),
+        watchdog: Arc::clone(&bundle.shared_state.watchdog),
+        upstream_pools: bundle.shared_state.upstream_pools.clone(),
+        listener_runtime_configs: Arc::clone(&bundle.shared_state.listener_runtime_configs),
+        listener_tls_store: Arc::clone(&bundle.shared_state.listener_tls_store),
+        primary_listener_label: QUICListener::listener_label(&listener_config),
+        expected_workers: 1,
+        started_at: Instant::now(),
+        runtime_bundle: Some(Arc::clone(&runtime_handle)),
+    };
+    (state, runtime_handle)
 }
 
 #[test]
@@ -389,5 +414,81 @@ fn validate_startup_owned_reload_compatibility_rejects_control_plane_thread_chan
         issues
             .iter()
             .any(|issue| issue.contains("performance.control_plane_threads"))
+    );
+}
+
+#[tokio::test]
+async fn runtime_bundle_cert_reload_ignores_unrelated_config_drift_and_bundle_swap() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_cert_for_name(dir.path(), "server", "api.example.com");
+    let mut live = test_config(cert.clone(), key.clone());
+    live.observability.metrics.enabled = true;
+    live.observability.metrics.path = "/metrics-live".to_string();
+
+    let live_bundle = runtime_bundle_from_config("live.yaml", &live);
+    let (state, runtime_handle) = runtime_bundle_control_api_state(live_bundle);
+
+    let mut drifted = live.clone();
+    drifted.observability.metrics.path = "/metrics-drifted".to_string();
+    drifted.performance.control_plane_threads =
+        live.performance.control_plane_threads.saturating_add(1);
+    let drifted_bundle = runtime_bundle_from_config("drifted.yaml", &drifted);
+    let full_reload_issues = QUICListener::validate_startup_owned_reload_compatibility(
+        runtime_handle.current().as_ref(),
+        &drifted_bundle,
+    );
+    assert!(
+        full_reload_issues
+            .iter()
+            .any(|issue| issue.contains("performance.control_plane_threads")),
+        "expected a full reload blocker from on-disk drift, got: {full_reload_issues:?}"
+    );
+
+    let generation_before = runtime_handle.generation();
+    let tls_generation_before = runtime_handle
+        .current()
+        .shared_state
+        .listener_tls_store
+        .generation(&state.primary_listener_label)
+        .unwrap_or(0);
+
+    let response = QUICListener::reload_listener_certs(
+        runtime_handle
+            .current()
+            .shared_state
+            .listener_runtime_configs
+            .as_ref(),
+        runtime_handle
+            .current()
+            .shared_state
+            .listener_tls_store
+            .as_ref(),
+        runtime_handle.current().shared_state.metrics.as_ref(),
+    );
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("collect response body")
+        .to_bytes();
+    let payload: serde_json::Value = serde_json::from_slice(&body).expect("response json");
+    assert_eq!(payload["reloaded"], serde_json::Value::Bool(true));
+
+    let current_runtime = runtime_handle.current();
+    assert_eq!(current_runtime.generation, generation_before);
+    assert_eq!(
+        current_runtime.runtime_config.observability.metrics.path,
+        "/metrics-live"
+    );
+    assert!(
+        current_runtime
+            .shared_state
+            .listener_tls_store
+            .generation(&state.primary_listener_label)
+            .unwrap_or(0)
+            > tls_generation_before,
+        "expected cert reload to rotate the live listener TLS generation"
     );
 }
