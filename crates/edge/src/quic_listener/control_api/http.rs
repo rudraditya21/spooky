@@ -273,6 +273,63 @@ impl QUICListener {
         }
     }
 
+    fn reload_listener_certs(
+        listener_runtime_configs: &HashMap<String, ListenerRuntimeConfig>,
+        listener_tls_store: &ListenerTlsReloadStore,
+        metrics: &Metrics,
+    ) -> Response<Full<Bytes>> {
+        let mut reloaded = Vec::new();
+        for (listener_label, listener_config) in listener_runtime_configs {
+            let reloaded_state = match Self::build_listener_tls_reload_state(listener_config) {
+                Ok(state) => state,
+                Err(err) => {
+                    return Self::json_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        json!({
+                            "reloaded": false,
+                            "listener": listener_label,
+                            "error": err.to_string(),
+                        }),
+                    );
+                }
+            };
+            let generation = match listener_tls_store.replace_listener(
+                listener_label,
+                reloaded_state.inventory.clone(),
+                reloaded_state.bootstrap_server_config,
+            ) {
+                Ok(generation) => generation,
+                Err(err) => {
+                    return Self::json_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        json!({
+                            "reloaded": false,
+                            "listener": listener_label,
+                            "error": err.to_string(),
+                        }),
+                    );
+                }
+            };
+            Self::update_listener_tls_expiry_metrics(
+                metrics,
+                listener_label,
+                &reloaded_state.inventory,
+            );
+            reloaded.push(json!({
+                "listener": listener_label,
+                "generation": generation,
+            }));
+        }
+
+        Self::json_response(
+            StatusCode::ACCEPTED,
+            json!({
+                "reloaded": true,
+                "listeners": reloaded,
+            }),
+        )
+    }
+
     pub(super) fn handle_control_api_request(
         req: Request<Incoming>,
         state: &ControlApiState,
@@ -399,55 +456,10 @@ impl QUICListener {
             let live_tls_store = state.current_listener_tls_store();
             let live_listener_configs = state.current_listener_runtime_configs();
             let live_metrics = state.current_metrics();
-            let mut reloaded = Vec::new();
-            for (listener_label, listener_config) in live_listener_configs.iter() {
-                let reloaded_state = match Self::build_listener_tls_reload_state(listener_config) {
-                    Ok(state) => state,
-                    Err(err) => {
-                        return Self::json_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            json!({
-                                "reloaded": false,
-                                "listener": listener_label,
-                                "error": err.to_string(),
-                            }),
-                        );
-                    }
-                };
-                let generation = match live_tls_store.replace_listener(
-                    listener_label,
-                    reloaded_state.inventory.clone(),
-                    reloaded_state.bootstrap_server_config,
-                ) {
-                    Ok(generation) => generation,
-                    Err(err) => {
-                        return Self::json_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            json!({
-                                "reloaded": false,
-                                "listener": listener_label,
-                                "error": err.to_string(),
-                            }),
-                        );
-                    }
-                };
-                Self::update_listener_tls_expiry_metrics(
-                    &live_metrics,
-                    listener_label,
-                    &reloaded_state.inventory,
-                );
-                reloaded.push(json!({
-                    "listener": listener_label,
-                    "generation": generation,
-                }));
-            }
-
-            return Self::json_response(
-                StatusCode::ACCEPTED,
-                json!({
-                    "reloaded": true,
-                    "listeners": reloaded,
-                }),
+            return Self::reload_listener_certs(
+                live_listener_configs.as_ref(),
+                live_tls_store.as_ref(),
+                live_metrics.as_ref(),
             );
         }
 
@@ -618,9 +630,25 @@ impl QUICListener {
             return Self::json_response(StatusCode::OK, response);
         }
 
-        if req.method() == Method::POST
-            && (path == paths.reload_certs_path.as_str() || path == paths.reload_path.as_str())
-        {
+        if req.method() == Method::POST && path == paths.reload_certs_path.as_str() {
+            if !Self::control_api_is_authorized(&req, state) {
+                return Self::json_response(
+                    StatusCode::UNAUTHORIZED,
+                    json!({
+                        "reloaded": false,
+                        "error": "unauthorized",
+                    }),
+                );
+            }
+
+            return Self::reload_listener_certs(
+                shared_state.listener_runtime_configs.as_ref(),
+                shared_state.listener_tls_store.as_ref(),
+                shared_state.metrics.as_ref(),
+            );
+        }
+
+        if req.method() == Method::POST && path == paths.reload_path.as_str() {
             if !Self::control_api_is_authorized(&req, state) {
                 return Self::json_response(
                     StatusCode::UNAUTHORIZED,
