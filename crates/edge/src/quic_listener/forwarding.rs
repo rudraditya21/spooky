@@ -1521,7 +1521,9 @@ impl QUICListener {
                                                 if !can_retry {
                                                     if !bodyless_mode {
                                                         retry_denial_reason = Some(RetryReason::NotBodylessMode);
-                                                    } else if !is_retryable_err || !budget_ok {
+                                                    } else if !is_retryable_err {
+                                                        retry_denial_reason = None;
+                                                    } else if !budget_ok {
                                                         retry_denial_reason = Some(RetryReason::BudgetDenied);
                                                     } else {
                                                         retry_denial_reason = Some(RetryReason::NoAlternateBackend);
