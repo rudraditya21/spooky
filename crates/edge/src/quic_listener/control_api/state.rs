@@ -95,6 +95,17 @@ impl ControlApiState {
             .unwrap_or_else(|| Arc::clone(&self.metrics))
     }
 
+    pub(super) fn current_primary_listener_label(&self) -> Option<String> {
+        self.current_runtime()
+            .and_then(|runtime| {
+                runtime
+                    .runtime_config
+                    .primary_listener_runtime_config()
+                    .map(|listener| QUICListener::listener_label(&listener))
+            })
+            .or_else(|| Some(self.primary_listener_label.clone()))
+    }
+
     pub(super) fn snapshot_backend_health(&self) -> (usize, usize) {
         if let Some(runtime) = self.current_runtime() {
             let mut healthy = 0usize;

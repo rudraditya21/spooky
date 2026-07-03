@@ -230,6 +230,37 @@ fn control_api_state_prefers_reloaded_paths_and_auth_token() {
 }
 
 #[test]
+fn control_api_state_uses_live_primary_listener_label_after_runtime_swap() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_cert_for_name(dir.path(), "server", "api.example.com");
+    let startup = test_config(cert.clone(), key.clone());
+
+    let mut reloaded = startup.clone();
+    reloaded.listeners = vec![
+        Listen {
+            protocol: "http3".to_string(),
+            port: 9890,
+            address: "127.0.0.1".to_string(),
+            tls: Tls {
+                cert: cert.clone(),
+                key: key.clone(),
+                certificates: vec![],
+                client_auth: ClientAuth::default(),
+            },
+        },
+        startup.listen.clone(),
+    ];
+
+    let state = control_api_state_with_runtime_bundle(&startup, &reloaded);
+
+    assert_eq!(state.primary_listener_label, "127.0.0.1:9889");
+    assert_eq!(
+        state.current_primary_listener_label().as_deref(),
+        Some("127.0.0.1:9890")
+    );
+}
+
+#[test]
 fn validate_control_api_reload_compatibility_allows_bind_change_when_socket_is_free() {
     let dir = tempdir().expect("tempdir");
     let (cert, key) = write_test_cert_for_name(dir.path(), "server", "api.example.com");

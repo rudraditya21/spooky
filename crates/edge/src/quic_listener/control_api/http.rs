@@ -196,12 +196,19 @@ impl QUICListener {
                             state.current_control_api().connection_timeout_ms.max(1),
                         );
                         let listener_tls_store = state.current_listener_tls_store();
+                        let Some(primary_listener_label) = state.current_primary_listener_label()
+                        else {
+                            error!(
+                                "Control API endpoint missing live primary listener label for TLS selection"
+                            );
+                            return;
+                        };
                         let Some(server_config) = listener_tls_store
-                            .bootstrap_server_config(&state.primary_listener_label)
+                            .bootstrap_server_config(&primary_listener_label)
                         else {
                             error!(
                                 "Control API endpoint missing live TLS config for listener {}",
-                                state.primary_listener_label
+                                primary_listener_label
                             );
                             return;
                         };
