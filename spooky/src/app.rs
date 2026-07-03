@@ -296,7 +296,10 @@ fn apply_privilege_drop(uid: libc::uid_t, runtime_config: &RuntimeConfig) {
     let group = runtime_config.security.privileges.group.trim();
     match privilege_drop::drop_privileges(user, group) {
         Ok(()) => {
-            info!("Dropped process privileges to user='{}' group='{}'", user, group);
+            info!(
+                "Dropped process privileges to user='{}' group='{}'",
+                user, group
+            );
         }
         Err(err) => {
             fatal_startup_error(

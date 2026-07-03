@@ -203,8 +203,8 @@ impl QUICListener {
                             );
                             return;
                         };
-                        let Some(server_config) = listener_tls_store
-                            .bootstrap_server_config(&primary_listener_label)
+                        let Some(server_config) =
+                            listener_tls_store.bootstrap_server_config(&primary_listener_label)
                         else {
                             error!(
                                 "Control API endpoint missing live TLS config for listener {}",
