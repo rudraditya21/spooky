@@ -6,6 +6,8 @@ source "$(dirname "$0")/common.sh"
 ensure_bins
 
 cat > /tmp/spooky-lb-ch.yaml <<'YAML'
+version: 1
+
 listen:
     protocol: http3
     port: 9889
@@ -14,28 +16,31 @@ listen:
         cert: "certs/proxy-cert.pem"
         key: "certs/proxy-key-pkcs8.pem"
 
-backends:
-    -   id: "backend1"
-        address: "127.0.0.1:8081"
-        weight: 1
-        health_check:
-            path: "/health"
-            interval: 5000
-    -   id: "backend2"
-        address: "127.0.0.1:8082"
-        weight: 1
-        health_check:
-            path: "/health"
-            interval: 5000
-    -   id: "backend3"
-        address: "127.0.0.1:8083"
-        weight: 1
-        health_check:
-            path: "/health"
-            interval: 5000
-
-load_balancing:
-    type: consistent-hash
+upstream:
+    default:
+        load_balancing:
+            type: consistent-hash
+        route:
+            path_prefix: "/"
+        backends:
+            -   id: "backend1"
+                address: "http://127.0.0.1:8081"
+                weight: 1
+                health_check:
+                    path: "/health"
+                    interval: 5000
+            -   id: "backend2"
+                address: "http://127.0.0.1:8082"
+                weight: 1
+                health_check:
+                    path: "/health"
+                    interval: 5000
+            -   id: "backend3"
+                address: "http://127.0.0.1:8083"
+                weight: 1
+                health_check:
+                    path: "/health"
+                    interval: 5000
 
 log:
   level: info
