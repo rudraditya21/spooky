@@ -301,6 +301,8 @@ mod tests {
             .auth
             .external_auth = Some(crate::config::ExternalAuth::Http {
             endpoint: "https://auth.internal/check".to_string(),
+            request_headers: Vec::new(),
+            response_header_allowlist: Vec::new(),
             timeout_ms: 1_000,
         });
 
@@ -314,9 +316,13 @@ mod tests {
         match auth.external_auth.as_ref() {
             Some(crate::config::ExternalAuth::Http {
                 endpoint,
+                request_headers,
+                response_header_allowlist,
                 timeout_ms,
             }) => {
                 assert_eq!(endpoint, "https://auth.internal/check");
+                assert!(request_headers.is_empty());
+                assert!(response_header_allowlist.is_empty());
                 assert_eq!(*timeout_ms, 1_000);
             }
             other => panic!("unexpected external_auth contract: {:?}", other),
@@ -340,6 +346,8 @@ mod tests {
             client_secret: Some("secret-1".to_string()),
             audience: Some("spooky-api".to_string()),
             scopes: vec!["openid".to_string(), "profile".to_string()],
+            request_headers: Vec::new(),
+            response_header_allowlist: Vec::new(),
             timeout_ms: 1_500,
         });
 
@@ -360,6 +368,8 @@ mod tests {
                 client_secret,
                 audience,
                 scopes,
+                request_headers,
+                response_header_allowlist,
                 timeout_ms,
             }) => {
                 assert_eq!(
@@ -371,6 +381,8 @@ mod tests {
                 assert_eq!(client_secret.as_deref(), Some("secret-1"));
                 assert_eq!(audience.as_deref(), Some("spooky-api"));
                 assert_eq!(scopes, &vec!["openid".to_string(), "profile".to_string()]);
+                assert!(request_headers.is_empty());
+                assert!(response_header_allowlist.is_empty());
                 assert_eq!(*timeout_ms, 1_500);
             }
             other => panic!("unexpected external_auth contract: {:?}", other),

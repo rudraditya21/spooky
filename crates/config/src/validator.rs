@@ -102,6 +102,88 @@ macro_rules! validation_error {
 
 type RouteMatcherKey = (Option<String>, Option<String>, Option<String>);
 
+fn validate_external_auth_headers(
+    upstream_name: &str,
+    field_prefix: &str,
+    request_headers: &[crate::config::ExternalAuthRequestHeader],
+    response_header_allowlist: &[String],
+) -> bool {
+    let mut seen_request_headers = std::collections::HashSet::new();
+    for (idx, header) in request_headers.iter().enumerate() {
+        let header_name = header.name.trim();
+        if header_name.is_empty() {
+            validation_error!(
+                "upstream '{}' {}.request_headers[{}].name must be non-empty",
+                upstream_name,
+                field_prefix,
+                idx
+            );
+            return false;
+        }
+        if http::header::HeaderName::from_bytes(header_name.as_bytes()).is_err() {
+            validation_error!(
+                "upstream '{}' {}.request_headers[{}].name must be a valid HTTP header name",
+                upstream_name,
+                field_prefix,
+                idx
+            );
+            return false;
+        }
+        if http::HeaderValue::from_str(header.value.as_str()).is_err() {
+            validation_error!(
+                "upstream '{}' {}.request_headers[{}].value must be a valid HTTP header value",
+                upstream_name,
+                field_prefix,
+                idx
+            );
+            return false;
+        }
+        let normalized_name = header_name.to_ascii_lowercase();
+        if !seen_request_headers.insert(normalized_name) {
+            validation_error!(
+                "upstream '{}' {}.request_headers contains duplicate header names",
+                upstream_name,
+                field_prefix
+            );
+            return false;
+        }
+    }
+
+    let mut seen_allowed_headers = std::collections::HashSet::new();
+    for (idx, header_name) in response_header_allowlist.iter().enumerate() {
+        let header_name = header_name.trim();
+        if header_name.is_empty() {
+            validation_error!(
+                "upstream '{}' {}.response_header_allowlist[{}] must be non-empty",
+                upstream_name,
+                field_prefix,
+                idx
+            );
+            return false;
+        }
+        if http::header::HeaderName::from_bytes(header_name.as_bytes()).is_err() {
+            validation_error!(
+                "upstream '{}' {}.response_header_allowlist[{}] must be a valid HTTP header name",
+                upstream_name,
+                field_prefix,
+                idx
+            );
+            return false;
+        }
+        let normalized_name = header_name.to_ascii_lowercase();
+        if !seen_allowed_headers.insert(normalized_name) {
+            validation_error!(
+                "upstream '{}' {}.response_header_allowlist contains duplicate header names",
+                upstream_name,
+                field_prefix
+            );
+            return false;
+        }
+    }
+
+    true
+}
+
 pub fn validate(config: &Config) -> Result<(), ValidationError> {
     clear_validation_error();
     if validate_inner(config) {
@@ -1154,6 +1236,8 @@ fn validate_inner(config: &Config) -> bool {
             match external_auth {
                 ExternalAuth::Http {
                     endpoint,
+                    request_headers,
+                    response_header_allowlist,
                     timeout_ms,
                 } => {
                     if !is_valid_http_url(endpoint) {
@@ -1161,6 +1245,14 @@ fn validate_inner(config: &Config) -> bool {
                             "upstream '{}' auth.external_auth.http.endpoint must be an absolute http(s) URL",
                             upstream_name
                         );
+                        return false;
+                    }
+                    if !validate_external_auth_headers(
+                        upstream_name,
+                        "auth.external_auth.http",
+                        request_headers,
+                        response_header_allowlist,
+                    ) {
                         return false;
                     }
                     if *timeout_ms == 0 {
@@ -1178,6 +1270,8 @@ fn validate_inner(config: &Config) -> bool {
                     client_secret,
                     audience,
                     scopes,
+                    request_headers,
+                    response_header_allowlist,
                     timeout_ms,
                 } => {
                     let has_discovery_url = discovery_url
@@ -1245,6 +1339,14 @@ fn validate_inner(config: &Config) -> bool {
                             "upstream '{}' auth.external_auth.oidc.scopes must not contain empty values",
                             upstream_name
                         );
+                        return false;
+                    }
+                    if !validate_external_auth_headers(
+                        upstream_name,
+                        "auth.external_auth.oidc",
+                        request_headers,
+                        response_header_allowlist,
+                    ) {
                         return false;
                     }
                     if *timeout_ms == 0 {

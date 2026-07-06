@@ -1,9 +1,9 @@
 use super::validate;
 use crate::config::{
-    ApiKeyAuth, Backend, ClientAuth, Config, ControlApi, ExternalAuth, HealthCheck, JwtAuth,
-    Listen, LoadBalancing, Log, LogFormat, MetricsEndpoint, Observability, Performance, Resilience,
-    RouteAuth, RouteMatch, ScopedRateLimit, ScopedRateLimitScope, Security, Tls, TlsCertificate,
-    Tracing, Upstream, UpstreamTls,
+    ApiKeyAuth, Backend, ClientAuth, Config, ControlApi, ExternalAuth, ExternalAuthRequestHeader,
+    HealthCheck, JwtAuth, Listen, LoadBalancing, Log, LogFormat, MetricsEndpoint, Observability,
+    Performance, Resilience, RouteAuth, RouteMatch, ScopedRateLimit, ScopedRateLimitScope,
+    Security, Tls, TlsCertificate, Tracing, Upstream, UpstreamTls,
 };
 use rcgen::{Certificate, CertificateParams, SanType};
 use std::collections::HashMap;
@@ -230,9 +230,13 @@ upstream:
     match auth.external_auth.as_ref() {
         Some(ExternalAuth::Http {
             endpoint,
+            request_headers,
+            response_header_allowlist,
             timeout_ms,
         }) => {
             assert_eq!(endpoint, "https://auth.internal/check");
+            assert!(request_headers.is_empty());
+            assert!(response_header_allowlist.is_empty());
             assert_eq!(*timeout_ms, 1_000);
         }
         other => panic!("unexpected external auth config: {:?}", other),
@@ -289,6 +293,8 @@ upstream:
             client_secret,
             audience,
             scopes,
+            request_headers,
+            response_header_allowlist,
             timeout_ms,
         }) => {
             assert_eq!(
@@ -300,6 +306,8 @@ upstream:
             assert_eq!(client_secret, &None);
             assert_eq!(audience, &None);
             assert!(scopes.is_empty());
+            assert!(request_headers.is_empty());
+            assert!(response_header_allowlist.is_empty());
             assert_eq!(*timeout_ms, 1_000);
         }
         other => panic!("unexpected external auth config: {:?}", other),
@@ -1307,6 +1315,8 @@ fn accepts_http_external_auth_with_default_timeout() {
         .auth
         .external_auth = Some(ExternalAuth::Http {
         endpoint: "https://auth.internal/check".to_string(),
+        request_headers: Vec::new(),
+        response_header_allowlist: Vec::new(),
         timeout_ms: 1_000,
     });
 
@@ -1332,6 +1342,8 @@ fn accepts_oidc_external_auth() {
         client_secret: Some("secret-1".to_string()),
         audience: Some("spooky-api".to_string()),
         scopes: vec!["openid".to_string(), "profile".to_string()],
+        request_headers: Vec::new(),
+        response_header_allowlist: Vec::new(),
         timeout_ms: 1_500,
     });
 
@@ -1355,6 +1367,8 @@ fn rejects_oidc_external_auth_without_discovery_or_issuer() {
         client_secret: Some("secret-1".to_string()),
         audience: Some("spooky-api".to_string()),
         scopes: vec!["openid".to_string()],
+        request_headers: Vec::new(),
+        response_header_allowlist: Vec::new(),
         timeout_ms: 1_500,
     });
 
@@ -1380,6 +1394,8 @@ fn rejects_oidc_external_auth_with_empty_client_secret() {
         client_secret: Some("   ".to_string()),
         audience: Some("spooky-api".to_string()),
         scopes: vec!["openid".to_string()],
+        request_headers: Vec::new(),
+        response_header_allowlist: Vec::new(),
         timeout_ms: 1_500,
     });
 
@@ -1405,8 +1421,132 @@ fn rejects_oidc_external_auth_with_empty_scope() {
         client_secret: Some("secret-1".to_string()),
         audience: Some("spooky-api".to_string()),
         scopes: vec!["openid".to_string(), "   ".to_string()],
+        request_headers: Vec::new(),
+        response_header_allowlist: Vec::new(),
         timeout_ms: 1_500,
     });
+
+    assert!(validate(&cfg).is_err());
+}
+
+#[test]
+fn rejects_external_auth_with_invalid_request_header_name() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.upstream
+        .get_mut("test_upstream")
+        .expect("upstream")
+        .auth
+        .external_auth = Some(ExternalAuth::Http {
+        endpoint: "https://auth.internal/check".to_string(),
+        request_headers: vec![ExternalAuthRequestHeader {
+            name: "x auth".to_string(),
+            value: "allow".to_string(),
+        }],
+        response_header_allowlist: Vec::new(),
+        timeout_ms: 1_000,
+    });
+
+    assert!(validate(&cfg).is_err());
+}
+
+#[test]
+fn accepts_http_external_auth_with_explicit_headers() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.upstream
+        .get_mut("test_upstream")
+        .expect("upstream")
+        .auth
+        .external_auth = Some(ExternalAuth::Http {
+        endpoint: "https://auth.internal/check".to_string(),
+        request_headers: vec![
+            ExternalAuthRequestHeader {
+                name: "x-auth-service".to_string(),
+                value: "spooky".to_string(),
+            },
+            ExternalAuthRequestHeader {
+                name: "x-auth-mode".to_string(),
+                value: "allow".to_string(),
+            },
+        ],
+        response_header_allowlist: vec!["www-authenticate".to_string(), "location".to_string()],
+        timeout_ms: 1_000,
+    });
+
+    assert!(validate(&cfg).is_ok());
+}
+
+#[test]
+fn rejects_oidc_external_auth_with_empty_discovery_url() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.upstream
+        .get_mut("test_upstream")
+        .expect("upstream")
+        .auth
+        .external_auth = Some(ExternalAuth::Oidc {
+        discovery_url: Some("   ".to_string()),
+        issuer_url: None,
+        client_id: "edge-gateway".to_string(),
+        client_secret: Some("secret-1".to_string()),
+        audience: Some("spooky-api".to_string()),
+        scopes: vec!["openid".to_string()],
+        request_headers: Vec::new(),
+        response_header_allowlist: Vec::new(),
+        timeout_ms: 1_500,
+    });
+
+    assert!(validate(&cfg).is_err());
+}
+
+#[test]
+fn rejects_external_auth_with_invalid_response_allowlist_header_name() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.upstream
+        .get_mut("test_upstream")
+        .expect("upstream")
+        .auth
+        .external_auth = Some(ExternalAuth::Http {
+        endpoint: "https://auth.internal/check".to_string(),
+        request_headers: Vec::new(),
+        response_header_allowlist: vec!["bad header".to_string()],
+        timeout_ms: 1_000,
+    });
+
+    assert!(validate(&cfg).is_err());
+}
+
+#[test]
+fn rejects_external_auth_with_rbac_requirements_in_v1() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.upstream
+        .get_mut("test_upstream")
+        .expect("upstream")
+        .auth = RouteAuth {
+        api_key: None,
+        jwt: None,
+        external_auth: Some(ExternalAuth::Http {
+            endpoint: "https://auth.internal/check".to_string(),
+            request_headers: Vec::new(),
+            response_header_allowlist: Vec::new(),
+            timeout_ms: 1_000,
+        }),
+        required_scopes: vec!["read:fast".to_string()],
+        required_roles: vec!["admin".to_string()],
+    };
 
     assert!(validate(&cfg).is_err());
 }
@@ -1423,6 +1563,8 @@ fn rejects_external_auth_with_invalid_http_endpoint() {
         .auth
         .external_auth = Some(ExternalAuth::Http {
         endpoint: "not-a-url".to_string(),
+        request_headers: Vec::new(),
+        response_header_allowlist: Vec::new(),
         timeout_ms: 1_000,
     });
 
@@ -1446,6 +1588,8 @@ fn rejects_external_auth_combined_with_builtin_auth_in_v1() {
         jwt: None,
         external_auth: Some(ExternalAuth::Http {
             endpoint: "https://auth.internal/check".to_string(),
+            request_headers: Vec::new(),
+            response_header_allowlist: Vec::new(),
             timeout_ms: 1_000,
         }),
         required_scopes: Vec::new(),

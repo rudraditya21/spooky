@@ -253,6 +253,10 @@ pub struct RouteAuth {
 pub enum ExternalAuth {
     Http {
         endpoint: String,
+        #[serde(default)]
+        request_headers: Vec<ExternalAuthRequestHeader>,
+        #[serde(default)]
+        response_header_allowlist: Vec<String>,
         #[serde(default = "auth_default_external_timeout_ms")]
         timeout_ms: u64,
     },
@@ -268,9 +272,20 @@ pub enum ExternalAuth {
         audience: Option<String>,
         #[serde(default)]
         scopes: Vec<String>,
+        #[serde(default)]
+        request_headers: Vec<ExternalAuthRequestHeader>,
+        #[serde(default)]
+        response_header_allowlist: Vec<String>,
         #[serde(default = "auth_default_external_timeout_ms")]
         timeout_ms: u64,
     },
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalAuthRequestHeader {
+    pub name: String,
+    pub value: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
