@@ -14,6 +14,32 @@ fn runtime_external_auth_request_headers(
         .collect()
 }
 
+fn runtime_external_auth_failure_mode(
+    mode: crate::config::ExternalAuthFailureMode,
+) -> RuntimeExternalAuthFailureMode {
+    match mode {
+        crate::config::ExternalAuthFailureMode::FailOpen => {
+            RuntimeExternalAuthFailureMode::FailOpen
+        }
+        crate::config::ExternalAuthFailureMode::FailClosed => {
+            RuntimeExternalAuthFailureMode::FailClosed
+        }
+    }
+}
+
+fn config_external_auth_failure_mode(
+    mode: RuntimeExternalAuthFailureMode,
+) -> crate::config::ExternalAuthFailureMode {
+    match mode {
+        RuntimeExternalAuthFailureMode::FailOpen => {
+            crate::config::ExternalAuthFailureMode::FailOpen
+        }
+        RuntimeExternalAuthFailureMode::FailClosed => {
+            crate::config::ExternalAuthFailureMode::FailClosed
+        }
+    }
+}
+
 fn runtime_auth_policy(auth: &crate::config::RouteAuth) -> RuntimeAuthPolicy {
     let api_key = auth.api_key.as_ref().map(|api_key| RuntimeApiKeyAuth {
         header_name: api_key.header_name.clone(),
@@ -34,11 +60,13 @@ fn runtime_auth_policy(auth: &crate::config::RouteAuth) -> RuntimeAuthPolicy {
                 request_headers,
                 response_header_allowlist,
                 timeout_ms,
+                failure_mode,
             } => RuntimeExternalAuth::Http {
                 endpoint: endpoint.clone(),
                 request_headers: runtime_external_auth_request_headers(request_headers),
                 response_header_allowlist: response_header_allowlist.clone(),
                 timeout_ms: *timeout_ms,
+                failure_mode: runtime_external_auth_failure_mode(*failure_mode),
             },
             crate::config::ExternalAuth::Oidc {
                 discovery_url,
@@ -50,6 +78,7 @@ fn runtime_auth_policy(auth: &crate::config::RouteAuth) -> RuntimeAuthPolicy {
                 request_headers,
                 response_header_allowlist,
                 timeout_ms,
+                failure_mode,
             } => RuntimeExternalAuth::Oidc {
                 discovery_url: discovery_url.clone(),
                 issuer_url: issuer_url.clone(),
@@ -60,6 +89,7 @@ fn runtime_auth_policy(auth: &crate::config::RouteAuth) -> RuntimeAuthPolicy {
                 request_headers: runtime_external_auth_request_headers(request_headers),
                 response_header_allowlist: response_header_allowlist.clone(),
                 timeout_ms: *timeout_ms,
+                failure_mode: runtime_external_auth_failure_mode(*failure_mode),
             },
         });
 
@@ -107,11 +137,13 @@ fn config_route_auth(auth: &RuntimeAuthPolicy) -> crate::config::RouteAuth {
                 request_headers,
                 response_header_allowlist,
                 timeout_ms,
+                failure_mode,
             } => crate::config::ExternalAuth::Http {
                 endpoint: endpoint.clone(),
                 request_headers: config_external_auth_request_headers(request_headers),
                 response_header_allowlist: response_header_allowlist.clone(),
                 timeout_ms: *timeout_ms,
+                failure_mode: config_external_auth_failure_mode(*failure_mode),
             },
             RuntimeExternalAuth::Oidc {
                 discovery_url,
@@ -123,6 +155,7 @@ fn config_route_auth(auth: &RuntimeAuthPolicy) -> crate::config::RouteAuth {
                 request_headers,
                 response_header_allowlist,
                 timeout_ms,
+                failure_mode,
             } => crate::config::ExternalAuth::Oidc {
                 discovery_url: discovery_url.clone(),
                 issuer_url: issuer_url.clone(),
@@ -133,6 +166,7 @@ fn config_route_auth(auth: &RuntimeAuthPolicy) -> crate::config::RouteAuth {
                 request_headers: config_external_auth_request_headers(request_headers),
                 response_header_allowlist: response_header_allowlist.clone(),
                 timeout_ms: *timeout_ms,
+                failure_mode: config_external_auth_failure_mode(*failure_mode),
             },
         });
 
@@ -483,6 +517,7 @@ fn validate_upstream_policy(
                 request_headers,
                 response_header_allowlist,
                 timeout_ms,
+                ..
             } => {
                 let valid_endpoint = endpoint
                     .trim()
@@ -519,6 +554,7 @@ fn validate_upstream_policy(
                 request_headers,
                 response_header_allowlist,
                 timeout_ms,
+                ..
             } => {
                 let has_discovery_url = discovery_url
                     .as_deref()

@@ -91,6 +91,10 @@ pub fn auth_default_external_timeout_ms() -> u64 {
     1_000
 }
 
+pub fn auth_default_external_failure_mode() -> String {
+    String::from("fail_closed")
+}
+
 pub fn auth_default_jwt_clock_skew_secs() -> u64 {
     30
 }

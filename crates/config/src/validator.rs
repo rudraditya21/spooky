@@ -1239,6 +1239,7 @@ fn validate_inner(config: &Config) -> bool {
                     request_headers,
                     response_header_allowlist,
                     timeout_ms,
+                    ..
                 } => {
                     if !is_valid_http_url(endpoint) {
                         validation_error!(
@@ -1273,6 +1274,7 @@ fn validate_inner(config: &Config) -> bool {
                     request_headers,
                     response_header_allowlist,
                     timeout_ms,
+                    ..
                 } => {
                     let has_discovery_url = discovery_url
                         .as_deref()

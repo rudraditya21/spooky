@@ -1,9 +1,10 @@
 use super::validate;
 use crate::config::{
-    ApiKeyAuth, Backend, ClientAuth, Config, ControlApi, ExternalAuth, ExternalAuthRequestHeader,
-    HealthCheck, JwtAuth, Listen, LoadBalancing, Log, LogFormat, MetricsEndpoint, Observability,
-    Performance, Resilience, RouteAuth, RouteMatch, ScopedRateLimit, ScopedRateLimitScope,
-    Security, Tls, TlsCertificate, Tracing, Upstream, UpstreamTls,
+    ApiKeyAuth, Backend, ClientAuth, Config, ControlApi, ExternalAuth, ExternalAuthFailureMode,
+    ExternalAuthRequestHeader, HealthCheck, JwtAuth, Listen, LoadBalancing, Log, LogFormat,
+    MetricsEndpoint, Observability, Performance, Resilience, RouteAuth, RouteMatch,
+    ScopedRateLimit, ScopedRateLimitScope, Security, Tls, TlsCertificate, Tracing, Upstream,
+    UpstreamTls,
 };
 use rcgen::{Certificate, CertificateParams, SanType};
 use std::collections::HashMap;
@@ -233,6 +234,7 @@ upstream:
             request_headers,
             response_header_allowlist,
             timeout_ms,
+            ..
         }) => {
             assert_eq!(endpoint, "https://auth.internal/check");
             assert!(request_headers.is_empty());
@@ -296,6 +298,7 @@ upstream:
             request_headers,
             response_header_allowlist,
             timeout_ms,
+            ..
         }) => {
             assert_eq!(
                 discovery_url.as_deref(),
@@ -1318,6 +1321,7 @@ fn accepts_http_external_auth_with_default_timeout() {
         request_headers: Vec::new(),
         response_header_allowlist: Vec::new(),
         timeout_ms: 1_000,
+        failure_mode: ExternalAuthFailureMode::FailClosed,
     });
 
     assert!(validate(&cfg).is_ok());
@@ -1345,6 +1349,7 @@ fn accepts_oidc_external_auth() {
         request_headers: Vec::new(),
         response_header_allowlist: Vec::new(),
         timeout_ms: 1_500,
+        failure_mode: ExternalAuthFailureMode::FailClosed,
     });
 
     assert!(validate(&cfg).is_ok());
@@ -1370,6 +1375,7 @@ fn rejects_oidc_external_auth_without_discovery_or_issuer() {
         request_headers: Vec::new(),
         response_header_allowlist: Vec::new(),
         timeout_ms: 1_500,
+        failure_mode: ExternalAuthFailureMode::FailClosed,
     });
 
     assert!(validate(&cfg).is_err());
@@ -1397,6 +1403,7 @@ fn rejects_oidc_external_auth_with_empty_client_secret() {
         request_headers: Vec::new(),
         response_header_allowlist: Vec::new(),
         timeout_ms: 1_500,
+        failure_mode: ExternalAuthFailureMode::FailClosed,
     });
 
     assert!(validate(&cfg).is_err());
@@ -1424,6 +1431,7 @@ fn rejects_oidc_external_auth_with_empty_scope() {
         request_headers: Vec::new(),
         response_header_allowlist: Vec::new(),
         timeout_ms: 1_500,
+        failure_mode: ExternalAuthFailureMode::FailClosed,
     });
 
     assert!(validate(&cfg).is_err());
@@ -1447,6 +1455,7 @@ fn rejects_external_auth_with_invalid_request_header_name() {
         }],
         response_header_allowlist: Vec::new(),
         timeout_ms: 1_000,
+        failure_mode: ExternalAuthFailureMode::FailClosed,
     });
 
     assert!(validate(&cfg).is_err());
@@ -1476,6 +1485,7 @@ fn accepts_http_external_auth_with_explicit_headers() {
         ],
         response_header_allowlist: vec!["www-authenticate".to_string(), "location".to_string()],
         timeout_ms: 1_000,
+        failure_mode: ExternalAuthFailureMode::FailClosed,
     });
 
     assert!(validate(&cfg).is_ok());
@@ -1501,6 +1511,7 @@ fn rejects_oidc_external_auth_with_empty_discovery_url() {
         request_headers: Vec::new(),
         response_header_allowlist: Vec::new(),
         timeout_ms: 1_500,
+        failure_mode: ExternalAuthFailureMode::FailClosed,
     });
 
     assert!(validate(&cfg).is_err());
@@ -1521,6 +1532,7 @@ fn rejects_external_auth_with_invalid_response_allowlist_header_name() {
         request_headers: Vec::new(),
         response_header_allowlist: vec!["bad header".to_string()],
         timeout_ms: 1_000,
+        failure_mode: ExternalAuthFailureMode::FailClosed,
     });
 
     assert!(validate(&cfg).is_err());
@@ -1543,6 +1555,7 @@ fn rejects_external_auth_with_rbac_requirements_in_v1() {
             request_headers: Vec::new(),
             response_header_allowlist: Vec::new(),
             timeout_ms: 1_000,
+            failure_mode: ExternalAuthFailureMode::FailClosed,
         }),
         required_scopes: vec!["read:fast".to_string()],
         required_roles: vec!["admin".to_string()],
@@ -1566,6 +1579,7 @@ fn rejects_external_auth_with_invalid_http_endpoint() {
         request_headers: Vec::new(),
         response_header_allowlist: Vec::new(),
         timeout_ms: 1_000,
+        failure_mode: ExternalAuthFailureMode::FailClosed,
     });
 
     assert!(validate(&cfg).is_err());
@@ -1591,6 +1605,7 @@ fn rejects_external_auth_combined_with_builtin_auth_in_v1() {
             request_headers: Vec::new(),
             response_header_allowlist: Vec::new(),
             timeout_ms: 1_000,
+            failure_mode: ExternalAuthFailureMode::FailClosed,
         }),
         required_scopes: Vec::new(),
         required_roles: Vec::new(),

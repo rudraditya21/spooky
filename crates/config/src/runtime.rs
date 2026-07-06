@@ -232,6 +232,13 @@ pub struct RuntimeJwtAuth {
     pub clock_skew_secs: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RuntimeExternalAuthFailureMode {
+    FailOpen,
+    #[default]
+    FailClosed,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeExternalAuthRequestHeader {
     pub name: String,
@@ -245,6 +252,7 @@ pub enum RuntimeExternalAuth {
         request_headers: Vec<RuntimeExternalAuthRequestHeader>,
         response_header_allowlist: Vec<String>,
         timeout_ms: u64,
+        failure_mode: RuntimeExternalAuthFailureMode,
     },
     Oidc {
         discovery_url: Option<String>,
@@ -256,6 +264,7 @@ pub enum RuntimeExternalAuth {
         request_headers: Vec<RuntimeExternalAuthRequestHeader>,
         response_header_allowlist: Vec<String>,
         timeout_ms: u64,
+        failure_mode: RuntimeExternalAuthFailureMode,
     },
 }
 
@@ -354,6 +363,7 @@ mod tests {
             request_headers: Vec::new(),
             response_header_allowlist: Vec::new(),
             timeout_ms: 1_000,
+            failure_mode: crate::config::ExternalAuthFailureMode::FailClosed,
         });
 
         let runtime = RuntimeConfig::from_config(&config).expect("runtime config");
@@ -369,6 +379,7 @@ mod tests {
                 request_headers,
                 response_header_allowlist,
                 timeout_ms,
+                ..
             }) => {
                 assert_eq!(endpoint, "https://auth.internal/check");
                 assert!(request_headers.is_empty());
@@ -399,6 +410,7 @@ mod tests {
             request_headers: Vec::new(),
             response_header_allowlist: Vec::new(),
             timeout_ms: 1_500,
+            failure_mode: crate::config::ExternalAuthFailureMode::FailClosed,
         });
 
         let runtime = RuntimeConfig::from_config(&config).expect("runtime config");
@@ -421,6 +433,7 @@ mod tests {
                 request_headers,
                 response_header_allowlist,
                 timeout_ms,
+                ..
             }) => {
                 assert_eq!(
                     discovery_url.as_deref(),

@@ -248,6 +248,14 @@ pub struct RouteAuth {
     pub required_roles: Vec<String>,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalAuthFailureMode {
+    FailOpen,
+    #[default]
+    FailClosed,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExternalAuth {
@@ -259,6 +267,8 @@ pub enum ExternalAuth {
         response_header_allowlist: Vec<String>,
         #[serde(default = "auth_default_external_timeout_ms")]
         timeout_ms: u64,
+        #[serde(default = "ExternalAuthFailureMode::default")]
+        failure_mode: ExternalAuthFailureMode,
     },
     Oidc {
         #[serde(default)]
@@ -278,6 +288,8 @@ pub enum ExternalAuth {
         response_header_allowlist: Vec<String>,
         #[serde(default = "auth_default_external_timeout_ms")]
         timeout_ms: u64,
+        #[serde(default = "ExternalAuthFailureMode::default")]
+        failure_mode: ExternalAuthFailureMode,
     },
 }
 
