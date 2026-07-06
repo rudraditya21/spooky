@@ -17,6 +17,10 @@ pub struct Metrics {
     pub requests_failure: AtomicU64,
     pub request_validation_rejects: AtomicU64,
     pub policy_denied: AtomicU64,
+    pub external_auth_allowed: AtomicU64,
+    pub external_auth_denied: AtomicU64,
+    pub external_auth_timeout: AtomicU64,
+    pub external_auth_error: AtomicU64,
     pub request_rate_limited: AtomicU64,
     pub early_data_accepted: AtomicU64,
     pub early_data_rejected: AtomicU64,
@@ -411,6 +415,10 @@ impl Metrics {
             requests_failure: AtomicU64::new(0),
             request_validation_rejects: AtomicU64::new(0),
             policy_denied: AtomicU64::new(0),
+            external_auth_allowed: AtomicU64::new(0),
+            external_auth_denied: AtomicU64::new(0),
+            external_auth_timeout: AtomicU64::new(0),
+            external_auth_error: AtomicU64::new(0),
             request_rate_limited: AtomicU64::new(0),
             early_data_accepted: AtomicU64::new(0),
             early_data_rejected: AtomicU64::new(0),
@@ -528,6 +536,22 @@ impl Metrics {
 
     pub fn inc_policy_denied(&self) {
         self.policy_denied.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_external_auth_allowed(&self) {
+        self.external_auth_allowed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_external_auth_denied(&self) {
+        self.external_auth_denied.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_external_auth_timeout(&self) {
+        self.external_auth_timeout.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_external_auth_error(&self) {
+        self.external_auth_error.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn inc_request_rate_limited(&self) {

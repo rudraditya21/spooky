@@ -43,6 +43,42 @@ impl Metrics {
         ));
 
         out.push_str(
+            "# HELP spooky_external_auth_allowed Total requests explicitly allowed by external auth.\n",
+        );
+        out.push_str("# TYPE spooky_external_auth_allowed counter\n");
+        out.push_str(&format!(
+            "spooky_external_auth_allowed {}\n",
+            self.external_auth_allowed.load(Ordering::Relaxed)
+        ));
+
+        out.push_str(
+            "# HELP spooky_external_auth_denied Total requests denied, challenged, or redirected by external auth.\n",
+        );
+        out.push_str("# TYPE spooky_external_auth_denied counter\n");
+        out.push_str(&format!(
+            "spooky_external_auth_denied {}\n",
+            self.external_auth_denied.load(Ordering::Relaxed)
+        ));
+
+        out.push_str(
+            "# HELP spooky_external_auth_timeout Total external auth decisions that timed out.\n",
+        );
+        out.push_str("# TYPE spooky_external_auth_timeout counter\n");
+        out.push_str(&format!(
+            "spooky_external_auth_timeout {}\n",
+            self.external_auth_timeout.load(Ordering::Relaxed)
+        ));
+
+        out.push_str(
+            "# HELP spooky_external_auth_error Total external auth transport or execution errors.\n",
+        );
+        out.push_str("# TYPE spooky_external_auth_error counter\n");
+        out.push_str(&format!(
+            "spooky_external_auth_error {}\n",
+            self.external_auth_error.load(Ordering::Relaxed)
+        ));
+
+        out.push_str(
             "# HELP spooky_request_rate_limited Total requests rejected by scoped request rate limits.\n",
         );
         out.push_str("# TYPE spooky_request_rate_limited counter\n");

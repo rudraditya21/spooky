@@ -742,7 +742,9 @@ pub struct UpstreamResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExternalAuthDecision {
-    Allow,
+    Allow {
+        request_header_mutations: Vec<PendingHeaderMutation>,
+    },
     Deny(ExternalAuthDenyResponse),
     Redirect(ExternalAuthRedirectResponse),
     Challenge(ExternalAuthChallengeResponse),
@@ -751,18 +753,21 @@ pub enum ExternalAuthDecision {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalAuthDenyResponse {
     pub status: http::StatusCode,
+    pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalAuthRedirectResponse {
     pub status: http::StatusCode,
+    pub headers: Vec<(String, String)>,
     pub location: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalAuthChallengeResponse {
     pub status: http::StatusCode,
+    pub headers: Vec<(String, String)>,
     pub www_authenticate: String,
     pub body: Vec<u8>,
 }
@@ -880,6 +885,7 @@ pub struct RequestEnvelope {
     pub routing_transparency_enabled: bool,
     pub routing_transparency_include_reason: bool,
     pub response_status: Option<u16>,
+    pub backend_request_started: bool,
     pub backend_request_finished: bool,
     pub global_inflight_permit: Option<OwnedSemaphorePermit>,
     pub upstream_inflight_permit: Option<OwnedSemaphorePermit>,
@@ -896,6 +902,8 @@ pub struct RequestEnvelope {
     pub pending_forward: Option<Arc<PendingForward>>,
     /// Receives the external auth decision once async auth completes.
     pub auth_result_rx: Option<oneshot::Receiver<ExternalAuthResult>>,
+    /// Whether auth transport errors and timeouts should allow the request.
+    pub auth_fail_open: bool,
     /// Deadline for the external auth decision, when auth is running asynchronously.
     pub auth_deadline: Option<Instant>,
 

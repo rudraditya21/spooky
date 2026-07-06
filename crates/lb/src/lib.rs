@@ -221,6 +221,11 @@ impl UpstreamPool {
         self.load_balancer.pick_readonly(key, &self.pool)
     }
 
+    pub fn pick_without_begin(&mut self, key: &str) -> Option<usize> {
+        self.pool.reconcile_readmit();
+        self.load_balancer.pick(key, &self.pool)
+    }
+
     pub fn begin_request_if_healthy(&self, index: usize) -> bool {
         if self.pool.is_healthy_index(index) {
             self.pool.begin_request(index);

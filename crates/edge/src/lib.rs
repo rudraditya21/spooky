@@ -185,6 +185,33 @@ mod tests {
     }
 
     #[test]
+    fn metrics_render_includes_external_auth_counters() {
+        let metrics = Metrics::default();
+        metrics.inc_external_auth_allowed();
+        metrics.inc_external_auth_denied();
+        metrics.inc_external_auth_timeout();
+        metrics.inc_external_auth_error();
+
+        let output = metrics.render_prometheus();
+        assert!(output.contains(
+            "spooky_external_auth_allowed 1
+"
+        ));
+        assert!(output.contains(
+            "spooky_external_auth_denied 1
+"
+        ));
+        assert!(output.contains(
+            "spooky_external_auth_timeout 1
+"
+        ));
+        assert!(output.contains(
+            "spooky_external_auth_error 1
+"
+        ));
+    }
+
+    #[test]
     fn metrics_render_includes_rate_limited_counters() {
         let metrics = Metrics::new(1, [String::from("api_pool")]);
         metrics.inc_request_rate_limited();
