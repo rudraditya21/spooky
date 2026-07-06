@@ -3284,7 +3284,7 @@ impl QUICListener {
         Some(token.to_string())
     }
 
-    fn api_key_is_authorized(
+    pub(super) fn api_key_is_authorized(
         policy: &RuntimeUpstreamPolicy,
         header_lookup: Option<&LbHeaderLookup<'_>>,
     ) -> bool {
@@ -3303,7 +3303,7 @@ impl QUICListener {
                 .any(|expected| bool::from(provided.as_bytes().ct_eq(expected.as_bytes())))
     }
 
-    fn jwt_is_authorized(
+    pub(super) fn jwt_is_authorized(
         policy: &RuntimeUpstreamPolicy,
         header_lookup: Option<&LbHeaderLookup<'_>>,
     ) -> bool {
@@ -3460,7 +3460,7 @@ impl QUICListener {
         values
     }
 
-    fn resolve_scoped_rate_limit_key(
+    pub(super) fn resolve_scoped_rate_limit_key(
         rule: &crate::resilience::ScopedRateLimitRule,
         route: &str,
         method: &str,
