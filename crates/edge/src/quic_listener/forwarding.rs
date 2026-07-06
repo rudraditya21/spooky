@@ -3145,12 +3145,18 @@ impl QUICListener {
                     cid_key,
                     header_lookup,
                 );
-                let fast_pick = pool
-                    .pick_readonly(key.as_str())
-                    .and_then(|idx| pool.pool.address(idx).map(|addr| (idx, addr.to_string())));
-                let fast_selected = fast_pick.and_then(|(idx, addr)| {
-                    pool.begin_request_if_healthy(idx).then_some((idx, addr))
-                });
+                // When a passively-ejected backend is due for re-admission, skip
+                // the read-only fast path so the write-locked slow path can
+                // reconcile it back into rotation.
+                let fast_selected = if pool.pool.readmit_due(Instant::now()) {
+                    None
+                } else {
+                    pool.pick_readonly(key.as_str())
+                        .and_then(|idx| pool.pool.address(idx).map(|addr| (idx, addr.to_string())))
+                        .and_then(|(idx, addr)| {
+                            pool.begin_request_if_healthy(idx).then_some((idx, addr))
+                        })
+                };
                 (lb_type, fast_selected)
             };
 
