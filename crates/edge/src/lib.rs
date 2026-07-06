@@ -17,8 +17,8 @@ pub use metrics::{HealthFailureReason, Metrics, OverloadShedReason, RetryReason,
 pub use quic_listener::configure_async_runtime;
 pub use types::{
     ForwardResult, HealthClassification, HedgeTelemetry, QUICListener, QuicConnection,
-    RequestEnvelope, ResponseChunk, SharedRuntimeState, StreamPhase, UpstreamResult,
-    outcome_from_status,
+    RequestEnvelope, ResponseChunk, SharedRuntimeState, StreamAdmissionState, StreamPhase,
+    UpstreamResult, outcome_from_status,
 };
 #[cfg(test)]
 mod tests {

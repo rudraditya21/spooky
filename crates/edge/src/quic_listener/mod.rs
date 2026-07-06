@@ -69,7 +69,7 @@ use crate::types::{ForwardSuccess, TunnelMode};
 use crate::{
     ChannelBody, ForwardResult, HealthClassification, Metrics, OverloadShedReason, QUICListener,
     QuicConnection, REQUEST_ID_COUNTER, RequestEnvelope, ResponseChunk, RetryReason, RouteOutcome,
-    SharedRuntimeState, StreamPhase, UpstreamResult,
+    SharedRuntimeState, StreamAdmissionState, StreamPhase, UpstreamResult,
     cid_radix::CidRadix,
     constants::{
         DEFAULT_SCID_LEN_BYTES, MAX_DATAGRAM_SIZE_BYTES, MAX_UDP_PAYLOAD_BYTES, MIN_SCID_LEN_BYTES,
@@ -246,6 +246,10 @@ fn is_connect_tunnel_response(method: &str, status: StatusCode) -> bool {
 }
 
 fn can_poll_upstream_result(req: &RequestEnvelope) -> bool {
+    if req.admission_state != StreamAdmissionState::ReadyToForward {
+        return false;
+    }
+
     if is_tunnel_mode(req.tunnel_mode)
         && (req.phase == StreamPhase::ReceivingRequest
             || req.phase == StreamPhase::AwaitingUpstream)

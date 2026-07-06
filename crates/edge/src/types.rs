@@ -782,6 +782,17 @@ pub enum StreamPhase {
     Failed,
 }
 
+/// Admission/auth state for a single request stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamAdmissionState {
+    /// Request admission is still pending an external auth/authz decision.
+    WaitingForAuth,
+    /// Request cleared admission checks and may proceed to upstream forwarding.
+    ReadyToForward,
+    /// Request was denied by admission/auth checks and should not be forwarded.
+    Denied,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TunnelMode {
     None,
@@ -853,6 +864,8 @@ pub struct RequestEnvelope {
 
     /// Current lifecycle phase of this stream.
     pub phase: StreamPhase,
+    /// Current auth/admission state of this stream.
+    pub admission_state: StreamAdmissionState,
     /// True once the client has sent FIN on the request stream.
     pub request_fin_received: bool,
     /// Receives the upstream H2 response (status, headers, body stream).

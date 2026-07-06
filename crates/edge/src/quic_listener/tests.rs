@@ -18,8 +18,8 @@ use tempfile::tempdir;
 
 use super::is_bodyless_request_mode;
 
-use crate::REQUEST_ID_COUNTER;
 use crate::cid_radix::CidRadix;
+use crate::{REQUEST_ID_COUNTER, StreamAdmissionState};
 use http::{HeaderMap, HeaderValue, StatusCode};
 
 use std::collections::HashSet;
@@ -1190,6 +1190,9 @@ fn non_connect_requires_request_completion_before_upstream_poll() {
 
     req.request_fin_received = true;
     assert!(can_poll_upstream_result(&req));
+
+    req.admission_state = StreamAdmissionState::WaitingForAuth;
+    assert!(!can_poll_upstream_result(&req));
 }
 
 #[test]
@@ -1794,6 +1797,7 @@ fn make_envelope(phase: StreamPhase) -> RequestEnvelope {
         error_kind: None,
         tunnel_mode: crate::types::TunnelMode::None,
         phase,
+        admission_state: StreamAdmissionState::ReadyToForward,
         request_fin_received: false,
         upstream_result_rx: None,
         response_chunk_rx: None,

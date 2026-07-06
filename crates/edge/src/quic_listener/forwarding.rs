@@ -1,4 +1,5 @@
 use super::*;
+use crate::StreamAdmissionState;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use serde_json::Value;
@@ -1872,6 +1873,7 @@ impl QUICListener {
                             retry_count: 0,
                             error_kind: None,
                             phase: StreamPhase::ReceivingRequest,
+                            admission_state: StreamAdmissionState::ReadyToForward,
                             request_fin_received,
                             upstream_result_rx,
                             response_chunk_rx: None,
