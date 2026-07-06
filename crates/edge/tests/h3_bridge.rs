@@ -3520,6 +3520,7 @@ fn upstream_api_key_auth_rejects_missing_key_and_allows_valid_key() {
                 keys: vec!["edge-key".to_string()],
             }),
             jwt: None,
+            external_auth: None,
             required_scopes: Vec::new(),
             required_roles: Vec::new(),
         };
@@ -3591,6 +3592,7 @@ fn upstream_jwt_auth_rejects_missing_token_and_allows_valid_token() {
                 audience: Some("aud-1".to_string()),
                 clock_skew_secs: 30,
             }),
+            external_auth: None,
             required_scopes: vec!["read:fast".to_string()],
             required_roles: Vec::new(),
         };

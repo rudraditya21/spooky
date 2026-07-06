@@ -1,7 +1,7 @@
 use crate::backend_endpoint::{BackendEndpoint, BackendScheme};
 use crate::config::{
-    CURRENT_CONFIG_VERSION, Config, Listen, SUPPORTED_CONFIG_VERSIONS, ScopedRateLimitScope,
-    UpstreamHostPolicyMode, UpstreamTls,
+    CURRENT_CONFIG_VERSION, Config, ExternalAuth, Listen, SUPPORTED_CONFIG_VERSIONS,
+    ScopedRateLimitScope, UpstreamHostPolicyMode, UpstreamTls,
 };
 use log::{info, warn};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
@@ -1130,6 +1130,84 @@ fn validate_inner(config: &Config) -> bool {
                         upstream_name
                     );
                     return false;
+                }
+            }
+        }
+
+        if let Some(external_auth) = upstream.auth.external_auth.as_ref() {
+            if upstream.auth.api_key.is_some() || upstream.auth.jwt.is_some() {
+                validation_error!(
+                    "upstream '{}' auth.external_auth cannot be combined with auth.api_key or auth.jwt in v1",
+                    upstream_name
+                );
+                return false;
+            }
+            if !upstream.auth.required_scopes.is_empty() || !upstream.auth.required_roles.is_empty()
+            {
+                validation_error!(
+                    "upstream '{}' auth.external_auth cannot be combined with auth.required_scopes or auth.required_roles in v1",
+                    upstream_name
+                );
+                return false;
+            }
+
+            match external_auth {
+                ExternalAuth::Http {
+                    endpoint,
+                    timeout_ms,
+                } => {
+                    if !is_valid_http_url(endpoint) {
+                        validation_error!(
+                            "upstream '{}' auth.external_auth.http.endpoint must be an absolute http(s) URL",
+                            upstream_name
+                        );
+                        return false;
+                    }
+                    if *timeout_ms == 0 {
+                        validation_error!(
+                            "upstream '{}' auth.external_auth.http.timeout_ms must be greater than 0",
+                            upstream_name
+                        );
+                        return false;
+                    }
+                }
+                ExternalAuth::Oidc {
+                    issuer_url,
+                    client_id,
+                    audience,
+                    timeout_ms,
+                } => {
+                    if !is_valid_http_url(issuer_url) {
+                        validation_error!(
+                            "upstream '{}' auth.external_auth.oidc.issuer_url must be an absolute http(s) URL",
+                            upstream_name
+                        );
+                        return false;
+                    }
+                    if client_id.trim().is_empty() {
+                        validation_error!(
+                            "upstream '{}' auth.external_auth.oidc.client_id must be non-empty",
+                            upstream_name
+                        );
+                        return false;
+                    }
+                    if audience
+                        .as_deref()
+                        .is_some_and(|value| value.trim().is_empty())
+                    {
+                        validation_error!(
+                            "upstream '{}' auth.external_auth.oidc.audience must be non-empty when provided",
+                            upstream_name
+                        );
+                        return false;
+                    }
+                    if *timeout_ms == 0 {
+                        validation_error!(
+                            "upstream '{}' auth.external_auth.oidc.timeout_ms must be greater than 0",
+                            upstream_name
+                        );
+                        return false;
+                    }
                 }
             }
         }

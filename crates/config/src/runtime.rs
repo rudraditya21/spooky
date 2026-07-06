@@ -291,6 +291,33 @@ mod tests {
     }
 
     #[test]
+    fn runtime_config_preserves_external_auth_contract() {
+        let mut config = sample_config();
+        config
+            .upstream
+            .get_mut("api")
+            .expect("api")
+            .auth
+            .external_auth = Some(crate::config::ExternalAuth::Http {
+            endpoint: "https://auth.internal/check".to_string(),
+            timeout_ms: 1_000,
+        });
+
+        let runtime = RuntimeConfig::from_config(&config).expect("runtime config");
+        let auth = &runtime.upstreams.get("api").expect("api").policy.auth;
+        match auth.external_auth.as_ref() {
+            Some(crate::config::ExternalAuth::Http {
+                endpoint,
+                timeout_ms,
+            }) => {
+                assert_eq!(endpoint, "https://auth.internal/check");
+                assert_eq!(*timeout_ms, 1_000);
+            }
+            other => panic!("unexpected external_auth contract: {:?}", other),
+        }
+    }
+
+    #[test]
     fn runtime_listeners_uses_legacy_listen_when_explicit_list_is_empty() {
         let config = sample_config();
         let listeners = runtime_listeners(&config).expect("legacy listeners");

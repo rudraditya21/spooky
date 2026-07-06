@@ -87,6 +87,10 @@ pub fn auth_default_api_key_header_name() -> String {
     String::from("x-api-key")
 }
 
+pub fn auth_default_external_timeout_ms() -> u64 {
+    1_000
+}
+
 pub fn auth_default_jwt_clock_skew_secs() -> u64 {
     30
 }

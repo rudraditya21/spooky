@@ -268,6 +268,84 @@ fn validate_upstream_policy(
         }
     }
 
+    if let Some(external_auth) = upstream.auth.external_auth.as_ref() {
+        if upstream.auth.api_key.is_some() || upstream.auth.jwt.is_some() {
+            return Err(RuntimeConfigError::UnsupportedPolicyCombination(format!(
+                "upstream '{upstream_name}' auth.external_auth cannot be combined with auth.api_key or auth.jwt in v1"
+            )));
+        }
+        if !upstream.auth.required_scopes.is_empty() || !upstream.auth.required_roles.is_empty() {
+            return Err(RuntimeConfigError::UnsupportedPolicyCombination(format!(
+                "upstream '{upstream_name}' auth.external_auth cannot be combined with auth.required_scopes or auth.required_roles in v1"
+            )));
+        }
+
+        match external_auth {
+            crate::config::ExternalAuth::Http {
+                endpoint,
+                timeout_ms,
+            } => {
+                let valid_endpoint = endpoint
+                    .trim()
+                    .parse::<http::Uri>()
+                    .ok()
+                    .is_some_and(|uri| {
+                        matches!(uri.scheme_str(), Some("http") | Some("https"))
+                            && uri.authority().is_some()
+                    });
+                if !valid_endpoint {
+                    return Err(RuntimeConfigError::ConfigInvalid(format!(
+                        "upstream '{upstream_name}' auth.external_auth.http.endpoint must be an absolute http(s) URL"
+                    )));
+                }
+                if *timeout_ms == 0 {
+                    return Err(RuntimeConfigError::ConfigInvalid(format!(
+                        "upstream '{upstream_name}' auth.external_auth.http.timeout_ms must be greater than 0"
+                    )));
+                }
+            }
+            crate::config::ExternalAuth::Oidc {
+                issuer_url,
+                client_id,
+                audience,
+                timeout_ms,
+            } => {
+                let valid_issuer_url =
+                    issuer_url
+                        .trim()
+                        .parse::<http::Uri>()
+                        .ok()
+                        .is_some_and(|uri| {
+                            matches!(uri.scheme_str(), Some("http") | Some("https"))
+                                && uri.authority().is_some()
+                        });
+                if !valid_issuer_url {
+                    return Err(RuntimeConfigError::ConfigInvalid(format!(
+                        "upstream '{upstream_name}' auth.external_auth.oidc.issuer_url must be an absolute http(s) URL"
+                    )));
+                }
+                if client_id.trim().is_empty() {
+                    return Err(RuntimeConfigError::ConfigInvalid(format!(
+                        "upstream '{upstream_name}' auth.external_auth.oidc.client_id must be non-empty"
+                    )));
+                }
+                if audience
+                    .as_deref()
+                    .is_some_and(|value| value.trim().is_empty())
+                {
+                    return Err(RuntimeConfigError::ConfigInvalid(format!(
+                        "upstream '{upstream_name}' auth.external_auth.oidc.audience must be non-empty when provided"
+                    )));
+                }
+                if *timeout_ms == 0 {
+                    return Err(RuntimeConfigError::ConfigInvalid(format!(
+                        "upstream '{upstream_name}' auth.external_auth.oidc.timeout_ms must be greater than 0"
+                    )));
+                }
+            }
+        }
+    }
+
     if let Some(jwt) = upstream.auth.jwt.as_ref() {
         if jwt.secret.trim().is_empty() {
             return Err(RuntimeConfigError::ConfigInvalid(format!(

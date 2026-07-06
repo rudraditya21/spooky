@@ -3688,6 +3688,7 @@ mod tests {
                     keys: vec!["secret-key".to_string()],
                 }),
                 jwt: None,
+                external_auth: None,
                 required_scopes: Vec::new(),
                 required_roles: Vec::new(),
             },
@@ -3732,6 +3733,7 @@ mod tests {
                     audience: Some("aud-1".to_string()),
                     clock_skew_secs: 30,
                 }),
+                external_auth: None,
                 required_scopes: Vec::new(),
                 required_roles: Vec::new(),
             },
@@ -3790,6 +3792,7 @@ mod tests {
             auth: RouteAuth {
                 api_key: None,
                 jwt: None,
+                external_auth: None,
                 required_scopes: vec!["read:fast".to_string()],
                 required_roles: vec!["admin".to_string()],
             },

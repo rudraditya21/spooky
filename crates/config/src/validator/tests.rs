@@ -1,7 +1,7 @@
 use super::validate;
 use crate::config::{
-    ApiKeyAuth, Backend, ClientAuth, Config, ControlApi, HealthCheck, JwtAuth, Listen,
-    LoadBalancing, Log, LogFormat, MetricsEndpoint, Observability, Performance, Resilience,
+    ApiKeyAuth, Backend, ClientAuth, Config, ControlApi, ExternalAuth, HealthCheck, JwtAuth,
+    Listen, LoadBalancing, Log, LogFormat, MetricsEndpoint, Observability, Performance, Resilience,
     RouteAuth, RouteMatch, ScopedRateLimit, ScopedRateLimitScope, Security, Tls, TlsCertificate,
     Tracing, Upstream, UpstreamTls,
 };
@@ -1037,6 +1037,7 @@ fn rejects_upstream_api_key_auth_without_keys() {
             keys: Vec::new(),
         }),
         jwt: None,
+        external_auth: None,
         required_scopes: Vec::new(),
         required_roles: Vec::new(),
     };
@@ -1059,6 +1060,7 @@ fn rejects_upstream_api_key_auth_with_invalid_header_name() {
             keys: vec!["test-key".to_string()],
         }),
         jwt: None,
+        external_auth: None,
         required_scopes: Vec::new(),
         required_roles: Vec::new(),
     };
@@ -1083,6 +1085,7 @@ fn accepts_upstream_jwt_auth_with_issuer_and_audience() {
             audience: Some("aud-1".to_string()),
             clock_skew_secs: 30,
         }),
+        external_auth: None,
         required_scopes: Vec::new(),
         required_roles: Vec::new(),
     };
@@ -1107,6 +1110,7 @@ fn rejects_upstream_jwt_auth_without_secret() {
             audience: None,
             clock_skew_secs: 30,
         }),
+        external_auth: None,
         required_scopes: Vec::new(),
         required_roles: Vec::new(),
     };
@@ -1131,6 +1135,89 @@ fn rejects_upstream_jwt_auth_with_empty_issuer() {
             audience: None,
             clock_skew_secs: 30,
         }),
+        external_auth: None,
+        required_scopes: Vec::new(),
+        required_roles: Vec::new(),
+    };
+
+    assert!(validate(&cfg).is_err());
+}
+
+#[test]
+fn accepts_http_external_auth_with_default_timeout() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.upstream
+        .get_mut("test_upstream")
+        .expect("upstream")
+        .auth
+        .external_auth = Some(ExternalAuth::Http {
+        endpoint: "https://auth.internal/check".to_string(),
+        timeout_ms: 1_000,
+    });
+
+    assert!(validate(&cfg).is_ok());
+}
+
+#[test]
+fn accepts_oidc_external_auth() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.upstream
+        .get_mut("test_upstream")
+        .expect("upstream")
+        .auth
+        .external_auth = Some(ExternalAuth::Oidc {
+        issuer_url: "https://issuer.example.com".to_string(),
+        client_id: "edge-gateway".to_string(),
+        audience: Some("spooky-api".to_string()),
+        timeout_ms: 1_500,
+    });
+
+    assert!(validate(&cfg).is_ok());
+}
+
+#[test]
+fn rejects_external_auth_with_invalid_http_endpoint() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.upstream
+        .get_mut("test_upstream")
+        .expect("upstream")
+        .auth
+        .external_auth = Some(ExternalAuth::Http {
+        endpoint: "not-a-url".to_string(),
+        timeout_ms: 1_000,
+    });
+
+    assert!(validate(&cfg).is_err());
+}
+
+#[test]
+fn rejects_external_auth_combined_with_builtin_auth_in_v1() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.upstream
+        .get_mut("test_upstream")
+        .expect("upstream")
+        .auth = RouteAuth {
+        api_key: Some(ApiKeyAuth {
+            header_name: "x-api-key".to_string(),
+            keys: vec!["test-key".to_string()],
+        }),
+        jwt: None,
+        external_auth: Some(ExternalAuth::Http {
+            endpoint: "https://auth.internal/check".to_string(),
+            timeout_ms: 1_000,
+        }),
         required_scopes: Vec::new(),
         required_roles: Vec::new(),
     };
@@ -1153,6 +1240,7 @@ fn rejects_rbac_requirements_without_jwt_auth() {
             keys: vec!["test-key".to_string()],
         }),
         jwt: None,
+        external_auth: None,
         required_scopes: vec!["read:fast".to_string()],
         required_roles: Vec::new(),
     };

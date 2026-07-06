@@ -740,6 +740,33 @@ pub struct UpstreamResult {
     pub retry_denial_reason: Option<RetryReason>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternalAuthDecision {
+    Allow,
+    Deny(ExternalAuthDenyResponse),
+    Redirect(ExternalAuthRedirectResponse),
+    Challenge(ExternalAuthChallengeResponse),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalAuthDenyResponse {
+    pub status: http::StatusCode,
+    pub body: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalAuthRedirectResponse {
+    pub status: http::StatusCode,
+    pub location: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalAuthChallengeResponse {
+    pub status: http::StatusCode,
+    pub www_authenticate: String,
+    pub body: Vec<u8>,
+}
+
 /// Lifecycle phase of a single HTTP/3 request stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamPhase {

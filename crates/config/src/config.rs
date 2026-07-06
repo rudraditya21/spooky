@@ -3,18 +3,19 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::default::{
-    auth_default_api_key_header_name, auth_default_jwt_clock_skew_secs, get_default_address,
-    get_default_cooldown_ms, get_default_failure_threshold, get_default_health_timeout,
-    get_default_interval, get_default_load_balancing, get_default_log, get_default_log_file_path,
-    get_default_log_level, get_default_path, get_default_port, get_default_protocol,
-    get_default_success_threshold, get_default_version, get_default_weight,
-    observe_default_address, observe_default_control_api_address,
-    observe_default_control_api_connection_timeout_ms, observe_default_control_api_health_path,
-    observe_default_control_api_max_connections, observe_default_control_api_port,
-    observe_default_control_api_ready_path, observe_default_control_api_reload_certs_path,
-    observe_default_control_api_reload_path, observe_default_control_api_restart_path,
-    observe_default_control_api_runtime_path, observe_default_metrics_connection_timeout_ms,
-    observe_default_metrics_max_connections, observe_default_metrics_path, observe_default_port,
+    auth_default_api_key_header_name, auth_default_external_timeout_ms,
+    auth_default_jwt_clock_skew_secs, get_default_address, get_default_cooldown_ms,
+    get_default_failure_threshold, get_default_health_timeout, get_default_interval,
+    get_default_load_balancing, get_default_log, get_default_log_file_path, get_default_log_level,
+    get_default_path, get_default_port, get_default_protocol, get_default_success_threshold,
+    get_default_version, get_default_weight, observe_default_address,
+    observe_default_control_api_address, observe_default_control_api_connection_timeout_ms,
+    observe_default_control_api_health_path, observe_default_control_api_max_connections,
+    observe_default_control_api_port, observe_default_control_api_ready_path,
+    observe_default_control_api_reload_certs_path, observe_default_control_api_reload_path,
+    observe_default_control_api_restart_path, observe_default_control_api_runtime_path,
+    observe_default_metrics_connection_timeout_ms, observe_default_metrics_max_connections,
+    observe_default_metrics_path, observe_default_port,
     observe_default_routing_transparency_enabled,
     observe_default_routing_transparency_expose_header,
     observe_default_routing_transparency_header_name,
@@ -230,6 +231,8 @@ pub struct Upstream {
     pub backends: Vec<Backend>,
 }
 
+/// Upstream-scoped auth policy. External auth is a single-provider contract
+/// per upstream; there is no provider chaining.
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub struct RouteAuth {
@@ -238,9 +241,29 @@ pub struct RouteAuth {
     #[serde(default)]
     pub jwt: Option<JwtAuth>,
     #[serde(default)]
+    pub external_auth: Option<ExternalAuth>,
+    #[serde(default)]
     pub required_scopes: Vec<String>,
     #[serde(default)]
     pub required_roles: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExternalAuth {
+    Http {
+        endpoint: String,
+        #[serde(default = "auth_default_external_timeout_ms")]
+        timeout_ms: u64,
+    },
+    Oidc {
+        issuer_url: String,
+        client_id: String,
+        #[serde(default)]
+        audience: Option<String>,
+        #[serde(default = "auth_default_external_timeout_ms")]
+        timeout_ms: u64,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
