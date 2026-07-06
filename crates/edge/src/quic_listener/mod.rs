@@ -685,7 +685,8 @@ impl QUICListener {
         for cap in effective_resilience.route_queue.caps.values_mut() {
             *cap = (*cap).min(default_route_cap_limit).max(1);
         }
-        let tuned_high_latency = ((config.performance.backend_timeout_ms * 7) / 10).max(50);
+        let tuned_high_latency =
+            (config.performance.backend_timeout_ms.saturating_mul(7) / 10).max(50);
         if effective_resilience.adaptive_admission.high_latency_ms > tuned_high_latency {
             warn!(
                 "resilience.adaptive_admission.high_latency_ms={} is above tuned limit {}; clamping for faster overload reaction",

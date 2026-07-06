@@ -202,13 +202,37 @@ fn validate_inner(config: &Config) -> bool {
         return false;
     }
 
+    if config.performance.worker_threads > 1024 {
+        validation_error!(
+            "performance.worker_threads={} exceeds the maximum of 1024",
+            config.performance.worker_threads
+        );
+        return false;
+    }
+
     if config.performance.control_plane_threads == 0 {
         validation_error!("performance.control_plane_threads must be greater than 0");
         return false;
     }
 
+    if config.performance.control_plane_threads > 1024 {
+        validation_error!(
+            "performance.control_plane_threads={} exceeds the maximum of 1024",
+            config.performance.control_plane_threads
+        );
+        return false;
+    }
+
     if config.performance.packet_shards_per_worker == 0 {
         validation_error!("performance.packet_shards_per_worker must be greater than 0");
+        return false;
+    }
+
+    if config.performance.packet_shards_per_worker > 256 {
+        validation_error!(
+            "performance.packet_shards_per_worker={} exceeds the maximum of 256",
+            config.performance.packet_shards_per_worker
+        );
         return false;
     }
 
