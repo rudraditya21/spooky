@@ -1095,7 +1095,7 @@ impl Default for MetricsEndpoint {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ControlApi {
     #[serde(default)]
@@ -1129,7 +1129,9 @@ pub struct ControlApi {
     #[serde(default = "observe_default_control_api_reload_certs_path")]
     pub reload_certs_path: String,
 
-    #[serde(default)]
+    // Admin credential: never emitted by Serialize (e.g. the /admin/runtime
+    // dump) and redacted in Debug; still accepted on deserialize.
+    #[serde(default, skip_serializing)]
     pub auth_token: Option<String>,
 
     #[serde(default = "observe_default_control_api_max_connections")]
@@ -1156,6 +1158,27 @@ impl Default for ControlApi {
             max_connections: observe_default_control_api_max_connections(),
             connection_timeout_ms: observe_default_control_api_connection_timeout_ms(),
         }
+    }
+}
+
+impl std::fmt::Debug for ControlApi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlApi")
+            .field("enabled", &self.enabled)
+            .field("required", &self.required)
+            .field("address", &self.address)
+            .field("port", &self.port)
+            .field("health_path", &self.health_path)
+            .field("ready_path", &self.ready_path)
+            .field("runtime_path", &self.runtime_path)
+            .field("restart_path", &self.restart_path)
+            .field("reload_path", &self.reload_path)
+            .field("reload_certs_path", &self.reload_certs_path)
+            // Redacted: show presence, never the value.
+            .field("auth_token", &self.auth_token.as_ref().map(|_| "<redacted>"))
+            .field("max_connections", &self.max_connections)
+            .field("connection_timeout_ms", &self.connection_timeout_ms)
+            .finish()
     }
 }
 
