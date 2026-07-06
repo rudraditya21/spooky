@@ -152,8 +152,7 @@ pub(crate) fn allocate_worker_index_base(
         .map(|g| {
             (
                 g.worker_index_base,
-                g.worker_index_base
-                    .saturating_add(g.signature.worker_count),
+                g.worker_index_base.saturating_add(g.signature.worker_count),
             )
         })
         .collect();

@@ -1175,7 +1175,10 @@ impl std::fmt::Debug for ControlApi {
             .field("reload_path", &self.reload_path)
             .field("reload_certs_path", &self.reload_certs_path)
             // Redacted: show presence, never the value.
-            .field("auth_token", &self.auth_token.as_ref().map(|_| "<redacted>"))
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "<redacted>"),
+            )
             .field("max_connections", &self.max_connections)
             .field("connection_timeout_ms", &self.connection_timeout_ms)
             .finish()
