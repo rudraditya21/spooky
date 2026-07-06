@@ -92,6 +92,35 @@ pub(crate) fn abort_stream(req: &mut RequestEnvelope, metrics: &Metrics) -> Stre
     phase
 }
 
+/// Balances the `begin_request` performed inside `resolve_backend` when a
+/// request is rejected before its `RequestEnvelope` is committed to
+/// `connection.streams` (after which `abort_stream` owns the finish). Without
+/// this, every post-routing rejection — auth denial, brownout, rate limit,
+/// admission caps, endpoint/build failures, stream cap — leaks one backend
+/// in-flight slot. Disarmed at commit; also covers `?` error early-returns.
+struct BackendInflightGuard {
+    pool: Arc<RwLock<UpstreamPool>>,
+    index: usize,
+    start: std::time::Instant,
+    armed: bool,
+}
+
+impl BackendInflightGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BackendInflightGuard {
+    fn drop(&mut self) {
+        if self.armed
+            && let Ok(mut guard) = self.pool.write()
+        {
+            guard.finish_request(self.index, self.start.elapsed(), Some(503));
+        }
+    }
+}
+
 impl QUICListener {
     pub(super) fn classify_upstream_failure_reason(
         is_connect: bool,
@@ -1022,6 +1051,10 @@ impl QUICListener {
                         Some(&lb_header_lookup),
                     );
 
+                    // Balances the in-flight begin_request done inside
+                    // resolve_backend; the Drop finishes it on any rejection
+                    // below, and is disarmed once the envelope is committed.
+                    let mut backend_inflight_guard: Option<BackendInflightGuard> = None;
                     let (
                         body_tx,
                         upstream_result_rx,
@@ -1055,6 +1088,12 @@ impl QUICListener {
                             route_host_specific,
                             route_reason,
                         }) => {
+                            backend_inflight_guard = Some(BackendInflightGuard {
+                                pool: Arc::clone(&upstream_pool),
+                                index: idx,
+                                start: request_start,
+                                armed: true,
+                            });
                             if let Some(policy) = upstream_policies.get(&upstream_name) {
                                 let denied_challenge = if !Self::api_key_is_authorized(
                                     policy,
@@ -1789,6 +1828,10 @@ impl QUICListener {
                         continue;
                     }
 
+                    // Envelope now owns the in-flight finish via abort_stream.
+                    if let Some(mut guard) = backend_inflight_guard.take() {
+                        guard.disarm();
+                    }
                     connection.streams.insert(
                         stream_id,
                         RequestEnvelope {
