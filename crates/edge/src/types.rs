@@ -902,6 +902,8 @@ pub struct RequestEnvelope {
     pub pending_forward: Option<Arc<PendingForward>>,
     /// Receives the external auth decision once async auth completes.
     pub auth_result_rx: Option<oneshot::Receiver<ExternalAuthResult>>,
+    /// Aborts the detached external auth task when the stream is cancelled.
+    pub auth_abort: Option<AbortHandle>,
     /// Whether auth transport errors and timeouts should allow the request.
     pub auth_fail_open: bool,
     /// Deadline for the external auth decision, when auth is running asynchronously.

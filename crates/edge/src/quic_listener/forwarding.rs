@@ -16,7 +16,10 @@ use std::convert::Infallible;
 use std::error::Error as StdError;
 use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
+use tokio::task::AbortHandle;
 use tracing::Span;
+
+const MAX_AUTH_BODY_BYTES: usize = 64 * 1024;
 
 impl PendingForward {
     fn request_headers(&self) -> Vec<quiche::h3::Header> {
@@ -156,6 +159,7 @@ impl AuthHttpClient {
 
 struct AuthStart {
     rx: oneshot::Receiver<ExternalAuthResult>,
+    abort: AbortHandle,
     deadline: Instant,
     fail_open: bool,
 }
@@ -209,6 +213,40 @@ fn fail_open(mode: RuntimeExternalAuthFailureMode) -> bool {
     matches!(mode, RuntimeExternalAuthFailureMode::FailOpen)
 }
 
+fn is_unsafe_forwarded_auth_request_header(name: &[u8]) -> bool {
+    name.eq_ignore_ascii_case(http::header::HOST.as_str().as_bytes())
+        || name.eq_ignore_ascii_case(http::header::CONNECTION.as_str().as_bytes())
+        || name.eq_ignore_ascii_case(http::header::CONTENT_LENGTH.as_str().as_bytes())
+        || name.eq_ignore_ascii_case(http::header::TRANSFER_ENCODING.as_str().as_bytes())
+        || name.eq_ignore_ascii_case(http::header::UPGRADE.as_str().as_bytes())
+        || name.eq_ignore_ascii_case(http::header::TE.as_str().as_bytes())
+        || name.eq_ignore_ascii_case(http::header::TRAILER.as_str().as_bytes())
+        || name.eq_ignore_ascii_case(http::header::EXPECT.as_str().as_bytes())
+        || name.eq_ignore_ascii_case(b"keep-alive")
+        || name.eq_ignore_ascii_case(b"proxy-connection")
+}
+
+fn is_safe_auth_request_mutation_header(name: &str) -> bool {
+    !name.eq_ignore_ascii_case(http::header::HOST.as_str())
+        && !name.eq_ignore_ascii_case(http::header::CONNECTION.as_str())
+        && !name.eq_ignore_ascii_case(http::header::CONTENT_LENGTH.as_str())
+        && !name.eq_ignore_ascii_case(http::header::TRANSFER_ENCODING.as_str())
+        && !name.eq_ignore_ascii_case(http::header::UPGRADE.as_str())
+        && !name.eq_ignore_ascii_case(http::header::TE.as_str())
+        && !name.eq_ignore_ascii_case(http::header::TRAILER.as_str())
+        && !name.eq_ignore_ascii_case(http::header::EXPECT.as_str())
+        && !name.eq_ignore_ascii_case(http::header::AUTHORIZATION.as_str())
+        && !name.eq_ignore_ascii_case(http::header::LOCATION.as_str())
+        && !name.eq_ignore_ascii_case(http::header::WWW_AUTHENTICATE.as_str())
+        && !name.eq_ignore_ascii_case(http::header::FORWARDED.as_str())
+        && !name.eq_ignore_ascii_case("x-forwarded-for")
+        && !name.eq_ignore_ascii_case("x-forwarded-host")
+        && !name.eq_ignore_ascii_case("x-forwarded-port")
+        && !name.eq_ignore_ascii_case("x-forwarded-proto")
+        && !name.eq_ignore_ascii_case("keep-alive")
+        && !name.eq_ignore_ascii_case("proxy-connection")
+}
+
 fn allowed_auth_headers(headers: &http::HeaderMap, allowlist: &[String]) -> Vec<(String, String)> {
     headers
         .iter()
@@ -233,6 +271,7 @@ fn auth_allow_mutations(
 ) -> Vec<PendingHeaderMutation> {
     allowed_auth_headers(headers, allowlist)
         .into_iter()
+        .filter(|(name, _)| is_safe_auth_request_mutation_header(name))
         .map(|(name, value)| PendingHeaderMutation::Upsert {
             name: name.into_bytes(),
             value: value.into_bytes(),
@@ -246,7 +285,8 @@ fn append_auth_request_headers(
     configured_headers: &[spooky_config::runtime::RuntimeExternalAuthRequestHeader],
 ) {
     for header in pending_forward.request_headers() {
-        if header.name().starts_with(b":") {
+        if header.name().starts_with(b":") || is_unsafe_forwarded_auth_request_header(header.name())
+        {
             continue;
         }
         if let (Ok(name), Ok(value)) = (
@@ -303,11 +343,24 @@ fn append_auth_request_headers(
     }
 }
 
-async fn collect_auth_body(body: Incoming) -> Result<Vec<u8>, ProxyError> {
-    http_body_util::BodyExt::collect(body)
-        .await
-        .map(|body| body.to_bytes().to_vec())
-        .map_err(|err| ProxyError::Transport(err.to_string()))
+async fn collect_auth_body(mut body: Incoming) -> Result<Vec<u8>, ProxyError> {
+    use http_body_util::BodyExt as _;
+
+    let mut bytes = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|err| ProxyError::Transport(err.to_string()))?;
+        let Ok(chunk) = frame.into_data() else {
+            continue;
+        };
+        let next_len = bytes.len().saturating_add(chunk.len());
+        if next_len > MAX_AUTH_BODY_BYTES {
+            return Err(ProxyError::Transport(format!(
+                "external auth body exceeded {MAX_AUTH_BODY_BYTES} bytes"
+            )));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 fn authorization_header_from_pending_forward(pending_forward: &PendingForward) -> Option<String> {
@@ -342,6 +395,16 @@ async fn send_auth_request(
         .map_err(|_| ProxyError::Timeout)?
 }
 
+async fn run_external_auth_with_timeout(
+    pending_forward: Arc<PendingForward>,
+    external_auth: RuntimeExternalAuth,
+    timeout: Duration,
+) -> ExternalAuthResult {
+    tokio::time::timeout(timeout, run_external_auth(pending_forward, external_auth))
+        .await
+        .map_err(|_| ProxyError::Timeout)?
+}
+
 fn map_http_external_auth_response(
     status: http::StatusCode,
     headers: &http::HeaderMap,
@@ -367,7 +430,12 @@ fn map_http_external_auth_response(
             return Ok(ExternalAuthDecision::Redirect(
                 ExternalAuthRedirectResponse {
                     status,
-                    headers: allowed_headers,
+                    headers: allowed_headers
+                        .into_iter()
+                        .filter(|(name, _)| {
+                            !name.eq_ignore_ascii_case(http::header::LOCATION.as_str())
+                        })
+                        .collect(),
                     location,
                 },
             ));
@@ -381,7 +449,12 @@ fn map_http_external_auth_response(
             return Ok(ExternalAuthDecision::Challenge(
                 ExternalAuthChallengeResponse {
                     status,
-                    headers: allowed_headers,
+                    headers: allowed_headers
+                        .into_iter()
+                        .filter(|(name, _)| {
+                            !name.eq_ignore_ascii_case(http::header::WWW_AUTHENTICATE.as_str())
+                        })
+                        .collect(),
                     www_authenticate,
                     body,
                 },
@@ -509,6 +582,14 @@ async fn run_oidc_external_auth(
         .ok_or_else(|| {
             ProxyError::Transport("oidc discovery missing introspection_endpoint".into())
         })?;
+    let introspection_uri = introspection_endpoint
+        .parse::<http::Uri>()
+        .map_err(|err| ProxyError::Transport(err.to_string()))?;
+    if introspection_uri.scheme_str() != Some("https") || introspection_uri.authority().is_none() {
+        return Err(ProxyError::Transport(
+            "oidc discovery returned non-https introspection endpoint".into(),
+        ));
+    }
 
     let mut body = format!(
         "token={}&client_id={}",
@@ -658,20 +739,22 @@ fn start_external_auth_task(
 ) -> Result<AuthStart, ProxyError> {
     let timeout_ms = auth_timeout_ms(&external_auth).max(1);
     let mode = auth_failure_mode(&external_auth);
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let timeout = Duration::from_millis(timeout_ms);
     let (tx, rx) = oneshot::channel();
     let fut = async move {
-        let result = run_external_auth(pending_forward, external_auth).await;
+        let result = run_external_auth_with_timeout(pending_forward, external_auth, timeout).await;
         let _ = tx.send(result);
     };
-    if !spawn_async_task(fut, "external-auth") {
+    let Some(handle) = runtime_handle() else {
         return Err(ProxyError::Transport(
             "dropping external auth task: no runtime available".into(),
         ));
-    }
+    };
+    let join = handle.spawn(fut);
     Ok(AuthStart {
         rx,
-        deadline,
+        abort: join.abort_handle(),
+        deadline: Instant::now() + timeout,
         fail_open: fail_open(mode),
     })
 }
@@ -697,6 +780,9 @@ pub(crate) fn abort_stream(req: &mut RequestEnvelope, metrics: &Metrics) -> Stre
     req.body_buf.clear();
     req.body_tx = None;
     req.auth_result_rx = None;
+    if let Some(abort) = req.auth_abort.take() {
+        abort.abort();
+    }
     req.upstream_result_rx = None;
     req.response_chunk_rx = None;
     req.pending_chunk = None;
@@ -2148,6 +2234,7 @@ impl QUICListener {
             req.body_tx = None;
             req.phase = StreamPhase::AwaitingUpstream;
         }
+        req.auth_abort = None;
         Ok(true)
     }
 
@@ -2168,6 +2255,9 @@ impl QUICListener {
         inflight_acquire_wait: Duration,
     ) -> Result<bool, quiche::h3::Error> {
         req.auth_result_rx = None;
+        if let Some(abort) = req.auth_abort.take() {
+            abort.abort();
+        }
         req.auth_deadline = None;
         match result {
             Ok(ExternalAuthDecision::Allow {
@@ -2490,6 +2580,7 @@ impl QUICListener {
             match start_external_auth_task(Arc::clone(&request.pending_forward), external_auth) {
                 Ok(start) => Some(start),
                 Err(err) if auth_fail_open => {
+                    metrics.inc_external_auth_error();
                     warn!(
                         "request_id={} route={} external auth startup failed open: {:?}",
                         request.request_id, request.upstream_name, err
@@ -2498,6 +2589,7 @@ impl QUICListener {
                 }
                 Err(err) => {
                     metrics.inc_failure();
+                    metrics.inc_external_auth_error();
                     metrics.record_route(
                         &request.upstream_name,
                         request_start.elapsed(),
@@ -2680,6 +2772,26 @@ impl QUICListener {
                         }
                     }
 
+                    // App-level stream count cap: mirrors the QUIC max_streams_bidi
+                    // limit so the streams HashMap can never grow beyond what the
+                    // transport layer allows even if a race or misconfiguration
+                    // delivers a stream-open event before the flow-control frame
+                    // reaches the client.
+                    if connection.streams.len() >= max_streams_per_connection {
+                        warn!(
+                            "stream limit reached ({} streams), rejecting stream {}",
+                            max_streams_per_connection, stream_id
+                        );
+                        Self::send_simple_response(
+                            h3,
+                            &mut connection.quic,
+                            stream_id,
+                            http::StatusCode::SERVICE_UNAVAILABLE,
+                            b"too many concurrent streams\n",
+                        )?;
+                        continue;
+                    }
+
                     // Route lookup now only selects an upstream/backend; actual
                     // backend/inflight admission is deferred until local auth
                     // succeeds immediately or async external auth completes.
@@ -2745,41 +2857,28 @@ impl QUICListener {
                         auth_requested,
                     } = started_auth;
 
-                    // App-level stream count cap: mirrors the QUIC max_streams_bidi
-                    // limit so the streams HashMap can never grow beyond what the
-                    // transport layer allows even if a race or misconfiguration
-                    // delivers a stream-open event before the flow-control frame
-                    // reaches the client.
-                    if connection.streams.len() >= max_streams_per_connection {
-                        warn!(
-                            "stream limit reached ({} streams), rejecting stream {}",
-                            max_streams_per_connection, stream_id
-                        );
-                        Self::send_simple_response(
-                            h3,
-                            &mut connection.quic,
-                            stream_id,
-                            http::StatusCode::SERVICE_UNAVAILABLE,
-                            b"too many concurrent streams\n",
-                        )?;
-                        continue;
-                    }
-
-                    let (auth_result_rx, auth_deadline, auth_fail_open, admission_state) =
-                        match auth_start {
-                            Some(start) => (
-                                Some(start.rx),
-                                Some(start.deadline),
-                                start.fail_open,
-                                StreamAdmissionState::WaitingForAuth,
-                            ),
-                            None => (
-                                None,
-                                None,
-                                auth_fail_open,
-                                StreamAdmissionState::ReadyToForward,
-                            ),
-                        };
+                    let (
+                        auth_result_rx,
+                        auth_abort,
+                        auth_deadline,
+                        auth_fail_open,
+                        admission_state,
+                    ) = match auth_start {
+                        Some(start) => (
+                            Some(start.rx),
+                            Some(start.abort),
+                            Some(start.deadline),
+                            start.fail_open,
+                            StreamAdmissionState::WaitingForAuth,
+                        ),
+                        None => (
+                            None,
+                            None,
+                            None,
+                            auth_fail_open,
+                            StreamAdmissionState::ReadyToForward,
+                        ),
+                    };
                     connection.streams.insert(
                         stream_id,
                         RequestEnvelope {
@@ -2821,6 +2920,7 @@ impl QUICListener {
                             error_kind: None,
                             pending_forward: Some(pending_forward),
                             auth_result_rx,
+                            auth_abort,
                             auth_fail_open,
                             auth_deadline,
                             phase: StreamPhase::ReceivingRequest,
@@ -4712,6 +4812,30 @@ mod tests {
         RuntimeJwtAuth, RuntimeUpstreamPolicy,
     };
 
+    fn sample_pending_forward(headers: Vec<quiche::h3::Header>) -> PendingForward {
+        PendingForward {
+            method: Arc::<str>::from("GET"),
+            path: Arc::<str>::from("/"),
+            authority: Some(Arc::<str>::from("example.com")),
+            headers: Arc::new(headers),
+            upstream_name: Arc::<str>::from("api"),
+            route_reason: Arc::<str>::from("path_prefix"),
+            route_path_len: 1,
+            route_host_specific: false,
+            backend_addr: Arc::<str>::from("http://127.0.0.1:8080"),
+            backend_index: 0,
+            backend_lb: None,
+            client_addr: "127.0.0.1:443".parse().expect("client addr"),
+            request_id: 7,
+            trace_id: None,
+            span_id: None,
+            traceparent: None,
+            host_policy: Default::default(),
+            forwarded_header_policy: Default::default(),
+            auth_header_mutations: Vec::new(),
+        }
+    }
+
     fn test_hs256_jwt(secret: &str, claims: serde_json::Value, alg: &str) -> String {
         let header = URL_SAFE_NO_PAD.encode(
             serde_json::to_vec(&serde_json::json!({ "alg": alg, "typ": "JWT" }))
@@ -5067,28 +5191,6 @@ mod tests {
     #[test]
     fn pending_forward_request_headers_apply_auth_mutations() {
         let pending_forward = PendingForward {
-            method: Arc::<str>::from("GET"),
-            path: Arc::<str>::from("/"),
-            authority: Some(Arc::<str>::from("example.com")),
-            headers: Arc::new(vec![
-                quiche::h3::Header::new(b":method", b"GET"),
-                quiche::h3::Header::new(b"x-user-id", b"stale"),
-                quiche::h3::Header::new(b"x-remove-me", b"1"),
-            ]),
-            upstream_name: Arc::<str>::from("api"),
-            route_reason: Arc::<str>::from("path_prefix"),
-            route_path_len: 1,
-            route_host_specific: false,
-            backend_addr: Arc::<str>::from("http://127.0.0.1:8080"),
-            backend_index: 0,
-            backend_lb: None,
-            client_addr: "127.0.0.1:443".parse().expect("client addr"),
-            request_id: 7,
-            trace_id: None,
-            span_id: None,
-            traceparent: None,
-            host_policy: Default::default(),
-            forwarded_header_policy: Default::default(),
             auth_header_mutations: vec![
                 PendingHeaderMutation::Upsert {
                     name: b"x-user-id".to_vec(),
@@ -5098,6 +5200,11 @@ mod tests {
                     name: b"x-remove-me".to_vec(),
                 },
             ],
+            ..sample_pending_forward(vec![
+                quiche::h3::Header::new(b":method", b"GET"),
+                quiche::h3::Header::new(b"x-user-id", b"stale"),
+                quiche::h3::Header::new(b"x-remove-me", b"1"),
+            ])
         };
 
         let headers = pending_forward.request_headers();
@@ -5120,6 +5227,10 @@ mod tests {
         let mut headers = http::HeaderMap::new();
         headers.insert("x-auth-user", http::HeaderValue::from_static("alice"));
         headers.insert("x-ignore", http::HeaderValue::from_static("nope"));
+        headers.insert(
+            http::header::CONTENT_LENGTH,
+            http::HeaderValue::from_static("12"),
+        );
 
         assert_eq!(
             allowed_auth_headers(&headers, &["X-Auth-User".to_string()]),
@@ -5132,6 +5243,74 @@ mod tests {
                 name: b"x-auth-user".to_vec(),
                 value: b"alice".to_vec(),
             }]
+        );
+    }
+
+    #[test]
+    fn auth_allow_mutations_drops_unsafe_request_headers() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-auth-user", http::HeaderValue::from_static("alice"));
+        headers.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer test"),
+        );
+        headers.insert(
+            http::header::LOCATION,
+            http::HeaderValue::from_static("https://login"),
+        );
+        headers.insert(
+            http::header::CONTENT_LENGTH,
+            http::HeaderValue::from_static("12"),
+        );
+
+        assert_eq!(
+            auth_allow_mutations(
+                &headers,
+                &[
+                    "x-auth-user".to_string(),
+                    "authorization".to_string(),
+                    "location".to_string(),
+                    "content-length".to_string(),
+                ],
+            ),
+            vec![PendingHeaderMutation::Upsert {
+                name: b"x-auth-user".to_vec(),
+                value: b"alice".to_vec(),
+            }]
+        );
+    }
+
+    #[test]
+    fn append_auth_request_headers_strips_hop_by_hop_and_framing_headers() {
+        let pending_forward = sample_pending_forward(vec![
+            quiche::h3::Header::new(b":method", b"GET"),
+            quiche::h3::Header::new(b"host", b"client.example.com"),
+            quiche::h3::Header::new(b"content-length", b"42"),
+            quiche::h3::Header::new(b"connection", b"keep-alive"),
+            quiche::h3::Header::new(b"cookie", b"session=1"),
+            quiche::h3::Header::new(b"authorization", b"Bearer token"),
+        ]);
+        let mut builder = Request::builder()
+            .method(http::Method::GET)
+            .uri("https://auth.internal/check");
+
+        append_auth_request_headers(&mut builder, &pending_forward, &[]);
+
+        let headers = builder.headers_ref().expect("headers");
+        assert!(!headers.contains_key(http::header::HOST));
+        assert!(!headers.contains_key(http::header::CONTENT_LENGTH));
+        assert!(!headers.contains_key(http::header::CONNECTION));
+        assert_eq!(
+            headers
+                .get(http::header::COOKIE)
+                .and_then(|value| value.to_str().ok()),
+            Some("session=1")
+        );
+        assert_eq!(
+            headers
+                .get(http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer token")
         );
     }
 
@@ -5190,6 +5369,49 @@ mod tests {
                     response.headers,
                     vec![("x-auth-reason".to_string(), "expired".to_string())]
                 );
+            }
+            other => panic!("unexpected decision: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn http_external_auth_response_mapping_dedupes_standard_redirect_and_challenge_headers() {
+        let mut redirect_headers = http::HeaderMap::new();
+        redirect_headers.insert(
+            http::header::LOCATION,
+            http::HeaderValue::from_static("https://login.example.com/"),
+        );
+        let redirect = map_http_external_auth_response(
+            http::StatusCode::FOUND,
+            &redirect_headers,
+            Vec::new(),
+            &["location".to_string()],
+        )
+        .expect("redirect decision");
+        match redirect {
+            ExternalAuthDecision::Redirect(response) => {
+                assert!(response.headers.is_empty());
+                assert_eq!(response.location, "https://login.example.com/");
+            }
+            other => panic!("unexpected decision: {other:?}"),
+        }
+
+        let mut challenge_headers = http::HeaderMap::new();
+        challenge_headers.insert(
+            http::header::WWW_AUTHENTICATE,
+            http::HeaderValue::from_static("Bearer realm=\"spooky\""),
+        );
+        let challenge = map_http_external_auth_response(
+            http::StatusCode::UNAUTHORIZED,
+            &challenge_headers,
+            b"challenge\n".to_vec(),
+            &["www-authenticate".to_string()],
+        )
+        .expect("challenge decision");
+        match challenge {
+            ExternalAuthDecision::Challenge(response) => {
+                assert!(response.headers.is_empty());
+                assert_eq!(response.www_authenticate, "Bearer realm=\"spooky\"");
             }
             other => panic!("unexpected decision: {other:?}"),
         }

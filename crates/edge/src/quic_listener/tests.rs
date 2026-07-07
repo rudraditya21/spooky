@@ -1798,6 +1798,7 @@ fn make_envelope(phase: StreamPhase) -> RequestEnvelope {
         error_kind: None,
         pending_forward: None,
         auth_result_rx: None,
+        auth_abort: None,
         auth_fail_open: false,
         auth_deadline: None,
         tunnel_mode: crate::types::TunnelMode::None,
@@ -1896,6 +1897,7 @@ fn abort_stream_waiting_for_auth_clears_async_auth_state() {
 
     assert_eq!(phase, StreamPhase::ReceivingRequest);
     assert!(req.auth_result_rx.is_none());
+    assert!(req.auth_abort.is_none());
     assert!(req.auth_deadline.is_none());
     assert!(req.pending_forward.is_none());
     assert!(

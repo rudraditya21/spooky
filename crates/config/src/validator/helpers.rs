@@ -283,6 +283,19 @@ pub(super) fn is_valid_http_url(value: &str) -> bool {
     matches!(uri.scheme_str(), Some("http") | Some("https")) && uri.authority().is_some()
 }
 
+pub(super) fn is_valid_https_url(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let Ok(uri) = trimmed.parse::<http::Uri>() else {
+        return false;
+    };
+
+    uri.scheme_str() == Some("https") && uri.authority().is_some()
+}
+
 pub(super) fn is_valid_connect_authority(value: &str) -> bool {
     let trimmed = value.trim();
     if trimmed.is_empty() || trimmed.chars().any(char::is_whitespace) {

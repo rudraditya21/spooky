@@ -1291,20 +1291,20 @@ fn validate_inner(config: &Config) -> bool {
                     }
                     if let Some(discovery_url) = discovery_url.as_deref()
                         && !discovery_url.trim().is_empty()
-                        && !is_valid_http_url(discovery_url)
+                        && !is_valid_https_url(discovery_url)
                     {
                         validation_error!(
-                            "upstream '{}' auth.external_auth.oidc.discovery_url must be an absolute http(s) URL",
+                            "upstream '{}' auth.external_auth.oidc.discovery_url must be an absolute https URL",
                             upstream_name
                         );
                         return false;
                     }
                     if let Some(issuer_url) = issuer_url.as_deref()
                         && !issuer_url.trim().is_empty()
-                        && !is_valid_http_url(issuer_url)
+                        && !is_valid_https_url(issuer_url)
                     {
                         validation_error!(
-                            "upstream '{}' auth.external_auth.oidc.issuer_url must be an absolute http(s) URL",
+                            "upstream '{}' auth.external_auth.oidc.issuer_url must be an absolute https URL",
                             upstream_name
                         );
                         return false;
@@ -1349,6 +1349,13 @@ fn validate_inner(config: &Config) -> bool {
                         request_headers,
                         response_header_allowlist,
                     ) {
+                        return false;
+                    }
+                    if !response_header_allowlist.is_empty() {
+                        validation_error!(
+                            "upstream '{}' auth.external_auth.oidc.response_header_allowlist is not supported in v1",
+                            upstream_name
+                        );
                         return false;
                     }
                     if *timeout_ms == 0 {

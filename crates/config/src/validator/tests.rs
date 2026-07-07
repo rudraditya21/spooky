@@ -1539,6 +1539,62 @@ fn rejects_external_auth_with_invalid_response_allowlist_header_name() {
 }
 
 #[test]
+fn rejects_oidc_external_auth_with_non_https_discovery_url() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.upstream
+        .get_mut("test_upstream")
+        .expect("upstream")
+        .auth
+        .external_auth = Some(ExternalAuth::Oidc {
+        discovery_url: Some(
+            "http://issuer.example.com/.well-known/openid-configuration".to_string(),
+        ),
+        issuer_url: Some("https://issuer.example.com".to_string()),
+        client_id: "edge-gateway".to_string(),
+        client_secret: Some("secret-1".to_string()),
+        audience: Some("spooky-api".to_string()),
+        scopes: vec!["openid".to_string()],
+        request_headers: Vec::new(),
+        response_header_allowlist: Vec::new(),
+        timeout_ms: 1_500,
+        failure_mode: ExternalAuthFailureMode::FailClosed,
+    });
+
+    assert!(validate(&cfg).is_err());
+}
+
+#[test]
+fn rejects_oidc_external_auth_with_response_header_allowlist() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(dir.path());
+
+    let mut cfg = base_config(&cert.to_string_lossy(), &key.to_string_lossy());
+    cfg.upstream
+        .get_mut("test_upstream")
+        .expect("upstream")
+        .auth
+        .external_auth = Some(ExternalAuth::Oidc {
+        discovery_url: Some(
+            "https://issuer.example.com/.well-known/openid-configuration".to_string(),
+        ),
+        issuer_url: Some("https://issuer.example.com".to_string()),
+        client_id: "edge-gateway".to_string(),
+        client_secret: Some("secret-1".to_string()),
+        audience: Some("spooky-api".to_string()),
+        scopes: vec!["openid".to_string()],
+        request_headers: Vec::new(),
+        response_header_allowlist: vec!["x-user-id".to_string()],
+        timeout_ms: 1_500,
+        failure_mode: ExternalAuthFailureMode::FailClosed,
+    });
+
+    assert!(validate(&cfg).is_err());
+}
+
+#[test]
 fn rejects_external_auth_with_rbac_requirements_in_v1() {
     let dir = tempdir().expect("tempdir");
     let (cert, key) = write_test_certs(dir.path());
