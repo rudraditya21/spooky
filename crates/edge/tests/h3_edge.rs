@@ -5,6 +5,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
     thread,
     time::{Duration, Instant},
@@ -208,6 +209,14 @@ where
     addr
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ListenerLoopReport {
+    poll_count: u64,
+    remaining_connections: usize,
+    remaining_cid_routes: usize,
+    remaining_peer_routes: usize,
+}
+
 fn spawn_listener_loop(
     mut listener: QUICListener,
 ) -> (
@@ -229,6 +238,44 @@ fn spawn_listener_loop(
 fn stop_listener_loop(stop: Arc<AtomicBool>, handle: thread::JoinHandle<()>) {
     stop.store(true, Ordering::Relaxed);
     let _ = handle.join();
+}
+
+fn spawn_listener_loop_with_report(
+    mut listener: QUICListener,
+) -> (
+    std::net::SocketAddr,
+    Arc<AtomicBool>,
+    thread::JoinHandle<()>,
+    mpsc::Receiver<ListenerLoopReport>,
+) {
+    let addr = listener.socket.local_addr().expect("local addr");
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_flag = Arc::clone(&stop);
+    let (report_tx, report_rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let mut poll_count = 0u64;
+        while !stop_flag.load(Ordering::Relaxed) {
+            listener.poll();
+            poll_count = poll_count.saturating_add(1);
+        }
+        let _ = report_tx.send(ListenerLoopReport {
+            poll_count,
+            remaining_connections: listener.connections().len(),
+            remaining_cid_routes: listener.cid_routes().len(),
+            remaining_peer_routes: listener.peer_routes().len(),
+        });
+    });
+    (addr, stop, handle, report_rx)
+}
+
+fn stop_listener_loop_with_report(
+    stop: Arc<AtomicBool>,
+    handle: thread::JoinHandle<()>,
+    report_rx: mpsc::Receiver<ListenerLoopReport>,
+) -> ListenerLoopReport {
+    stop.store(true, Ordering::Relaxed);
+    let _ = handle.join();
+    report_rx.recv().expect("listener loop report")
 }
 
 #[derive(Debug)]

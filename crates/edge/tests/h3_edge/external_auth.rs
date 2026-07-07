@@ -579,62 +579,233 @@ async fn client_disconnect_during_pending_auth_leaves_no_connection_state() {
     );
 }
 
+#[derive(Debug)]
+struct AuthLoopBenchmarkSummary {
+    label: &'static str,
+    request_count: usize,
+    wall: Duration,
+    cpu_micros: u64,
+    poll_report: ListenerLoopReport,
+    latencies: Vec<Duration>,
+}
+
+impl AuthLoopBenchmarkSummary {
+    fn avg_latency(&self) -> Duration {
+        Duration::from_micros(
+            (self
+                .latencies
+                .iter()
+                .map(|latency| latency.as_micros() as u64)
+                .sum::<u64>()
+                / self.request_count.max(1) as u64)
+                .max(1),
+        )
+    }
+
+    fn percentile_latency(&self, percentile: f64) -> Duration {
+        let mut samples = self.latencies.clone();
+        samples.sort_unstable();
+        let capped = percentile.clamp(0.0, 100.0);
+        let idx = (((samples.len().saturating_sub(1)) as f64) * (capped / 100.0)).round() as usize;
+        samples[idx.min(samples.len().saturating_sub(1))]
+    }
+
+    fn cpu_per_request_micros(&self) -> u64 {
+        (self.cpu_micros / self.request_count.max(1) as u64).max(1)
+    }
+
+    fn polls_per_request(&self) -> u64 {
+        (self.poll_report.poll_count / self.request_count.max(1) as u64).max(1)
+    }
+}
+
+#[cfg(unix)]
+fn process_cpu_micros() -> u64 {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    if rc != 0 {
+        return 0;
+    }
+    let usage = unsafe { usage.assume_init() };
+    let user = (usage.ru_utime.tv_sec as u64)
+        .saturating_mul(1_000_000)
+        .saturating_add(usage.ru_utime.tv_usec as u64);
+    let sys = (usage.ru_stime.tv_sec as u64)
+        .saturating_mul(1_000_000)
+        .saturating_add(usage.ru_stime.tv_usec as u64);
+    user.saturating_add(sys)
+}
+
+#[cfg(not(unix))]
+fn process_cpu_micros() -> u64 {
+    0
+}
+
+async fn run_auth_loop_benchmark(
+    label: &'static str,
+    auth_enabled: bool,
+    request_count: usize,
+) -> AuthLoopBenchmarkSummary {
+    const IDLE_TIMEOUT_MS: u64 = 180;
+
+    let backend_addr = start_h2_backend("benchmark backend").await;
+    let auth_addr = if auth_enabled {
+        Some(
+            start_http_auth_server(|_req| async move {
+                Ok::<_, Infallible>(
+                    Response::builder()
+                        .status(http::StatusCode::NO_CONTENT)
+                        .body(Full::new(Bytes::new()))
+                        .expect("auth allow response"),
+                )
+            })
+            .await,
+        )
+    } else {
+        None
+    };
+
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_certs(&dir);
+    let mut config = make_config(0, cert, key, backend_addr.to_string());
+    config.performance.quic_max_idle_timeout_ms = IDLE_TIMEOUT_MS;
+    config.performance.new_connections_per_sec = 10_000;
+    config.performance.new_connections_burst = 1_000;
+    if let Some(auth_addr) = auth_addr {
+        configure_http_external_auth(
+            &mut config,
+            format!("http://{auth_addr}/check"),
+            250,
+            ExternalAuthFailureMode::FailClosed,
+            vec![],
+        );
+    }
+
+    let listener = QUICListener::new(config).expect("listener");
+    let (addr, stop, handle, report_rx) = spawn_listener_loop_with_report(listener);
+
+    let warmup = run_h3_client_request(addr, "GET", "/", &[], None).expect("warmup response");
+    assert_eq!(warmup.status, 200);
+    assert_eq!(warmup.body, "benchmark backend");
+
+    let cpu_start = process_cpu_micros();
+    let wall_start = Instant::now();
+    let mut latencies = Vec::with_capacity(request_count);
+    for _ in 0..request_count {
+        let req_start = Instant::now();
+        let response =
+            run_h3_client_request(addr, "GET", "/", &[], None).expect("benchmark response");
+        latencies.push(req_start.elapsed());
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, "benchmark backend");
+    }
+    let wall = wall_start.elapsed();
+    let cpu_micros = process_cpu_micros().saturating_sub(cpu_start);
+
+    tokio::time::sleep(Duration::from_millis(IDLE_TIMEOUT_MS * 2)).await;
+    let poll_report = stop_listener_loop_with_report(stop, handle, report_rx);
+
+    AuthLoopBenchmarkSummary {
+        label,
+        request_count,
+        wall,
+        cpu_micros,
+        poll_report,
+        latencies,
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "manual perf smoke"]
+#[ignore = "manual perf benchmark"]
 async fn auth_allow_path_latency_smoke_does_not_explode_vs_disabled() {
     if !local_listener_bind_available() {
         return;
     }
 
-    let backend_addr = start_h2_backend("benchmark backend").await;
-    let auth_addr = start_http_auth_server(|_req| async move {
-        Ok::<_, Infallible>(
-            Response::builder()
-                .status(http::StatusCode::NO_CONTENT)
-                .body(Full::new(Bytes::new()))
-                .expect("auth allow response"),
-        )
-    })
-    .await;
+    let disabled = run_auth_loop_benchmark("auth_disabled", false, 20).await;
+    let enabled = run_auth_loop_benchmark("auth_enabled", true, 20).await;
 
-    let dir = tempdir().expect("tempdir");
-    let (cert, key) = write_test_certs(&dir);
-
-    let config_without_auth = make_config(0, cert.clone(), key.clone(), backend_addr.to_string());
-    let listener_without_auth = QUICListener::new(config_without_auth).expect("listener");
-    let (addr_without_auth, stop_without_auth, handle_without_auth) =
-        spawn_listener_loop(listener_without_auth);
-    let baseline_start = Instant::now();
-    for _ in 0..10 {
-        let response = run_h3_client_request(addr_without_auth, "GET", "/", &[], None)
-            .expect("baseline response");
-        assert_eq!(response.status, 200);
-    }
-    let baseline_elapsed = baseline_start.elapsed();
-    stop_listener_loop(stop_without_auth, handle_without_auth);
-
-    let mut config_with_auth = make_config(0, cert, key, backend_addr.to_string());
-    configure_http_external_auth(
-        &mut config_with_auth,
-        format!("http://{auth_addr}/check"),
-        250,
-        ExternalAuthFailureMode::FailClosed,
-        vec![],
+    eprintln!(
+        "{}: requests={} wall={:?} avg={:?} p95={:?} cpu_us={} cpu_per_req_us={} polls={} polls_per_req={} teardown=({},{},{})",
+        disabled.label,
+        disabled.request_count,
+        disabled.wall,
+        disabled.avg_latency(),
+        disabled.percentile_latency(95.0),
+        disabled.cpu_micros,
+        disabled.cpu_per_request_micros(),
+        disabled.poll_report.poll_count,
+        disabled.polls_per_request(),
+        disabled.poll_report.remaining_connections,
+        disabled.poll_report.remaining_cid_routes,
+        disabled.poll_report.remaining_peer_routes,
     );
-    let listener_with_auth = QUICListener::new(config_with_auth).expect("listener");
-    let (addr_with_auth, stop_with_auth, handle_with_auth) =
-        spawn_listener_loop(listener_with_auth);
-    let auth_start = Instant::now();
-    for _ in 0..10 {
-        let response =
-            run_h3_client_request(addr_with_auth, "GET", "/", &[], None).expect("auth response");
-        assert_eq!(response.status, 200);
-    }
-    let auth_elapsed = auth_start.elapsed();
-    stop_listener_loop(stop_with_auth, handle_with_auth);
+    eprintln!(
+        "{}: requests={} wall={:?} avg={:?} p95={:?} cpu_us={} cpu_per_req_us={} polls={} polls_per_req={} teardown=({},{},{})",
+        enabled.label,
+        enabled.request_count,
+        enabled.wall,
+        enabled.avg_latency(),
+        enabled.percentile_latency(95.0),
+        enabled.cpu_micros,
+        enabled.cpu_per_request_micros(),
+        enabled.poll_report.poll_count,
+        enabled.polls_per_request(),
+        enabled.poll_report.remaining_connections,
+        enabled.poll_report.remaining_cid_routes,
+        enabled.poll_report.remaining_peer_routes,
+    );
 
+    for summary in [&disabled, &enabled] {
+        assert_eq!(
+            summary.poll_report.remaining_connections, 0,
+            "{} leaked connections",
+            summary.label
+        );
+        assert_eq!(
+            summary.poll_report.remaining_cid_routes, 0,
+            "{} leaked cid routes",
+            summary.label
+        );
+        assert_eq!(
+            summary.poll_report.remaining_peer_routes, 0,
+            "{} leaked peer routes",
+            summary.label
+        );
+        assert!(
+            summary.poll_report.poll_count > 0,
+            "{} made no loop progress",
+            summary.label
+        );
+    }
+
+    let latency_limit = disabled.percentile_latency(95.0) * 12 + Duration::from_millis(75);
     assert!(
-        auth_elapsed <= baseline_elapsed.saturating_mul(10),
-        "auth-enabled path regressed too far: baseline={baseline_elapsed:?} auth={auth_elapsed:?}"
+        enabled.percentile_latency(95.0) <= latency_limit,
+        "auth-enabled p95 latency regressed too far: disabled={:?} enabled={:?} limit={:?}",
+        disabled.percentile_latency(95.0),
+        enabled.percentile_latency(95.0),
+        latency_limit,
+    );
+
+    let cpu_limit = disabled
+        .cpu_per_request_micros()
+        .saturating_mul(25)
+        .max(50_000);
+    assert!(
+        enabled.cpu_per_request_micros() <= cpu_limit,
+        "auth-enabled CPU per request regressed too far: disabled={} enabled={} limit={}",
+        disabled.cpu_per_request_micros(),
+        enabled.cpu_per_request_micros(),
+        cpu_limit,
+    );
+
+    let poll_limit = disabled.polls_per_request().saturating_mul(25).max(400);
+    assert!(
+        enabled.polls_per_request() <= poll_limit,
+        "auth-enabled poll-loop work regressed too far: disabled={} enabled={} limit={}",
+        disabled.polls_per_request(),
+        enabled.polls_per_request(),
+        poll_limit,
     );
 }
