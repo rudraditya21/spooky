@@ -1,17 +1,21 @@
 use std::{
+    convert::Infallible,
+    future::Future,
     net::UdpSocket,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
     thread,
     time::{Duration, Instant},
 };
 
 use bytes::Bytes;
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response, body::Incoming, service::service_fn};
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::TokioIo;
+use quiche::h3::NameValue;
 use rand::RngCore;
 use rcgen::{Certificate, CertificateParams, SanType};
 use tempfile::{TempDir, tempdir};
@@ -20,8 +24,8 @@ use tokio::net::TcpListener;
 mod support;
 
 use spooky_config::config::{
-    Backend, ClientAuth, Config, HealthCheck, Listen, LoadBalancing, Log, LogFormat, Security, Tls,
-    UpstreamTls,
+    Backend, ClientAuth, Config, ExternalAuth, ExternalAuthFailureMode, ExternalAuthRequestHeader,
+    HealthCheck, Listen, LoadBalancing, Log, LogFormat, Security, Tls, UpstreamTls,
 };
 use spooky_edge::QUICListener;
 use spooky_edge::constants::{
@@ -62,6 +66,7 @@ fn make_config(port: u32, cert: String, key: String, backend_address: String) ->
                 lb_type: "random".to_string(),
                 key: None,
             },
+            auth: Default::default(),
             host_policy: Default::default(),
             forwarded_headers: Default::default(),
             tls: None,
@@ -131,9 +136,14 @@ fn quic_read_timeout(conn: &quiche::Connection) -> Duration {
         .unwrap_or(Duration::from_millis(UDP_READ_TIMEOUT_MS))
 }
 
-async fn start_h2_backend(body: &'static str) -> std::net::SocketAddr {
+async fn start_h2_backend_service<F, Fut>(handler: F) -> std::net::SocketAddr
+where
+    F: Fn(Request<Incoming>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<Response<Full<Bytes>>, Infallible>> + Send + 'static,
+{
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let handler = Arc::new(handler);
 
     tokio::spawn(async move {
         loop {
@@ -142,12 +152,14 @@ async fn start_h2_backend(body: &'static str) -> std::net::SocketAddr {
                 Err(_) => break,
             };
             let io = TokioIo::new(stream);
-            let service = service_fn(move |_req: Request<Incoming>| async move {
-                Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from(body))))
+            let handler = Arc::clone(&handler);
+            let service = service_fn(move |req: Request<Incoming>| {
+                let handler = Arc::clone(&handler);
+                async move { handler(req).await }
             });
 
             tokio::spawn(async move {
-                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                let _ = hyper::server::conn::http1::Builder::new()
                     .serve_connection(io, service)
                     .await;
             });
@@ -157,7 +169,142 @@ async fn start_h2_backend(body: &'static str) -> std::net::SocketAddr {
     addr
 }
 
+async fn start_h2_backend(body: &'static str) -> std::net::SocketAddr {
+    start_h2_backend_service(move |_req| async move {
+        Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(body))))
+    })
+    .await
+}
+
+async fn start_http_auth_server<F, Fut>(handler: F) -> std::net::SocketAddr
+where
+    F: Fn(Request<Incoming>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<Response<Full<Bytes>>, Infallible>> + Send + 'static,
+{
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handler = Arc::new(handler);
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let io = TokioIo::new(stream);
+            let handler = Arc::clone(&handler);
+            let service = service_fn(move |req: Request<Incoming>| {
+                let handler = Arc::clone(&handler);
+                async move { handler(req).await }
+            });
+
+            tokio::spawn(async move {
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(io, service)
+                    .await;
+            });
+        }
+    });
+
+    addr
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ListenerLoopReport {
+    poll_count: u64,
+    remaining_connections: usize,
+    remaining_cid_routes: usize,
+    remaining_peer_routes: usize,
+}
+
+fn spawn_listener_loop(
+    mut listener: QUICListener,
+) -> (
+    std::net::SocketAddr,
+    Arc<AtomicBool>,
+    thread::JoinHandle<()>,
+) {
+    let addr = listener.socket.local_addr().expect("local addr");
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_flag = Arc::clone(&stop);
+    let handle = thread::spawn(move || {
+        while !stop_flag.load(Ordering::Relaxed) {
+            listener.poll();
+        }
+    });
+    (addr, stop, handle)
+}
+
+fn stop_listener_loop(stop: Arc<AtomicBool>, handle: thread::JoinHandle<()>) {
+    stop.store(true, Ordering::Relaxed);
+    let _ = handle.join();
+}
+
+fn spawn_listener_loop_with_report(
+    mut listener: QUICListener,
+) -> (
+    std::net::SocketAddr,
+    Arc<AtomicBool>,
+    thread::JoinHandle<()>,
+    mpsc::Receiver<ListenerLoopReport>,
+) {
+    let addr = listener.socket.local_addr().expect("local addr");
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_flag = Arc::clone(&stop);
+    let (report_tx, report_rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let mut poll_count = 0u64;
+        while !stop_flag.load(Ordering::Relaxed) {
+            listener.poll();
+            poll_count = poll_count.saturating_add(1);
+        }
+        let _ = report_tx.send(ListenerLoopReport {
+            poll_count,
+            remaining_connections: listener.connections().len(),
+            remaining_cid_routes: listener.cid_routes().len(),
+            remaining_peer_routes: listener.peer_routes().len(),
+        });
+    });
+    (addr, stop, handle, report_rx)
+}
+
+fn stop_listener_loop_with_report(
+    stop: Arc<AtomicBool>,
+    handle: thread::JoinHandle<()>,
+    report_rx: mpsc::Receiver<ListenerLoopReport>,
+) -> ListenerLoopReport {
+    stop.store(true, Ordering::Relaxed);
+    let _ = handle.join();
+    report_rx.recv().expect("listener loop report")
+}
+
+#[derive(Debug)]
+struct H3Response {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: String,
+}
+
+impl H3Response {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
+
 fn run_h3_client(addr: std::net::SocketAddr) -> Result<String, String> {
+    run_h3_client_request(addr, "GET", "/", &[], None).map(|response| response.body)
+}
+
+fn run_h3_client_request(
+    addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Option<&[u8]>,
+) -> Result<H3Response, String> {
     let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
     let local_addr = socket.local_addr().map_err(|e| e.to_string())?;
 
@@ -198,6 +345,8 @@ fn run_h3_client(addr: std::net::SocketAddr) -> Result<String, String> {
 
     let start = Instant::now();
     let mut req_sent = false;
+    let mut response_status = 0u16;
+    let mut response_headers = Vec::new();
     let mut response_body = Vec::new();
 
     loop {
@@ -243,20 +392,43 @@ fn run_h3_client(addr: std::net::SocketAddr) -> Result<String, String> {
 
         if let Some(h3) = h3_conn.as_mut() {
             if conn.is_established() && !req_sent {
-                let req = vec![
-                    quiche::h3::Header::new(b":method", b"GET"),
+                let mut req = vec![
+                    quiche::h3::Header::new(b":method", method.as_bytes()),
                     quiche::h3::Header::new(b":scheme", b"https"),
                     quiche::h3::Header::new(b":authority", b"localhost"),
-                    quiche::h3::Header::new(b":path", b"/"),
+                    quiche::h3::Header::new(b":path", path.as_bytes()),
                     quiche::h3::Header::new(b"user-agent", b"spooky-test"),
                 ];
-                h3.send_request(&mut conn, &req, true)
+                req.extend(headers.iter().map(|(name, value)| {
+                    quiche::h3::Header::new(name.as_bytes(), value.as_bytes())
+                }));
+                let body = body.unwrap_or_default();
+                let stream_id = h3
+                    .send_request(&mut conn, &req, body.is_empty())
                     .map_err(|e| format!("send_request: {e:?}"))?;
+                if !body.is_empty() {
+                    h3.send_body(&mut conn, stream_id, body, true)
+                        .map_err(|e| format!("send_body: {e:?}"))?;
+                }
                 req_sent = true;
             }
 
             loop {
                 match h3.poll(&mut conn) {
+                    Ok((_stream_id, quiche::h3::Event::Headers { list, .. })) => {
+                        for header in &list {
+                            if header.name() == b":status" {
+                                response_status = String::from_utf8_lossy(header.value())
+                                    .parse::<u16>()
+                                    .map_err(|e| format!("status parse: {e}"))?;
+                            } else {
+                                response_headers.push((
+                                    String::from_utf8_lossy(header.name()).to_string(),
+                                    String::from_utf8_lossy(header.value()).to_string(),
+                                ));
+                            }
+                        }
+                    }
                     Ok((stream_id, quiche::h3::Event::Data)) => loop {
                         match h3.recv_body(&mut conn, stream_id, &mut buf) {
                             Ok(read) => response_body.extend_from_slice(&buf[..read]),
@@ -264,10 +436,13 @@ fn run_h3_client(addr: std::net::SocketAddr) -> Result<String, String> {
                             Err(e) => return Err(format!("recv_body: {e:?}")),
                         }
                     },
-                    Ok((_stream_id, quiche::h3::Event::Headers { .. })) => {}
                     Ok((_stream_id, quiche::h3::Event::Finished)) => {
                         let body = String::from_utf8_lossy(&response_body).to_string();
-                        return Ok(body);
+                        return Ok(H3Response {
+                            status: response_status,
+                            headers: response_headers,
+                            body,
+                        });
                     }
                     Ok((_stream_id, quiche::h3::Event::Reset(_))) => {
                         return Err("stream reset".to_string());
@@ -573,6 +748,7 @@ fn make_config_with_rate_limit(
                 lb_type: "random".to_string(),
                 key: None,
             },
+            auth: Default::default(),
             host_policy: Default::default(),
             forwarded_headers: Default::default(),
             tls: None,
@@ -667,6 +843,9 @@ fn build_initial_packet(dest_addr: std::net::SocketAddr) -> Vec<u8> {
 
 #[path = "h3_edge/admission.rs"]
 mod admission;
+
+#[path = "h3_edge/external_auth.rs"]
+mod external_auth;
 
 // ---------------------------------------------------------------------------
 // Connection-lifecycle churn stress test (task 4.3)

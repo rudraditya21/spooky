@@ -2,6 +2,183 @@ use super::*;
 
 type RouteMatcherKey = (Option<String>, Option<String>, Option<String>);
 
+fn runtime_external_auth_request_headers(
+    headers: &[crate::config::ExternalAuthRequestHeader],
+) -> Vec<RuntimeExternalAuthRequestHeader> {
+    headers
+        .iter()
+        .map(|header| RuntimeExternalAuthRequestHeader {
+            name: header.name.clone(),
+            value: header.value.clone(),
+        })
+        .collect()
+}
+
+fn runtime_external_auth_failure_mode(
+    mode: crate::config::ExternalAuthFailureMode,
+) -> RuntimeExternalAuthFailureMode {
+    match mode {
+        crate::config::ExternalAuthFailureMode::FailOpen => {
+            RuntimeExternalAuthFailureMode::FailOpen
+        }
+        crate::config::ExternalAuthFailureMode::FailClosed => {
+            RuntimeExternalAuthFailureMode::FailClosed
+        }
+    }
+}
+
+fn config_external_auth_failure_mode(
+    mode: RuntimeExternalAuthFailureMode,
+) -> crate::config::ExternalAuthFailureMode {
+    match mode {
+        RuntimeExternalAuthFailureMode::FailOpen => {
+            crate::config::ExternalAuthFailureMode::FailOpen
+        }
+        RuntimeExternalAuthFailureMode::FailClosed => {
+            crate::config::ExternalAuthFailureMode::FailClosed
+        }
+    }
+}
+
+fn runtime_auth_policy(auth: &crate::config::RouteAuth) -> RuntimeAuthPolicy {
+    let api_key = auth.api_key.as_ref().map(|api_key| RuntimeApiKeyAuth {
+        header_name: api_key.header_name.clone(),
+        keys: api_key.keys.clone(),
+    });
+    let jwt = auth.jwt.as_ref().map(|jwt| RuntimeJwtAuth {
+        secret: jwt.secret.clone(),
+        issuer: jwt.issuer.clone(),
+        audience: jwt.audience.clone(),
+        clock_skew_secs: jwt.clock_skew_secs,
+    });
+    let external_auth = auth
+        .external_auth
+        .as_ref()
+        .map(|external_auth| match external_auth {
+            crate::config::ExternalAuth::Http {
+                endpoint,
+                request_headers,
+                response_header_allowlist,
+                timeout_ms,
+                failure_mode,
+            } => RuntimeExternalAuth::Http {
+                endpoint: endpoint.clone(),
+                request_headers: runtime_external_auth_request_headers(request_headers),
+                response_header_allowlist: response_header_allowlist.clone(),
+                timeout_ms: *timeout_ms,
+                failure_mode: runtime_external_auth_failure_mode(*failure_mode),
+            },
+            crate::config::ExternalAuth::Oidc {
+                discovery_url,
+                issuer_url,
+                client_id,
+                client_secret,
+                audience,
+                scopes,
+                request_headers,
+                response_header_allowlist,
+                timeout_ms,
+                failure_mode,
+            } => RuntimeExternalAuth::Oidc {
+                discovery_url: discovery_url.clone(),
+                issuer_url: issuer_url.clone(),
+                client_id: client_id.clone(),
+                client_secret: client_secret.clone(),
+                audience: audience.clone(),
+                scopes: scopes.clone(),
+                request_headers: runtime_external_auth_request_headers(request_headers),
+                response_header_allowlist: response_header_allowlist.clone(),
+                timeout_ms: *timeout_ms,
+                failure_mode: runtime_external_auth_failure_mode(*failure_mode),
+            },
+        });
+
+    RuntimeAuthPolicy {
+        api_key,
+        jwt,
+        external_auth,
+        required_scopes: auth.required_scopes.clone(),
+        required_roles: auth.required_roles.clone(),
+    }
+}
+
+fn config_external_auth_request_headers(
+    headers: &[RuntimeExternalAuthRequestHeader],
+) -> Vec<crate::config::ExternalAuthRequestHeader> {
+    headers
+        .iter()
+        .map(|header| crate::config::ExternalAuthRequestHeader {
+            name: header.name.clone(),
+            value: header.value.clone(),
+        })
+        .collect()
+}
+
+fn config_route_auth(auth: &RuntimeAuthPolicy) -> crate::config::RouteAuth {
+    let api_key = auth
+        .api_key
+        .as_ref()
+        .map(|api_key| crate::config::ApiKeyAuth {
+            header_name: api_key.header_name.clone(),
+            keys: api_key.keys.clone(),
+        });
+    let jwt = auth.jwt.as_ref().map(|jwt| crate::config::JwtAuth {
+        secret: jwt.secret.clone(),
+        issuer: jwt.issuer.clone(),
+        audience: jwt.audience.clone(),
+        clock_skew_secs: jwt.clock_skew_secs,
+    });
+    let external_auth = auth
+        .external_auth
+        .as_ref()
+        .map(|external_auth| match external_auth {
+            RuntimeExternalAuth::Http {
+                endpoint,
+                request_headers,
+                response_header_allowlist,
+                timeout_ms,
+                failure_mode,
+            } => crate::config::ExternalAuth::Http {
+                endpoint: endpoint.clone(),
+                request_headers: config_external_auth_request_headers(request_headers),
+                response_header_allowlist: response_header_allowlist.clone(),
+                timeout_ms: *timeout_ms,
+                failure_mode: config_external_auth_failure_mode(*failure_mode),
+            },
+            RuntimeExternalAuth::Oidc {
+                discovery_url,
+                issuer_url,
+                client_id,
+                client_secret,
+                audience,
+                scopes,
+                request_headers,
+                response_header_allowlist,
+                timeout_ms,
+                failure_mode,
+            } => crate::config::ExternalAuth::Oidc {
+                discovery_url: discovery_url.clone(),
+                issuer_url: issuer_url.clone(),
+                client_id: client_id.clone(),
+                client_secret: client_secret.clone(),
+                audience: audience.clone(),
+                scopes: scopes.clone(),
+                request_headers: config_external_auth_request_headers(request_headers),
+                response_header_allowlist: response_header_allowlist.clone(),
+                timeout_ms: *timeout_ms,
+                failure_mode: config_external_auth_failure_mode(*failure_mode),
+            },
+        });
+
+    crate::config::RouteAuth {
+        api_key,
+        jwt,
+        external_auth,
+        required_scopes: auth.required_scopes.clone(),
+        required_roles: auth.required_roles.clone(),
+    }
+}
+
 impl RuntimeUpstream {
     pub(super) fn from_config(config: &Config, name: &str, upstream: &Upstream) -> Self {
         let effective_tls = upstream
@@ -14,6 +191,7 @@ impl RuntimeUpstream {
             load_balancing: upstream.load_balancing.clone(),
             route: upstream.route.clone(),
             policy: RuntimeUpstreamPolicy {
+                upstream_auth: runtime_auth_policy(&upstream.auth),
                 host: RuntimeHostPolicy(upstream.host_policy.clone()),
                 forwarded_headers: RuntimeForwardedHeaderPolicy(upstream.forwarded_headers.clone()),
                 protocol: RuntimeProtocolPolicy(config.resilience.protocol.clone()),
@@ -34,6 +212,7 @@ impl RuntimeUpstream {
     pub fn as_config_upstream(&self) -> Upstream {
         Upstream {
             load_balancing: self.load_balancing.clone(),
+            auth: config_route_auth(&self.policy.upstream_auth),
             host_policy: self.policy.host.0.clone(),
             forwarded_headers: self.policy.forwarded_headers.0.clone(),
             tls: Some(self.effective_tls.clone()),
@@ -200,6 +379,60 @@ fn validate_protocol_policy(policy: &ProtocolPolicy) -> Result<(), RuntimeConfig
     Ok(())
 }
 
+fn validate_runtime_external_auth_headers(
+    upstream_name: &str,
+    field_prefix: &str,
+    request_headers: &[crate::config::ExternalAuthRequestHeader],
+    response_header_allowlist: &[String],
+) -> Result<(), RuntimeConfigError> {
+    let mut seen_request_headers = std::collections::HashSet::new();
+    for header in request_headers {
+        let header_name = header.name.trim();
+        if header_name.is_empty() {
+            return Err(RuntimeConfigError::ConfigInvalid(format!(
+                "upstream '{upstream_name}' {field_prefix}.request_headers[].name must be non-empty"
+            )));
+        }
+        if http::header::HeaderName::from_bytes(header_name.as_bytes()).is_err() {
+            return Err(RuntimeConfigError::ConfigInvalid(format!(
+                "upstream '{upstream_name}' {field_prefix}.request_headers[].name must be a valid HTTP header name"
+            )));
+        }
+        if http::HeaderValue::from_str(header.value.as_str()).is_err() {
+            return Err(RuntimeConfigError::ConfigInvalid(format!(
+                "upstream '{upstream_name}' {field_prefix}.request_headers[].value must be a valid HTTP header value"
+            )));
+        }
+        if !seen_request_headers.insert(header_name.to_ascii_lowercase()) {
+            return Err(RuntimeConfigError::ConfigInvalid(format!(
+                "upstream '{upstream_name}' {field_prefix}.request_headers contains duplicate header names"
+            )));
+        }
+    }
+
+    let mut seen_allowed_headers = std::collections::HashSet::new();
+    for header_name in response_header_allowlist {
+        let header_name = header_name.trim();
+        if header_name.is_empty() {
+            return Err(RuntimeConfigError::ConfigInvalid(format!(
+                "upstream '{upstream_name}' {field_prefix}.response_header_allowlist[] must be non-empty"
+            )));
+        }
+        if http::header::HeaderName::from_bytes(header_name.as_bytes()).is_err() {
+            return Err(RuntimeConfigError::ConfigInvalid(format!(
+                "upstream '{upstream_name}' {field_prefix}.response_header_allowlist[] must be a valid HTTP header name"
+            )));
+        }
+        if !seen_allowed_headers.insert(header_name.to_ascii_lowercase()) {
+            return Err(RuntimeConfigError::ConfigInvalid(format!(
+                "upstream '{upstream_name}' {field_prefix}.response_header_allowlist contains duplicate header names"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 fn validate_upstream_policy(
     config: &Config,
     upstream_name: &str,
@@ -237,6 +470,225 @@ fn validate_upstream_policy(
     {
         return Err(RuntimeConfigError::UnsupportedPolicyCombination(format!(
             "upstream '{upstream_name}' routes CONNECT but resilience.protocol.allow_connect=false"
+        )));
+    }
+
+    if let Some(api_key) = upstream.auth.api_key.as_ref() {
+        if api_key.header_name.trim().is_empty() {
+            return Err(RuntimeConfigError::ConfigInvalid(format!(
+                "upstream '{upstream_name}' auth.api_key.header_name must be non-empty"
+            )));
+        }
+        if http::header::HeaderName::from_bytes(api_key.header_name.trim().as_bytes()).is_err() {
+            return Err(RuntimeConfigError::ConfigInvalid(format!(
+                "upstream '{upstream_name}' auth.api_key.header_name must be a valid HTTP header name"
+            )));
+        }
+        if api_key.keys.is_empty() || api_key.keys.iter().any(|value| value.trim().is_empty()) {
+            return Err(RuntimeConfigError::ConfigInvalid(format!(
+                "upstream '{upstream_name}' auth.api_key.keys must contain at least one non-empty key"
+            )));
+        }
+        let mut seen_api_keys = std::collections::HashSet::new();
+        for key in &api_key.keys {
+            if !seen_api_keys.insert(key.trim().to_string()) {
+                return Err(RuntimeConfigError::ConfigInvalid(format!(
+                    "upstream '{upstream_name}' auth.api_key.keys contains duplicate values"
+                )));
+            }
+        }
+    }
+
+    if let Some(external_auth) = upstream.auth.external_auth.as_ref() {
+        if upstream.auth.api_key.is_some() || upstream.auth.jwt.is_some() {
+            return Err(RuntimeConfigError::UnsupportedPolicyCombination(format!(
+                "upstream '{upstream_name}' auth.external_auth cannot be combined with auth.api_key or auth.jwt in v1"
+            )));
+        }
+        if !upstream.auth.required_scopes.is_empty() || !upstream.auth.required_roles.is_empty() {
+            return Err(RuntimeConfigError::UnsupportedPolicyCombination(format!(
+                "upstream '{upstream_name}' auth.external_auth cannot be combined with auth.required_scopes or auth.required_roles in v1"
+            )));
+        }
+
+        match external_auth {
+            crate::config::ExternalAuth::Http {
+                endpoint,
+                request_headers,
+                response_header_allowlist,
+                timeout_ms,
+                ..
+            } => {
+                let valid_endpoint = endpoint
+                    .trim()
+                    .parse::<http::Uri>()
+                    .ok()
+                    .is_some_and(|uri| {
+                        matches!(uri.scheme_str(), Some("http") | Some("https"))
+                            && uri.authority().is_some()
+                    });
+                if !valid_endpoint {
+                    return Err(RuntimeConfigError::ConfigInvalid(format!(
+                        "upstream '{upstream_name}' auth.external_auth.http.endpoint must be an absolute http(s) URL"
+                    )));
+                }
+                validate_runtime_external_auth_headers(
+                    upstream_name,
+                    "auth.external_auth.http",
+                    request_headers,
+                    response_header_allowlist,
+                )?;
+                if *timeout_ms == 0 {
+                    return Err(RuntimeConfigError::ConfigInvalid(format!(
+                        "upstream '{upstream_name}' auth.external_auth.http.timeout_ms must be greater than 0"
+                    )));
+                }
+            }
+            crate::config::ExternalAuth::Oidc {
+                discovery_url,
+                issuer_url,
+                client_id,
+                client_secret,
+                audience,
+                scopes,
+                request_headers,
+                response_header_allowlist,
+                timeout_ms,
+                ..
+            } => {
+                let has_discovery_url = discovery_url
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty());
+                let has_issuer_url = issuer_url
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty());
+                if !has_discovery_url && !has_issuer_url {
+                    return Err(RuntimeConfigError::ConfigInvalid(format!(
+                        "upstream '{upstream_name}' auth.external_auth.oidc requires discovery_url or issuer_url"
+                    )));
+                }
+                if let Some(discovery_url) = discovery_url.as_deref() {
+                    let valid_discovery_url = discovery_url
+                        .trim()
+                        .parse::<http::Uri>()
+                        .ok()
+                        .is_some_and(|uri| {
+                            matches!(uri.scheme_str(), Some("http") | Some("https"))
+                                && uri.authority().is_some()
+                        });
+                    if !discovery_url.trim().is_empty() && !valid_discovery_url {
+                        return Err(RuntimeConfigError::ConfigInvalid(format!(
+                            "upstream '{upstream_name}' auth.external_auth.oidc.discovery_url must be an absolute http(s) URL"
+                        )));
+                    }
+                }
+                if let Some(issuer_url) = issuer_url.as_deref() {
+                    let valid_issuer_url =
+                        issuer_url
+                            .trim()
+                            .parse::<http::Uri>()
+                            .ok()
+                            .is_some_and(|uri| {
+                                matches!(uri.scheme_str(), Some("http") | Some("https"))
+                                    && uri.authority().is_some()
+                            });
+                    if !issuer_url.trim().is_empty() && !valid_issuer_url {
+                        return Err(RuntimeConfigError::ConfigInvalid(format!(
+                            "upstream '{upstream_name}' auth.external_auth.oidc.issuer_url must be an absolute http(s) URL"
+                        )));
+                    }
+                }
+                if client_id.trim().is_empty() {
+                    return Err(RuntimeConfigError::ConfigInvalid(format!(
+                        "upstream '{upstream_name}' auth.external_auth.oidc.client_id must be non-empty"
+                    )));
+                }
+                if client_secret
+                    .as_deref()
+                    .is_some_and(|value| value.trim().is_empty())
+                {
+                    return Err(RuntimeConfigError::ConfigInvalid(format!(
+                        "upstream '{upstream_name}' auth.external_auth.oidc.client_secret must be non-empty when provided"
+                    )));
+                }
+                if audience
+                    .as_deref()
+                    .is_some_and(|value| value.trim().is_empty())
+                {
+                    return Err(RuntimeConfigError::ConfigInvalid(format!(
+                        "upstream '{upstream_name}' auth.external_auth.oidc.audience must be non-empty when provided"
+                    )));
+                }
+                if scopes.iter().any(|scope| scope.trim().is_empty()) {
+                    return Err(RuntimeConfigError::ConfigInvalid(format!(
+                        "upstream '{upstream_name}' auth.external_auth.oidc.scopes must not contain empty values"
+                    )));
+                }
+                validate_runtime_external_auth_headers(
+                    upstream_name,
+                    "auth.external_auth.oidc",
+                    request_headers,
+                    response_header_allowlist,
+                )?;
+                if *timeout_ms == 0 {
+                    return Err(RuntimeConfigError::ConfigInvalid(format!(
+                        "upstream '{upstream_name}' auth.external_auth.oidc.timeout_ms must be greater than 0"
+                    )));
+                }
+            }
+        }
+    }
+
+    if let Some(jwt) = upstream.auth.jwt.as_ref() {
+        if jwt.secret.trim().is_empty() {
+            return Err(RuntimeConfigError::ConfigInvalid(format!(
+                "upstream '{upstream_name}' auth.jwt.secret must be non-empty"
+            )));
+        }
+        if jwt
+            .issuer
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(RuntimeConfigError::ConfigInvalid(format!(
+                "upstream '{upstream_name}' auth.jwt.issuer must be non-empty when provided"
+            )));
+        }
+        if jwt
+            .audience
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(RuntimeConfigError::ConfigInvalid(format!(
+                "upstream '{upstream_name}' auth.jwt.audience must be non-empty when provided"
+            )));
+        }
+    }
+    if upstream
+        .auth
+        .required_scopes
+        .iter()
+        .any(|value| value.trim().is_empty())
+    {
+        return Err(RuntimeConfigError::ConfigInvalid(format!(
+            "upstream '{upstream_name}' auth.required_scopes must not contain empty values"
+        )));
+    }
+    if upstream
+        .auth
+        .required_roles
+        .iter()
+        .any(|value| value.trim().is_empty())
+    {
+        return Err(RuntimeConfigError::ConfigInvalid(format!(
+            "upstream '{upstream_name}' auth.required_roles must not contain empty values"
+        )));
+    }
+    if (!upstream.auth.required_scopes.is_empty() || !upstream.auth.required_roles.is_empty())
+        && upstream.auth.jwt.is_none()
+    {
+        return Err(RuntimeConfigError::ConfigInvalid(format!(
+            "upstream '{upstream_name}' auth.required_scopes/auth.required_roles require auth.jwt"
         )));
     }
 

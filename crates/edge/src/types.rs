@@ -4,7 +4,7 @@ use log::warn;
 use rustls::ServerConfig as RustlsServerConfig;
 use spooky_config::{
     backend_endpoint::BackendEndpoint,
-    config::Log,
+    config::{ForwardedHeaderPolicy, Log, UpstreamHostPolicy},
     runtime::{
         ListenerRuntimeConfig, RuntimeConfig, RuntimeListenerTls, RuntimeTlsIdentity,
         RuntimeUpstreamPolicy,
@@ -740,6 +740,40 @@ pub struct UpstreamResult {
     pub retry_denial_reason: Option<RetryReason>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternalAuthDecision {
+    Allow {
+        request_header_mutations: Vec<PendingHeaderMutation>,
+    },
+    Deny(ExternalAuthDenyResponse),
+    Redirect(ExternalAuthRedirectResponse),
+    Challenge(ExternalAuthChallengeResponse),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalAuthDenyResponse {
+    pub status: http::StatusCode,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalAuthRedirectResponse {
+    pub status: http::StatusCode,
+    pub headers: Vec<(String, String)>,
+    pub location: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalAuthChallengeResponse {
+    pub status: http::StatusCode,
+    pub headers: Vec<(String, String)>,
+    pub www_authenticate: String,
+    pub body: Vec<u8>,
+}
+
+pub type ExternalAuthResult = Result<ExternalAuthDecision, ProxyError>;
+
 /// Lifecycle phase of a single HTTP/3 request stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamPhase {
@@ -753,6 +787,46 @@ pub enum StreamPhase {
     Completed,
     /// Stream terminated with an error.
     Failed,
+}
+
+/// Admission/auth state for a single request stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamAdmissionState {
+    /// Request admission is still pending an external auth/authz decision.
+    WaitingForAuth,
+    /// Request cleared admission checks and may proceed to upstream forwarding.
+    ReadyToForward,
+    /// Request was denied by admission/auth checks and should not be forwarded.
+    Denied,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingHeaderMutation {
+    Upsert { name: Vec<u8>, value: Vec<u8> },
+    Remove { name: Vec<u8> },
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingForward {
+    pub method: Arc<str>,
+    pub path: Arc<str>,
+    pub authority: Option<Arc<str>>,
+    pub headers: Arc<Vec<quiche::h3::Header>>,
+    pub upstream_name: Arc<str>,
+    pub route_reason: Arc<str>,
+    pub route_path_len: usize,
+    pub route_host_specific: bool,
+    pub backend_addr: Arc<str>,
+    pub backend_index: usize,
+    pub backend_lb: Option<Arc<str>>,
+    pub client_addr: SocketAddr,
+    pub request_id: u64,
+    pub trace_id: Option<Arc<str>>,
+    pub span_id: Option<Arc<str>>,
+    pub traceparent: Option<Arc<str>>,
+    pub host_policy: UpstreamHostPolicy,
+    pub forwarded_header_policy: ForwardedHeaderPolicy,
+    pub auth_header_mutations: Vec<PendingHeaderMutation>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -811,6 +885,7 @@ pub struct RequestEnvelope {
     pub routing_transparency_enabled: bool,
     pub routing_transparency_include_reason: bool,
     pub response_status: Option<u16>,
+    pub backend_request_started: bool,
     pub backend_request_finished: bool,
     pub global_inflight_permit: Option<OwnedSemaphorePermit>,
     pub upstream_inflight_permit: Option<OwnedSemaphorePermit>,
@@ -823,9 +898,21 @@ pub struct RequestEnvelope {
 
     pub retry_count: u8,
     pub error_kind: Option<&'static str>,
+    /// Deferred request-building snapshot for async auth/admission handoff.
+    pub pending_forward: Option<Arc<PendingForward>>,
+    /// Receives the external auth decision once async auth completes.
+    pub auth_result_rx: Option<oneshot::Receiver<ExternalAuthResult>>,
+    /// Aborts the detached external auth task when the stream is cancelled.
+    pub auth_abort: Option<AbortHandle>,
+    /// Whether auth transport errors and timeouts should allow the request.
+    pub auth_fail_open: bool,
+    /// Deadline for the external auth decision, when auth is running asynchronously.
+    pub auth_deadline: Option<Instant>,
 
     /// Current lifecycle phase of this stream.
     pub phase: StreamPhase,
+    /// Current auth/admission state of this stream.
+    pub admission_state: StreamAdmissionState,
     /// True once the client has sent FIN on the request stream.
     pub request_fin_received: bool,
     /// Receives the upstream H2 response (status, headers, body stream).

@@ -1,31 +1,59 @@
 use super::*;
-use spooky_config::config::{ForwardedHeaderPolicy, UpstreamHostPolicy};
+use crate::types::{
+    ExternalAuthChallengeResponse, ExternalAuthDecision, ExternalAuthDenyResponse,
+    ExternalAuthRedirectResponse, ExternalAuthResult,
+};
+use crate::{PendingForward, PendingHeaderMutation, StreamAdmissionState};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use hmac::{Hmac, Mac};
+use hyper_rustls::HttpsConnectorBuilder;
+use hyper_util::client::legacy::{Client, connect::HttpConnector};
+use serde_json::Value;
+use sha2::Sha256;
+use spooky_config::config::ScopedRateLimitScope;
+use spooky_config::runtime::{RuntimeExternalAuth, RuntimeExternalAuthFailureMode};
+use std::convert::Infallible;
 use std::error::Error as StdError;
+use std::time::{SystemTime, UNIX_EPOCH};
+use subtle::ConstantTimeEq;
+use tokio::task::AbortHandle;
+use tracing::Span;
 
-#[derive(Clone)]
-pub(super) struct ForwardRequestMeta {
-    pub(super) method: Arc<str>,
-    pub(super) path: Arc<str>,
-    pub(super) authority: Option<Arc<str>>,
-    pub(super) headers: Arc<Vec<quiche::h3::Header>>,
-    pub(super) client_addr: SocketAddr,
-    pub(super) request_id: u64,
-    pub(super) traceparent: Option<Arc<str>>,
-    pub(super) host_policy: UpstreamHostPolicy,
-    pub(super) forwarded_header_policy: ForwardedHeaderPolicy,
-}
+const MAX_AUTH_BODY_BYTES: usize = 64 * 1024;
 
-impl ForwardRequestMeta {
-    pub(super) fn build_bodyless_request(
-        &self,
-        endpoint: &BackendEndpoint,
-    ) -> Result<Request<BoxBody<Bytes, std::convert::Infallible>>, ProxyError> {
-        let ctx = ForwardedContext {
+impl PendingForward {
+    fn request_headers(&self) -> Vec<quiche::h3::Header> {
+        let mut headers = self.headers.as_ref().clone();
+        for mutation in &self.auth_header_mutations {
+            match mutation {
+                PendingHeaderMutation::Upsert { name, value } => {
+                    headers.retain(|header| !header.name().eq_ignore_ascii_case(name.as_slice()));
+                    headers.push(quiche::h3::Header::new(name.as_slice(), value.as_slice()));
+                }
+                PendingHeaderMutation::Remove { name } => {
+                    headers.retain(|header| !header.name().eq_ignore_ascii_case(name.as_slice()));
+                }
+            }
+        }
+        headers
+    }
+
+    fn forwarded_context(&self) -> ForwardedContext<'_> {
+        ForwardedContext {
             client_addr: self.client_addr,
             request_authority: self.authority.as_deref(),
             request_id: self.request_id,
             traceparent: self.traceparent.as_deref(),
-        };
+        }
+    }
+
+    fn build_request(
+        &self,
+        endpoint: &BackendEndpoint,
+        body: BoxBody<Bytes, std::convert::Infallible>,
+        content_length: Option<usize>,
+    ) -> Result<Request<BoxBody<Bytes, std::convert::Infallible>>, ProxyError> {
+        let headers = self.request_headers();
         if endpoint.scheme() == BackendScheme::Http {
             build_h1_request_for_endpoint_with_host_policy(
                 endpoint,
@@ -33,10 +61,10 @@ impl ForwardRequestMeta {
                 &self.forwarded_header_policy,
                 &self.method,
                 &self.path,
-                self.headers.as_slice(),
-                BoxBody::new(Full::new(Bytes::new())),
-                Some(0),
-                ctx,
+                &headers,
+                body,
+                content_length,
+                self.forwarded_context(),
             )
             .map_err(ProxyError::from)
         } else {
@@ -46,19 +74,725 @@ impl ForwardRequestMeta {
                 &self.forwarded_header_policy,
                 &self.method,
                 &self.path,
-                self.headers.as_slice(),
-                BoxBody::new(Full::new(Bytes::new())),
-                Some(0),
-                ctx,
+                &headers,
+                body,
+                content_length,
+                self.forwarded_context(),
             )
             .map_err(ProxyError::from)
         }
     }
+
+    pub(super) fn build_bodyless_request(
+        &self,
+        endpoint: &BackendEndpoint,
+    ) -> Result<Request<BoxBody<Bytes, std::convert::Infallible>>, ProxyError> {
+        self.build_request(endpoint, BoxBody::new(Full::new(Bytes::new())), Some(0))
+    }
+
+    fn build_http1_websocket_tunnel_request(
+        &self,
+        endpoint: &BackendEndpoint,
+    ) -> Result<Request<BoxBody<Bytes, std::convert::Infallible>>, ProxyError> {
+        let mut request_headers = self.request_headers();
+        let has_upgrade = request_headers
+            .iter()
+            .any(|header| header.name().eq_ignore_ascii_case(b"upgrade"));
+        if !has_upgrade {
+            request_headers.push(quiche::h3::Header::new(b"upgrade", b"websocket"));
+        }
+        let has_connection = request_headers
+            .iter()
+            .any(|header| header.name().eq_ignore_ascii_case(b"connection"));
+        if !has_connection {
+            request_headers.push(quiche::h3::Header::new(b"connection", b"upgrade"));
+        }
+
+        build_h1_request_for_endpoint_with_host_policy(
+            endpoint,
+            &self.host_policy,
+            &self.forwarded_header_policy,
+            "GET",
+            &self.path,
+            &request_headers,
+            BoxBody::new(Full::new(Bytes::new())),
+            None,
+            self.forwarded_context(),
+        )
+        .map_err(ProxyError::from)
+    }
+}
+
+struct AuthHttpClient {
+    client: Client<hyper_rustls::HttpsConnector<HttpConnector>, BoxBody<Bytes, Infallible>>,
+}
+
+static AUTH_HTTP_CLIENT: OnceLock<AuthHttpClient> = OnceLock::new();
+
+impl AuthHttpClient {
+    fn shared() -> &'static Self {
+        AUTH_HTTP_CLIENT.get_or_init(|| {
+            let https = HttpsConnectorBuilder::new()
+                .with_webpki_roots()
+                .https_or_http()
+                .enable_http1()
+                .enable_http2()
+                .build();
+            let client = Client::builder(hyper_util::rt::TokioExecutor::new())
+                .pool_max_idle_per_host(32)
+                .pool_idle_timeout(Duration::from_secs(30))
+                .build(https);
+            Self { client }
+        })
+    }
+
+    async fn send(
+        &self,
+        request: Request<BoxBody<Bytes, Infallible>>,
+    ) -> Result<Response<Incoming>, ProxyError> {
+        self.client
+            .request(request)
+            .await
+            .map_err(|err| ProxyError::Transport(err.to_string()))
+    }
+}
+
+struct AuthStart {
+    rx: oneshot::Receiver<ExternalAuthResult>,
+    abort: AbortHandle,
+    deadline: Instant,
+    fail_open: bool,
+}
+
+struct PreparedRequest {
+    upstream_name: String,
+    backend_addr: String,
+    backend_index: usize,
+    upstream_pool: Arc<RwLock<UpstreamPool>>,
+    backend_lb: String,
+    route_path_len: usize,
+    route_host_specific: bool,
+    route_reason: String,
+    request_id: u64,
+    trace_id: Option<String>,
+    span_id: Option<String>,
+    traceparent: Option<String>,
+    trace_span: Option<Span>,
+    bodyless_mode: bool,
+    request_fin_received: bool,
+    pending_forward: Arc<PendingForward>,
+    auth_fail_open: bool,
+}
+
+struct PreAuthRequest {
+    request: PreparedRequest,
+    external_auth: Option<RuntimeExternalAuth>,
+}
+
+struct StartedAuthRequest {
+    request: PreparedRequest,
+    auth_start: Option<AuthStart>,
+    auth_requested: bool,
+}
+
+fn auth_failure_mode(external_auth: &RuntimeExternalAuth) -> RuntimeExternalAuthFailureMode {
+    match external_auth {
+        RuntimeExternalAuth::Http { failure_mode, .. }
+        | RuntimeExternalAuth::Oidc { failure_mode, .. } => *failure_mode,
+    }
+}
+
+fn auth_timeout_ms(external_auth: &RuntimeExternalAuth) -> u64 {
+    match external_auth {
+        RuntimeExternalAuth::Http { timeout_ms, .. }
+        | RuntimeExternalAuth::Oidc { timeout_ms, .. } => *timeout_ms,
+    }
+}
+
+fn fail_open(mode: RuntimeExternalAuthFailureMode) -> bool {
+    matches!(mode, RuntimeExternalAuthFailureMode::FailOpen)
+}
+
+fn is_unsafe_forwarded_auth_request_header(name: &[u8]) -> bool {
+    name.eq_ignore_ascii_case(http::header::HOST.as_str().as_bytes())
+        || name.eq_ignore_ascii_case(http::header::CONNECTION.as_str().as_bytes())
+        || name.eq_ignore_ascii_case(http::header::CONTENT_LENGTH.as_str().as_bytes())
+        || name.eq_ignore_ascii_case(http::header::TRANSFER_ENCODING.as_str().as_bytes())
+        || name.eq_ignore_ascii_case(http::header::UPGRADE.as_str().as_bytes())
+        || name.eq_ignore_ascii_case(http::header::TE.as_str().as_bytes())
+        || name.eq_ignore_ascii_case(http::header::TRAILER.as_str().as_bytes())
+        || name.eq_ignore_ascii_case(http::header::EXPECT.as_str().as_bytes())
+        || name.eq_ignore_ascii_case(b"keep-alive")
+        || name.eq_ignore_ascii_case(b"proxy-connection")
+}
+
+fn is_safe_auth_request_mutation_header(name: &str) -> bool {
+    !name.eq_ignore_ascii_case(http::header::HOST.as_str())
+        && !name.eq_ignore_ascii_case(http::header::CONNECTION.as_str())
+        && !name.eq_ignore_ascii_case(http::header::CONTENT_LENGTH.as_str())
+        && !name.eq_ignore_ascii_case(http::header::TRANSFER_ENCODING.as_str())
+        && !name.eq_ignore_ascii_case(http::header::UPGRADE.as_str())
+        && !name.eq_ignore_ascii_case(http::header::TE.as_str())
+        && !name.eq_ignore_ascii_case(http::header::TRAILER.as_str())
+        && !name.eq_ignore_ascii_case(http::header::EXPECT.as_str())
+        && !name.eq_ignore_ascii_case(http::header::AUTHORIZATION.as_str())
+        && !name.eq_ignore_ascii_case(http::header::LOCATION.as_str())
+        && !name.eq_ignore_ascii_case(http::header::WWW_AUTHENTICATE.as_str())
+        && !name.eq_ignore_ascii_case(http::header::FORWARDED.as_str())
+        && !name.eq_ignore_ascii_case("x-forwarded-for")
+        && !name.eq_ignore_ascii_case("x-forwarded-host")
+        && !name.eq_ignore_ascii_case("x-forwarded-port")
+        && !name.eq_ignore_ascii_case("x-forwarded-proto")
+        && !name.eq_ignore_ascii_case("keep-alive")
+        && !name.eq_ignore_ascii_case("proxy-connection")
+}
+
+fn allowed_auth_headers(headers: &http::HeaderMap, allowlist: &[String]) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            allowlist
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(name.as_str()))
+                .then(|| {
+                    value
+                        .to_str()
+                        .ok()
+                        .map(|value| (name.as_str().to_string(), value.to_string()))
+                })
+                .flatten()
+        })
+        .collect()
+}
+
+fn auth_allow_mutations(
+    headers: &http::HeaderMap,
+    allowlist: &[String],
+) -> Vec<PendingHeaderMutation> {
+    allowed_auth_headers(headers, allowlist)
+        .into_iter()
+        .filter(|(name, _)| is_safe_auth_request_mutation_header(name))
+        .map(|(name, value)| PendingHeaderMutation::Upsert {
+            name: name.into_bytes(),
+            value: value.into_bytes(),
+        })
+        .collect()
+}
+
+fn append_auth_request_headers(
+    builder: &mut http::request::Builder,
+    pending_forward: &PendingForward,
+    configured_headers: &[spooky_config::runtime::RuntimeExternalAuthRequestHeader],
+) {
+    for header in pending_forward.request_headers() {
+        if header.name().starts_with(b":") || is_unsafe_forwarded_auth_request_header(header.name())
+        {
+            continue;
+        }
+        if let (Ok(name), Ok(value)) = (
+            http::header::HeaderName::from_bytes(header.name()),
+            http::header::HeaderValue::from_bytes(header.value()),
+        ) && let Some(headers) = builder.headers_mut()
+        {
+            headers.append(name, value);
+        }
+    }
+    for header in configured_headers {
+        builder.headers_mut().into_iter().for_each(|headers| {
+            if let (Ok(name), Ok(value)) = (
+                http::header::HeaderName::from_bytes(header.name.as_bytes()),
+                http::header::HeaderValue::from_str(&header.value),
+            ) {
+                headers.insert(name, value);
+            }
+        });
+    }
+    if let Some(headers) = builder.headers_mut() {
+        if let Ok(value) = http::header::HeaderValue::from_str(&pending_forward.method) {
+            headers.insert(
+                http::header::HeaderName::from_static("x-spooky-original-method"),
+                value,
+            );
+        }
+        if let Ok(value) = http::header::HeaderValue::from_str(&pending_forward.path) {
+            headers.insert(
+                http::header::HeaderName::from_static("x-spooky-original-path"),
+                value,
+            );
+        }
+        if let Some(authority) = pending_forward.authority.as_deref()
+            && let Ok(value) = http::header::HeaderValue::from_str(authority)
+        {
+            headers.insert(
+                http::header::HeaderName::from_static("x-spooky-original-authority"),
+                value,
+            );
+        }
+        if let Ok(value) = http::header::HeaderValue::from_str(&pending_forward.upstream_name) {
+            headers.insert(
+                http::header::HeaderName::from_static("x-spooky-route-upstream"),
+                value,
+            );
+        }
+        if let Ok(value) = http::header::HeaderValue::from_str(&pending_forward.backend_addr) {
+            headers.insert(
+                http::header::HeaderName::from_static("x-spooky-backend-address"),
+                value,
+            );
+        }
+    }
+}
+
+async fn collect_auth_body(mut body: Incoming) -> Result<Vec<u8>, ProxyError> {
+    use http_body_util::BodyExt as _;
+
+    let mut bytes = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|err| ProxyError::Transport(err.to_string()))?;
+        let Ok(chunk) = frame.into_data() else {
+            continue;
+        };
+        let next_len = bytes.len().saturating_add(chunk.len());
+        if next_len > MAX_AUTH_BODY_BYTES {
+            return Err(ProxyError::Transport(format!(
+                "external auth body exceeded {MAX_AUTH_BODY_BYTES} bytes"
+            )));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+fn authorization_header_from_pending_forward(pending_forward: &PendingForward) -> Option<String> {
+    pending_forward
+        .request_headers()
+        .into_iter()
+        .find(|header| {
+            header
+                .name()
+                .eq_ignore_ascii_case(http::header::AUTHORIZATION.as_str().as_bytes())
+        })
+        .and_then(|header| std::str::from_utf8(header.value()).ok().map(str::to_string))
+}
+
+fn percent_encode_component(raw: &str) -> String {
+    raw.bytes()
+        .flat_map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                vec![byte as char]
+            }
+            _ => format!("%{:02X}", byte).chars().collect::<Vec<_>>(),
+        })
+        .collect()
+}
+
+async fn send_auth_request(
+    request: Request<BoxBody<Bytes, Infallible>>,
+    timeout: Duration,
+) -> Result<Response<Incoming>, ProxyError> {
+    tokio::time::timeout(timeout, AuthHttpClient::shared().send(request))
+        .await
+        .map_err(|_| ProxyError::Timeout)?
+}
+
+async fn run_external_auth_with_timeout(
+    pending_forward: Arc<PendingForward>,
+    external_auth: RuntimeExternalAuth,
+    timeout: Duration,
+) -> ExternalAuthResult {
+    tokio::time::timeout(timeout, run_external_auth(pending_forward, external_auth))
+        .await
+        .map_err(|_| ProxyError::Timeout)?
+}
+
+fn map_http_external_auth_response(
+    status: http::StatusCode,
+    headers: &http::HeaderMap,
+    body: Vec<u8>,
+    response_header_allowlist: &[String],
+) -> ExternalAuthResult {
+    let location = headers
+        .get(http::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let challenge = headers
+        .get(http::header::WWW_AUTHENTICATE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let allowed_headers = allowed_auth_headers(headers, response_header_allowlist);
+    if status.is_success() {
+        return Ok(ExternalAuthDecision::Allow {
+            request_header_mutations: auth_allow_mutations(headers, response_header_allowlist),
+        });
+    }
+    if status.is_redirection() {
+        if let Some(location) = location {
+            return Ok(ExternalAuthDecision::Redirect(
+                ExternalAuthRedirectResponse {
+                    status,
+                    headers: allowed_headers
+                        .into_iter()
+                        .filter(|(name, _)| {
+                            !name.eq_ignore_ascii_case(http::header::LOCATION.as_str())
+                        })
+                        .collect(),
+                    location,
+                },
+            ));
+        }
+        return Err(ProxyError::Transport(
+            "external auth redirect missing location header".into(),
+        ));
+    }
+    if status == http::StatusCode::UNAUTHORIZED
+        && let Some(www_authenticate) = challenge
+    {
+        return Ok(ExternalAuthDecision::Challenge(
+            ExternalAuthChallengeResponse {
+                status,
+                headers: allowed_headers
+                    .into_iter()
+                    .filter(|(name, _)| {
+                        !name.eq_ignore_ascii_case(http::header::WWW_AUTHENTICATE.as_str())
+                    })
+                    .collect(),
+                www_authenticate,
+                body,
+            },
+        ));
+    }
+    if status.is_client_error() {
+        return Ok(ExternalAuthDecision::Deny(ExternalAuthDenyResponse {
+            status,
+            headers: allowed_headers,
+            body,
+        }));
+    }
+    Err(ProxyError::Transport(format!(
+        "external auth endpoint returned {status}"
+    )))
+}
+
+async fn run_http_external_auth(
+    pending_forward: Arc<PendingForward>,
+    endpoint: String,
+    request_headers: Vec<spooky_config::runtime::RuntimeExternalAuthRequestHeader>,
+    response_header_allowlist: Vec<String>,
+    timeout: Duration,
+) -> ExternalAuthResult {
+    let mut builder = Request::builder().method(http::Method::GET).uri(endpoint);
+    append_auth_request_headers(&mut builder, &pending_forward, &request_headers);
+    let request = builder
+        .body(BoxBody::new(Full::new(Bytes::new())))
+        .map_err(|err| ProxyError::Transport(err.to_string()))?;
+    let response = send_auth_request(request, timeout).await?;
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = if status.is_success() || status.is_redirection() {
+        Vec::new()
+    } else {
+        collect_auth_body(response.into_body()).await?
+    };
+    map_http_external_auth_response(status, &headers, body, &response_header_allowlist)
+}
+
+async fn fetch_json_document(uri: String, timeout: Duration) -> Result<Value, ProxyError> {
+    let request = Request::builder()
+        .method(http::Method::GET)
+        .uri(uri)
+        .body(BoxBody::new(Full::new(Bytes::new())))
+        .map_err(|err| ProxyError::Transport(err.to_string()))?;
+    let response = send_auth_request(request, timeout).await?;
+    if !response.status().is_success() {
+        return Err(ProxyError::Transport(format!(
+            "oidc discovery returned {}",
+            response.status()
+        )));
+    }
+    let body = collect_auth_body(response.into_body()).await?;
+    serde_json::from_slice(&body).map_err(|err| ProxyError::Transport(err.to_string()))
+}
+
+/// Auth endpoints must use https; http is permitted only to loopback hosts,
+/// which are not reachable by on-path attackers (local development/testing).
+fn auth_uri_scheme_permitted(uri: &http::Uri) -> bool {
+    match uri.scheme_str() {
+        Some("https") => uri.authority().is_some(),
+        Some("http") => uri.host().is_some_and(uri_host_is_loopback),
+        _ => false,
+    }
+}
+
+fn uri_host_is_loopback(host: &str) -> bool {
+    // Accept an IPv6 literal with or without surrounding brackets.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host);
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+fn oidc_discovery_url(discovery_url: Option<String>, issuer_url: Option<String>) -> Option<String> {
+    discovery_url.or_else(|| {
+        issuer_url.map(|issuer| {
+            format!(
+                "{}/.well-known/openid-configuration",
+                issuer.trim_end_matches('/')
+            )
+        })
+    })
+}
+
+fn oidc_scope_satisfied(required_scopes: &[String], granted_scopes: &str) -> bool {
+    let granted: std::collections::HashSet<&str> = granted_scopes.split_whitespace().collect();
+    required_scopes
+        .iter()
+        .all(|scope| granted.contains(scope.as_str()))
+}
+
+fn oidc_audience_matches(expected: Option<&str>, value: Option<&Value>) -> bool {
+    let Some(expected) = expected else {
+        return true;
+    };
+    match value {
+        Some(Value::String(single)) => single == expected,
+        Some(Value::Array(values)) => values.iter().any(|value| value.as_str() == Some(expected)),
+        _ => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_oidc_external_auth(
+    pending_forward: Arc<PendingForward>,
+    discovery_url: Option<String>,
+    issuer_url: Option<String>,
+    client_id: String,
+    client_secret: Option<String>,
+    audience: Option<String>,
+    scopes: Vec<String>,
+    request_headers: Vec<spooky_config::runtime::RuntimeExternalAuthRequestHeader>,
+    timeout: Duration,
+) -> ExternalAuthResult {
+    let Some(authorization) = authorization_header_from_pending_forward(&pending_forward) else {
+        return Ok(ExternalAuthDecision::Challenge(
+            ExternalAuthChallengeResponse {
+                status: http::StatusCode::UNAUTHORIZED,
+                headers: Vec::new(),
+                www_authenticate: "Bearer".to_string(),
+                body: b"missing bearer token\n".to_vec(),
+            },
+        ));
+    };
+    let Some(token) = QUICListener::bearer_token_from_authorization_value(&authorization) else {
+        return Ok(ExternalAuthDecision::Challenge(
+            ExternalAuthChallengeResponse {
+                status: http::StatusCode::UNAUTHORIZED,
+                headers: Vec::new(),
+                www_authenticate: "Bearer".to_string(),
+                body: b"invalid bearer token\n".to_vec(),
+            },
+        ));
+    };
+    let discovery = oidc_discovery_url(discovery_url, issuer_url.clone())
+        .ok_or_else(|| ProxyError::Transport("oidc auth missing discovery metadata".into()))?;
+    let discovery_uri = discovery
+        .parse::<http::Uri>()
+        .map_err(|err| ProxyError::Transport(err.to_string()))?;
+    if !auth_uri_scheme_permitted(&discovery_uri) {
+        return Err(ProxyError::Transport(
+            "oidc discovery endpoint must use https (http allowed only for loopback)".into(),
+        ));
+    }
+    let document = fetch_json_document(discovery, timeout).await?;
+    let introspection_endpoint = document
+        .get("introspection_endpoint")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            ProxyError::Transport("oidc discovery missing introspection_endpoint".into())
+        })?;
+    let introspection_uri = introspection_endpoint
+        .parse::<http::Uri>()
+        .map_err(|err| ProxyError::Transport(err.to_string()))?;
+    if !auth_uri_scheme_permitted(&introspection_uri) {
+        return Err(ProxyError::Transport(
+            "oidc introspection endpoint must use https (http allowed only for loopback)".into(),
+        ));
+    }
+
+    let mut body = format!(
+        "token={}&client_id={}",
+        percent_encode_component(&token),
+        percent_encode_component(&client_id)
+    );
+    if let Some(secret) = client_secret.as_deref() {
+        body.push_str("&client_secret=");
+        body.push_str(&percent_encode_component(secret));
+    }
+    if let Some(audience) = audience.as_deref() {
+        body.push_str("&audience=");
+        body.push_str(&percent_encode_component(audience));
+    }
+
+    let mut builder = Request::builder()
+        .method(http::Method::POST)
+        .uri(introspection_endpoint)
+        .header(
+            http::header::CONTENT_TYPE,
+            http::header::HeaderValue::from_static("application/x-www-form-urlencoded"),
+        );
+    append_auth_request_headers(&mut builder, &pending_forward, &request_headers);
+    let request = builder
+        .body(BoxBody::new(Full::new(Bytes::from(body))))
+        .map_err(|err| ProxyError::Transport(err.to_string()))?;
+    let response = send_auth_request(request, timeout).await?;
+    if !response.status().is_success() {
+        if response.status().is_client_error() {
+            return Ok(ExternalAuthDecision::Deny(ExternalAuthDenyResponse {
+                status: http::StatusCode::FORBIDDEN,
+                headers: Vec::new(),
+                body: b"oidc token rejected\n".to_vec(),
+            }));
+        }
+        return Err(ProxyError::Transport(format!(
+            "oidc introspection returned {}",
+            response.status()
+        )));
+    }
+    let payload = collect_auth_body(response.into_body()).await?;
+    let value: Value =
+        serde_json::from_slice(&payload).map_err(|err| ProxyError::Transport(err.to_string()))?;
+    if !value
+        .get("active")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(ExternalAuthDecision::Deny(ExternalAuthDenyResponse {
+            status: http::StatusCode::FORBIDDEN,
+            headers: Vec::new(),
+            body: b"inactive oidc token\n".to_vec(),
+        }));
+    }
+    if let Some(issuer_url) = issuer_url.as_deref()
+        && value.get("iss").and_then(Value::as_str) != Some(issuer_url)
+    {
+        return Ok(ExternalAuthDecision::Deny(ExternalAuthDenyResponse {
+            status: http::StatusCode::FORBIDDEN,
+            headers: Vec::new(),
+            body: b"unexpected oidc issuer\n".to_vec(),
+        }));
+    }
+    if !oidc_audience_matches(audience.as_deref(), value.get("aud")) {
+        return Ok(ExternalAuthDecision::Deny(ExternalAuthDenyResponse {
+            status: http::StatusCode::FORBIDDEN,
+            headers: Vec::new(),
+            body: b"unexpected oidc audience\n".to_vec(),
+        }));
+    }
+    if !scopes.is_empty() {
+        let Some(scope_value) = value.get("scope").and_then(Value::as_str) else {
+            return Ok(ExternalAuthDecision::Deny(ExternalAuthDenyResponse {
+                status: http::StatusCode::FORBIDDEN,
+                headers: Vec::new(),
+                body: b"missing oidc scopes
+"
+                .to_vec(),
+            }));
+        };
+        if !oidc_scope_satisfied(&scopes, scope_value) {
+            return Ok(ExternalAuthDecision::Deny(ExternalAuthDenyResponse {
+                status: http::StatusCode::FORBIDDEN,
+                headers: Vec::new(),
+                body: b"missing oidc scopes
+"
+                .to_vec(),
+            }));
+        }
+    }
+
+    Ok(ExternalAuthDecision::Allow {
+        request_header_mutations: Vec::new(),
+    })
+}
+
+async fn run_external_auth(
+    pending_forward: Arc<PendingForward>,
+    external_auth: RuntimeExternalAuth,
+) -> ExternalAuthResult {
+    let timeout = Duration::from_millis(auth_timeout_ms(&external_auth).max(1));
+    match external_auth {
+        RuntimeExternalAuth::Http {
+            endpoint,
+            request_headers,
+            response_header_allowlist,
+            ..
+        } => {
+            run_http_external_auth(
+                pending_forward,
+                endpoint,
+                request_headers,
+                response_header_allowlist,
+                timeout,
+            )
+            .await
+        }
+        RuntimeExternalAuth::Oidc {
+            discovery_url,
+            issuer_url,
+            client_id,
+            client_secret,
+            audience,
+            scopes,
+            request_headers,
+            ..
+        } => {
+            run_oidc_external_auth(
+                pending_forward,
+                discovery_url,
+                issuer_url,
+                client_id,
+                client_secret,
+                audience,
+                scopes,
+                request_headers,
+                timeout,
+            )
+            .await
+        }
+    }
+}
+
+fn start_external_auth_task(
+    pending_forward: Arc<PendingForward>,
+    external_auth: RuntimeExternalAuth,
+) -> Result<AuthStart, ProxyError> {
+    let timeout_ms = auth_timeout_ms(&external_auth).max(1);
+    let mode = auth_failure_mode(&external_auth);
+    let timeout = Duration::from_millis(timeout_ms);
+    let (tx, rx) = oneshot::channel();
+    let fut = async move {
+        let result = run_external_auth_with_timeout(pending_forward, external_auth, timeout).await;
+        let _ = tx.send(result);
+    };
+    let Some(handle) = runtime_handle() else {
+        return Err(ProxyError::Transport(
+            "dropping external auth task: no runtime available".into(),
+        ));
+    };
+    let join = handle.spawn(fut);
+    Ok(AuthStart {
+        rx,
+        abort: join.abort_handle(),
+        deadline: Instant::now() + timeout,
+        fail_open: fail_open(mode),
+    })
 }
 
 pub(crate) fn abort_stream(req: &mut RequestEnvelope, metrics: &Metrics) -> StreamPhase {
     let phase = req.phase.clone();
-    if !req.backend_request_finished {
+    if req.backend_request_started && !req.backend_request_finished {
         if let (Some(pool), Some(index)) = (&req.upstream_pool, req.backend_index)
             && let Ok(mut guard) = pool.write()
         {
@@ -76,9 +810,15 @@ pub(crate) fn abort_stream(req: &mut RequestEnvelope, metrics: &Metrics) -> Stre
     }
     req.body_buf.clear();
     req.body_tx = None;
+    req.auth_result_rx = None;
+    if let Some(abort) = req.auth_abort.take() {
+        abort.abort();
+    }
     req.upstream_result_rx = None;
     req.response_chunk_rx = None;
     req.pending_chunk = None;
+    req.pending_forward = None;
+    req.auth_deadline = None;
     req.global_inflight_permit = None;
     req.upstream_inflight_permit = None;
     req.adaptive_admission_permit = None;
@@ -149,76 +889,14 @@ impl QUICListener {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn build_http1_websocket_tunnel_request(
-        endpoint: &BackendEndpoint,
-        host_policy: &UpstreamHostPolicy,
-        forwarded_policy: &ForwardedHeaderPolicy,
-        path: &str,
-        headers: &[quiche::h3::Header],
-        client_addr: SocketAddr,
-        request_authority: Option<&str>,
-        request_id: u64,
-        traceparent: Option<&str>,
-    ) -> Result<Request<BoxBody<Bytes, std::convert::Infallible>>, ProxyError> {
-        let mut request_headers = headers.to_vec();
-        let has_upgrade = request_headers
-            .iter()
-            .any(|header| header.name().eq_ignore_ascii_case(b"upgrade"));
-        if !has_upgrade {
-            request_headers.push(quiche::h3::Header::new(b"upgrade", b"websocket"));
-        }
-        let has_connection = request_headers
-            .iter()
-            .any(|header| header.name().eq_ignore_ascii_case(b"connection"));
-        if !has_connection {
-            request_headers.push(quiche::h3::Header::new(b"connection", b"upgrade"));
-        }
-
-        build_h1_request_for_endpoint_with_host_policy(
-            endpoint,
-            host_policy,
-            forwarded_policy,
-            "GET",
-            path,
-            &request_headers,
-            BoxBody::new(Full::new(Bytes::new())),
-            None,
-            ForwardedContext {
-                client_addr,
-                request_authority,
-                request_id,
-                traceparent,
-            },
-        )
-        .map_err(ProxyError::from)
-    }
-
-    #[allow(clippy::too_many_arguments)]
     async fn forward_http1_websocket_tunnel(
         endpoint: BackendEndpoint,
-        host_policy: UpstreamHostPolicy,
-        forwarded_policy: ForwardedHeaderPolicy,
-        path: String,
-        headers: Vec<quiche::h3::Header>,
-        client_addr: SocketAddr,
-        request_authority: Option<String>,
-        request_id: u64,
-        traceparent: Option<String>,
+        pending_forward: Arc<PendingForward>,
         mut body_rx: mpsc::Receiver<Bytes>,
         backend_timeout: Duration,
         metrics: Arc<Metrics>,
     ) -> ForwardResult {
-        let request = Self::build_http1_websocket_tunnel_request(
-            &endpoint,
-            &host_policy,
-            &forwarded_policy,
-            &path,
-            &headers,
-            client_addr,
-            request_authority.as_deref(),
-            request_id,
-            traceparent.as_deref(),
-        )?;
+        let request = pending_forward.build_http1_websocket_tunnel_request(&endpoint)?;
 
         let stream = tokio::time::timeout(
             backend_timeout,
@@ -801,6 +1479,1183 @@ impl QUICListener {
         Ok(())
     }
 
+    pub(super) fn send_rate_limited_response(
+        h3: &mut quiche::h3::Connection,
+        quic: &mut quiche::Connection,
+        stream_id: u64,
+        body: &[u8],
+        retry_after_seconds: u32,
+    ) -> Result<(), quiche::h3::Error> {
+        let retry_after = retry_after_seconds.max(1).to_string();
+        let resp_headers = vec![
+            quiche::h3::Header::new(
+                b":status",
+                http::StatusCode::TOO_MANY_REQUESTS.as_str().as_bytes(),
+            ),
+            quiche::h3::Header::new(b"content-type", b"text/plain"),
+            quiche::h3::Header::new(b"retry-after", retry_after.as_bytes()),
+            quiche::h3::Header::new(b"content-length", body.len().to_string().as_bytes()),
+        ];
+
+        h3.send_response(quic, stream_id, &resp_headers, false)?;
+        h3.send_body(quic, stream_id, body, true)?;
+        Ok(())
+    }
+
+    pub(super) fn send_unauthorized_response(
+        h3: &mut quiche::h3::Connection,
+        quic: &mut quiche::Connection,
+        stream_id: u64,
+        body: &[u8],
+        challenge: &[u8],
+    ) -> Result<(), quiche::h3::Error> {
+        let resp_headers = vec![
+            quiche::h3::Header::new(
+                b":status",
+                http::StatusCode::UNAUTHORIZED.as_str().as_bytes(),
+            ),
+            quiche::h3::Header::new(b"content-type", b"text/plain"),
+            quiche::h3::Header::new(b"www-authenticate", challenge),
+            quiche::h3::Header::new(b"content-length", body.len().to_string().as_bytes()),
+        ];
+
+        h3.send_response(quic, stream_id, &resp_headers, false)?;
+        h3.send_body(quic, stream_id, body, true)?;
+        Ok(())
+    }
+
+    fn send_response_with_headers(
+        h3: &mut quiche::h3::Connection,
+        quic: &mut quiche::Connection,
+        stream_id: u64,
+        status: http::StatusCode,
+        body: &[u8],
+        headers: &[(String, String)],
+    ) -> Result<(), quiche::h3::Error> {
+        let mut resp_headers = vec![quiche::h3::Header::new(
+            b":status",
+            status.as_str().as_bytes(),
+        )];
+        let mut has_content_type = false;
+        let mut has_content_length = false;
+        for (name, value) in headers {
+            if name.eq_ignore_ascii_case(http::header::CONTENT_TYPE.as_str()) {
+                has_content_type = true;
+            }
+            if name.eq_ignore_ascii_case(http::header::CONTENT_LENGTH.as_str()) {
+                has_content_length = true;
+            }
+            resp_headers.push(quiche::h3::Header::new(name.as_bytes(), value.as_bytes()));
+        }
+        if !has_content_type {
+            resp_headers.push(quiche::h3::Header::new(b"content-type", b"text/plain"));
+        }
+        if !has_content_length {
+            resp_headers.push(quiche::h3::Header::new(
+                b"content-length",
+                body.len().to_string().as_bytes(),
+            ));
+        }
+        h3.send_response(quic, stream_id, &resp_headers, false)?;
+        h3.send_body(quic, stream_id, body, true)?;
+        Ok(())
+    }
+
+    fn send_external_auth_decision_response(
+        h3: &mut quiche::h3::Connection,
+        quic: &mut quiche::Connection,
+        stream_id: u64,
+        decision: &ExternalAuthDecision,
+    ) -> Result<(), quiche::h3::Error> {
+        match decision {
+            ExternalAuthDecision::Allow { .. } => Ok(()),
+            ExternalAuthDecision::Deny(response) => Self::send_response_with_headers(
+                h3,
+                quic,
+                stream_id,
+                response.status,
+                &response.body,
+                &response.headers,
+            ),
+            ExternalAuthDecision::Redirect(response) => {
+                let mut headers = response.headers.clone();
+                headers.push((
+                    http::header::LOCATION.as_str().to_string(),
+                    response.location.clone(),
+                ));
+                Self::send_response_with_headers(
+                    h3,
+                    quic,
+                    stream_id,
+                    response.status,
+                    &[],
+                    &headers,
+                )
+            }
+            ExternalAuthDecision::Challenge(response) => {
+                let mut headers = response.headers.clone();
+                headers.push((
+                    http::header::WWW_AUTHENTICATE.as_str().to_string(),
+                    response.www_authenticate.clone(),
+                ));
+                Self::send_response_with_headers(
+                    h3,
+                    quic,
+                    stream_id,
+                    response.status,
+                    &response.body,
+                    &headers,
+                )
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_upstream_forward_task(
+        req: &RequestEnvelope,
+        pending_forward: Arc<PendingForward>,
+        backend_endpoint: BackendEndpoint,
+        request: Option<Request<BoxBody<Bytes, Infallible>>>,
+        websocket_tunnel_body_rx: Option<mpsc::Receiver<Bytes>>,
+        transport_pool: Arc<UpstreamTransportPool>,
+        backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
+        backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
+        backend_timeout: Duration,
+        metrics: Arc<Metrics>,
+        resilience: &RuntimeResilience,
+    ) -> Result<oneshot::Receiver<UpstreamResult>, ProxyError> {
+        let fwd_addr = pending_forward.backend_addr.to_string();
+        let cb = Arc::clone(&resilience.circuit_breakers);
+        let retry_budget = Arc::clone(&resilience.retry_budget);
+        let route_name = pending_forward.upstream_name.to_string();
+        let _backend_resolutions = Arc::clone(&backend_resolution_store);
+        let transport = Arc::clone(&transport_pool);
+        let allow_hedge = req.tunnel_mode == TunnelMode::None
+            && req.bodyless_mode
+            && resilience.hedging_allowed_for(&req.method, &route_name, true);
+        let hedge_delay = resilience.hedging_delay;
+        let alternate_backend = req.upstream_pool.as_ref().and_then(|upstream_pool| {
+            Self::pick_alternate_backend(upstream_pool, pending_forward.backend_index)
+        });
+        let trace_span_for_upstream = req.trace_span.clone();
+        let pending_forward_for_upstream = Arc::clone(&pending_forward);
+        let (result_tx, result_rx) = oneshot::channel::<UpstreamResult>();
+        let tunnel_mode = req.tunnel_mode;
+        let bodyless_mode = req.bodyless_mode;
+        let request_id = req.request_id;
+        let fut = async move {
+            let mut hedge_telemetry = crate::HedgeTelemetry::default();
+            let mut retry_count: u8 = 0;
+            let mut retry_attempt_reason: Option<RetryReason> = None;
+            let mut retry_denial_reason: Option<RetryReason> = None;
+            let result: ForwardResult = async {
+                retry_budget.mark_primary(&route_name);
+
+                let send_once =
+                    |backend: String,
+                     req: http::Request<BoxBody<Bytes, std::convert::Infallible>>,
+                     cb: Arc<crate::resilience::CircuitBreakers>,
+                     transport: Arc<UpstreamTransportPool>| async move {
+                        if !cb.allow_request(&backend) {
+                            return Err(ProxyError::Pool(PoolError::CircuitOpen(backend)));
+                        }
+                        let send_result = tokio::time::timeout(
+                            backend_timeout,
+                            transport.send(&backend, req),
+                        )
+                        .await
+                        .map_err(|_| ProxyError::Timeout);
+                        match &send_result {
+                            Ok(Ok(_)) => cb.record_success(&backend),
+                            _ => cb.record_failure(&backend),
+                        }
+                        Ok(send_result??)
+                    };
+
+                let forward_success: ForwardSuccess = if tunnel_mode == TunnelMode::Websocket
+                    && backend_endpoint.scheme() == BackendScheme::Http
+                {
+                    let Some(body_rx) = websocket_tunnel_body_rx else {
+                        return Err(ProxyError::Transport(
+                            "websocket H1 tunnels require a downstream body channel".into(),
+                        ));
+                    };
+                    Self::forward_http1_websocket_tunnel(
+                        backend_endpoint.clone(),
+                        Arc::clone(&pending_forward_for_upstream),
+                        body_rx,
+                        backend_timeout,
+                        Arc::clone(&metrics),
+                    )
+                    .await?
+                } else {
+                    let request = request.ok_or_else(|| {
+                        ProxyError::Transport(
+                            "missing upstream request for non-websocket forward".into(),
+                        )
+                    })?;
+                    let response: Response<Incoming> = if allow_hedge {
+                        let hedge_candidate = alternate_backend.clone().and_then(|(backend, _idx)| {
+                            let endpoint = backend_endpoints.get(&backend)?;
+                            pending_forward_for_upstream
+                                .build_bodyless_request(endpoint)
+                                .ok()
+                                .map(|req| (backend, req))
+                        });
+
+                        if let Some((hedge_backend, hedge_request)) = hedge_candidate {
+                            let primary_started = Instant::now();
+                            let primary_backend = fwd_addr.clone();
+                            let primary_fut = send_once(
+                                primary_backend,
+                                request,
+                                Arc::clone(&cb),
+                                Arc::clone(&transport),
+                            );
+                            tokio::pin!(primary_fut);
+                            let hedge_sleep = tokio::time::sleep(hedge_delay);
+                            tokio::pin!(hedge_sleep);
+
+                            if let Some(result) = tokio::select! {
+                                result = &mut primary_fut => Some(result),
+                                _ = &mut hedge_sleep => None,
+                            } {
+                                result?
+                            } else if retry_budget.allow_retry(&route_name).is_ok() {
+                                hedge_telemetry.launched = true;
+                                let hedge_fut = send_once(
+                                    hedge_backend,
+                                    hedge_request,
+                                    Arc::clone(&cb),
+                                    Arc::clone(&transport),
+                                );
+                                tokio::pin!(hedge_fut);
+                                tokio::select! {
+                                    result = &mut primary_fut => {
+                                        hedge_telemetry.primary_won_after_trigger = true;
+                                        hedge_telemetry.hedge_wasted = true;
+                                        result?
+                                    },
+                                    result = &mut hedge_fut => {
+                                        hedge_telemetry.hedge_won = true;
+                                        let elapsed_ms = primary_started.elapsed().as_millis() as u64;
+                                        let delay_ms = hedge_delay.as_millis() as u64;
+                                        hedge_telemetry.primary_late_ms = elapsed_ms.saturating_sub(delay_ms);
+                                        result?
+                                    },
+                                }
+                            } else {
+                                primary_fut.await?
+                            }
+                        } else {
+                            send_once(
+                                fwd_addr.clone(),
+                                request,
+                                Arc::clone(&cb),
+                                Arc::clone(&transport),
+                            )
+                            .await?
+                        }
+                    } else {
+                        match send_once(
+                            fwd_addr.clone(),
+                            request,
+                            Arc::clone(&cb),
+                            Arc::clone(&transport),
+                        )
+                        .await
+                        {
+                            Ok(response) => response,
+                            Err(primary_err) => {
+                                let retry_reason = classify_retry_reason(&primary_err);
+                                let is_retryable_err = is_retryable(&primary_err);
+                                let budget_ok = retry_budget.allow_retry(&route_name).is_ok();
+                                let can_retry = bodyless_mode
+                                    && is_retryable_err
+                                    && budget_ok
+                                    && alternate_backend.is_some();
+                                if !can_retry {
+                                    if !bodyless_mode {
+                                        retry_denial_reason = Some(RetryReason::NotBodylessMode);
+                                    } else if !is_retryable_err {
+                                        retry_denial_reason = None;
+                                    } else if !budget_ok {
+                                        retry_denial_reason = Some(RetryReason::BudgetDenied);
+                                    } else {
+                                        retry_denial_reason = Some(RetryReason::NoAlternateBackend);
+                                    }
+                                    return Err(primary_err);
+                                }
+                                if let Some((retry_backend, _)) = alternate_backend.clone()
+                                    && let Some(endpoint) = backend_endpoints.get(&retry_backend)
+                                    && let Ok(retry_request) =
+                                        pending_forward_for_upstream.build_bodyless_request(endpoint)
+                                {
+                                    retry_count = retry_count.saturating_add(1);
+                                    retry_attempt_reason = Some(retry_reason);
+                                    info!(
+                                        "request_id={} retrying request on alternate backend: route={} reason={:?}",
+                                        request_id, route_name, retry_reason
+                                    );
+                                    send_once(
+                                        retry_backend,
+                                        retry_request,
+                                        Arc::clone(&cb),
+                                        Arc::clone(&transport),
+                                    )
+                                    .await?
+                                } else {
+                                    return Err(primary_err);
+                                }
+                            }
+                        }
+                    };
+
+                    let (parts, body) = response.into_parts();
+                    ForwardSuccess::Response {
+                        status: parts.status,
+                        headers: parts.headers,
+                        body,
+                    }
+                };
+                Ok(forward_success)
+            }
+            .await;
+            let _ = result_tx.send(UpstreamResult {
+                forward: result,
+                hedge: hedge_telemetry,
+                retry_count,
+                retry_attempt_reason,
+                retry_denial_reason,
+            });
+        };
+        let spawned = match trace_span_for_upstream {
+            Some(span) => spawn_async_task(fut.instrument(span), "upstream"),
+            None => spawn_async_task(fut, "upstream"),
+        };
+        if !spawned {
+            return Err(ProxyError::Transport(
+                "dropping upstream task: no runtime available".into(),
+            ));
+        }
+        Ok(result_rx)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn materialize_forward_after_auth(
+        stream_id: u64,
+        req: &mut RequestEnvelope,
+        h3: &mut quiche::h3::Connection,
+        quic: &mut quiche::Connection,
+        transport_pool: Arc<UpstreamTransportPool>,
+        backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
+        backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
+        upstream_inflight: &HashMap<String, Arc<Semaphore>>,
+        global_inflight: Arc<Semaphore>,
+        backend_timeout: Duration,
+        resilience: &RuntimeResilience,
+        metrics: Arc<Metrics>,
+        inflight_acquire_wait: Duration,
+    ) -> Result<bool, quiche::h3::Error> {
+        let Some(pending_forward) = req.pending_forward.as_ref().cloned() else {
+            metrics.inc_failure();
+            Self::send_simple_response(
+                h3,
+                quic,
+                stream_id,
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                b"missing deferred forward snapshot\n",
+            )?;
+            return Ok(false);
+        };
+        let Some(upstream_name) = req.upstream_name.clone() else {
+            metrics.inc_failure();
+            Self::send_simple_response(
+                h3,
+                quic,
+                stream_id,
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                b"missing upstream route\n",
+            )?;
+            return Ok(false);
+        };
+        let header_lookup = |name: &str| {
+            pending_forward
+                .headers
+                .iter()
+                .find(|header| header.name().eq_ignore_ascii_case(name.as_bytes()))
+                .and_then(|header| std::str::from_utf8(header.value()).ok())
+                .map(str::to_string)
+        };
+
+        resilience
+            .brownout
+            .observe_admission_pressure(resilience.adaptive_admission.inflight_percent());
+        metrics.set_brownout_active(resilience.brownout.is_active());
+        if !resilience.brownout.route_allowed(&upstream_name) {
+            metrics.inc_failure();
+            metrics.inc_overload_shed_reason(OverloadShedReason::Brownout);
+            metrics.record_route(
+                &upstream_name,
+                req.start.elapsed(),
+                RouteOutcome::OverloadShed,
+            );
+            Self::send_overload_response(
+                h3,
+                quic,
+                stream_id,
+                b"brownout active, non-core route shed\n",
+                resilience.shed_retry_after_seconds,
+            )?;
+            resilience
+                .adaptive_admission
+                .observe(req.start.elapsed(), true);
+            return Ok(false);
+        }
+
+        if let Some(rejection) = resilience.scoped_rate_limits.check(&upstream_name, |rule| {
+            Self::resolve_scoped_rate_limit_key(
+                rule,
+                &upstream_name,
+                &req.method,
+                &req.path,
+                req.authority.as_deref(),
+                pending_forward.client_addr,
+                Some(&header_lookup),
+            )
+        }) {
+            metrics.inc_failure();
+            metrics.inc_request_rate_limited();
+            metrics.record_route(
+                &upstream_name,
+                req.start.elapsed(),
+                RouteOutcome::RateLimited,
+            );
+            warn!(
+                "request_id={} route={} scoped rate limit exceeded by rule={}",
+                req.request_id, rejection.route, rejection.rule_name
+            );
+            Self::send_rate_limited_response(
+                h3,
+                quic,
+                stream_id,
+                b"request rate limited\n",
+                rejection.retry_after_seconds,
+            )?;
+            return Ok(false);
+        }
+
+        let adaptive_permit = match resilience.adaptive_admission.try_acquire() {
+            Some(permit) => permit,
+            None => {
+                metrics.inc_failure();
+                metrics.inc_overload_shed_reason(OverloadShedReason::AdaptiveAdmission);
+                metrics.record_route(
+                    &upstream_name,
+                    req.start.elapsed(),
+                    RouteOutcome::OverloadShed,
+                );
+                Self::send_overload_response(
+                    h3,
+                    quic,
+                    stream_id,
+                    b"adaptive admission overload\n",
+                    resilience.shed_retry_after_seconds,
+                )?;
+                resilience
+                    .adaptive_admission
+                    .observe(req.start.elapsed(), true);
+                return Ok(false);
+            }
+        };
+
+        let route_queue_permit = match resilience.route_queue.try_acquire(&upstream_name) {
+            Ok(permit) => permit,
+            Err(RouteQueueRejection::RouteCap) => {
+                metrics.inc_failure();
+                metrics.inc_overload_shed_reason(OverloadShedReason::RouteCap);
+                metrics.record_route(
+                    &upstream_name,
+                    req.start.elapsed(),
+                    RouteOutcome::OverloadShed,
+                );
+                Self::send_overload_response(
+                    h3,
+                    quic,
+                    stream_id,
+                    b"route queue cap exceeded\n",
+                    resilience.shed_retry_after_seconds,
+                )?;
+                resilience
+                    .adaptive_admission
+                    .observe(req.start.elapsed(), true);
+                return Ok(false);
+            }
+            Err(RouteQueueRejection::GlobalCap) => {
+                metrics.inc_failure();
+                metrics.inc_overload_shed_reason(OverloadShedReason::RouteGlobalCap);
+                metrics.record_route(
+                    &upstream_name,
+                    req.start.elapsed(),
+                    RouteOutcome::OverloadShed,
+                );
+                Self::send_overload_response(
+                    h3,
+                    quic,
+                    stream_id,
+                    b"global queue cap exceeded\n",
+                    resilience.shed_retry_after_seconds,
+                )?;
+                resilience
+                    .adaptive_admission
+                    .observe(req.start.elapsed(), true);
+                return Ok(false);
+            }
+        };
+
+        let global_permit = match Self::try_acquire_owned_with_micro_wait(
+            Arc::clone(&global_inflight),
+            inflight_acquire_wait,
+        ) {
+            Ok((permit, waited)) => {
+                if waited {
+                    metrics.inc_inflight_wait_admit_global();
+                }
+                permit
+            }
+            Err(_) => {
+                drop(route_queue_permit);
+                drop(adaptive_permit);
+                metrics.inc_failure();
+                metrics.inc_overload_shed_reason(OverloadShedReason::GlobalInflight);
+                metrics.record_route(
+                    &upstream_name,
+                    req.start.elapsed(),
+                    RouteOutcome::OverloadShed,
+                );
+                Self::send_overload_response(
+                    h3,
+                    quic,
+                    stream_id,
+                    b"overloaded, retry later\n",
+                    resilience.shed_retry_after_seconds,
+                )?;
+                resilience
+                    .adaptive_admission
+                    .observe(req.start.elapsed(), true);
+                return Ok(false);
+            }
+        };
+
+        let upstream_permit = match upstream_inflight.get(&upstream_name).cloned() {
+            Some(semaphore) => {
+                match Self::try_acquire_owned_with_micro_wait(semaphore, inflight_acquire_wait) {
+                    Ok((permit, waited)) => {
+                        if waited {
+                            metrics.inc_inflight_wait_admit_upstream();
+                        }
+                        permit
+                    }
+                    Err(_) => {
+                        drop(global_permit);
+                        drop(route_queue_permit);
+                        drop(adaptive_permit);
+                        metrics.inc_failure();
+                        metrics.inc_overload_shed_reason(OverloadShedReason::UpstreamInflight);
+                        metrics.record_route(
+                            &upstream_name,
+                            req.start.elapsed(),
+                            RouteOutcome::OverloadShed,
+                        );
+                        Self::send_overload_response(
+                            h3,
+                            quic,
+                            stream_id,
+                            b"upstream overloaded, retry later\n",
+                            resilience.shed_retry_after_seconds,
+                        )?;
+                        resilience
+                            .adaptive_admission
+                            .observe(req.start.elapsed(), true);
+                        return Ok(false);
+                    }
+                }
+            }
+            None => {
+                drop(global_permit);
+                drop(route_queue_permit);
+                drop(adaptive_permit);
+                metrics.inc_failure();
+                metrics.inc_overload_shed_reason(OverloadShedReason::UpstreamInflight);
+                metrics.record_route(
+                    &upstream_name,
+                    req.start.elapsed(),
+                    RouteOutcome::OverloadShed,
+                );
+                Self::send_simple_response(
+                    h3,
+                    quic,
+                    stream_id,
+                    http::StatusCode::SERVICE_UNAVAILABLE,
+                    b"upstream admission limiter unavailable\n",
+                )?;
+                resilience
+                    .adaptive_admission
+                    .observe(req.start.elapsed(), true);
+                return Ok(false);
+            }
+        };
+
+        let backend_index = req.backend_index.unwrap_or(pending_forward.backend_index);
+        let Some(upstream_pool) = req.upstream_pool.as_ref().cloned() else {
+            drop(upstream_permit);
+            drop(global_permit);
+            drop(route_queue_permit);
+            drop(adaptive_permit);
+            metrics.inc_failure();
+            Self::send_simple_response(
+                h3,
+                quic,
+                stream_id,
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                b"missing upstream pool\n",
+            )?;
+            return Ok(false);
+        };
+        let request_started = upstream_pool
+            .read()
+            .ok()
+            .is_some_and(|pool| pool.begin_request_if_healthy(backend_index));
+        if !request_started {
+            drop(upstream_permit);
+            drop(global_permit);
+            drop(route_queue_permit);
+            drop(adaptive_permit);
+            metrics.inc_failure();
+            metrics.record_route(&upstream_name, req.start.elapsed(), RouteOutcome::Failure);
+            Self::send_simple_response(
+                h3,
+                quic,
+                stream_id,
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                b"selected backend no longer healthy\n",
+            )?;
+            return Ok(false);
+        }
+
+        let backend_addr = pending_forward.backend_addr.to_string();
+        let Some(backend_endpoint) = backend_endpoints.get(&backend_addr).cloned() else {
+            if let Ok(mut guard) = upstream_pool.write() {
+                guard.finish_request(backend_index, req.start.elapsed(), Some(503));
+            }
+            drop(upstream_permit);
+            drop(global_permit);
+            drop(route_queue_permit);
+            drop(adaptive_permit);
+            metrics.inc_failure();
+            metrics.record_route(&upstream_name, req.start.elapsed(), RouteOutcome::Failure);
+            Self::send_simple_response(
+                h3,
+                quic,
+                stream_id,
+                http::StatusCode::BAD_GATEWAY,
+                b"unknown backend endpoint\n",
+            )?;
+            return Ok(false);
+        };
+
+        let websocket_h1_tunnel = req.tunnel_mode == TunnelMode::Websocket
+            && backend_endpoint.scheme() == BackendScheme::Http;
+        let (body_tx, websocket_tunnel_body_rx, request_body) = if req.bodyless_mode {
+            (None, None, Some(BoxBody::new(Full::new(Bytes::new()))))
+        } else if websocket_h1_tunnel {
+            let (tx, rx) = mpsc::channel::<Bytes>(REQUEST_CHUNK_CHANNEL_CAPACITY);
+            (Some(tx), Some(rx), None)
+        } else {
+            let (tx, channel_body) = ChannelBody::channel(REQUEST_CHUNK_CHANNEL_CAPACITY);
+            (Some(tx), None, Some(channel_body.boxed()))
+        };
+
+        let request = if websocket_h1_tunnel {
+            None
+        } else {
+            match pending_forward.build_request(
+                &backend_endpoint,
+                // Non-websocket branches above always set a body; fall back to an
+                // empty body rather than panicking if that invariant ever changes.
+                request_body.unwrap_or_else(|| BoxBody::new(Full::new(Bytes::new()))),
+                None,
+            ) {
+                Ok(request) => Some(request),
+                Err(err) => {
+                    if let Ok(mut guard) = upstream_pool.write() {
+                        guard.finish_request(backend_index, req.start.elapsed(), Some(503));
+                    }
+                    metrics.inc_failure();
+                    metrics.record_route(
+                        &upstream_name,
+                        req.start.elapsed(),
+                        RouteOutcome::Failure,
+                    );
+                    Self::send_simple_response(
+                        h3,
+                        quic,
+                        stream_id,
+                        http::StatusCode::BAD_REQUEST,
+                        b"invalid request\n",
+                    )?;
+                    error!("failed to build upstream request after auth: {}", err);
+                    resilience
+                        .adaptive_admission
+                        .observe(req.start.elapsed(), true);
+                    return Ok(false);
+                }
+            }
+        };
+
+        let result_rx = match Self::spawn_upstream_forward_task(
+            req,
+            Arc::clone(&pending_forward),
+            backend_endpoint,
+            request,
+            websocket_tunnel_body_rx,
+            transport_pool,
+            backend_endpoints,
+            backend_resolution_store,
+            backend_timeout,
+            Arc::clone(&metrics),
+            resilience,
+        ) {
+            Ok(result_rx) => result_rx,
+            Err(err) => {
+                if let Ok(mut guard) = upstream_pool.write() {
+                    guard.finish_request(backend_index, req.start.elapsed(), Some(503));
+                }
+                metrics.inc_failure();
+                metrics.record_route(&upstream_name, req.start.elapsed(), RouteOutcome::Failure);
+                Self::send_simple_response(
+                    h3,
+                    quic,
+                    stream_id,
+                    http::StatusCode::SERVICE_UNAVAILABLE,
+                    b"upstream runtime unavailable
+",
+                )?;
+                error!("failed to spawn upstream task after auth: {}", err);
+                resilience
+                    .adaptive_admission
+                    .observe(req.start.elapsed(), true);
+                return Ok(false);
+            }
+        };
+
+        req.backend_request_started = true;
+        req.backend_request_finished = false;
+        req.body_tx = body_tx;
+        req.upstream_result_rx = Some(result_rx);
+        req.global_inflight_permit = Some(global_permit);
+        req.upstream_inflight_permit = Some(upstream_permit);
+        req.adaptive_admission_permit = Some(adaptive_permit);
+        req.route_queue_permit = Some(route_queue_permit);
+        req.admission_state = StreamAdmissionState::ReadyToForward;
+        req.phase = if req.request_fin_received {
+            StreamPhase::AwaitingUpstream
+        } else {
+            StreamPhase::ReceivingRequest
+        };
+        Self::flush_request_buffer(req, &metrics);
+        if req.request_fin_received && req.body_buf.is_empty() {
+            req.body_tx = None;
+            req.phase = StreamPhase::AwaitingUpstream;
+        }
+        req.auth_abort = None;
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn complete_auth_result(
+        stream_id: u64,
+        req: &mut RequestEnvelope,
+        result: ExternalAuthResult,
+        h3: &mut quiche::h3::Connection,
+        quic: &mut quiche::Connection,
+        transport_pool: Arc<UpstreamTransportPool>,
+        backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
+        backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
+        upstream_inflight: &HashMap<String, Arc<Semaphore>>,
+        global_inflight: Arc<Semaphore>,
+        backend_timeout: Duration,
+        resilience: &RuntimeResilience,
+        metrics: Arc<Metrics>,
+        inflight_acquire_wait: Duration,
+    ) -> Result<bool, quiche::h3::Error> {
+        req.auth_result_rx = None;
+        if let Some(abort) = req.auth_abort.take() {
+            abort.abort();
+        }
+        req.auth_deadline = None;
+        match result {
+            Ok(ExternalAuthDecision::Allow {
+                request_header_mutations,
+            }) => {
+                metrics.inc_external_auth_allowed();
+                if let Some(pending_forward) = req.pending_forward.as_mut() {
+                    Arc::make_mut(pending_forward)
+                        .auth_header_mutations
+                        .extend(request_header_mutations);
+                }
+                Self::materialize_forward_after_auth(
+                    stream_id,
+                    req,
+                    h3,
+                    quic,
+                    transport_pool,
+                    backend_endpoints,
+                    backend_resolution_store,
+                    upstream_inflight,
+                    global_inflight,
+                    backend_timeout,
+                    resilience,
+                    metrics,
+                    inflight_acquire_wait,
+                )
+            }
+            Ok(decision) => {
+                req.admission_state = StreamAdmissionState::Denied;
+                req.response_status = match &decision {
+                    ExternalAuthDecision::Deny(response) => Some(response.status.as_u16()),
+                    ExternalAuthDecision::Redirect(response) => Some(response.status.as_u16()),
+                    ExternalAuthDecision::Challenge(response) => Some(response.status.as_u16()),
+                    ExternalAuthDecision::Allow { .. } => None,
+                };
+                metrics.inc_failure();
+                metrics.inc_policy_denied();
+                metrics.inc_external_auth_denied();
+                metrics.record_route(
+                    req.upstream_name.as_deref().unwrap_or("unrouted"),
+                    req.start.elapsed(),
+                    RouteOutcome::Failure,
+                );
+                warn!(
+                    "request_id={} route={} external auth denied with status={}",
+                    req.request_id,
+                    req.upstream_name.as_deref().unwrap_or("unrouted"),
+                    req.response_status.unwrap_or(0)
+                );
+                Self::send_external_auth_decision_response(h3, quic, stream_id, &decision)?;
+                Ok(false)
+            }
+            Err(err) if req.auth_fail_open => {
+                match &err {
+                    ProxyError::Timeout => metrics.inc_external_auth_timeout(),
+                    _ => metrics.inc_external_auth_error(),
+                }
+                warn!(
+                    "request_id={} route={} external auth failed open: {:?}",
+                    req.request_id,
+                    req.upstream_name.as_deref().unwrap_or("unrouted"),
+                    err
+                );
+                Self::materialize_forward_after_auth(
+                    stream_id,
+                    req,
+                    h3,
+                    quic,
+                    transport_pool,
+                    backend_endpoints,
+                    backend_resolution_store,
+                    upstream_inflight,
+                    global_inflight,
+                    backend_timeout,
+                    resilience,
+                    metrics,
+                    inflight_acquire_wait,
+                )
+            }
+            Err(err) => {
+                metrics.inc_failure();
+                let route_label = req.upstream_name.as_deref().unwrap_or("unrouted");
+                let (status, body, outcome) = match err {
+                    ProxyError::Timeout => {
+                        metrics.inc_external_auth_timeout();
+                        (
+                            http::StatusCode::GATEWAY_TIMEOUT,
+                            b"external auth timeout\n".as_slice(),
+                            RouteOutcome::Timeout,
+                        )
+                    }
+                    _ => {
+                        metrics.inc_external_auth_error();
+                        (
+                            http::StatusCode::SERVICE_UNAVAILABLE,
+                            b"external auth unavailable\n".as_slice(),
+                            RouteOutcome::Failure,
+                        )
+                    }
+                };
+                req.admission_state = StreamAdmissionState::Denied;
+                req.response_status = Some(status.as_u16());
+                metrics.record_route(route_label, req.start.elapsed(), outcome);
+                Self::send_simple_response(h3, quic, stream_id, status, body)?;
+                Ok(false)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_request_for_auth(
+        stream_id: u64,
+        h3: &mut quiche::h3::Connection,
+        quic: &mut quiche::Connection,
+        peer_address: SocketAddr,
+        quic_trace_id: &str,
+        request_start: Instant,
+        method: &str,
+        path: &str,
+        authority: Option<&str>,
+        content_length: Option<usize>,
+        tunnel_mode: TunnelMode,
+        headers: &[quiche::h3::Header],
+        sticky_cid_key: &str,
+        tracing_enabled: bool,
+        routing_index: &RouteIndex,
+        upstream_policies: &HashMap<String, RuntimeUpstreamPolicy>,
+        upstream_pools: &HashMap<String, Arc<RwLock<UpstreamPool>>>,
+        metrics: &Metrics,
+        resilience: &RuntimeResilience,
+    ) -> Result<Option<PreAuthRequest>, quiche::h3::Error> {
+        let lb_header_lookup = |name: &str| {
+            headers
+                .iter()
+                .find(|header| header.name().eq_ignore_ascii_case(name.as_bytes()))
+                .and_then(|header| std::str::from_utf8(header.value()).ok())
+                .map(str::to_string)
+        };
+        let route_method = if matches!(tunnel_mode, TunnelMode::Websocket) {
+            "GET"
+        } else {
+            method
+        };
+        let resolved = Self::resolve_backend_without_inflight(
+            route_method,
+            path,
+            authority,
+            Some(sticky_cid_key),
+            upstream_pools,
+            routing_index,
+            Some(&lb_header_lookup),
+        );
+
+        let prepared = match resolved {
+            Ok(ResolvedBackend {
+                upstream_name,
+                backend_addr,
+                backend_index,
+                upstream_pool,
+                backend_lb,
+                route_path_len,
+                route_host_specific,
+                route_reason,
+            }) => {
+                let upstream_policy = upstream_policies
+                    .get(&upstream_name)
+                    .cloned()
+                    .unwrap_or_default();
+                let denied_challenge =
+                    if !Self::api_key_is_authorized(&upstream_policy, Some(&lb_header_lookup)) {
+                        Some(b"ApiKey".as_slice())
+                    } else if !Self::jwt_is_authorized(&upstream_policy, Some(&lb_header_lookup)) {
+                        Some(b"Bearer".as_slice())
+                    } else {
+                        None
+                    };
+                if let Some(challenge) = denied_challenge {
+                    metrics.inc_failure();
+                    metrics.inc_policy_denied();
+                    metrics.record_route(
+                        &upstream_name,
+                        request_start.elapsed(),
+                        RouteOutcome::Failure,
+                    );
+                    warn!(
+                        "request_id=unassigned route={} denied by local auth policy",
+                        upstream_name
+                    );
+                    Self::send_unauthorized_response(
+                        h3,
+                        quic,
+                        stream_id,
+                        b"unauthorized\n",
+                        challenge,
+                    )?;
+                    return Ok(None);
+                }
+
+                let request_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let incoming_traceparent =
+                    extract_header_value(headers, b"traceparent").and_then(parse_traceparent);
+                let trace_id = incoming_traceparent
+                    .as_ref()
+                    .map(|(trace_id, _)| trace_id.clone())
+                    .or_else(|| {
+                        tracing_enabled.then(|| generated_trace_id(quic_trace_id, request_id))
+                    });
+                let span_id = trace_id.as_ref().map(|_| generated_span_id(request_id));
+                let traceparent = trace_id
+                    .as_ref()
+                    .zip(span_id.as_ref())
+                    .map(|(trace_id, span_id)| format!("00-{trace_id}-{span_id}-01"));
+                let trace_span =
+                    trace_id
+                        .as_ref()
+                        .zip(span_id.as_ref())
+                        .map(|(trace_id, span_id)| {
+                            info_span!(
+                                "spooky.request",
+                                request_id = request_id,
+                                trace_id = %trace_id,
+                                span_id = %span_id,
+                                method = %method,
+                                path = %path
+                            )
+                        });
+                let bodyless_mode = !is_tunnel_mode(tunnel_mode)
+                    && is_bodyless_request_mode(method, content_length);
+                let request_fin_received = bodyless_mode;
+                let route_reason = format!("{route_reason:?}");
+                let external_auth = upstream_policy.upstream_auth.external_auth.clone();
+                let auth_fail_open = external_auth
+                    .as_ref()
+                    .map(|auth| fail_open(auth_failure_mode(auth)))
+                    .unwrap_or(false);
+                let pending_forward = Arc::new(PendingForward {
+                    method: Arc::<str>::from(method),
+                    path: Arc::<str>::from(path),
+                    authority: authority.map(Arc::<str>::from),
+                    headers: Arc::new(headers.to_vec()),
+                    upstream_name: Arc::<str>::from(upstream_name.as_str()),
+                    route_reason: Arc::<str>::from(route_reason.as_str()),
+                    route_path_len,
+                    route_host_specific,
+                    backend_addr: Arc::<str>::from(backend_addr.as_str()),
+                    backend_index,
+                    backend_lb: Some(Arc::<str>::from(backend_lb.as_str())),
+                    client_addr: peer_address,
+                    request_id,
+                    trace_id: trace_id.as_deref().map(Arc::<str>::from),
+                    span_id: span_id.as_deref().map(Arc::<str>::from),
+                    traceparent: traceparent.as_deref().map(Arc::<str>::from),
+                    host_policy: upstream_policy.host.0.clone(),
+                    forwarded_header_policy: upstream_policy.forwarded_headers.0.clone(),
+                    auth_header_mutations: Vec::new(),
+                });
+
+                Some(PreAuthRequest {
+                    request: PreparedRequest {
+                        upstream_name,
+                        backend_addr,
+                        backend_index,
+                        upstream_pool,
+                        backend_lb,
+                        route_path_len,
+                        route_host_specific,
+                        route_reason,
+                        request_id,
+                        trace_id,
+                        span_id,
+                        traceparent,
+                        trace_span,
+                        bodyless_mode,
+                        request_fin_received,
+                        pending_forward,
+                        auth_fail_open,
+                    },
+                    external_auth,
+                })
+            }
+            Err(err) => {
+                metrics.inc_failure();
+                metrics.record_route("unrouted", request_start.elapsed(), RouteOutcome::Failure);
+                let (status, body): (http::StatusCode, &[u8]) = match err {
+                    ProxyError::Transport(_) => (
+                        http::StatusCode::SERVICE_UNAVAILABLE,
+                        b"no upstream available\n",
+                    ),
+                    ProxyError::Bridge(_) => (http::StatusCode::BAD_REQUEST, b"invalid request\n"),
+                    _ => (
+                        http::StatusCode::INTERNAL_SERVER_ERROR,
+                        b"internal proxy error\n",
+                    ),
+                };
+                Self::send_simple_response(h3, quic, stream_id, status, body)?;
+                resilience
+                    .adaptive_admission
+                    .observe(request_start.elapsed(), true);
+                None
+            }
+        };
+
+        Ok(prepared)
+    }
+
+    fn start_request_auth(
+        stream_id: u64,
+        h3: &mut quiche::h3::Connection,
+        quic: &mut quiche::Connection,
+        request_start: Instant,
+        metrics: &Metrics,
+        pre_auth: PreAuthRequest,
+    ) -> Result<Option<StartedAuthRequest>, quiche::h3::Error> {
+        let PreAuthRequest {
+            request,
+            external_auth,
+        } = pre_auth;
+        let auth_fail_open = request.auth_fail_open;
+        let auth_start = if let Some(external_auth) = external_auth {
+            match start_external_auth_task(Arc::clone(&request.pending_forward), external_auth) {
+                Ok(start) => Some(start),
+                Err(err) if auth_fail_open => {
+                    metrics.inc_external_auth_error();
+                    warn!(
+                        "request_id={} route={} external auth startup failed open: {:?}",
+                        request.request_id, request.upstream_name, err
+                    );
+                    None
+                }
+                Err(err) => {
+                    metrics.inc_failure();
+                    metrics.inc_external_auth_error();
+                    metrics.record_route(
+                        &request.upstream_name,
+                        request_start.elapsed(),
+                        RouteOutcome::Failure,
+                    );
+                    error!(
+                        "request_id={} route={} external auth startup failed: {:?}",
+                        request.request_id, request.upstream_name, err
+                    );
+                    Self::send_simple_response(
+                        h3,
+                        quic,
+                        stream_id,
+                        http::StatusCode::SERVICE_UNAVAILABLE,
+                        b"external auth unavailable\n",
+                    )?;
+                    return Ok(None);
+                }
+            }
+        } else {
+            None
+        };
+        let auth_requested = auth_start.is_some();
+
+        Ok(Some(StartedAuthRequest {
+            request,
+            auth_start,
+            auth_requested,
+        }))
+    }
+
     pub(super) fn flush_send(
         socket: &UdpSocket,
         send_buf: &mut [u8],
@@ -952,695 +2807,6 @@ impl QUICListener {
                         }
                     }
 
-                    // Route lookup — needed to start the H2 request immediately.
-                    let sticky_cid_key = hex::encode(connection.primary_scid.as_ref());
-                    let lb_header_lookup = |name: &str| {
-                        list.iter()
-                            .find(|header| header.name().eq_ignore_ascii_case(name.as_bytes()))
-                            .and_then(|header| std::str::from_utf8(header.value()).ok())
-                            .map(str::to_string)
-                    };
-                    let route_method = if websocket_tunnel { "GET" } else { &method };
-                    let resolved = Self::resolve_backend(
-                        route_method,
-                        &path,
-                        authority.as_deref(),
-                        Some(sticky_cid_key.as_str()),
-                        upstream_pools,
-                        routing_index,
-                        Some(&lb_header_lookup),
-                    );
-
-                    let (
-                        body_tx,
-                        upstream_result_rx,
-                        backend_addr,
-                        backend_index,
-                        upstream_name,
-                        backend_lb,
-                        route_path_len,
-                        route_host_specific,
-                        route_reason,
-                        upstream_pool,
-                        global_inflight_permit,
-                        upstream_inflight_permit,
-                        adaptive_admission_permit,
-                        route_queue_permit,
-                        request_fin_received,
-                        bodyless_mode,
-                        trace_id,
-                        span_id,
-                        traceparent,
-                        trace_span,
-                        request_id,
-                    ) = match resolved {
-                        Ok(ResolvedBackend {
-                            upstream_name,
-                            backend_addr: addr,
-                            backend_index: idx,
-                            upstream_pool,
-                            backend_lb,
-                            route_path_len,
-                            route_host_specific,
-                            route_reason,
-                        }) => {
-                            resilience.brownout.observe_admission_pressure(
-                                resilience.adaptive_admission.inflight_percent(),
-                            );
-                            metrics.set_brownout_active(resilience.brownout.is_active());
-                            if !resilience.brownout.route_allowed(&upstream_name) {
-                                metrics.inc_failure();
-                                metrics.inc_overload_shed_reason(OverloadShedReason::Brownout);
-                                metrics.record_route(
-                                    &upstream_name,
-                                    request_start.elapsed(),
-                                    RouteOutcome::OverloadShed,
-                                );
-                                Self::send_overload_response(
-                                    h3,
-                                    &mut connection.quic,
-                                    stream_id,
-                                    b"brownout active, non-core route shed\n",
-                                    resilience.shed_retry_after_seconds,
-                                )?;
-                                resilience
-                                    .adaptive_admission
-                                    .observe(request_start.elapsed(), true);
-                                continue;
-                            }
-
-                            let adaptive_permit = match resilience.adaptive_admission.try_acquire()
-                            {
-                                Some(permit) => permit,
-                                None => {
-                                    metrics.inc_failure();
-                                    metrics.inc_overload_shed_reason(
-                                        OverloadShedReason::AdaptiveAdmission,
-                                    );
-                                    metrics.record_route(
-                                        &upstream_name,
-                                        request_start.elapsed(),
-                                        RouteOutcome::OverloadShed,
-                                    );
-                                    Self::send_overload_response(
-                                        h3,
-                                        &mut connection.quic,
-                                        stream_id,
-                                        b"adaptive admission overload\n",
-                                        resilience.shed_retry_after_seconds,
-                                    )?;
-                                    resilience
-                                        .adaptive_admission
-                                        .observe(request_start.elapsed(), true);
-                                    continue;
-                                }
-                            };
-
-                            let route_queue_permit =
-                                match resilience.route_queue.try_acquire(&upstream_name) {
-                                    Ok(permit) => permit,
-                                    Err(RouteQueueRejection::RouteCap) => {
-                                        metrics.inc_failure();
-                                        metrics
-                                            .inc_overload_shed_reason(OverloadShedReason::RouteCap);
-                                        metrics.record_route(
-                                            &upstream_name,
-                                            request_start.elapsed(),
-                                            RouteOutcome::OverloadShed,
-                                        );
-                                        Self::send_overload_response(
-                                            h3,
-                                            &mut connection.quic,
-                                            stream_id,
-                                            b"route queue cap exceeded\n",
-                                            resilience.shed_retry_after_seconds,
-                                        )?;
-                                        resilience
-                                            .adaptive_admission
-                                            .observe(request_start.elapsed(), true);
-                                        continue;
-                                    }
-                                    Err(RouteQueueRejection::GlobalCap) => {
-                                        metrics.inc_failure();
-                                        metrics.inc_overload_shed_reason(
-                                            OverloadShedReason::RouteGlobalCap,
-                                        );
-                                        metrics.record_route(
-                                            &upstream_name,
-                                            request_start.elapsed(),
-                                            RouteOutcome::OverloadShed,
-                                        );
-                                        Self::send_overload_response(
-                                            h3,
-                                            &mut connection.quic,
-                                            stream_id,
-                                            b"global queue cap exceeded\n",
-                                            resilience.shed_retry_after_seconds,
-                                        )?;
-                                        resilience
-                                            .adaptive_admission
-                                            .observe(request_start.elapsed(), true);
-                                        continue;
-                                    }
-                                };
-
-                            let global_permit = match Self::try_acquire_owned_with_micro_wait(
-                                Arc::clone(&global_inflight),
-                                inflight_acquire_wait,
-                            ) {
-                                Ok((permit, waited)) => {
-                                    if waited {
-                                        metrics.inc_inflight_wait_admit_global();
-                                    }
-                                    permit
-                                }
-                                Err(_) => {
-                                    metrics.inc_failure();
-                                    metrics.inc_overload_shed_reason(
-                                        OverloadShedReason::GlobalInflight,
-                                    );
-                                    metrics.record_route(
-                                        &upstream_name,
-                                        request_start.elapsed(),
-                                        RouteOutcome::OverloadShed,
-                                    );
-                                    Self::send_overload_response(
-                                        h3,
-                                        &mut connection.quic,
-                                        stream_id,
-                                        b"overloaded, retry later\n",
-                                        resilience.shed_retry_after_seconds,
-                                    )?;
-                                    resilience
-                                        .adaptive_admission
-                                        .observe(request_start.elapsed(), true);
-                                    continue;
-                                }
-                            };
-
-                            let upstream_permit = match upstream_inflight
-                                .get(&upstream_name)
-                                .cloned()
-                            {
-                                Some(semaphore) => match Self::try_acquire_owned_with_micro_wait(
-                                    semaphore,
-                                    inflight_acquire_wait,
-                                ) {
-                                    Ok((permit, waited)) => {
-                                        if waited {
-                                            metrics.inc_inflight_wait_admit_upstream();
-                                        }
-                                        permit
-                                    }
-                                    Err(_) => {
-                                        drop(global_permit);
-                                        metrics.inc_failure();
-                                        metrics.inc_overload_shed_reason(
-                                            OverloadShedReason::UpstreamInflight,
-                                        );
-                                        metrics.record_route(
-                                            &upstream_name,
-                                            request_start.elapsed(),
-                                            RouteOutcome::OverloadShed,
-                                        );
-                                        Self::send_overload_response(
-                                            h3,
-                                            &mut connection.quic,
-                                            stream_id,
-                                            b"upstream overloaded, retry later\n",
-                                            resilience.shed_retry_after_seconds,
-                                        )?;
-                                        resilience
-                                            .adaptive_admission
-                                            .observe(request_start.elapsed(), true);
-                                        continue;
-                                    }
-                                },
-                                None => {
-                                    drop(global_permit);
-                                    metrics.inc_failure();
-                                    metrics.inc_overload_shed_reason(
-                                        OverloadShedReason::UpstreamInflight,
-                                    );
-                                    metrics.record_route(
-                                        &upstream_name,
-                                        request_start.elapsed(),
-                                        RouteOutcome::OverloadShed,
-                                    );
-                                    Self::send_simple_response(
-                                        h3,
-                                        &mut connection.quic,
-                                        stream_id,
-                                        http::StatusCode::SERVICE_UNAVAILABLE,
-                                        b"upstream admission limiter unavailable\n",
-                                    )?;
-                                    resilience
-                                        .adaptive_admission
-                                        .observe(request_start.elapsed(), true);
-                                    continue;
-                                }
-                            };
-
-                            let request_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-                            let incoming_traceparent = extract_header_value(&list, b"traceparent")
-                                .and_then(parse_traceparent);
-                            let trace_id = incoming_traceparent
-                                .as_ref()
-                                .map(|(trace_id, _)| trace_id.clone())
-                                .or_else(|| {
-                                    tracing_enabled.then(|| {
-                                        generated_trace_id(connection.quic.trace_id(), request_id)
-                                    })
-                                });
-                            let span_id = trace_id.as_ref().map(|_| generated_span_id(request_id));
-                            let traceparent = trace_id
-                                .as_ref()
-                                .zip(span_id.as_ref())
-                                .map(|(trace_id, span_id)| format!("00-{trace_id}-{span_id}-01"));
-                            let trace_span = trace_id.as_ref().zip(span_id.as_ref()).map(
-                                |(trace_id, span_id)| {
-                                    info_span!(
-                                        "spooky.request",
-                                        request_id = request_id,
-                                        trace_id = %trace_id,
-                                        span_id = %span_id,
-                                        method = %method,
-                                        path = %path
-                                    )
-                                },
-                            );
-                            let backend_endpoint = match backend_endpoints.get(&addr).cloned() {
-                                Some(endpoint) => endpoint,
-                                None => {
-                                    drop(upstream_permit);
-                                    drop(global_permit);
-                                    metrics.inc_failure();
-                                    metrics.record_route(
-                                        &upstream_name,
-                                        request_start.elapsed(),
-                                        RouteOutcome::Failure,
-                                    );
-                                    Self::send_simple_response(
-                                        h3,
-                                        &mut connection.quic,
-                                        stream_id,
-                                        http::StatusCode::BAD_GATEWAY,
-                                        b"unknown backend endpoint\n",
-                                    )?;
-                                    error!("missing parsed backend endpoint for {}", addr);
-                                    resilience
-                                        .adaptive_admission
-                                        .observe(request_start.elapsed(), true);
-                                    continue;
-                                }
-                            };
-                            let websocket_h1_tunnel = websocket_tunnel
-                                && backend_endpoint.scheme() == BackendScheme::Http;
-                            let bodyless_mode = !is_tunnel_mode(tunnel_mode)
-                                && is_bodyless_request_mode(&method, content_length);
-                            let (tx, websocket_tunnel_body_rx, boxed, request_fin_received) =
-                                if bodyless_mode {
-                                    (None, None, BoxBody::new(Full::new(Bytes::new())), true)
-                                } else if websocket_h1_tunnel {
-                                    let (tx, rx) =
-                                        mpsc::channel::<Bytes>(REQUEST_CHUNK_CHANNEL_CAPACITY);
-                                    (
-                                        Some(tx),
-                                        Some(rx),
-                                        BoxBody::new(Full::new(Bytes::new())),
-                                        false,
-                                    )
-                                } else {
-                                    // Create a channel body so quiche Data chunks stream
-                                    // directly into the in-flight request.
-                                    let (tx, channel_body) =
-                                        ChannelBody::channel(REQUEST_CHUNK_CHANNEL_CAPACITY);
-                                    (Some(tx), None, channel_body.boxed(), false)
-                                };
-                            let upstream_policy = upstream_policies
-                                .get(&upstream_name)
-                                .cloned()
-                                .unwrap_or_default();
-                            let build_result = if backend_endpoint.scheme() == BackendScheme::Http {
-                                build_h1_request_for_endpoint_with_host_policy(
-                                    &backend_endpoint,
-                                    &upstream_policy.host.0,
-                                    &upstream_policy.forwarded_headers.0,
-                                    &method,
-                                    &path,
-                                    &list,
-                                    boxed,
-                                    None,
-                                    ForwardedContext {
-                                        client_addr: connection.peer_address,
-                                        request_authority: authority.as_deref(),
-                                        request_id,
-                                        traceparent: traceparent.as_deref(),
-                                    },
-                                )
-                            } else {
-                                build_h2_request_for_endpoint_with_host_policy(
-                                    &backend_endpoint,
-                                    &upstream_policy.host.0,
-                                    &upstream_policy.forwarded_headers.0,
-                                    &method,
-                                    &path,
-                                    &list,
-                                    boxed,
-                                    None,
-                                    ForwardedContext {
-                                        client_addr: connection.peer_address,
-                                        request_authority: authority.as_deref(),
-                                        request_id,
-                                        traceparent: traceparent.as_deref(),
-                                    },
-                                )
-                            };
-                            let request = match build_result {
-                                Ok(request) => request,
-                                Err(err) => {
-                                    drop(upstream_permit);
-                                    drop(global_permit);
-                                    metrics.inc_failure();
-                                    metrics.record_route(
-                                        &upstream_name,
-                                        request_start.elapsed(),
-                                        RouteOutcome::Failure,
-                                    );
-                                    Self::send_simple_response(
-                                        h3,
-                                        &mut connection.quic,
-                                        stream_id,
-                                        http::StatusCode::BAD_REQUEST,
-                                        b"invalid request\n",
-                                    )?;
-                                    error!("failed to build upstream request: {}", err);
-                                    resilience
-                                        .adaptive_admission
-                                        .observe(request_start.elapsed(), true);
-                                    continue;
-                                }
-                            };
-
-                            let transport = transport_pool.clone();
-                            let fwd_addr = addr.clone();
-                            let cb = Arc::clone(&resilience.circuit_breakers);
-                            let retry_budget = Arc::clone(&resilience.retry_budget);
-                            let route_name = upstream_name.clone();
-                            let backend_endpoints = Arc::clone(&backend_endpoints);
-                            let _backend_resolutions = Arc::clone(&backend_resolution_store);
-                            let allow_hedge = !is_tunnel_mode(tunnel_mode)
-                                && bodyless_mode
-                                && resilience.hedging_allowed_for(&method, &upstream_name, true);
-                            let hedge_delay = resilience.hedging_delay;
-                            let alternate_backend =
-                                Self::pick_alternate_backend(&upstream_pool, idx);
-                            let forward_meta = (!is_tunnel_mode(tunnel_mode) && bodyless_mode)
-                                .then(|| {
-                                    Arc::new(ForwardRequestMeta {
-                                        method: Arc::<str>::from(method.as_str()),
-                                        path: Arc::<str>::from(path.as_str()),
-                                        authority: authority.as_deref().map(Arc::<str>::from),
-                                        headers: Arc::new(list.clone()),
-                                        client_addr: connection.peer_address,
-                                        request_id,
-                                        traceparent: traceparent.as_deref().map(Arc::<str>::from),
-                                        host_policy: upstream_policy.host.0.clone(),
-                                        forwarded_header_policy: upstream_policy
-                                            .forwarded_headers
-                                            .0
-                                            .clone(),
-                                    })
-                                });
-                            let trace_span_for_upstream = trace_span.clone();
-                            let (result_tx, result_rx) = oneshot::channel::<UpstreamResult>();
-                            let client_addr = connection.peer_address;
-                            let path_for_upstream = path.clone();
-                            let authority_for_upstream = authority.clone();
-                            let traceparent_for_upstream = traceparent.clone();
-                            let upstream_metrics = Arc::clone(&metrics);
-                            let fut = async move {
-                                let mut hedge_telemetry = crate::HedgeTelemetry::default();
-                                let mut retry_count: u8 = 0;
-                                let mut retry_attempt_reason: Option<RetryReason> = None;
-                                let mut retry_denial_reason: Option<RetryReason> = None;
-                                let result: ForwardResult = async {
-                                    retry_budget.mark_primary(&route_name);
-
-                                    let send_once =
-                                        |backend: String,
-                                         req: http::Request<
-                                            BoxBody<Bytes, std::convert::Infallible>,
-                                        >,
-                                         cb: Arc<crate::resilience::CircuitBreakers>,
-                                         transport: Arc<UpstreamTransportPool>| async move {
-                                            if !cb.allow_request(&backend) {
-                                                return Err(ProxyError::Pool(
-                                                    PoolError::CircuitOpen(backend),
-                                                ));
-                                            }
-                                            let send_result = tokio::time::timeout(
-                                                backend_timeout,
-                                                transport.send(&backend, req),
-                                            )
-                                            .await
-                                            .map_err(|_| ProxyError::Timeout);
-                                            match &send_result {
-                                                Ok(Ok(_)) => cb.record_success(&backend),
-                                                _ => cb.record_failure(&backend),
-                                            }
-                                            Ok(send_result??)
-                                        };
-
-                                    let forward_success: ForwardSuccess = if websocket_h1_tunnel {
-                                        let Some(body_rx) = websocket_tunnel_body_rx else {
-                                            return Err(ProxyError::Transport(
-                                                "websocket H1 tunnels require a downstream body channel".into(),
-                                            ));
-                                        };
-                                        Self::forward_http1_websocket_tunnel(
-                                            backend_endpoint.clone(),
-                                            upstream_policy.host.0.clone(),
-                                            upstream_policy.forwarded_headers.0.clone(),
-                                            path_for_upstream.clone(),
-                                            list.clone(),
-                                            client_addr,
-                                            authority_for_upstream.clone(),
-                                            request_id,
-                                            traceparent_for_upstream.clone(),
-                                            body_rx,
-                                            backend_timeout,
-                                            Arc::clone(&upstream_metrics),
-                                        )
-                                        .await?
-                                    } else {
-                                        let response: Response<Incoming> = if allow_hedge {
-                                        let hedge_candidate = alternate_backend
-                                            .clone()
-                                            .and_then(|(backend, _idx)| {
-                                                let meta = forward_meta.as_ref()?;
-                                                let endpoint = backend_endpoints.get(&backend)?;
-                                                meta.build_bodyless_request(endpoint)
-                                                    .ok()
-                                                    .map(|req| (backend, req))
-                                            });
-
-                                        if let Some((hedge_backend, hedge_request)) =
-                                            hedge_candidate
-                                        {
-                                            let primary_started = Instant::now();
-                                            let primary_backend = fwd_addr.clone();
-                                            let primary_fut = send_once(
-                                                primary_backend,
-                                                request,
-                                                Arc::clone(&cb),
-                                                Arc::clone(&transport),
-                                            );
-                                            tokio::pin!(primary_fut);
-                                            let hedge_sleep = tokio::time::sleep(hedge_delay);
-                                            tokio::pin!(hedge_sleep);
-
-                                            if let Some(result) = tokio::select! {
-                                                result = &mut primary_fut => Some(result),
-                                                _ = &mut hedge_sleep => None,
-                                            } {
-                                                result?
-                                            } else if retry_budget.allow_retry(&route_name).is_ok() {
-                                                hedge_telemetry.launched = true;
-                                                let hedge_fut = send_once(
-                                                    hedge_backend,
-                                                    hedge_request,
-                                                    Arc::clone(&cb),
-                                                    Arc::clone(&transport),
-                                                        );
-                                                tokio::pin!(hedge_fut);
-                                                tokio::select! {
-                                                    result = &mut primary_fut => {
-                                                        hedge_telemetry.primary_won_after_trigger = true;
-                                                        hedge_telemetry.hedge_wasted = true;
-                                                        result?
-                                                    },
-                                                    result = &mut hedge_fut => {
-                                                        hedge_telemetry.hedge_won = true;
-                                                        let elapsed_ms = primary_started.elapsed().as_millis() as u64;
-                                                        let delay_ms = hedge_delay.as_millis() as u64;
-                                                        hedge_telemetry.primary_late_ms = elapsed_ms.saturating_sub(delay_ms);
-                                                        result?
-                                                    },
-                                                }
-                                            } else {
-                                                primary_fut.await?
-                                            }
-                                        } else {
-                                            send_once(
-                                                fwd_addr.clone(),
-                                                request,
-                                                Arc::clone(&cb),
-                                                Arc::clone(&transport),
-                                            )
-                                            .await?
-                                        }
-                                    } else {
-                                        match send_once(
-                                            fwd_addr.clone(),
-                                            request,
-                                            Arc::clone(&cb),
-                                            Arc::clone(&transport),
-                                        )
-                                        .await
-                                        {
-                                            Ok(response) => response,
-                                            Err(primary_err) => {
-                                                let retry_reason = classify_retry_reason(&primary_err);
-                                                let is_retryable_err = is_retryable(&primary_err);
-                                                let budget_ok = retry_budget.allow_retry(&route_name).is_ok();
-                                                let can_retry = bodyless_mode
-                                                    && is_retryable_err
-                                                    && budget_ok
-                                                    && alternate_backend.is_some();
-                                                if !can_retry {
-                                                    if !bodyless_mode {
-                                                        retry_denial_reason = Some(RetryReason::NotBodylessMode);
-                                                    } else if !is_retryable_err {
-                                                        retry_denial_reason = None;
-                                                    } else if !budget_ok {
-                                                        retry_denial_reason = Some(RetryReason::BudgetDenied);
-                                                    } else {
-                                                        retry_denial_reason = Some(RetryReason::NoAlternateBackend);
-                                                    }
-                                                    return Err(primary_err);
-                                                } else if let Some((retry_backend, _)) =
-                                                        alternate_backend.clone()
-                                                    && let Some(meta) = forward_meta.as_ref()
-                                                    && let Some(endpoint) = backend_endpoints
-                                                        .get(&retry_backend)
-                                                    && let Ok(retry_request) =
-                                                        meta.build_bodyless_request(endpoint)
-                                                {
-                                                    retry_count = retry_count.saturating_add(1);
-                                                    retry_attempt_reason = Some(retry_reason);
-                                                    info!(
-                                                        "request_id={} retrying request on alternate backend: route={} reason={:?}",
-                                                        request_id, route_name, retry_reason
-                                                    );
-                                                    send_once(
-                                                        retry_backend,
-                                                        retry_request,
-                                                        Arc::clone(&cb),
-                                                        Arc::clone(&transport),
-                                                                    )
-                                                    .await?
-                                                } else {
-                                                    return Err(primary_err);
-                                                }
-                                            }
-                                        }
-                                    };
-
-                                        let (parts, body) = response.into_parts();
-                                        ForwardSuccess::Response {
-                                            status: parts.status,
-                                            headers: parts.headers,
-                                            body,
-                                        }
-                                    };
-                                    Ok(forward_success)
-                                }
-                                .await;
-                                // Ignore send error: receiver dropped means the stream was reset.
-                                let _ = result_tx.send(UpstreamResult {
-                                    forward: result,
-                                    hedge: hedge_telemetry,
-                                    retry_count,
-                                    retry_attempt_reason,
-                                    retry_denial_reason,
-                                });
-                            };
-                            let spawned = match trace_span_for_upstream {
-                                Some(span) => spawn_async_task(fut.instrument(span), "upstream"),
-                                None => spawn_async_task(fut, "upstream"),
-                            };
-                            if !spawned {
-                                error!("dropping upstream task: no runtime available");
-                            }
-                            (
-                                tx,
-                                Some(result_rx),
-                                Some(addr),
-                                Some(idx),
-                                Some(upstream_name),
-                                Some(backend_lb),
-                                Some(route_path_len),
-                                Some(route_host_specific),
-                                Some(format!("{route_reason:?}")),
-                                Some(upstream_pool),
-                                Some(global_permit),
-                                Some(upstream_permit),
-                                Some(adaptive_permit),
-                                Some(route_queue_permit),
-                                request_fin_received,
-                                bodyless_mode,
-                                trace_id,
-                                span_id,
-                                traceparent,
-                                trace_span,
-                                request_id,
-                            )
-                        }
-                        Err(err) => {
-                            metrics.inc_failure();
-                            metrics.record_route(
-                                "unrouted",
-                                request_start.elapsed(),
-                                RouteOutcome::Failure,
-                            );
-                            let (status, body): (http::StatusCode, &[u8]) = match err {
-                                ProxyError::Transport(_) => (
-                                    http::StatusCode::SERVICE_UNAVAILABLE,
-                                    b"no upstream available\n",
-                                ),
-                                ProxyError::Bridge(_) => {
-                                    (http::StatusCode::BAD_REQUEST, b"invalid request\n")
-                                }
-                                _ => (
-                                    http::StatusCode::INTERNAL_SERVER_ERROR,
-                                    b"internal proxy error\n",
-                                ),
-                            };
-                            Self::send_simple_response(
-                                h3,
-                                &mut connection.quic,
-                                stream_id,
-                                status,
-                                body,
-                            )?;
-                            resilience
-                                .adaptive_admission
-                                .observe(request_start.elapsed(), true);
-                            continue;
-                        }
-                    };
-
                     // App-level stream count cap: mirrors the QUIC max_streams_bidi
                     // limit so the streams HashMap can never grow beyond what the
                     // transport layer allows even if a race or misconfiguration
@@ -1651,14 +2817,6 @@ impl QUICListener {
                             "stream limit reached ({} streams), rejecting stream {}",
                             max_streams_per_connection, stream_id
                         );
-                        // Dropping the permits and body_tx here releases inflight
-                        // semaphore slots and signals the upstream task to abort.
-                        drop(body_tx);
-                        drop(global_inflight_permit);
-                        drop(upstream_inflight_permit);
-                        drop(adaptive_admission_permit);
-                        drop(route_queue_permit);
-                        drop(upstream_result_rx);
                         Self::send_simple_response(
                             h3,
                             &mut connection.quic,
@@ -1669,6 +2827,93 @@ impl QUICListener {
                         continue;
                     }
 
+                    // Route lookup now only selects an upstream/backend; actual
+                    // backend/inflight admission is deferred until local auth
+                    // succeeds immediately or async external auth completes.
+                    let sticky_cid_key = hex::encode(connection.primary_scid.as_ref());
+                    let quic_trace_id = connection.quic.trace_id().to_string();
+                    let pre_auth = match Self::prepare_request_for_auth(
+                        stream_id,
+                        h3,
+                        &mut connection.quic,
+                        connection.peer_address,
+                        &quic_trace_id,
+                        request_start,
+                        &method,
+                        &path,
+                        authority.as_deref(),
+                        content_length,
+                        tunnel_mode,
+                        &list,
+                        sticky_cid_key.as_str(),
+                        tracing_enabled,
+                        routing_index,
+                        &upstream_policies,
+                        upstream_pools,
+                        &metrics,
+                        resilience,
+                    )? {
+                        Some(pre_auth) => pre_auth,
+                        None => continue,
+                    };
+                    let started_auth = match Self::start_request_auth(
+                        stream_id,
+                        h3,
+                        &mut connection.quic,
+                        request_start,
+                        &metrics,
+                        pre_auth,
+                    )? {
+                        Some(started_auth) => started_auth,
+                        None => continue,
+                    };
+                    let StartedAuthRequest {
+                        request:
+                            PreparedRequest {
+                                upstream_name,
+                                backend_addr,
+                                backend_index,
+                                upstream_pool,
+                                backend_lb,
+                                route_path_len,
+                                route_host_specific,
+                                route_reason,
+                                request_id,
+                                trace_id,
+                                span_id,
+                                traceparent,
+                                trace_span,
+                                bodyless_mode,
+                                request_fin_received,
+                                pending_forward,
+                                auth_fail_open,
+                            },
+                        auth_start,
+                        auth_requested,
+                    } = started_auth;
+
+                    let (
+                        auth_result_rx,
+                        auth_abort,
+                        auth_deadline,
+                        auth_fail_open,
+                        admission_state,
+                    ) = match auth_start {
+                        Some(start) => (
+                            Some(start.rx),
+                            Some(start.abort),
+                            Some(start.deadline),
+                            start.fail_open,
+                            StreamAdmissionState::WaitingForAuth,
+                        ),
+                        None => (
+                            None,
+                            None,
+                            None,
+                            auth_fail_open,
+                            StreamAdmissionState::ReadyToForward,
+                        ),
+                    };
                     connection.streams.insert(
                         stream_id,
                         RequestEnvelope {
@@ -1680,41 +2925,77 @@ impl QUICListener {
                             method,
                             path,
                             authority,
-                            body_tx,
+                            body_tx: None,
                             body_buf: std::collections::VecDeque::new(),
                             body_buf_bytes: 0,
                             body_bytes_received: 0,
                             last_body_activity: request_start,
-                            backend_addr,
-                            backend_index,
-                            upstream_name,
-                            route_reason,
-                            route_path_len,
-                            route_host_specific,
-                            backend_lb,
-                            upstream_pool,
+                            backend_addr: Some(backend_addr),
+                            backend_index: Some(backend_index),
+                            upstream_name: Some(upstream_name),
+                            route_reason: Some(route_reason),
+                            route_path_len: Some(route_path_len),
+                            route_host_specific: Some(route_host_specific),
+                            backend_lb: Some(backend_lb),
+                            upstream_pool: Some(upstream_pool),
                             routing_transparency_enabled,
                             routing_transparency_include_reason,
                             response_status: None,
+                            backend_request_started: false,
                             backend_request_finished: false,
-                            global_inflight_permit,
-                            upstream_inflight_permit,
-                            adaptive_admission_permit,
-                            route_queue_permit,
+                            global_inflight_permit: None,
+                            upstream_inflight_permit: None,
+                            adaptive_admission_permit: None,
+                            route_queue_permit: None,
                             start: request_start,
                             total_request_deadline: request_start + backend_total_request_timeout,
                             bodyless_mode,
                             tunnel_mode,
                             retry_count: 0,
                             error_kind: None,
+                            pending_forward: Some(pending_forward),
+                            auth_result_rx,
+                            auth_abort,
+                            auth_fail_open,
+                            auth_deadline,
                             phase: StreamPhase::ReceivingRequest,
+                            admission_state,
                             request_fin_received,
-                            upstream_result_rx,
+                            upstream_result_rx: None,
                             response_chunk_rx: None,
                             response_headers_sent: false,
                             pending_chunk: None,
                         },
                     );
+                    if !auth_requested {
+                        let keep_stream = if let Some(req) = connection.streams.get_mut(&stream_id)
+                        {
+                            Self::materialize_forward_after_auth(
+                                stream_id,
+                                req,
+                                h3,
+                                &mut connection.quic,
+                                Arc::clone(&transport_pool),
+                                Arc::clone(&backend_endpoints),
+                                Arc::clone(&backend_resolution_store),
+                                upstream_inflight,
+                                Arc::clone(&global_inflight),
+                                backend_timeout,
+                                resilience,
+                                Arc::clone(&metrics),
+                                inflight_acquire_wait,
+                            )?
+                        } else {
+                            false
+                        };
+                        if !keep_stream {
+                            if let Some(req) = connection.streams.get_mut(&stream_id) {
+                                abort_stream(req, &metrics);
+                            }
+                            connection.streams.remove(&stream_id);
+                            continue;
+                        }
+                    }
                     if let Some(req) = connection.streams.get(&stream_id) {
                         debug!(
                             "request_id={} method={} path={} stream_id={}",
@@ -1887,8 +3168,11 @@ impl QUICListener {
                         if req.body_buf.is_empty() {
                             req.body_tx = None;
                         }
-                        // Request body fully handed off — now waiting on upstream.
-                        req.phase = StreamPhase::AwaitingUpstream;
+                        // Only move to AwaitingUpstream once auth has allowed the request
+                        // and an upstream task/body channel actually exists.
+                        if req.admission_state == StreamAdmissionState::ReadyToForward {
+                            req.phase = StreamPhase::AwaitingUpstream;
+                        }
                         // Upstream polling and response dispatch are handled entirely
                         // by advance_streams_non_blocking, called unconditionally below.
                     }
@@ -1914,16 +3198,23 @@ impl QUICListener {
             &mut connection.streams,
             &mut connection.quic,
             h3,
+            Arc::clone(&transport_pool),
+            Arc::clone(&backend_endpoints),
+            Arc::clone(&backend_resolution_store),
             upstream_pools,
+            upstream_inflight,
+            Arc::clone(&global_inflight),
+            backend_timeout,
             routing_index,
             backend_body_idle_timeout,
             backend_body_total_timeout,
-            &metrics,
+            Arc::clone(&metrics),
             backend_total_request_timeout,
             resilience,
             max_response_body_bytes,
             unknown_length_response_prebuffer_bytes,
             client_body_idle_timeout,
+            inflight_acquire_wait,
             listen_port,
         )?;
 
@@ -1954,16 +3245,23 @@ impl QUICListener {
         streams: &mut HashMap<u64, RequestEnvelope>,
         quic: &mut quiche::Connection,
         h3: &mut quiche::h3::Connection,
+        transport_pool: Arc<UpstreamTransportPool>,
+        backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
+        backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
         upstream_pools: &HashMap<String, Arc<RwLock<UpstreamPool>>>,
+        upstream_inflight: &HashMap<String, Arc<Semaphore>>,
+        global_inflight: Arc<Semaphore>,
+        backend_timeout: Duration,
         routing_index: &RouteIndex,
         backend_body_idle_timeout: Duration,
         backend_body_total_timeout: Duration,
-        metrics: &Metrics,
+        metrics: Arc<Metrics>,
         _backend_total_request_timeout: Duration,
         resilience: &RuntimeResilience,
         max_response_body_bytes: usize,
         unknown_length_response_prebuffer_bytes: usize,
         client_body_idle_timeout: Duration,
+        inflight_acquire_wait: Duration,
         listen_port: u16,
     ) -> Result<(), quiche::h3::Error> {
         let stream_ids: Vec<u64> = streams.keys().copied().collect();
@@ -1980,7 +3278,7 @@ impl QUICListener {
                     Err(ProxyError::Timeout),
                     upstream_pools,
                     routing_index,
-                    metrics,
+                    &metrics,
                     resilience.shed_retry_after_seconds,
                 ) {
                     error!(
@@ -1992,7 +3290,7 @@ impl QUICListener {
                     .adaptive_admission
                     .observe(req.start.elapsed(), true);
                 if let Some(req) = streams.get_mut(&stream_id) {
-                    abort_stream(req, metrics);
+                    abort_stream(req, &metrics);
                 }
                 streams.remove(&stream_id);
                 continue;
@@ -2020,7 +3318,7 @@ impl QUICListener {
                     .adaptive_admission
                     .observe(req.start.elapsed(), true);
                 if let Some(req) = streams.get_mut(&stream_id) {
-                    abort_stream(req, metrics);
+                    abort_stream(req, &metrics);
                 }
                 streams.remove(&stream_id);
                 continue;
@@ -2028,26 +3326,72 @@ impl QUICListener {
 
             // ── 1 & 2: request body drain ────────────────────────────────────
             if let Some(req) = streams.get_mut(&stream_id) {
-                Self::flush_request_buffer(req, metrics);
+                Self::flush_request_buffer(req, &metrics);
                 if req.request_fin_received && req.body_buf.is_empty() {
                     req.body_tx = None; // signals EOF to the upstream H2 task
                 }
             }
 
-            // ── 3: poll upstream oneshot ──────────────────────────────────────
-            // Only transition to response handling once request-body ingestion is
-            // complete. This preserves request-size enforcement semantics:
-            // oversized requests must still be able to terminate with 413 even if
-            // upstream produced an early response. CONNECT is the exception:
-            // successful CONNECT establishes a tunnel and must not wait for request FIN.
+            // ── 3: poll external auth first, then upstream oneshot ─────────────
+            let auth_ready: Option<ExternalAuthResult> = if streams
+                .get(&stream_id)
+                .is_some_and(|req| req.admission_state == StreamAdmissionState::WaitingForAuth)
+            {
+                if streams
+                    .get(&stream_id)
+                    .and_then(|req| req.auth_deadline)
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    Some(Err(ProxyError::Timeout))
+                } else {
+                    streams
+                        .get_mut(&stream_id)
+                        .and_then(|req| req.auth_result_rx.as_mut())
+                        .and_then(|rx| match rx.try_recv() {
+                            Ok(result) => Some(result),
+                            Err(oneshot::error::TryRecvError::Empty) => None,
+                            Err(oneshot::error::TryRecvError::Closed) => Some(Err(
+                                ProxyError::Transport("external auth task dropped sender".into()),
+                            )),
+                        })
+                }
+            } else {
+                None
+            };
+
+            if let Some(auth_result) = auth_ready {
+                let keep_stream = if let Some(req) = streams.get_mut(&stream_id) {
+                    Self::complete_auth_result(
+                        stream_id,
+                        req,
+                        auth_result,
+                        h3,
+                        quic,
+                        Arc::clone(&transport_pool),
+                        Arc::clone(&backend_endpoints),
+                        Arc::clone(&backend_resolution_store),
+                        upstream_inflight,
+                        Arc::clone(&global_inflight),
+                        backend_timeout,
+                        resilience,
+                        Arc::clone(&metrics),
+                        inflight_acquire_wait,
+                    )?
+                } else {
+                    false
+                };
+                if !keep_stream {
+                    if let Some(req) = streams.get_mut(&stream_id) {
+                        abort_stream(req, &metrics);
+                    }
+                    streams.remove(&stream_id);
+                    continue;
+                }
+            }
+
             let can_poll_upstream = streams
                 .get(&stream_id)
                 .is_some_and(can_poll_upstream_result);
-
-            // upstream_ready: Option<UpstreamResult>
-            //   None          → oneshot not yet resolved (or not eligible), skip
-            //   Some(Ok(...)) → upstream responded successfully
-            //   Some(Err(.))  → upstream error (or sender dropped)
             let upstream_ready: Option<UpstreamResult> = if can_poll_upstream {
                 streams
                     .get_mut(&stream_id)
@@ -2168,7 +3512,7 @@ impl QUICListener {
                                 );
                             }
                             if let Some(req) = streams.get_mut(&stream_id) {
-                                abort_stream(req, metrics);
+                                abort_stream(req, &metrics);
                             }
                             streams.remove(&stream_id);
                             continue;
@@ -2227,7 +3571,7 @@ impl QUICListener {
                                         Err(protocol),
                                         upstream_pools,
                                         routing_index,
-                                        metrics,
+                                        &metrics,
                                         resilience.shed_retry_after_seconds,
                                     ) {
                                         error!(
@@ -2240,7 +3584,7 @@ impl QUICListener {
                                         .observe(req.start.elapsed(), true);
                                 }
                                 if let Some(req) = streams.get_mut(&stream_id) {
-                                    abort_stream(req, metrics);
+                                    abort_stream(req, &metrics);
                                 }
                                 streams.remove(&stream_id);
                                 continue;
@@ -2273,7 +3617,7 @@ impl QUICListener {
                                             Err(protocol),
                                             upstream_pools,
                                             routing_index,
-                                            metrics,
+                                            &metrics,
                                             resilience.shed_retry_after_seconds,
                                         ) {
                                             error!(
@@ -2286,7 +3630,7 @@ impl QUICListener {
                                             .observe(req.start.elapsed(), true);
                                     }
                                     if let Some(req) = streams.get_mut(&stream_id) {
-                                        abort_stream(req, metrics);
+                                        abort_stream(req, &metrics);
                                     }
                                     streams.remove(&stream_id);
                                     continue;
@@ -2552,7 +3896,7 @@ impl QUICListener {
                             let route_label = req.upstream_name.as_deref().unwrap_or("unrouted");
                             metrics.record_route(route_label, req.start.elapsed(), route_outcome);
                             Self::record_request_observation(
-                                metrics,
+                                &metrics,
                                 req,
                                 Some(status.as_u16()),
                                 route_outcome,
@@ -2564,7 +3908,7 @@ impl QUICListener {
                         }
                         if immediate_terminal {
                             if let Some(req) = streams.get_mut(&stream_id) {
-                                abort_stream(req, metrics);
+                                abort_stream(req, &metrics);
                             }
                             streams.remove(&stream_id);
                             continue;
@@ -2582,7 +3926,7 @@ impl QUICListener {
                                 Err(err),
                                 upstream_pools,
                                 routing_index,
-                                metrics,
+                                &metrics,
                                 resilience.shed_retry_after_seconds,
                             ) {
                                 error!(
@@ -2595,7 +3939,7 @@ impl QUICListener {
                                 .observe(req.start.elapsed(), true);
                         }
                         if let Some(req) = streams.get_mut(&stream_id) {
-                            abort_stream(req, metrics);
+                            abort_stream(req, &metrics);
                         }
                         streams.remove(&stream_id);
                         continue;
@@ -2658,7 +4002,7 @@ impl QUICListener {
                                         RouteOutcome::BackendError,
                                     );
                                     Self::record_request_observation(
-                                        metrics,
+                                        &metrics,
                                         req,
                                         Some(status.as_u16()),
                                         RouteOutcome::BackendError,
@@ -2695,7 +4039,7 @@ impl QUICListener {
                                         RouteOutcome::BackendError,
                                     );
                                     Self::record_request_observation(
-                                        metrics,
+                                        &metrics,
                                         req,
                                         req.response_status,
                                         RouteOutcome::BackendError,
@@ -2741,7 +4085,7 @@ impl QUICListener {
                                         RouteOutcome::BackendError,
                                     );
                                     Self::record_request_observation(
-                                        metrics,
+                                        &metrics,
                                         req,
                                         req.response_status,
                                         RouteOutcome::BackendError,
@@ -2780,7 +4124,7 @@ impl QUICListener {
                                     RouteOutcome::BackendError,
                                 );
                                 Self::record_request_observation(
-                                    metrics,
+                                    &metrics,
                                     req,
                                     req.response_status,
                                     RouteOutcome::BackendError,
@@ -2840,7 +4184,7 @@ impl QUICListener {
                                         RouteOutcome::Timeout,
                                     );
                                     Self::record_request_observation(
-                                        metrics,
+                                        &metrics,
                                         req,
                                         req.response_status.or(Some(
                                             http::StatusCode::SERVICE_UNAVAILABLE.as_u16(),
@@ -2878,7 +4222,7 @@ impl QUICListener {
                                         RouteOutcome::OverloadShed,
                                     );
                                     Self::record_request_observation(
-                                        metrics,
+                                        &metrics,
                                         req,
                                         req.response_status.or(Some(
                                             http::StatusCode::SERVICE_UNAVAILABLE.as_u16(),
@@ -2905,7 +4249,7 @@ impl QUICListener {
                                         RouteOutcome::BackendError,
                                     );
                                     Self::record_request_observation(
-                                        metrics,
+                                        &metrics,
                                         req,
                                         req.response_status
                                             .or(Some(http::StatusCode::BAD_GATEWAY.as_u16())),
@@ -2931,13 +4275,121 @@ impl QUICListener {
             // ── 5: remove terminal streams ────────────────────────────────────
             if terminal {
                 if let Some(req) = streams.get_mut(&stream_id) {
-                    abort_stream(req, metrics);
+                    abort_stream(req, &metrics);
                 }
                 streams.remove(&stream_id);
             }
         }
 
         Ok(())
+    }
+
+    pub(super) fn resolve_backend_without_inflight(
+        method: &str,
+        path: &str,
+        authority: Option<&str>,
+        cid_key: Option<&str>,
+        upstream_pools: &HashMap<String, Arc<RwLock<UpstreamPool>>>,
+        routing_index: &RouteIndex,
+        header_lookup: Option<&LbHeaderLookup<'_>>,
+    ) -> Result<ResolvedBackend, ProxyError> {
+        if method.is_empty() || path.is_empty() {
+            return Err(ProxyError::Transport("empty method or path".into()));
+        }
+
+        let route_decision = routing_index
+            .lookup_with_decision_for_method(path, authority, Some(method))
+            .ok_or_else(|| ProxyError::Transport(format!("no route for {path}")))?;
+        let upstream_name = route_decision.upstream;
+
+        let upstream_pool = upstream_pools
+            .get(upstream_name)
+            .ok_or_else(|| ProxyError::Transport(format!("pool not found: {upstream_name}")))?
+            .clone();
+
+        let (backend_index, lb_type, backend_addr) = {
+            let (read_lb_type, read_fast_selected) = {
+                let pool = upstream_pool
+                    .read()
+                    .map_err(|_| ProxyError::Transport("upstream pool lock poisoned".into()))?;
+                if pool.pool.is_empty() {
+                    return Err(ProxyError::Transport("no servers in upstream".into()));
+                }
+                let lb_type = pool.lb_name();
+                let key = Self::resolve_lb_request_key(
+                    lb_type,
+                    pool.lb_key(),
+                    method,
+                    path,
+                    authority,
+                    cid_key,
+                    header_lookup,
+                );
+                let fast_selected = if pool.pool.readmit_due() {
+                    None
+                } else {
+                    pool.pick_readonly(key.as_str())
+                        .and_then(|idx| pool.pool.address(idx).map(|addr| (idx, addr.to_string())))
+                };
+                (lb_type, fast_selected)
+            };
+
+            if let Some((idx, addr)) = read_fast_selected {
+                (idx, read_lb_type, addr)
+            } else {
+                let mut pool = upstream_pool
+                    .write()
+                    .map_err(|_| ProxyError::Transport("upstream pool lock poisoned".into()))?;
+                if pool.pool.is_empty() {
+                    return Err(ProxyError::Transport("no servers in upstream".into()));
+                }
+                let lb_type = pool.lb_name();
+                let key = Self::resolve_lb_request_key(
+                    lb_type,
+                    pool.lb_key(),
+                    method,
+                    path,
+                    authority,
+                    cid_key,
+                    header_lookup,
+                );
+                let idx = pool.pick_without_begin(key.as_str()).ok_or_else(|| {
+                    let total = pool.pool.len();
+                    let healthy = pool.pool.healthy_len();
+                    error!(
+                        "no healthy backends available: {}/{} backends healthy",
+                        healthy, total
+                    );
+                    ProxyError::Transport("no healthy servers".into())
+                })?;
+                let backend_addr = pool
+                    .pool
+                    .address(idx)
+                    .map(str::to_string)
+                    .ok_or_else(|| ProxyError::Transport("invalid server address".into()))?;
+                (idx, lb_type, backend_addr)
+            }
+        };
+
+        debug!(
+            "Selected backend {} via {} route={} path_len={} host_specific={} reason={:?}",
+            backend_addr,
+            lb_type,
+            upstream_name,
+            route_decision.matched_path_len,
+            route_decision.host_specific,
+            route_decision.reason
+        );
+        Ok(ResolvedBackend {
+            upstream_name: upstream_name.to_string(),
+            backend_addr,
+            backend_index,
+            upstream_pool,
+            backend_lb: lb_type.to_string(),
+            route_path_len: route_decision.matched_path_len,
+            route_host_specific: route_decision.host_specific,
+            route_reason: route_decision.reason,
+        })
     }
 
     /// Resolve routing + LB for a request, returning `(backend_addr, backend_index, pool)`.
@@ -2982,12 +4434,18 @@ impl QUICListener {
                     cid_key,
                     header_lookup,
                 );
-                let fast_pick = pool
-                    .pick_readonly(key.as_str())
-                    .and_then(|idx| pool.pool.address(idx).map(|addr| (idx, addr.to_string())));
-                let fast_selected = fast_pick.and_then(|(idx, addr)| {
-                    pool.begin_request_if_healthy(idx).then_some((idx, addr))
-                });
+                // When a passively-ejected backend is pending re-admission, skip
+                // the read-only fast path so the write-locked slow path can
+                // reconcile it back into rotation.
+                let fast_selected = if pool.pool.readmit_due() {
+                    None
+                } else {
+                    pool.pick_readonly(key.as_str())
+                        .and_then(|idx| pool.pool.address(idx).map(|addr| (idx, addr.to_string())))
+                        .and_then(|(idx, addr)| {
+                            pool.begin_request_if_healthy(idx).then_some((idx, addr))
+                        })
+                };
                 (lb_type, fast_selected)
             };
 
@@ -3056,6 +4514,7 @@ impl QUICListener {
         path: &str,
         authority: Option<&str>,
         cid_key: Option<&str>,
+        client_addr: Option<SocketAddr>,
         header_lookup: Option<&LbHeaderLookup<'_>>,
     ) -> Option<String> {
         let spec = lb_key_spec.trim();
@@ -3075,6 +4534,14 @@ impl QUICListener {
         }
         if spec.eq_ignore_ascii_case("cid") || spec.eq_ignore_ascii_case("sticky-cid") {
             return cid_key.map(str::to_string);
+        }
+        if spec.eq_ignore_ascii_case("peer_ip") || spec.eq_ignore_ascii_case("client_ip") {
+            return client_addr.map(|addr| addr.ip().to_string());
+        }
+        if spec.eq_ignore_ascii_case("bearer_token") {
+            let raw =
+                header_lookup.and_then(|lookup| lookup(http::header::AUTHORIZATION.as_str()))?;
+            return Self::bearer_token_from_authorization_value(&raw);
         }
 
         let (source, key_name) = spec.split_once(':')?;
@@ -3124,6 +4591,7 @@ impl QUICListener {
                 path,
                 authority,
                 cid_key,
+                None,
                 header_lookup,
             )
             && !value.is_empty()
@@ -3139,11 +4607,283 @@ impl QUICListener {
 
         default_key
     }
+
+    fn bearer_token_from_authorization_value(raw: &str) -> Option<String> {
+        let raw = raw.trim();
+        let split = raw.find(char::is_whitespace)?;
+        let (scheme, rest) = raw.split_at(split);
+        if !scheme.eq_ignore_ascii_case("bearer") {
+            return None;
+        }
+        let token = rest.trim_start();
+        if token.is_empty() {
+            return None;
+        }
+        Some(token.to_string())
+    }
+
+    pub(super) fn api_key_is_authorized(
+        policy: &RuntimeUpstreamPolicy,
+        header_lookup: Option<&LbHeaderLookup<'_>>,
+    ) -> bool {
+        let Some(api_key) = policy.upstream_auth.api_key.as_ref() else {
+            return true;
+        };
+        let Some(provided) = header_lookup.and_then(|lookup| lookup(api_key.header_name.as_str()))
+        else {
+            return false;
+        };
+        let provided = provided.trim();
+        !provided.is_empty()
+            && api_key
+                .keys
+                .iter()
+                .any(|expected| bool::from(provided.as_bytes().ct_eq(expected.as_bytes())))
+    }
+
+    pub(super) fn jwt_is_authorized(
+        policy: &RuntimeUpstreamPolicy,
+        header_lookup: Option<&LbHeaderLookup<'_>>,
+    ) -> bool {
+        let Some(jwt) = policy.upstream_auth.jwt.as_ref() else {
+            return true;
+        };
+        let Some(raw) =
+            header_lookup.and_then(|lookup| lookup(http::header::AUTHORIZATION.as_str()))
+        else {
+            return false;
+        };
+        let Some(token) = Self::bearer_token_from_authorization_value(&raw) else {
+            return false;
+        };
+        let Some(claims) = Self::validated_hs256_jwt_claims(token.as_str(), jwt, SystemTime::now())
+        else {
+            return false;
+        };
+        Self::jwt_claims_satisfy_rbac(policy, &claims)
+    }
+
+    fn validated_hs256_jwt_claims(
+        token: &str,
+        jwt: &spooky_config::runtime::RuntimeJwtAuth,
+        now: SystemTime,
+    ) -> Option<Value> {
+        let mut parts = token.split('.');
+        let (Some(header_b64), Some(payload_b64), Some(signature_b64), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return None;
+        };
+        let Ok(header_bytes) = URL_SAFE_NO_PAD.decode(header_b64) else {
+            return None;
+        };
+        let Ok(payload_bytes) = URL_SAFE_NO_PAD.decode(payload_b64) else {
+            return None;
+        };
+        let Ok(signature) = URL_SAFE_NO_PAD.decode(signature_b64) else {
+            return None;
+        };
+        let Ok(header) = serde_json::from_slice::<Value>(&header_bytes) else {
+            return None;
+        };
+        if header.get("alg").and_then(Value::as_str) != Some("HS256") {
+            return None;
+        }
+
+        let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(jwt.secret.as_bytes()) else {
+            return None;
+        };
+        mac.update(format!("{header_b64}.{payload_b64}").as_bytes());
+        let expected = mac.finalize().into_bytes();
+        if expected.len() != signature.len()
+            || !bool::from(expected.as_slice().ct_eq(signature.as_slice()))
+        {
+            return None;
+        }
+
+        let Ok(claims) = serde_json::from_slice::<Value>(&payload_bytes) else {
+            return None;
+        };
+        let Ok(now_secs) = now.duration_since(UNIX_EPOCH).map(|value| value.as_secs()) else {
+            return None;
+        };
+        let exp = claims.get("exp").and_then(Value::as_u64)?;
+        if now_secs > exp.saturating_add(jwt.clock_skew_secs) {
+            return None;
+        }
+        if claims
+            .get("nbf")
+            .and_then(Value::as_u64)
+            .is_some_and(|nbf| now_secs.saturating_add(jwt.clock_skew_secs) < nbf)
+        {
+            return None;
+        }
+        if claims
+            .get("iat")
+            .and_then(Value::as_u64)
+            .is_some_and(|iat| now_secs.saturating_add(jwt.clock_skew_secs) < iat)
+        {
+            return None;
+        }
+        if jwt
+            .issuer
+            .as_deref()
+            .is_some_and(|issuer| claims.get("iss").and_then(Value::as_str) != Some(issuer))
+        {
+            return None;
+        }
+        if let Some(audience) = jwt.audience.as_deref() {
+            let claim_aud = claims.get("aud")?;
+            match claim_aud {
+                Value::String(value) if value == audience => {}
+                Value::Array(values)
+                    if values
+                        .iter()
+                        .any(|value| value.as_str().is_some_and(|value| value == audience)) => {}
+                _ => return None,
+            }
+        }
+
+        Some(claims)
+    }
+
+    fn jwt_claims_satisfy_rbac(policy: &RuntimeUpstreamPolicy, claims: &Value) -> bool {
+        let scopes = Self::jwt_string_claim_values(claims, &["scope", "scp"]);
+        let roles = Self::jwt_string_claim_values(claims, &["roles", "role"]);
+        policy
+            .upstream_auth
+            .required_scopes
+            .iter()
+            .all(|required| scopes.contains(required))
+            && policy
+                .upstream_auth
+                .required_roles
+                .iter()
+                .all(|required| roles.contains(required))
+    }
+
+    fn jwt_string_claim_values(
+        claims: &Value,
+        claim_names: &[&str],
+    ) -> std::collections::HashSet<String> {
+        let mut values = std::collections::HashSet::new();
+        for claim_name in claim_names {
+            let Some(value) = claims.get(*claim_name) else {
+                continue;
+            };
+            match value {
+                Value::String(value) => {
+                    for item in value.split_whitespace() {
+                        if !item.is_empty() {
+                            values.insert(item.to_string());
+                        }
+                    }
+                }
+                Value::Array(items) => {
+                    for item in items {
+                        if let Some(item) = item.as_str()
+                            && !item.is_empty()
+                        {
+                            values.insert(item.to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        values
+    }
+
+    pub(super) fn resolve_scoped_rate_limit_key(
+        rule: &crate::resilience::ScopedRateLimitRule,
+        route: &str,
+        method: &str,
+        path: &str,
+        authority: Option<&str>,
+        client_addr: SocketAddr,
+        header_lookup: Option<&LbHeaderLookup<'_>>,
+    ) -> Option<String> {
+        match rule.scope() {
+            ScopedRateLimitScope::Route => Some(route.to_string()),
+            ScopedRateLimitScope::Client => Self::resolve_lb_key_from_spec(
+                rule.key_spec().unwrap_or("peer_ip"),
+                method,
+                path,
+                authority,
+                None,
+                Some(client_addr),
+                header_lookup,
+            ),
+            ScopedRateLimitScope::Tenant => rule.key_spec().and_then(|key_spec| {
+                Self::resolve_lb_key_from_spec(
+                    key_spec,
+                    method,
+                    path,
+                    authority,
+                    None,
+                    Some(client_addr),
+                    header_lookup,
+                )
+            }),
+            ScopedRateLimitScope::Token => Self::resolve_lb_key_from_spec(
+                rule.key_spec().unwrap_or("bearer_token"),
+                method,
+                path,
+                authority,
+                None,
+                Some(client_addr),
+                header_lookup,
+            ),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spooky_config::config::{ScopedRateLimit, ScopedRateLimitScope};
+    use spooky_config::runtime::{
+        RuntimeApiKeyAuth, RuntimeAuthPolicy, RuntimeExternalAuth, RuntimeExternalAuthFailureMode,
+        RuntimeJwtAuth, RuntimeUpstreamPolicy,
+    };
+
+    fn sample_pending_forward(headers: Vec<quiche::h3::Header>) -> PendingForward {
+        PendingForward {
+            method: Arc::<str>::from("GET"),
+            path: Arc::<str>::from("/"),
+            authority: Some(Arc::<str>::from("example.com")),
+            headers: Arc::new(headers),
+            upstream_name: Arc::<str>::from("api"),
+            route_reason: Arc::<str>::from("path_prefix"),
+            route_path_len: 1,
+            route_host_specific: false,
+            backend_addr: Arc::<str>::from("http://127.0.0.1:8080"),
+            backend_index: 0,
+            backend_lb: None,
+            client_addr: "127.0.0.1:443".parse().expect("client addr"),
+            request_id: 7,
+            trace_id: None,
+            span_id: None,
+            traceparent: None,
+            host_policy: Default::default(),
+            forwarded_header_policy: Default::default(),
+            auth_header_mutations: Vec::new(),
+        }
+    }
+
+    fn test_hs256_jwt(secret: &str, claims: serde_json::Value, alg: &str) -> String {
+        let header = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&serde_json::json!({ "alg": alg, "typ": "JWT" }))
+                .expect("serialize header"),
+        );
+        let payload =
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).expect("serialize claims"));
+        let signing_input = format!("{header}.{payload}");
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("mac");
+        mac.update(signing_input.as_bytes());
+        let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+        format!("{signing_input}.{signature}")
+    }
 
     #[test]
     fn internal_pool_errors_are_classified_as_control_plane_only() {
@@ -3251,5 +4991,513 @@ mod tests {
     fn format_error_chain_includes_nested_causes() {
         let msg = QUICListener::format_error_chain(&OuterErr(InnerErr));
         assert_eq!(msg, "outer: inner");
+    }
+
+    #[test]
+    fn api_key_authorization_requires_exact_configured_match() {
+        let policy = RuntimeUpstreamPolicy {
+            upstream_auth: RuntimeAuthPolicy {
+                api_key: Some(RuntimeApiKeyAuth {
+                    header_name: "x-api-key".to_string(),
+                    keys: vec!["secret-key".to_string()],
+                }),
+                jwt: None,
+                external_auth: None,
+                required_scopes: Vec::new(),
+                required_roles: Vec::new(),
+            },
+            host: Default::default(),
+            forwarded_headers: Default::default(),
+            protocol: Default::default(),
+        };
+        let headers = [("x-api-key".to_string(), "secret-key".to_string())]
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        let lookup = |name: &str| headers.get(&name.to_ascii_lowercase()).cloned();
+        let wrong_lookup = |_: &str| Some("wrong-key".to_string());
+
+        assert!(QUICListener::api_key_is_authorized(&policy, Some(&lookup)));
+        assert!(!QUICListener::api_key_is_authorized(
+            &policy,
+            Some(&wrong_lookup)
+        ));
+        assert!(!QUICListener::api_key_is_authorized(&policy, None));
+    }
+
+    #[test]
+    fn hs256_jwt_validation_enforces_signature_and_claims() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let token = test_hs256_jwt(
+            "jwt-secret",
+            serde_json::json!({
+                "sub": "user-1",
+                "iss": "issuer-1",
+                "aud": "aud-1",
+                "exp": 4_000_000_000u64,
+                "nbf": 1_699_999_900u64,
+            }),
+            "HS256",
+        );
+        let policy = RuntimeUpstreamPolicy {
+            upstream_auth: RuntimeAuthPolicy {
+                api_key: None,
+                jwt: Some(RuntimeJwtAuth {
+                    secret: "jwt-secret".to_string(),
+                    issuer: Some("issuer-1".to_string()),
+                    audience: Some("aud-1".to_string()),
+                    clock_skew_secs: 30,
+                }),
+                external_auth: None,
+                required_scopes: Vec::new(),
+                required_roles: Vec::new(),
+            },
+            host: Default::default(),
+            forwarded_headers: Default::default(),
+            protocol: Default::default(),
+        };
+        let headers = [("authorization".to_string(), format!("Bearer {token}"))]
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        let lookup = |name: &str| headers.get(&name.to_ascii_lowercase()).cloned();
+
+        assert!(QUICListener::jwt_is_authorized(&policy, Some(&lookup)));
+        assert!(
+            QUICListener::validated_hs256_jwt_claims(
+                token.as_str(),
+                policy.upstream_auth.jwt.as_ref().expect("jwt policy"),
+                now
+            )
+            .is_some()
+        );
+
+        let wrong_secret = RuntimeJwtAuth {
+            secret: "wrong".to_string(),
+            issuer: Some("issuer-1".to_string()),
+            audience: Some("aud-1".to_string()),
+            clock_skew_secs: 30,
+        };
+        assert!(
+            QUICListener::validated_hs256_jwt_claims(token.as_str(), &wrong_secret, now).is_none()
+        );
+
+        let expired = test_hs256_jwt(
+            "jwt-secret",
+            serde_json::json!({ "exp": 1_699_999_900u64 }),
+            "HS256",
+        );
+        assert!(
+            QUICListener::validated_hs256_jwt_claims(
+                expired.as_str(),
+                &RuntimeJwtAuth {
+                    secret: "jwt-secret".to_string(),
+                    issuer: None,
+                    audience: None,
+                    clock_skew_secs: 0,
+                },
+                now
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn jwt_rbac_requires_configured_scopes_and_roles() {
+        let policy = RuntimeUpstreamPolicy {
+            upstream_auth: RuntimeAuthPolicy {
+                api_key: None,
+                jwt: None,
+                external_auth: None,
+                required_scopes: vec!["read:fast".to_string()],
+                required_roles: vec!["admin".to_string()],
+            },
+            host: Default::default(),
+            forwarded_headers: Default::default(),
+            protocol: Default::default(),
+        };
+        let allowed_claims = serde_json::json!({
+            "scope": "read:fast write:slow",
+            "roles": ["admin", "operator"]
+        });
+        let denied_claims = serde_json::json!({
+            "scope": "write:slow",
+            "roles": ["operator"]
+        });
+
+        assert!(QUICListener::jwt_claims_satisfy_rbac(
+            &policy,
+            &allowed_claims
+        ));
+        assert!(!QUICListener::jwt_claims_satisfy_rbac(
+            &policy,
+            &denied_claims
+        ));
+    }
+
+    #[test]
+    fn resolve_lb_key_from_spec_supports_peer_ip_and_bearer_token() {
+        let headers = [("authorization".to_string(), "Bearer token-1".to_string())]
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        let lookup = |name: &str| headers.get(&name.to_ascii_lowercase()).cloned();
+        let client_addr = "203.0.113.9:443".parse().expect("client addr");
+
+        assert_eq!(
+            QUICListener::resolve_lb_key_from_spec(
+                "peer_ip",
+                "GET",
+                "/",
+                Some("api.example.com"),
+                None,
+                Some(client_addr),
+                Some(&lookup),
+            )
+            .as_deref(),
+            Some("203.0.113.9")
+        );
+        assert_eq!(
+            QUICListener::resolve_lb_key_from_spec(
+                "bearer_token",
+                "GET",
+                "/",
+                Some("api.example.com"),
+                None,
+                Some(client_addr),
+                Some(&lookup),
+            )
+            .as_deref(),
+            Some("token-1")
+        );
+    }
+
+    #[test]
+    fn resolve_scoped_rate_limit_key_defaults_match_scope() {
+        let client_rule = crate::resilience::ScopedRateLimitRule::from_config(&ScopedRateLimit {
+            name: "client".to_string(),
+            scope: ScopedRateLimitScope::Client,
+            requests_per_sec: 10,
+            burst: 10,
+            key: None,
+            route_allowlist: Vec::new(),
+            idle_ttl_secs: 300,
+        });
+        let token_rule = crate::resilience::ScopedRateLimitRule::from_config(&ScopedRateLimit {
+            name: "token".to_string(),
+            scope: ScopedRateLimitScope::Token,
+            requests_per_sec: 10,
+            burst: 10,
+            key: None,
+            route_allowlist: Vec::new(),
+            idle_ttl_secs: 300,
+        });
+        let headers = [("authorization".to_string(), "Bearer token-2".to_string())]
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        let lookup = |name: &str| headers.get(&name.to_ascii_lowercase()).cloned();
+        let client_addr = "198.51.100.10:443".parse().expect("client addr");
+
+        assert_eq!(
+            QUICListener::resolve_scoped_rate_limit_key(
+                &client_rule,
+                "api",
+                "GET",
+                "/resource",
+                Some("api.example.com"),
+                client_addr,
+                Some(&lookup),
+            )
+            .as_deref(),
+            Some("198.51.100.10")
+        );
+        assert_eq!(
+            QUICListener::resolve_scoped_rate_limit_key(
+                &token_rule,
+                "api",
+                "GET",
+                "/resource",
+                Some("api.example.com"),
+                client_addr,
+                Some(&lookup),
+            )
+            .as_deref(),
+            Some("token-2")
+        );
+    }
+
+    #[test]
+    fn pending_forward_request_headers_apply_auth_mutations() {
+        let pending_forward = PendingForward {
+            auth_header_mutations: vec![
+                PendingHeaderMutation::Upsert {
+                    name: b"x-user-id".to_vec(),
+                    value: b"fresh".to_vec(),
+                },
+                PendingHeaderMutation::Remove {
+                    name: b"x-remove-me".to_vec(),
+                },
+            ],
+            ..sample_pending_forward(vec![
+                quiche::h3::Header::new(b":method", b"GET"),
+                quiche::h3::Header::new(b"x-user-id", b"stale"),
+                quiche::h3::Header::new(b"x-remove-me", b"1"),
+            ])
+        };
+
+        let headers = pending_forward.request_headers();
+        assert!(headers.iter().any(|header| header.name() == b":method"));
+        assert!(
+            headers
+                .iter()
+                .any(|header| header.name() == b"x-user-id" && header.value() == b"fresh")
+        );
+        assert!(
+            !headers
+                .iter()
+                .any(|header| header.name() == b"x-user-id" && header.value() == b"stale")
+        );
+        assert!(!headers.iter().any(|header| header.name() == b"x-remove-me"));
+    }
+
+    #[test]
+    fn auth_header_allowlist_is_case_insensitive() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-auth-user", http::HeaderValue::from_static("alice"));
+        headers.insert("x-ignore", http::HeaderValue::from_static("nope"));
+        headers.insert(
+            http::header::CONTENT_LENGTH,
+            http::HeaderValue::from_static("12"),
+        );
+
+        assert_eq!(
+            allowed_auth_headers(&headers, &["X-Auth-User".to_string()]),
+            vec![("x-auth-user".to_string(), "alice".to_string())]
+        );
+
+        assert_eq!(
+            auth_allow_mutations(&headers, &["x-auth-user".to_string()]),
+            vec![PendingHeaderMutation::Upsert {
+                name: b"x-auth-user".to_vec(),
+                value: b"alice".to_vec(),
+            }]
+        );
+    }
+
+    #[test]
+    fn auth_allow_mutations_drops_unsafe_request_headers() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-auth-user", http::HeaderValue::from_static("alice"));
+        headers.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer test"),
+        );
+        headers.insert(
+            http::header::LOCATION,
+            http::HeaderValue::from_static("https://login"),
+        );
+        headers.insert(
+            http::header::CONTENT_LENGTH,
+            http::HeaderValue::from_static("12"),
+        );
+
+        assert_eq!(
+            auth_allow_mutations(
+                &headers,
+                &[
+                    "x-auth-user".to_string(),
+                    "authorization".to_string(),
+                    "location".to_string(),
+                    "content-length".to_string(),
+                ],
+            ),
+            vec![PendingHeaderMutation::Upsert {
+                name: b"x-auth-user".to_vec(),
+                value: b"alice".to_vec(),
+            }]
+        );
+    }
+
+    #[test]
+    fn append_auth_request_headers_strips_hop_by_hop_and_framing_headers() {
+        let pending_forward = sample_pending_forward(vec![
+            quiche::h3::Header::new(b":method", b"GET"),
+            quiche::h3::Header::new(b"host", b"client.example.com"),
+            quiche::h3::Header::new(b"content-length", b"42"),
+            quiche::h3::Header::new(b"connection", b"keep-alive"),
+            quiche::h3::Header::new(b"cookie", b"session=1"),
+            quiche::h3::Header::new(b"authorization", b"Bearer token"),
+        ]);
+        let mut builder = Request::builder()
+            .method(http::Method::GET)
+            .uri("https://auth.internal/check");
+
+        append_auth_request_headers(&mut builder, &pending_forward, &[]);
+
+        let headers = builder.headers_ref().expect("headers");
+        assert!(!headers.contains_key(http::header::HOST));
+        assert!(!headers.contains_key(http::header::CONTENT_LENGTH));
+        assert!(!headers.contains_key(http::header::CONNECTION));
+        assert_eq!(
+            headers
+                .get(http::header::COOKIE)
+                .and_then(|value| value.to_str().ok()),
+            Some("session=1")
+        );
+        assert_eq!(
+            headers
+                .get(http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer token")
+        );
+    }
+
+    #[test]
+    fn http_external_auth_response_mapping_preserves_allowlisted_denial_headers() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-auth-reason", http::HeaderValue::from_static("policy"));
+        headers.insert("x-drop", http::HeaderValue::from_static("secret"));
+
+        let decision = map_http_external_auth_response(
+            http::StatusCode::FORBIDDEN,
+            &headers,
+            b"denied
+"
+            .to_vec(),
+            &["x-auth-reason".to_string()],
+        )
+        .expect("deny decision");
+
+        match decision {
+            ExternalAuthDecision::Deny(response) => {
+                assert_eq!(response.status, http::StatusCode::FORBIDDEN);
+                assert_eq!(response.body, b"denied\n".to_vec());
+                assert_eq!(
+                    response.headers,
+                    vec![("x-auth-reason".to_string(), "policy".to_string())]
+                );
+            }
+            other => panic!("unexpected decision: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn http_external_auth_response_mapping_builds_challenge_from_401() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::WWW_AUTHENTICATE,
+            http::HeaderValue::from_static("Bearer realm=\"spooky\""),
+        );
+        headers.insert("x-auth-reason", http::HeaderValue::from_static("expired"));
+
+        let decision = map_http_external_auth_response(
+            http::StatusCode::UNAUTHORIZED,
+            &headers,
+            b"challenge\n".to_vec(),
+            &["x-auth-reason".to_string()],
+        )
+        .expect("challenge decision");
+
+        match decision {
+            ExternalAuthDecision::Challenge(response) => {
+                assert_eq!(response.status, http::StatusCode::UNAUTHORIZED);
+                assert_eq!(response.www_authenticate, "Bearer realm=\"spooky\"");
+                assert_eq!(response.body, b"challenge\n".to_vec());
+                assert_eq!(
+                    response.headers,
+                    vec![("x-auth-reason".to_string(), "expired".to_string())]
+                );
+            }
+            other => panic!("unexpected decision: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn http_external_auth_response_mapping_dedupes_standard_redirect_and_challenge_headers() {
+        let mut redirect_headers = http::HeaderMap::new();
+        redirect_headers.insert(
+            http::header::LOCATION,
+            http::HeaderValue::from_static("https://login.example.com/"),
+        );
+        let redirect = map_http_external_auth_response(
+            http::StatusCode::FOUND,
+            &redirect_headers,
+            Vec::new(),
+            &["location".to_string()],
+        )
+        .expect("redirect decision");
+        match redirect {
+            ExternalAuthDecision::Redirect(response) => {
+                assert!(response.headers.is_empty());
+                assert_eq!(response.location, "https://login.example.com/");
+            }
+            other => panic!("unexpected decision: {other:?}"),
+        }
+
+        let mut challenge_headers = http::HeaderMap::new();
+        challenge_headers.insert(
+            http::header::WWW_AUTHENTICATE,
+            http::HeaderValue::from_static("Bearer realm=\"spooky\""),
+        );
+        let challenge = map_http_external_auth_response(
+            http::StatusCode::UNAUTHORIZED,
+            &challenge_headers,
+            b"challenge\n".to_vec(),
+            &["www-authenticate".to_string()],
+        )
+        .expect("challenge decision");
+        match challenge {
+            ExternalAuthDecision::Challenge(response) => {
+                assert!(response.headers.is_empty());
+                assert_eq!(response.www_authenticate, "Bearer realm=\"spooky\"");
+            }
+            other => panic!("unexpected decision: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn http_external_auth_response_mapping_requires_redirect_location() {
+        let headers = http::HeaderMap::new();
+        let err =
+            map_http_external_auth_response(http::StatusCode::FOUND, &headers, Vec::new(), &[])
+                .expect_err("redirect without location must fail");
+        assert!(matches!(err, ProxyError::Transport(_)));
+    }
+
+    #[test]
+    fn oidc_helper_predicates_match_expected_scope_and_audience_shapes() {
+        assert!(oidc_scope_satisfied(
+            &["read".to_string(), "write".to_string()],
+            "read write admin"
+        ));
+        assert!(!oidc_scope_satisfied(
+            &["read".to_string(), "write".to_string()],
+            "read"
+        ));
+
+        assert!(oidc_audience_matches(
+            Some("api://edge"),
+            Some(&serde_json::Value::String("api://edge".to_string()))
+        ));
+        assert!(oidc_audience_matches(
+            Some("api://edge"),
+            Some(&serde_json::json!(["other", "api://edge"]))
+        ));
+        assert!(!oidc_audience_matches(
+            Some("api://edge"),
+            Some(&serde_json::Value::String("api://other".to_string()))
+        ));
+        assert!(oidc_audience_matches(None, None));
+    }
+
+    #[test]
+    fn external_auth_failure_mode_helpers_track_fail_open() {
+        let auth = RuntimeExternalAuth::Http {
+            endpoint: "http://127.0.0.1:9000/auth".to_string(),
+            request_headers: Vec::new(),
+            response_header_allowlist: Vec::new(),
+            timeout_ms: 250,
+            failure_mode: RuntimeExternalAuthFailureMode::FailOpen,
+        };
+
+        assert_eq!(auth_timeout_ms(&auth), 250);
+        assert!(fail_open(auth_failure_mode(&auth)));
     }
 }

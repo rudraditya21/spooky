@@ -319,6 +319,7 @@ impl QUICListener {
                             let routing_index = Arc::clone(&routing_index);
                             let max_request_body_bytes = max_request_body_bytes;
                             let max_response_body_bytes = max_response_body_bytes;
+                            let peer = peer;
 
                             Box::pin(async move {
                                 let is_websocket_upgrade =
@@ -407,6 +408,86 @@ impl QUICListener {
                                         );
                                     }
                                 };
+
+                                if let Some(policy) = upstream_policies.get(&upstream_name) {
+                                    let denied_challenge = if !Self::api_key_is_authorized(
+                                        policy,
+                                        Some(&lb_header_lookup),
+                                    ) {
+                                        Some("ApiKey")
+                                    } else if !Self::jwt_is_authorized(
+                                        policy,
+                                        Some(&lb_header_lookup),
+                                    ) {
+                                        Some("Bearer")
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(challenge) = denied_challenge {
+                                        metrics.inc_failure();
+                                        metrics.inc_policy_denied();
+                                        metrics.record_route(
+                                            &upstream_name,
+                                            Duration::from_millis(0),
+                                            RouteOutcome::Failure,
+                                        );
+                                        warn!(
+                                            "Bootstrap request route={} denied by auth policy",
+                                            upstream_name
+                                        );
+                                        return Ok(Response::builder()
+                                            .status(StatusCode::UNAUTHORIZED)
+                                            .header("alt-svc", &alt)
+                                            .header("www-authenticate", challenge)
+                                            .body(boxed_full(Bytes::from_static(b"unauthorized\n")))
+                                            .unwrap_or_else(|_| {
+                                                Response::new(boxed_full(Bytes::from_static(
+                                                    b"error\n",
+                                                )))
+                                            }));
+                                    }
+                                }
+
+                                if let Some(rejection) =
+                                    resilience.scoped_rate_limits.check(&upstream_name, |rule| {
+                                        Self::resolve_scoped_rate_limit_key(
+                                            rule,
+                                            &upstream_name,
+                                            &method,
+                                            &path,
+                                            authority.as_deref(),
+                                            peer,
+                                            Some(&lb_header_lookup),
+                                        )
+                                    })
+                                {
+                                    metrics.inc_failure();
+                                    metrics.inc_request_rate_limited();
+                                    metrics.record_route(
+                                        &upstream_name,
+                                        Duration::from_millis(0),
+                                        RouteOutcome::RateLimited,
+                                    );
+                                    warn!(
+                                        "Bootstrap request route={} scoped rate limit exceeded by rule={}",
+                                        rejection.route, rejection.rule_name
+                                    );
+                                    return Ok(Response::builder()
+                                        .status(StatusCode::TOO_MANY_REQUESTS)
+                                        .header("alt-svc", &alt)
+                                        .header(
+                                            "retry-after",
+                                            rejection.retry_after_seconds.max(1).to_string(),
+                                        )
+                                        .body(boxed_full(Bytes::from_static(
+                                            b"request rate limited\n",
+                                        )))
+                                        .unwrap_or_else(|_| {
+                                            Response::new(boxed_full(Bytes::from_static(
+                                                b"error\n",
+                                            )))
+                                        }));
+                                }
 
                                 let endpoint = match backend_endpoints.get(&backend_addr) {
                                     Some(ep) => ep.clone(),

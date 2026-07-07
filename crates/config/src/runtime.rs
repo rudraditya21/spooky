@@ -219,7 +219,68 @@ pub struct RuntimeForwardedHeaderPolicy(pub ForwardedHeaderPolicy);
 pub struct RuntimeProtocolPolicy(pub ProtocolPolicy);
 
 #[derive(Debug, Clone, Default)]
+pub struct RuntimeApiKeyAuth {
+    pub header_name: String,
+    pub keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeJwtAuth {
+    pub secret: String,
+    pub issuer: Option<String>,
+    pub audience: Option<String>,
+    pub clock_skew_secs: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RuntimeExternalAuthFailureMode {
+    FailOpen,
+    #[default]
+    FailClosed,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeExternalAuthRequestHeader {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum RuntimeExternalAuth {
+    Http {
+        endpoint: String,
+        request_headers: Vec<RuntimeExternalAuthRequestHeader>,
+        response_header_allowlist: Vec<String>,
+        timeout_ms: u64,
+        failure_mode: RuntimeExternalAuthFailureMode,
+    },
+    Oidc {
+        discovery_url: Option<String>,
+        issuer_url: Option<String>,
+        client_id: String,
+        client_secret: Option<String>,
+        audience: Option<String>,
+        scopes: Vec<String>,
+        request_headers: Vec<RuntimeExternalAuthRequestHeader>,
+        response_header_allowlist: Vec<String>,
+        timeout_ms: u64,
+        failure_mode: RuntimeExternalAuthFailureMode,
+    },
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeAuthPolicy {
+    pub api_key: Option<RuntimeApiKeyAuth>,
+    pub jwt: Option<RuntimeJwtAuth>,
+    pub external_auth: Option<RuntimeExternalAuth>,
+    pub required_scopes: Vec<String>,
+    pub required_roles: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct RuntimeUpstreamPolicy {
+    /// Upstream-owned auth policy selected after route lookup resolves an upstream.
+    pub upstream_auth: RuntimeAuthPolicy,
     pub host: RuntimeHostPolicy,
     pub forwarded_headers: RuntimeForwardedHeaderPolicy,
     pub protocol: RuntimeProtocolPolicy,
@@ -263,6 +324,7 @@ mod tests {
             "api".to_string(),
             Upstream {
                 load_balancing: LoadBalancing::default(),
+                auth: Default::default(),
                 host_policy: UpstreamHostPolicy {
                     mode: UpstreamHostPolicyMode::Rewrite,
                     host: Some("api.internal".to_string()),
@@ -286,6 +348,108 @@ mod tests {
         );
 
         config
+    }
+
+    #[test]
+    fn runtime_config_preserves_external_auth_contract() {
+        let mut config = sample_config();
+        config
+            .upstream
+            .get_mut("api")
+            .expect("api")
+            .auth
+            .external_auth = Some(crate::config::ExternalAuth::Http {
+            endpoint: "https://auth.internal/check".to_string(),
+            request_headers: Vec::new(),
+            response_header_allowlist: Vec::new(),
+            timeout_ms: 1_000,
+            failure_mode: crate::config::ExternalAuthFailureMode::FailClosed,
+        });
+
+        let runtime = RuntimeConfig::from_config(&config).expect("runtime config");
+        let auth = &runtime
+            .upstreams
+            .get("api")
+            .expect("api")
+            .policy
+            .upstream_auth;
+        match auth.external_auth.as_ref() {
+            Some(RuntimeExternalAuth::Http {
+                endpoint,
+                request_headers,
+                response_header_allowlist,
+                timeout_ms,
+                ..
+            }) => {
+                assert_eq!(endpoint, "https://auth.internal/check");
+                assert!(request_headers.is_empty());
+                assert!(response_header_allowlist.is_empty());
+                assert_eq!(*timeout_ms, 1_000);
+            }
+            other => panic!("unexpected external_auth contract: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn runtime_config_preserves_oidc_external_auth_metadata() {
+        let mut config = sample_config();
+        config
+            .upstream
+            .get_mut("api")
+            .expect("api")
+            .auth
+            .external_auth = Some(crate::config::ExternalAuth::Oidc {
+            discovery_url: Some(
+                "https://issuer.example.com/.well-known/openid-configuration".to_string(),
+            ),
+            issuer_url: Some("https://issuer.example.com".to_string()),
+            client_id: "edge-gateway".to_string(),
+            client_secret: Some("secret-1".to_string()),
+            audience: Some("spooky-api".to_string()),
+            scopes: vec!["openid".to_string(), "profile".to_string()],
+            request_headers: Vec::new(),
+            response_header_allowlist: Vec::new(),
+            timeout_ms: 1_500,
+            failure_mode: crate::config::ExternalAuthFailureMode::FailClosed,
+        });
+
+        let runtime = RuntimeConfig::from_config(&config).expect("runtime config");
+        match runtime
+            .upstreams
+            .get("api")
+            .expect("api")
+            .policy
+            .upstream_auth
+            .external_auth
+            .as_ref()
+        {
+            Some(RuntimeExternalAuth::Oidc {
+                discovery_url,
+                issuer_url,
+                client_id,
+                client_secret,
+                audience,
+                scopes,
+                request_headers,
+                response_header_allowlist,
+                timeout_ms,
+                ..
+            }) => {
+                assert_eq!(
+                    discovery_url.as_deref(),
+                    Some("https://issuer.example.com/.well-known/openid-configuration")
+                );
+                assert_eq!(issuer_url.as_deref(), Some("https://issuer.example.com"));
+                assert_eq!(client_id, "edge-gateway");
+                assert_eq!(client_secret.as_deref(), Some("secret-1"));
+                assert_eq!(audience.as_deref(), Some("spooky-api"));
+                assert_eq!(scopes, &vec!["openid".to_string(), "profile".to_string()]);
+                assert!(request_headers.is_empty());
+                assert!(response_header_allowlist.is_empty());
+                assert_eq!(*timeout_ms, 1_500);
+            }
+            other => panic!("unexpected external_auth contract: {:?}", other),
+        }
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use crate::backend_endpoint::{BackendEndpoint, BackendScheme};
 use crate::config::{
-    CURRENT_CONFIG_VERSION, Config, Listen, SUPPORTED_CONFIG_VERSIONS, UpstreamHostPolicyMode,
-    UpstreamTls,
+    CURRENT_CONFIG_VERSION, Config, ExternalAuth, Listen, SUPPORTED_CONFIG_VERSIONS,
+    ScopedRateLimitScope, UpstreamHostPolicyMode, UpstreamTls,
 };
 use log::{info, warn};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
@@ -101,6 +101,88 @@ macro_rules! validation_error {
 }
 
 type RouteMatcherKey = (Option<String>, Option<String>, Option<String>);
+
+fn validate_external_auth_headers(
+    upstream_name: &str,
+    field_prefix: &str,
+    request_headers: &[crate::config::ExternalAuthRequestHeader],
+    response_header_allowlist: &[String],
+) -> bool {
+    let mut seen_request_headers = std::collections::HashSet::new();
+    for (idx, header) in request_headers.iter().enumerate() {
+        let header_name = header.name.trim();
+        if header_name.is_empty() {
+            validation_error!(
+                "upstream '{}' {}.request_headers[{}].name must be non-empty",
+                upstream_name,
+                field_prefix,
+                idx
+            );
+            return false;
+        }
+        if http::header::HeaderName::from_bytes(header_name.as_bytes()).is_err() {
+            validation_error!(
+                "upstream '{}' {}.request_headers[{}].name must be a valid HTTP header name",
+                upstream_name,
+                field_prefix,
+                idx
+            );
+            return false;
+        }
+        if http::HeaderValue::from_str(header.value.as_str()).is_err() {
+            validation_error!(
+                "upstream '{}' {}.request_headers[{}].value must be a valid HTTP header value",
+                upstream_name,
+                field_prefix,
+                idx
+            );
+            return false;
+        }
+        let normalized_name = header_name.to_ascii_lowercase();
+        if !seen_request_headers.insert(normalized_name) {
+            validation_error!(
+                "upstream '{}' {}.request_headers contains duplicate header names",
+                upstream_name,
+                field_prefix
+            );
+            return false;
+        }
+    }
+
+    let mut seen_allowed_headers = std::collections::HashSet::new();
+    for (idx, header_name) in response_header_allowlist.iter().enumerate() {
+        let header_name = header_name.trim();
+        if header_name.is_empty() {
+            validation_error!(
+                "upstream '{}' {}.response_header_allowlist[{}] must be non-empty",
+                upstream_name,
+                field_prefix,
+                idx
+            );
+            return false;
+        }
+        if http::header::HeaderName::from_bytes(header_name.as_bytes()).is_err() {
+            validation_error!(
+                "upstream '{}' {}.response_header_allowlist[{}] must be a valid HTTP header name",
+                upstream_name,
+                field_prefix,
+                idx
+            );
+            return false;
+        }
+        let normalized_name = header_name.to_ascii_lowercase();
+        if !seen_allowed_headers.insert(normalized_name) {
+            validation_error!(
+                "upstream '{}' {}.response_header_allowlist contains duplicate header names",
+                upstream_name,
+                field_prefix
+            );
+            return false;
+        }
+    }
+
+    true
+}
 
 pub fn validate(config: &Config) -> Result<(), ValidationError> {
     clear_validation_error();
@@ -202,13 +284,37 @@ fn validate_inner(config: &Config) -> bool {
         return false;
     }
 
+    if config.performance.worker_threads > 1024 {
+        validation_error!(
+            "performance.worker_threads={} exceeds the maximum of 1024",
+            config.performance.worker_threads
+        );
+        return false;
+    }
+
     if config.performance.control_plane_threads == 0 {
         validation_error!("performance.control_plane_threads must be greater than 0");
         return false;
     }
 
+    if config.performance.control_plane_threads > 1024 {
+        validation_error!(
+            "performance.control_plane_threads={} exceeds the maximum of 1024",
+            config.performance.control_plane_threads
+        );
+        return false;
+    }
+
     if config.performance.packet_shards_per_worker == 0 {
         validation_error!("performance.packet_shards_per_worker must be greater than 0");
+        return false;
+    }
+
+    if config.performance.packet_shards_per_worker > 256 {
+        validation_error!(
+            "performance.packet_shards_per_worker={} exceeds the maximum of 256",
+            config.performance.packet_shards_per_worker
+        );
         return false;
     }
 
@@ -647,6 +753,96 @@ fn validate_inner(config: &Config) -> bool {
         return false;
     }
 
+    let mut seen_scoped_rate_limit_names = std::collections::HashSet::new();
+    for rule in &config.resilience.scoped_rate_limits {
+        let rule_name = rule.name.trim();
+        if rule_name.is_empty() {
+            validation_error!("resilience.scoped_rate_limits[].name must be non-empty");
+            return false;
+        }
+        if !seen_scoped_rate_limit_names.insert(rule_name.to_string()) {
+            validation_error!(
+                "resilience.scoped_rate_limits contains duplicate rule name '{}'",
+                rule_name
+            );
+            return false;
+        }
+        if rule.requests_per_sec == 0 {
+            validation_error!(
+                "resilience.scoped_rate_limits['{}'].requests_per_sec must be greater than 0",
+                rule_name
+            );
+            return false;
+        }
+        if rule.burst == 0 {
+            validation_error!(
+                "resilience.scoped_rate_limits['{}'].burst must be greater than 0",
+                rule_name
+            );
+            return false;
+        }
+        if rule.idle_ttl_secs == 0 {
+            validation_error!(
+                "resilience.scoped_rate_limits['{}'].idle_ttl_secs must be greater than 0",
+                rule_name
+            );
+            return false;
+        }
+        if rule
+            .route_allowlist
+            .iter()
+            .any(|route| route.trim().is_empty())
+        {
+            validation_error!(
+                "resilience.scoped_rate_limits['{}'].route_allowlist must not contain empty values",
+                rule_name
+            );
+            return false;
+        }
+        match rule.scope {
+            ScopedRateLimitScope::Route => {
+                if rule
+                    .key
+                    .as_ref()
+                    .is_some_and(|value| !value.trim().is_empty())
+                {
+                    validation_error!(
+                        "resilience.scoped_rate_limits['{}'].key is invalid for scope=route",
+                        rule_name
+                    );
+                    return false;
+                }
+            }
+            ScopedRateLimitScope::Tenant => {
+                let Some(key_spec) = rule.key.as_deref() else {
+                    validation_error!(
+                        "resilience.scoped_rate_limits['{}'].key is required for scope=tenant",
+                        rule_name
+                    );
+                    return false;
+                };
+                if !is_valid_request_key_spec(key_spec) {
+                    validation_error!(
+                        "resilience.scoped_rate_limits['{}'].key must be a supported request key spec",
+                        rule_name
+                    );
+                    return false;
+                }
+            }
+            ScopedRateLimitScope::Client | ScopedRateLimitScope::Token => {
+                if let Some(key_spec) = rule.key.as_deref()
+                    && !is_valid_request_key_spec(key_spec)
+                {
+                    validation_error!(
+                        "resilience.scoped_rate_limits['{}'].key must be a supported request key spec",
+                        rule_name
+                    );
+                    return false;
+                }
+            }
+        }
+    }
+
     if config.resilience.brownout.trigger_inflight_percent > 100
         || config.resilience.brownout.recover_inflight_percent > 100
     {
@@ -980,6 +1176,259 @@ fn validate_inner(config: &Config) -> bool {
             validation_error!(
                 "Invalid load balancing type '{}' for upstream '{}'",
                 upstream.load_balancing.lb_type,
+                upstream_name
+            );
+            return false;
+        }
+
+        if let Some(api_key) = upstream.auth.api_key.as_ref() {
+            let header_name = api_key.header_name.trim();
+            if header_name.is_empty() {
+                validation_error!(
+                    "upstream '{}' auth.api_key.header_name must be non-empty",
+                    upstream_name
+                );
+                return false;
+            }
+            if !is_valid_http_token(header_name) {
+                validation_error!(
+                    "upstream '{}' auth.api_key.header_name must be a valid HTTP header name",
+                    upstream_name
+                );
+                return false;
+            }
+            if api_key.keys.is_empty() || api_key.keys.iter().any(|value| value.trim().is_empty()) {
+                validation_error!(
+                    "upstream '{}' auth.api_key.keys must contain at least one non-empty key",
+                    upstream_name
+                );
+                return false;
+            }
+            let mut seen_api_keys = std::collections::HashSet::new();
+            for key in &api_key.keys {
+                if !seen_api_keys.insert(key.trim().to_string()) {
+                    validation_error!(
+                        "upstream '{}' auth.api_key.keys contains duplicate values",
+                        upstream_name
+                    );
+                    return false;
+                }
+            }
+        }
+
+        if let Some(external_auth) = upstream.auth.external_auth.as_ref() {
+            if upstream.auth.api_key.is_some() || upstream.auth.jwt.is_some() {
+                validation_error!(
+                    "upstream '{}' auth.external_auth cannot be combined with auth.api_key or auth.jwt in v1",
+                    upstream_name
+                );
+                return false;
+            }
+            if !upstream.auth.required_scopes.is_empty() || !upstream.auth.required_roles.is_empty()
+            {
+                validation_error!(
+                    "upstream '{}' auth.external_auth cannot be combined with auth.required_scopes or auth.required_roles in v1",
+                    upstream_name
+                );
+                return false;
+            }
+
+            match external_auth {
+                ExternalAuth::Http {
+                    endpoint,
+                    request_headers,
+                    response_header_allowlist,
+                    timeout_ms,
+                    ..
+                } => {
+                    if !is_valid_http_url(endpoint) {
+                        validation_error!(
+                            "upstream '{}' auth.external_auth.http.endpoint must be an absolute http(s) URL",
+                            upstream_name
+                        );
+                        return false;
+                    }
+                    if !validate_external_auth_headers(
+                        upstream_name,
+                        "auth.external_auth.http",
+                        request_headers,
+                        response_header_allowlist,
+                    ) {
+                        return false;
+                    }
+                    if *timeout_ms == 0 {
+                        validation_error!(
+                            "upstream '{}' auth.external_auth.http.timeout_ms must be greater than 0",
+                            upstream_name
+                        );
+                        return false;
+                    }
+                }
+                ExternalAuth::Oidc {
+                    discovery_url,
+                    issuer_url,
+                    client_id,
+                    client_secret,
+                    audience,
+                    scopes,
+                    request_headers,
+                    response_header_allowlist,
+                    timeout_ms,
+                    ..
+                } => {
+                    let has_discovery_url = discovery_url
+                        .as_deref()
+                        .is_some_and(|value| !value.trim().is_empty());
+                    let has_issuer_url = issuer_url
+                        .as_deref()
+                        .is_some_and(|value| !value.trim().is_empty());
+                    if !has_discovery_url && !has_issuer_url {
+                        validation_error!(
+                            "upstream '{}' auth.external_auth.oidc requires discovery_url or issuer_url",
+                            upstream_name
+                        );
+                        return false;
+                    }
+                    if let Some(discovery_url) = discovery_url.as_deref()
+                        && !discovery_url.trim().is_empty()
+                        && !is_valid_https_url(discovery_url)
+                    {
+                        validation_error!(
+                            "upstream '{}' auth.external_auth.oidc.discovery_url must be an absolute https URL",
+                            upstream_name
+                        );
+                        return false;
+                    }
+                    if let Some(issuer_url) = issuer_url.as_deref()
+                        && !issuer_url.trim().is_empty()
+                        && !is_valid_https_url(issuer_url)
+                    {
+                        validation_error!(
+                            "upstream '{}' auth.external_auth.oidc.issuer_url must be an absolute https URL",
+                            upstream_name
+                        );
+                        return false;
+                    }
+                    if client_id.trim().is_empty() {
+                        validation_error!(
+                            "upstream '{}' auth.external_auth.oidc.client_id must be non-empty",
+                            upstream_name
+                        );
+                        return false;
+                    }
+                    if client_secret
+                        .as_deref()
+                        .is_some_and(|value| value.trim().is_empty())
+                    {
+                        validation_error!(
+                            "upstream '{}' auth.external_auth.oidc.client_secret must be non-empty when provided",
+                            upstream_name
+                        );
+                        return false;
+                    }
+                    if audience
+                        .as_deref()
+                        .is_some_and(|value| value.trim().is_empty())
+                    {
+                        validation_error!(
+                            "upstream '{}' auth.external_auth.oidc.audience must be non-empty when provided",
+                            upstream_name
+                        );
+                        return false;
+                    }
+                    if scopes.iter().any(|scope| scope.trim().is_empty()) {
+                        validation_error!(
+                            "upstream '{}' auth.external_auth.oidc.scopes must not contain empty values",
+                            upstream_name
+                        );
+                        return false;
+                    }
+                    if !validate_external_auth_headers(
+                        upstream_name,
+                        "auth.external_auth.oidc",
+                        request_headers,
+                        response_header_allowlist,
+                    ) {
+                        return false;
+                    }
+                    if !response_header_allowlist.is_empty() {
+                        validation_error!(
+                            "upstream '{}' auth.external_auth.oidc.response_header_allowlist is not supported in v1",
+                            upstream_name
+                        );
+                        return false;
+                    }
+                    if *timeout_ms == 0 {
+                        validation_error!(
+                            "upstream '{}' auth.external_auth.oidc.timeout_ms must be greater than 0",
+                            upstream_name
+                        );
+                        return false;
+                    }
+                }
+            }
+        }
+
+        if let Some(jwt) = upstream.auth.jwt.as_ref() {
+            if jwt.secret.trim().is_empty() {
+                validation_error!(
+                    "upstream '{}' auth.jwt.secret must be non-empty",
+                    upstream_name
+                );
+                return false;
+            }
+            if jwt
+                .issuer
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                validation_error!(
+                    "upstream '{}' auth.jwt.issuer must be non-empty when provided",
+                    upstream_name
+                );
+                return false;
+            }
+            if jwt
+                .audience
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                validation_error!(
+                    "upstream '{}' auth.jwt.audience must be non-empty when provided",
+                    upstream_name
+                );
+                return false;
+            }
+        }
+        if upstream
+            .auth
+            .required_scopes
+            .iter()
+            .any(|value| value.trim().is_empty())
+        {
+            validation_error!(
+                "upstream '{}' auth.required_scopes must not contain empty values",
+                upstream_name
+            );
+            return false;
+        }
+        if upstream
+            .auth
+            .required_roles
+            .iter()
+            .any(|value| value.trim().is_empty())
+        {
+            validation_error!(
+                "upstream '{}' auth.required_roles must not contain empty values",
+                upstream_name
+            );
+            return false;
+        }
+        if (!upstream.auth.required_scopes.is_empty() || !upstream.auth.required_roles.is_empty())
+            && upstream.auth.jwt.is_none()
+        {
+            validation_error!(
+                "upstream '{}' auth.required_scopes/auth.required_roles require auth.jwt",
                 upstream_name
             );
             return false;

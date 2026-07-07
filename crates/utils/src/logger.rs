@@ -1,6 +1,7 @@
 use std::{
     fs::{OpenOptions, create_dir_all},
     io::Write,
+    os::unix::fs::OpenOptionsExt,
     path::Path,
     sync::{
         Mutex, OnceLock,
@@ -103,7 +104,16 @@ fn configure_and_init_logger(
             return try_init_builder(builder);
         }
 
-        let file = match OpenOptions::new().create(true).append(true).open(log_file) {
+        // Restrict newly-created log files (0o640, not world-readable) and
+        // refuse to follow a symlinked path — the log is opened as root before
+        // privilege drop, so a symlink there would be a root-write primitive.
+        let file = match OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o640)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(log_file)
+        {
             Ok(file) => file,
             Err(err) => {
                 eprintln!("{}", build_open_log_file_error(log_file, &err));

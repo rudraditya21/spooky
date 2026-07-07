@@ -141,6 +141,7 @@ pub(crate) enum RouteDecisionReason {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RouteDecision<'a> {
+    /// Name of the upstream selected by route matching; auth/policy stays attached to that upstream.
     pub upstream: &'a str,
     pub matched_path_len: usize,
     pub host_specific: bool,

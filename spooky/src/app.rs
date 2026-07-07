@@ -14,8 +14,8 @@ use spooky_edge::types::RuntimeBundleHandle;
 use spooky_edge::{QUICListener, configure_async_runtime};
 
 use crate::listener_group::{
-    ListenerGroupRuntime, collect_finished_listener_groups, log_listener_startup,
-    reconcile_listener_groups, spawn_managed_listener_group,
+    ListenerGroupRuntime, allocate_worker_index_base, collect_finished_listener_groups,
+    log_listener_startup, reconcile_listener_groups, spawn_managed_listener_group,
 };
 use crate::privilege_drop;
 use crate::runtime_guard;
@@ -177,17 +177,16 @@ async fn run(
     });
 
     let mut listener_groups = Vec::new();
-    let mut next_worker_index_base = 0usize;
     for listener_config in runtime_config.listener_runtime_configs() {
+        let worker_count = listener_config.performance.worker_threads.max(1);
+        let worker_index_base = allocate_worker_index_base(&listener_groups, worker_count);
         match spawn_managed_listener_group(
             listener_config,
             Arc::clone(&shared_state),
             Arc::clone(&runtime_bundle),
-            next_worker_index_base,
+            worker_index_base,
         ) {
             Ok(group) => {
-                next_worker_index_base =
-                    next_worker_index_base.saturating_add(group.signature.worker_count);
                 listener_groups.push(group);
             }
             Err(err) => {
@@ -203,11 +202,7 @@ async fn run(
     let mut worker_failed = false;
     while !shutdown.load(Ordering::Relaxed) {
         collect_finished_listener_groups(&mut listener_groups, &mut worker_failed);
-        reconcile_listener_groups(
-            &runtime_bundle,
-            &mut listener_groups,
-            &mut next_worker_index_base,
-        );
+        reconcile_listener_groups(&runtime_bundle, &mut listener_groups);
 
         if worker_failed {
             break;

@@ -160,6 +160,7 @@ fn make_config(port: u32, backend_addr: String, cert: String, key: String) -> Co
                 lb_type: "random".to_string(),
                 key: None,
             },
+            auth: Default::default(),
             host_policy: Default::default(),
             forwarded_headers: Default::default(),
             tls: None,
@@ -221,6 +222,23 @@ fn normalize_backend_address(address: String) -> String {
     } else {
         format!("http://{address}")
     }
+}
+
+fn encode_test_hs256_jwt(secret: &str, claims: serde_json::Value) -> String {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    let header = URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&serde_json::json!({ "alg": "HS256", "typ": "JWT" }))
+            .expect("serialize header"),
+    );
+    let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).expect("serialize claims"));
+    let signing_input = format!("{header}.{payload}");
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("mac");
+    mac.update(signing_input.as_bytes());
+    let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    format!("{signing_input}.{signature}")
 }
 
 fn quic_read_timeout(conn: &quiche::Connection) -> Duration {
@@ -3482,6 +3500,155 @@ fn protocol_policy_denies_blocked_path_prefix() {
         String::from_utf8_lossy(&denied.body).contains("path blocked"),
         "expected policy body in response"
     );
+}
+
+#[test]
+fn upstream_api_key_auth_rejects_missing_key_and_allows_valid_key() {
+    if !local_listener_bind_available() {
+        return;
+    }
+    let dir = tempdir().expect("failed to create temp dir");
+    let (cert, key) = write_test_certs(&dir);
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+
+    let backend_addr = rt.block_on(start_h2_backend_with_regression_routes());
+    let mut config = make_config(0, backend_addr.to_string(), cert, key);
+    config.upstream.get_mut("test_pool").expect("upstream").auth =
+        spooky_config::config::RouteAuth {
+            api_key: Some(spooky_config::config::ApiKeyAuth {
+                header_name: "x-api-key".to_string(),
+                keys: vec!["edge-key".to_string()],
+            }),
+            jwt: None,
+            external_auth: None,
+            required_scopes: Vec::new(),
+            required_roles: Vec::new(),
+        };
+
+    let listener = QUICListener::new(config).expect("failed to create listener");
+    let listen_addr = listener.socket.local_addr().unwrap();
+    let _listener_task = ListenerTaskGuard::spawn(&rt, listener);
+
+    let unauthorized = run_h3_client_collect_response(
+        listen_addr,
+        vec![
+            quiche::h3::Header::new(b":method", b"GET"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"localhost"),
+            quiche::h3::Header::new(b":path", b"/fast"),
+            quiche::h3::Header::new(b"user-agent", b"spooky-auth-test"),
+        ],
+        true,
+        Duration::from_secs(REQUEST_TIMEOUT_SECS + 4),
+    )
+    .expect("unauthorized request should complete");
+    assert_eq!(unauthorized.status, "401");
+    assert!(
+        unauthorized
+            .headers
+            .iter()
+            .any(|(name, value)| name == "www-authenticate" && value == "ApiKey")
+    );
+    assert!(
+        String::from_utf8_lossy(&unauthorized.body).contains("unauthorized"),
+        "expected unauthorized body"
+    );
+
+    let authorized = run_h3_client_collect_response(
+        listen_addr,
+        vec![
+            quiche::h3::Header::new(b":method", b"GET"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"localhost"),
+            quiche::h3::Header::new(b":path", b"/fast"),
+            quiche::h3::Header::new(b"user-agent", b"spooky-auth-test"),
+            quiche::h3::Header::new(b"x-api-key", b"edge-key"),
+        ],
+        true,
+        Duration::from_secs(REQUEST_TIMEOUT_SECS + 4),
+    )
+    .expect("authorized request should complete");
+    assert_eq!(authorized.status, "200");
+    assert_eq!(authorized.body, b"fast\n");
+}
+
+#[test]
+fn upstream_jwt_auth_rejects_missing_token_and_allows_valid_token() {
+    if !local_listener_bind_available() {
+        return;
+    }
+    let dir = tempdir().expect("failed to create temp dir");
+    let (cert, key) = write_test_certs(&dir);
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+
+    let backend_addr = rt.block_on(start_h2_backend_with_regression_routes());
+    let mut config = make_config(0, backend_addr.to_string(), cert, key);
+    config.upstream.get_mut("test_pool").expect("upstream").auth =
+        spooky_config::config::RouteAuth {
+            api_key: None,
+            jwt: Some(spooky_config::config::JwtAuth {
+                secret: "jwt-secret".to_string(),
+                issuer: Some("issuer-1".to_string()),
+                audience: Some("aud-1".to_string()),
+                clock_skew_secs: 30,
+            }),
+            external_auth: None,
+            required_scopes: vec!["read:fast".to_string()],
+            required_roles: Vec::new(),
+        };
+
+    let listener = QUICListener::new(config).expect("failed to create listener");
+    let listen_addr = listener.socket.local_addr().unwrap();
+    let _listener_task = ListenerTaskGuard::spawn(&rt, listener);
+
+    let unauthorized = run_h3_client_collect_response(
+        listen_addr,
+        vec![
+            quiche::h3::Header::new(b":method", b"GET"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"localhost"),
+            quiche::h3::Header::new(b":path", b"/fast"),
+            quiche::h3::Header::new(b"user-agent", b"spooky-jwt-test"),
+        ],
+        true,
+        Duration::from_secs(REQUEST_TIMEOUT_SECS + 4),
+    )
+    .expect("unauthorized jwt request should complete");
+    assert_eq!(unauthorized.status, "401");
+    assert!(
+        unauthorized
+            .headers
+            .iter()
+            .any(|(name, value)| name == "www-authenticate" && value == "Bearer")
+    );
+
+    let token = encode_test_hs256_jwt(
+        "jwt-secret",
+        serde_json::json!({
+            "sub": "user-1",
+            "iss": "issuer-1",
+            "aud": "aud-1",
+            "exp": 4_000_000_000u64,
+            "scope": "read:fast",
+        }),
+    );
+    let authorization = format!("Bearer {token}");
+    let authorized = run_h3_client_collect_response(
+        listen_addr,
+        vec![
+            quiche::h3::Header::new(b":method", b"GET"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"localhost"),
+            quiche::h3::Header::new(b":path", b"/fast"),
+            quiche::h3::Header::new(b"user-agent", b"spooky-jwt-test"),
+            quiche::h3::Header::new(b"authorization", authorization.as_bytes()),
+        ],
+        true,
+        Duration::from_secs(REQUEST_TIMEOUT_SECS + 4),
+    )
+    .expect("authorized jwt request should complete");
+    assert_eq!(authorized.status, "200");
+    assert_eq!(authorized.body, b"fast\n");
 }
 
 #[test]

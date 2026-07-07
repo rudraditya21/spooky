@@ -7,7 +7,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use spooky_config::config::Resilience as ResilienceConfig;
+use spooky_config::config::{
+    Resilience as ResilienceConfig, ScopedRateLimit as ScopedRateLimitConfig, ScopedRateLimitScope,
+};
 
 use crate::RetryReason;
 
@@ -195,6 +197,156 @@ impl Drop for RouteQueuePermit {
             }
             guard.total = guard.total.saturating_sub(1);
         }
+    }
+}
+
+struct ScopedRateLimitBucket {
+    burst: f64,
+    rate_per_sec: f64,
+    tokens: f64,
+    last_refill: Instant,
+    last_seen: Instant,
+}
+
+impl ScopedRateLimitBucket {
+    fn new(rate_per_sec: u32, burst: u32) -> Self {
+        let now = Instant::now();
+        let burst = burst.max(1) as f64;
+        Self {
+            burst,
+            rate_per_sec: rate_per_sec.max(1) as f64,
+            tokens: burst,
+            last_refill: now,
+            last_seen: now,
+        }
+    }
+
+    fn try_consume(&mut self) -> bool {
+        let now = Instant::now();
+        let refill = now
+            .saturating_duration_since(self.last_refill)
+            .as_secs_f64()
+            * self.rate_per_sec;
+        self.last_refill = now;
+        self.last_seen = now;
+
+        if refill.is_finite() && refill > 0.0 {
+            self.tokens = (self.tokens + refill).min(self.burst);
+        } else if !refill.is_finite() {
+            self.tokens = self.burst;
+        }
+
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+pub struct ScopedRateLimitRule {
+    name: String,
+    scope: ScopedRateLimitScope,
+    key_spec: Option<String>,
+    route_allowlist: HashSet<String>,
+    idle_ttl: Duration,
+    retry_after_seconds: u32,
+    rate_per_sec: u32,
+    burst: u32,
+    buckets: Mutex<HashMap<String, ScopedRateLimitBucket>>,
+}
+
+impl ScopedRateLimitRule {
+    pub(crate) fn from_config(config: &ScopedRateLimitConfig) -> Self {
+        Self {
+            name: config.name.clone(),
+            scope: config.scope,
+            key_spec: config.key.clone(),
+            route_allowlist: config.route_allowlist.iter().cloned().collect(),
+            idle_ttl: Duration::from_secs(config.idle_ttl_secs.max(1)),
+            retry_after_seconds: ((1.0 / config.requests_per_sec.max(1) as f64).ceil() as u32)
+                .max(1),
+            rate_per_sec: config.requests_per_sec.max(1),
+            burst: config.burst.max(1),
+            buckets: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn scope(&self) -> ScopedRateLimitScope {
+        self.scope
+    }
+
+    pub fn key_spec(&self) -> Option<&str> {
+        self.key_spec.as_deref()
+    }
+
+    fn applies_to_route(&self, route: &str) -> bool {
+        self.route_allowlist.is_empty() || self.route_allowlist.contains(route)
+    }
+
+    fn allow(&self, key: &str) -> bool {
+        let mut buckets = match self.buckets.lock() {
+            Ok(guard) => guard,
+            Err(_) => return true,
+        };
+        if buckets.len() >= 64 {
+            let idle_ttl = self.idle_ttl;
+            buckets.retain(|_, bucket| bucket.last_seen.elapsed() < idle_ttl);
+        }
+        let bucket = buckets
+            .entry(key.to_string())
+            .or_insert_with(|| ScopedRateLimitBucket::new(self.rate_per_sec, self.burst));
+        bucket.try_consume()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ScopedRateLimitRejection {
+    pub rule_name: String,
+    pub route: String,
+    pub retry_after_seconds: u32,
+}
+
+pub struct ScopedRateLimiters {
+    rules: Vec<Arc<ScopedRateLimitRule>>,
+}
+
+impl ScopedRateLimiters {
+    pub fn new(rules: &[ScopedRateLimitConfig]) -> Self {
+        Self {
+            rules: rules
+                .iter()
+                .map(|rule| Arc::new(ScopedRateLimitRule::from_config(rule)))
+                .collect(),
+        }
+    }
+
+    pub fn check<F>(&self, route: &str, mut key_for_rule: F) -> Option<ScopedRateLimitRejection>
+    where
+        F: FnMut(&ScopedRateLimitRule) -> Option<String>,
+    {
+        for rule in &self.rules {
+            if !rule.applies_to_route(route) {
+                continue;
+            }
+            let Some(key) = key_for_rule(rule) else {
+                continue;
+            };
+            if key.is_empty() || rule.allow(&key) {
+                continue;
+            }
+            return Some(ScopedRateLimitRejection {
+                rule_name: rule.name.clone(),
+                route: route.to_string(),
+                retry_after_seconds: rule.retry_after_seconds,
+            });
+        }
+        None
     }
 }
 
@@ -433,6 +585,7 @@ impl BrownoutController {
 pub struct RuntimeResilience {
     pub adaptive_admission: Arc<AdaptiveAdmission>,
     pub route_queue: Arc<RouteQueueLimiter>,
+    pub scoped_rate_limits: Arc<ScopedRateLimiters>,
     pub circuit_breakers: Arc<CircuitBreakers>,
     pub retry_budget: Arc<RetryBudget>,
     pub brownout: Arc<BrownoutController>,
@@ -470,6 +623,7 @@ impl RuntimeResilience {
             config.route_queue.global_cap,
             config.route_queue.caps.clone(),
         ));
+        let scoped_rate_limits = Arc::new(ScopedRateLimiters::new(&config.scoped_rate_limits));
         let cb = &config.circuit_breaker;
         let circuit_breakers = Arc::new(CircuitBreakers::new(
             cb.enabled,
@@ -529,6 +683,7 @@ impl RuntimeResilience {
         Self {
             adaptive_admission: admission,
             route_queue,
+            scoped_rate_limits,
             circuit_breakers,
             retry_budget,
             brownout,
@@ -715,6 +870,47 @@ mod tests {
         let rb = RetryBudget::new(false, 0, HashMap::new());
         assert!(rb.allow_retry("api").is_ok());
         assert!(rb.allow_retry("api").is_ok());
+    }
+
+    #[test]
+    fn scoped_rate_limit_enforces_per_route_tokens() {
+        let rule = ScopedRateLimitConfig {
+            name: "route-cap".to_string(),
+            scope: ScopedRateLimitScope::Route,
+            requests_per_sec: 1,
+            burst: 1,
+            key: None,
+            route_allowlist: Vec::new(),
+            idle_ttl_secs: 300,
+        };
+        let limiters = ScopedRateLimiters::new(&[rule]);
+
+        assert!(limiters.check("api", |_| Some("api".to_string())).is_none());
+        let rejection = limiters
+            .check("api", |_| Some("api".to_string()))
+            .expect("second request should be limited");
+        assert_eq!(rejection.rule_name, "route-cap");
+        assert_eq!(rejection.route, "api");
+    }
+
+    #[test]
+    fn scoped_rate_limit_skips_rules_outside_route_allowlist() {
+        let rule = ScopedRateLimitConfig {
+            name: "tenant-cap".to_string(),
+            scope: ScopedRateLimitScope::Tenant,
+            requests_per_sec: 1,
+            burst: 1,
+            key: Some("header:x-tenant-id".to_string()),
+            route_allowlist: vec!["api".to_string()],
+            idle_ttl_secs: 300,
+        };
+        let limiters = ScopedRateLimiters::new(&[rule]);
+
+        assert!(
+            limiters
+                .check("admin", |_| Some("tenant-a".to_string()))
+                .is_none()
+        );
     }
 
     #[test]

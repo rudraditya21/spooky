@@ -83,6 +83,22 @@ pub fn security_default_group() -> String {
     String::from("nogroup")
 }
 
+pub fn auth_default_api_key_header_name() -> String {
+    String::from("x-api-key")
+}
+
+pub fn auth_default_external_timeout_ms() -> u64 {
+    1_000
+}
+
+pub fn auth_default_external_failure_mode() -> String {
+    String::from("fail_closed")
+}
+
+pub fn auth_default_jwt_clock_skew_secs() -> u64 {
+    30
+}
+
 pub fn perf_default_worker_threads() -> usize {
     1
 }
@@ -217,6 +233,10 @@ pub fn perf_default_max_request_body_bytes() -> usize {
 
 pub fn perf_default_request_buffer_global_cap_bytes() -> usize {
     64 * 1024 * 1024 // 64 MiB
+}
+
+pub fn resilience_default_scoped_rate_limit_idle_ttl_secs() -> u64 {
+    300
 }
 
 pub fn perf_default_unknown_length_response_prebuffer_bytes() -> usize {

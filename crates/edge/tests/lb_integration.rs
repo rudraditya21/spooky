@@ -92,6 +92,7 @@ fn make_config(
                 lb_type: lb_type.to_string(),
                 key: None,
             },
+            auth: Default::default(),
             host_policy: Default::default(),
             forwarded_headers: Default::default(),
             tls: None,

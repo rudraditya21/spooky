@@ -150,6 +150,28 @@ impl BackendState {
         };
         Some(HealthTransition::BecameUnhealthy)
     }
+
+    /// Cooldown expiry, if this backend is currently unhealthy.
+    fn cooldown_until(&self) -> Option<Instant> {
+        if let HealthState::Unhealthy { until, .. } = self.health_state {
+            Some(until)
+        } else {
+            None
+        }
+    }
+
+    /// Optimistically re-admit an ejected backend once its cooldown has elapsed
+    /// so live traffic can probe it again. Returns true on transition.
+    fn readmit_if_expired(&mut self, now: Instant) -> bool {
+        if let HealthState::Unhealthy { until, .. } = self.health_state
+            && now >= until
+        {
+            self.consecutive_failures = 0;
+            self.health_state = HealthState::Healthy;
+            return true;
+        }
+        false
+    }
 }
 
 pub struct BackendPool {
@@ -157,6 +179,9 @@ pub struct BackendPool {
     healthy: Vec<usize>,
     healthy_pos: Vec<Option<usize>>,
     membership_epoch: u64,
+    // Earliest cooldown expiry among passively-ejected backends (no active
+    // health check), driving time-based re-admission. `None` when none pending.
+    earliest_readmit: Option<Instant>,
 }
 
 pub struct UpstreamPool {
@@ -186,6 +211,7 @@ impl UpstreamPool {
     }
 
     pub fn pick(&mut self, key: &str) -> Option<usize> {
+        self.pool.reconcile_readmit();
         let selected = self.load_balancer.pick(key, &self.pool)?;
         self.pool.begin_request(selected);
         Some(selected)
@@ -193,6 +219,11 @@ impl UpstreamPool {
 
     pub fn pick_readonly(&self, key: &str) -> Option<usize> {
         self.load_balancer.pick_readonly(key, &self.pool)
+    }
+
+    pub fn pick_without_begin(&mut self, key: &str) -> Option<usize> {
+        self.pool.reconcile_readmit();
+        self.load_balancer.pick(key, &self.pool)
     }
 
     pub fn begin_request_if_healthy(&self, index: usize) -> bool {
@@ -234,6 +265,7 @@ impl BackendPool {
             healthy,
             healthy_pos,
             membership_epoch: 0,
+            earliest_readmit: None,
         }
     }
 
@@ -315,11 +347,60 @@ impl BackendPool {
                 debug_assert!(self.mark_healthy(index));
             } else {
                 debug_assert!(self.mark_unhealthy(index));
+                // Passive ejections have no active loop to recover them; record
+                // the cooldown so `reconcile_readmit` can re-admit on expiry.
+                if !self.backends[index].has_active_health_check()
+                    && let Some(until) = self.backends[index].cooldown_until()
+                {
+                    self.earliest_readmit =
+                        Some(self.earliest_readmit.map_or(until, |e| e.min(until)));
+                }
             }
             self.membership_epoch = self.membership_epoch.wrapping_add(1);
         }
 
         transition
+    }
+
+    /// True when any backend is passively ejected and pending re-admission.
+    /// Clock-free so the read-locked hot path pays only a branch (no syscall):
+    /// while something is pending, callers take the write-locked slow path where
+    /// `reconcile_readmit` checks the actual cooldown clock.
+    pub fn readmit_due(&self) -> bool {
+        self.earliest_readmit.is_some()
+    }
+
+    /// Re-admit passively-ejected backends whose cooldown has elapsed so live
+    /// traffic can probe them. Reads the clock only when a re-admission is
+    /// actually pending, keeping the healthy pick path syscall-free.
+    pub fn reconcile_readmit(&mut self) {
+        if self.earliest_readmit.is_some() {
+            self.reconcile_readmit_at(Instant::now());
+        }
+    }
+
+    /// Core of [`reconcile_readmit`] with an injectable clock. Recomputes the
+    /// next pending expiry; early-returns while the soonest cooldown is unmet.
+    fn reconcile_readmit_at(&mut self, now: Instant) {
+        let Some(earliest) = self.earliest_readmit else {
+            return;
+        };
+        if now < earliest {
+            return;
+        }
+        let mut next: Option<Instant> = None;
+        for index in 0..self.backends.len() {
+            if self.backends[index].has_active_health_check() {
+                continue;
+            }
+            if self.backends[index].readmit_if_expired(now) {
+                debug_assert!(self.mark_healthy(index));
+                self.membership_epoch = self.membership_epoch.wrapping_add(1);
+            } else if let Some(until) = self.backends[index].cooldown_until() {
+                next = Some(next.map_or(until, |e| e.min(until)));
+            }
+        }
+        self.earliest_readmit = next;
     }
 
     pub fn health_check(&self, index: usize) -> Option<HealthCheck> {

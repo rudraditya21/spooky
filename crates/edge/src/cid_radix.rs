@@ -119,7 +119,7 @@ impl CidRadix {
         best_match
     }
 
-    /// Remove an SCID from the trie.
+    /// Remove an SCID from the trie, pruning now-empty interior nodes.
     ///
     /// # Arguments
     /// * `scid` - The SCID bytes to remove
@@ -128,35 +128,28 @@ impl CidRadix {
     /// O(k) where k = SCID length (typically 8-20 bytes)
     ///
     /// # Behavior
-    /// - Traverses to the leaf matching SCID bytes
-    /// - Clears the SCID value at that leaf
-    /// - Does NOT clean up empty nodes (lazy deletion)
+    /// - Traverses to the leaf matching SCID bytes and clears its value
+    /// - On the way back up, drops any node left with no value and no children,
+    ///   so the trie does not accumulate dead nodes under SCID churn
     /// - If SCID not found, silently returns (no error)
-    ///
-    /// # Note on Memory
-    /// Empty trie nodes are left in place (not deleted). This is acceptable because:
-    /// - SCID retirements are infrequent (max 60s apart)
-    /// - Empty nodes consume minimal memory (~40 bytes each for HashMap)
-    /// - Cleanup code would be more complex and not worth the savings
-    /// - Only `clear()` is called at shutdown
     pub fn remove(&mut self, scid: &[u8]) {
-        let mut node = &mut self.root;
+        Self::prune_remove(&mut self.root, scid);
+    }
 
-        // Traverse to the leaf
-        for &byte in scid {
-            match node.children.get_mut(&byte) {
-                Some(next_node) => {
-                    node = next_node;
-                }
-                None => {
-                    // Path doesn't exist, nothing to remove
-                    return;
+    /// Clear `scid` under `node`, pruning empty descendants. Returns true when
+    /// `node` itself becomes empty (no value and no children) and can be pruned.
+    fn prune_remove(node: &mut CidTrieNode, scid: &[u8]) -> bool {
+        match scid.split_first() {
+            None => node.scid = None,
+            Some((&byte, rest)) => {
+                if let Some(child) = node.children.get_mut(&byte)
+                    && Self::prune_remove(child, rest)
+                {
+                    node.children.remove(&byte);
                 }
             }
         }
-
-        // Clear the SCID at the leaf (lazy deletion)
-        node.scid = None;
+        node.scid.is_none() && node.children.is_empty()
     }
 
     /// Remove all SCIDs from the trie.
@@ -196,6 +189,15 @@ impl CidRadix {
                 count += count_recursive(child);
             }
             count
+        }
+        count_recursive(&self.root)
+    }
+
+    /// Count total trie nodes (including the root). Testing only.
+    #[cfg(test)]
+    fn count_nodes(&self) -> usize {
+        fn count_recursive(node: &CidTrieNode) -> usize {
+            1 + node.children.values().map(count_recursive).sum::<usize>()
         }
         count_recursive(&self.root)
     }
@@ -285,6 +287,42 @@ mod tests {
         );
 
         radix.remove(&[1u8, 2, 3, 4, 5, 6, 7, 8]);
+        assert!(
+            radix
+                .longest_prefix_match(&[1u8, 2, 3, 4, 5, 6, 7, 8])
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_remove_prunes_empty_nodes() {
+        let mut radix = CidRadix::new();
+        let base_nodes = radix.count_nodes(); // just the root
+        radix.insert(scid(&[1u8, 2, 3, 4, 5, 6, 7, 8]));
+        assert!(radix.count_nodes() > base_nodes);
+
+        radix.remove(&[1u8, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(
+            radix.count_nodes(),
+            base_nodes,
+            "removal must prune interior nodes, not leave them dangling"
+        );
+    }
+
+    #[test]
+    fn test_remove_keeps_shared_prefix() {
+        let mut radix = CidRadix::new();
+        radix.insert(scid(&[1u8, 2, 3, 4, 5, 6, 7, 8]));
+        radix.insert(scid(&[1u8, 2, 3, 4, 9, 10, 11, 12]));
+
+        radix.remove(&[1u8, 2, 3, 4, 5, 6, 7, 8]);
+
+        // The sibling SCID sharing the [1,2,3,4] prefix must survive.
+        assert!(
+            radix
+                .longest_prefix_match(&[1u8, 2, 3, 4, 9, 10, 11, 12])
+                .is_some()
+        );
         assert!(
             radix
                 .longest_prefix_match(&[1u8, 2, 3, 4, 5, 6, 7, 8])

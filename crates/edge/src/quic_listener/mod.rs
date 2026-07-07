@@ -69,7 +69,7 @@ use crate::types::{ForwardSuccess, TunnelMode};
 use crate::{
     ChannelBody, ForwardResult, HealthClassification, Metrics, OverloadShedReason, QUICListener,
     QuicConnection, REQUEST_ID_COUNTER, RequestEnvelope, ResponseChunk, RetryReason, RouteOutcome,
-    SharedRuntimeState, StreamPhase, UpstreamResult,
+    SharedRuntimeState, StreamAdmissionState, StreamPhase, UpstreamResult,
     cid_radix::CidRadix,
     constants::{
         DEFAULT_SCID_LEN_BYTES, MAX_DATAGRAM_SIZE_BYTES, MAX_UDP_PAYLOAD_BYTES, MIN_SCID_LEN_BYTES,
@@ -246,6 +246,10 @@ fn is_connect_tunnel_response(method: &str, status: StatusCode) -> bool {
 }
 
 fn can_poll_upstream_result(req: &RequestEnvelope) -> bool {
+    if req.admission_state != StreamAdmissionState::ReadyToForward {
+        return false;
+    }
+
     if is_tunnel_mode(req.tunnel_mode)
         && (req.phase == StreamPhase::ReceivingRequest
             || req.phase == StreamPhase::AwaitingUpstream)
@@ -685,7 +689,8 @@ impl QUICListener {
         for cap in effective_resilience.route_queue.caps.values_mut() {
             *cap = (*cap).min(default_route_cap_limit).max(1);
         }
-        let tuned_high_latency = ((config.performance.backend_timeout_ms * 7) / 10).max(50);
+        let tuned_high_latency =
+            (config.performance.backend_timeout_ms.saturating_mul(7) / 10).max(50);
         if effective_resilience.adaptive_admission.high_latency_ms > tuned_high_latency {
             warn!(
                 "resilience.adaptive_admission.high_latency_ms={} is above tuned limit {}; clamping for faster overload reaction",
@@ -1766,16 +1771,23 @@ impl QUICListener {
                     &mut connection.streams,
                     &mut connection.quic,
                     &mut h3,
+                    Arc::clone(&self.transport_pool),
+                    Arc::clone(&self.backend_endpoints),
+                    Arc::clone(&self.backend_resolution_store),
                     &self.upstream_pools,
+                    &self.upstream_inflight,
+                    Arc::clone(&self.global_inflight),
+                    self.backend_timeout,
                     &self.routing_index,
                     self.backend_body_idle_timeout,
                     self.backend_body_total_timeout,
-                    &self.metrics,
+                    Arc::clone(&self.metrics),
                     self.backend_total_request_timeout,
                     &self.resilience,
                     self.max_response_body_bytes,
                     self.unknown_length_response_prebuffer_bytes,
                     self.client_body_idle_timeout,
+                    self.inflight_acquire_wait,
                     self.config.listen.listen.port,
                 ) {
                     error!("advance_streams_non_blocking in timeout path: {:?}", e);
@@ -1914,24 +1926,11 @@ impl QUICListener {
 
     fn try_acquire_owned_with_micro_wait(
         semaphore: Arc<Semaphore>,
-        wait_budget: Duration,
+        _wait_budget: Duration,
     ) -> Result<(tokio::sync::OwnedSemaphorePermit, bool), tokio::sync::TryAcquireError> {
-        match Arc::clone(&semaphore).try_acquire_owned() {
-            Ok(permit) => return Ok((permit, false)),
-            Err(err) if wait_budget.is_zero() => return Err(err),
-            Err(_) => {}
-        }
-
-        let start = Instant::now();
-        loop {
-            if start.elapsed() >= wait_budget {
-                return Err(tokio::sync::TryAcquireError::NoPermits);
-            }
-            std::thread::sleep(Duration::from_millis(1));
-            if let Ok(permit) = Arc::clone(&semaphore).try_acquire_owned() {
-                return Ok((permit, true));
-            }
-        }
+        // Never block the synchronous QUIC worker thread: acquire immediately or
+        // shed. A blocking wait here stalls every connection on the shard.
+        semaphore.try_acquire_owned().map(|permit| (permit, false))
     }
 
     #[allow(clippy::too_many_arguments)]

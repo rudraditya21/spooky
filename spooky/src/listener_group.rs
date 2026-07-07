@@ -40,6 +40,7 @@ pub(crate) struct ListenerGroupRuntime {
     pub(crate) signature: ListenerGroupSignature,
     pub(crate) shutdown: Arc<AtomicBool>,
     worker_handles: Vec<thread::JoinHandle<Result<(), String>>>,
+    worker_index_base: usize,
 }
 
 impl ListenerGroupRuntime {
@@ -134,13 +135,42 @@ pub(crate) fn spawn_managed_listener_group(
         signature,
         shutdown,
         worker_handles,
+        worker_index_base,
     })
+}
+
+/// First-fit allocation of a worker-index range of `worker_count` slots that
+/// does not overlap any live group's range. Ranges freed when groups retire are
+/// reused, so indices stay bounded across reloads instead of growing without
+/// limit (which would push worker/metrics slots past the metrics capacity).
+pub(crate) fn allocate_worker_index_base(
+    groups: &[ListenerGroupRuntime],
+    worker_count: usize,
+) -> usize {
+    let mut ranges: Vec<(usize, usize)> = groups
+        .iter()
+        .map(|g| {
+            (
+                g.worker_index_base,
+                g.worker_index_base.saturating_add(g.signature.worker_count),
+            )
+        })
+        .collect();
+    ranges.sort_unstable();
+
+    let mut base = 0usize;
+    for (start, end) in ranges {
+        if base.saturating_add(worker_count) <= start {
+            return base; // fits in the gap before this range
+        }
+        base = base.max(end);
+    }
+    base
 }
 
 pub(crate) fn reconcile_listener_groups(
     runtime_bundle: &Arc<RuntimeBundleHandle>,
     groups: &mut Vec<ListenerGroupRuntime>,
-    next_worker_index_base: &mut usize,
 ) {
     let runtime = runtime_bundle.current();
     let desired_configs = runtime.runtime_config.listener_runtime_configs();
@@ -185,16 +215,15 @@ pub(crate) fn reconcile_listener_groups(
             continue;
         }
 
+        let worker_index_base = allocate_worker_index_base(groups, signature.worker_count);
         match spawn_managed_listener_group(
             listener_config,
             Arc::clone(&runtime.shared_state),
             Arc::clone(runtime_bundle),
-            *next_worker_index_base,
+            worker_index_base,
         ) {
             Ok(group) => {
                 info!("Spawned listener group {}", group.signature.label);
-                *next_worker_index_base =
-                    next_worker_index_base.saturating_add(group.signature.worker_count);
                 groups.push(group);
             }
             Err(err) => {

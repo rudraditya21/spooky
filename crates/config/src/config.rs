@@ -3,17 +3,19 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::default::{
-    get_default_address, get_default_cooldown_ms, get_default_failure_threshold,
-    get_default_health_timeout, get_default_interval, get_default_load_balancing, get_default_log,
-    get_default_log_file_path, get_default_log_level, get_default_path, get_default_port,
-    get_default_protocol, get_default_success_threshold, get_default_version, get_default_weight,
-    observe_default_address, observe_default_control_api_address,
-    observe_default_control_api_connection_timeout_ms, observe_default_control_api_health_path,
-    observe_default_control_api_max_connections, observe_default_control_api_port,
-    observe_default_control_api_ready_path, observe_default_control_api_reload_certs_path,
-    observe_default_control_api_reload_path, observe_default_control_api_restart_path,
-    observe_default_control_api_runtime_path, observe_default_metrics_connection_timeout_ms,
-    observe_default_metrics_max_connections, observe_default_metrics_path, observe_default_port,
+    auth_default_api_key_header_name, auth_default_external_timeout_ms,
+    auth_default_jwt_clock_skew_secs, get_default_address, get_default_cooldown_ms,
+    get_default_failure_threshold, get_default_health_timeout, get_default_interval,
+    get_default_load_balancing, get_default_log, get_default_log_file_path, get_default_log_level,
+    get_default_path, get_default_port, get_default_protocol, get_default_success_threshold,
+    get_default_version, get_default_weight, observe_default_address,
+    observe_default_control_api_address, observe_default_control_api_connection_timeout_ms,
+    observe_default_control_api_health_path, observe_default_control_api_max_connections,
+    observe_default_control_api_port, observe_default_control_api_ready_path,
+    observe_default_control_api_reload_certs_path, observe_default_control_api_reload_path,
+    observe_default_control_api_restart_path, observe_default_control_api_runtime_path,
+    observe_default_metrics_connection_timeout_ms, observe_default_metrics_max_connections,
+    observe_default_metrics_path, observe_default_port,
     observe_default_routing_transparency_enabled,
     observe_default_routing_transparency_expose_header,
     observe_default_routing_transparency_header_name,
@@ -50,6 +52,7 @@ use crate::default::{
     resilience_default_retry_budget_enabled, resilience_default_retry_budget_ratio_percent,
     resilience_default_route_queue_default_cap, resilience_default_route_queue_global_cap,
     resilience_default_route_queue_shed_retry_after_seconds,
+    resilience_default_scoped_rate_limit_idle_ttl_secs,
     resilience_default_watchdog_check_interval_ms, resilience_default_watchdog_drain_grace_ms,
     resilience_default_watchdog_enabled, resilience_default_watchdog_min_requests_per_window,
     resilience_default_watchdog_overload_inflight_percent,
@@ -212,6 +215,9 @@ pub struct Upstream {
     pub load_balancing: LoadBalancing,
 
     #[serde(default)]
+    pub auth: RouteAuth,
+
+    #[serde(default)]
     pub host_policy: UpstreamHostPolicy,
 
     #[serde(default)]
@@ -223,6 +229,116 @@ pub struct Upstream {
     pub route: RouteMatch, // Route matching criteria for this upstream
 
     pub backends: Vec<Backend>,
+}
+
+/// Upstream-scoped auth policy. External auth is a single-provider contract
+/// per upstream; there is no provider chaining.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RouteAuth {
+    #[serde(default)]
+    pub api_key: Option<ApiKeyAuth>,
+    #[serde(default)]
+    pub jwt: Option<JwtAuth>,
+    #[serde(default)]
+    pub external_auth: Option<ExternalAuth>,
+    #[serde(default)]
+    pub required_scopes: Vec<String>,
+    #[serde(default)]
+    pub required_roles: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalAuthFailureMode {
+    FailOpen,
+    #[default]
+    FailClosed,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExternalAuth {
+    Http {
+        endpoint: String,
+        #[serde(default)]
+        request_headers: Vec<ExternalAuthRequestHeader>,
+        #[serde(default)]
+        response_header_allowlist: Vec<String>,
+        #[serde(default = "auth_default_external_timeout_ms")]
+        timeout_ms: u64,
+        #[serde(default = "ExternalAuthFailureMode::default")]
+        failure_mode: ExternalAuthFailureMode,
+    },
+    Oidc {
+        #[serde(default)]
+        discovery_url: Option<String>,
+        #[serde(default)]
+        issuer_url: Option<String>,
+        client_id: String,
+        #[serde(default)]
+        client_secret: Option<String>,
+        #[serde(default)]
+        audience: Option<String>,
+        #[serde(default)]
+        scopes: Vec<String>,
+        #[serde(default)]
+        request_headers: Vec<ExternalAuthRequestHeader>,
+        #[serde(default)]
+        response_header_allowlist: Vec<String>,
+        #[serde(default = "auth_default_external_timeout_ms")]
+        timeout_ms: u64,
+        #[serde(default = "ExternalAuthFailureMode::default")]
+        failure_mode: ExternalAuthFailureMode,
+    },
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalAuthRequestHeader {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ApiKeyAuth {
+    #[serde(default = "auth_default_api_key_header_name")]
+    pub header_name: String,
+    #[serde(default)]
+    pub keys: Vec<String>,
+}
+
+impl Default for ApiKeyAuth {
+    fn default() -> Self {
+        Self {
+            header_name: auth_default_api_key_header_name(),
+            keys: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct JwtAuth {
+    pub secret: String,
+    #[serde(default)]
+    pub issuer: Option<String>,
+    #[serde(default)]
+    pub audience: Option<String>,
+    #[serde(default = "auth_default_jwt_clock_skew_secs")]
+    pub clock_skew_secs: u64,
+}
+
+impl Default for JwtAuth {
+    fn default() -> Self {
+        Self {
+            secret: String::new(),
+            issuer: None,
+            audience: None,
+            clock_skew_secs: auth_default_jwt_clock_skew_secs(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, Default)]
@@ -559,6 +675,8 @@ pub struct Resilience {
     #[serde(default)]
     pub route_queue: RouteQueue,
     #[serde(default)]
+    pub scoped_rate_limits: Vec<ScopedRateLimit>,
+    #[serde(default)]
     pub protocol: ProtocolPolicy,
     #[serde(default)]
     pub circuit_breaker: CircuitBreaker,
@@ -620,6 +738,111 @@ impl Resilience {
                 self.retry_budget.ratio_percent,
             ));
         }
+        for rule in &self.scoped_rate_limits {
+            let rule_name = rule.name.trim();
+            if rule_name.is_empty() {
+                return Err("resilience.scoped_rate_limits[].name must be non-empty".into());
+            }
+            if rule.requests_per_sec == 0 {
+                return Err(format!(
+                    "resilience.scoped_rate_limits['{}'].requests_per_sec must be > 0",
+                    rule_name
+                ));
+            }
+            if rule.burst == 0 {
+                return Err(format!(
+                    "resilience.scoped_rate_limits['{}'].burst must be > 0",
+                    rule_name
+                ));
+            }
+            if rule.idle_ttl_secs == 0 {
+                return Err(format!(
+                    "resilience.scoped_rate_limits['{}'].idle_ttl_secs must be > 0",
+                    rule_name
+                ));
+            }
+            if rule
+                .route_allowlist
+                .iter()
+                .any(|route| route.trim().is_empty())
+            {
+                return Err(format!(
+                    "resilience.scoped_rate_limits['{}'].route_allowlist must not contain empty values",
+                    rule_name
+                ));
+            }
+            match rule.scope {
+                ScopedRateLimitScope::Route => {
+                    if rule
+                        .key
+                        .as_ref()
+                        .is_some_and(|value| !value.trim().is_empty())
+                    {
+                        return Err(format!(
+                            "resilience.scoped_rate_limits['{}'].key is invalid for scope=route",
+                            rule_name
+                        ));
+                    }
+                }
+                ScopedRateLimitScope::Tenant => {
+                    let Some(key_spec) = rule.key.as_deref() else {
+                        return Err(format!(
+                            "resilience.scoped_rate_limits['{}'].key is required for scope=tenant",
+                            rule_name
+                        ));
+                    };
+                    if !matches!(
+                        key_spec.trim().to_ascii_lowercase().as_str(),
+                        "path"
+                            | "authority"
+                            | "method"
+                            | "cid"
+                            | "sticky-cid"
+                            | "peer_ip"
+                            | "client_ip"
+                            | "bearer_token"
+                    ) && !key_spec.split_once(':').is_some_and(|(source, key_name)| {
+                        !key_name.trim().is_empty()
+                            && matches!(
+                                source.trim().to_ascii_lowercase().as_str(),
+                                "header" | "cookie" | "query"
+                            )
+                    }) {
+                        return Err(format!(
+                            "resilience.scoped_rate_limits['{}'].key must be a supported request key spec",
+                            rule_name
+                        ));
+                    }
+                }
+                ScopedRateLimitScope::Client | ScopedRateLimitScope::Token => {
+                    if let Some(key_spec) = rule.key.as_deref()
+                        && !matches!(
+                            key_spec.trim().to_ascii_lowercase().as_str(),
+                            "path"
+                                | "authority"
+                                | "method"
+                                | "cid"
+                                | "sticky-cid"
+                                | "peer_ip"
+                                | "client_ip"
+                                | "bearer_token"
+                        )
+                        && !key_spec.split_once(':').is_some_and(|(source, key_name)| {
+                            !key_name.trim().is_empty()
+                                && matches!(
+                                    source.trim().to_ascii_lowercase().as_str(),
+                                    "header" | "cookie" | "query"
+                                )
+                        })
+                    {
+                        return Err(format!(
+                            "resilience.scoped_rate_limits['{}'].key must be a supported request key spec",
+                            rule_name
+                        ));
+                    }
+                }
+            }
+        }
         if self.hedging.enabled && self.hedging.delay_ms == 0 {
             return Err("resilience.hedging: delay_ms must be > 0 when hedging is enabled".into());
         }
@@ -662,6 +885,30 @@ impl Default for RouteQueue {
             caps: HashMap::new(),
         }
     }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScopedRateLimitScope {
+    Route,
+    Client,
+    Tenant,
+    Token,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ScopedRateLimit {
+    pub name: String,
+    pub scope: ScopedRateLimitScope,
+    pub requests_per_sec: u32,
+    pub burst: u32,
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub route_allowlist: Vec<String>,
+    #[serde(default = "resilience_default_scoped_rate_limit_idle_ttl_secs")]
+    pub idle_ttl_secs: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -905,7 +1152,7 @@ impl Default for MetricsEndpoint {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ControlApi {
     #[serde(default)]
@@ -939,7 +1186,9 @@ pub struct ControlApi {
     #[serde(default = "observe_default_control_api_reload_certs_path")]
     pub reload_certs_path: String,
 
-    #[serde(default)]
+    // Admin credential: never emitted by Serialize (e.g. the /admin/runtime
+    // dump) and redacted in Debug; still accepted on deserialize.
+    #[serde(default, skip_serializing)]
     pub auth_token: Option<String>,
 
     #[serde(default = "observe_default_control_api_max_connections")]
@@ -966,6 +1215,30 @@ impl Default for ControlApi {
             max_connections: observe_default_control_api_max_connections(),
             connection_timeout_ms: observe_default_control_api_connection_timeout_ms(),
         }
+    }
+}
+
+impl std::fmt::Debug for ControlApi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlApi")
+            .field("enabled", &self.enabled)
+            .field("required", &self.required)
+            .field("address", &self.address)
+            .field("port", &self.port)
+            .field("health_path", &self.health_path)
+            .field("ready_path", &self.ready_path)
+            .field("runtime_path", &self.runtime_path)
+            .field("restart_path", &self.restart_path)
+            .field("reload_path", &self.reload_path)
+            .field("reload_certs_path", &self.reload_certs_path)
+            // Redacted: show presence, never the value.
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("max_connections", &self.max_connections)
+            .field("connection_timeout_ms", &self.connection_timeout_ms)
+            .finish()
     }
 }
 

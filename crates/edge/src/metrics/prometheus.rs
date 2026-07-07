@@ -42,6 +42,51 @@ impl Metrics {
             self.policy_denied.load(Ordering::Relaxed)
         ));
 
+        out.push_str(
+            "# HELP spooky_external_auth_allowed Total requests explicitly allowed by external auth.\n",
+        );
+        out.push_str("# TYPE spooky_external_auth_allowed counter\n");
+        out.push_str(&format!(
+            "spooky_external_auth_allowed {}\n",
+            self.external_auth_allowed.load(Ordering::Relaxed)
+        ));
+
+        out.push_str(
+            "# HELP spooky_external_auth_denied Total requests denied, challenged, or redirected by external auth.\n",
+        );
+        out.push_str("# TYPE spooky_external_auth_denied counter\n");
+        out.push_str(&format!(
+            "spooky_external_auth_denied {}\n",
+            self.external_auth_denied.load(Ordering::Relaxed)
+        ));
+
+        out.push_str(
+            "# HELP spooky_external_auth_timeout Total external auth decisions that timed out.\n",
+        );
+        out.push_str("# TYPE spooky_external_auth_timeout counter\n");
+        out.push_str(&format!(
+            "spooky_external_auth_timeout {}\n",
+            self.external_auth_timeout.load(Ordering::Relaxed)
+        ));
+
+        out.push_str(
+            "# HELP spooky_external_auth_error Total external auth transport or execution errors.\n",
+        );
+        out.push_str("# TYPE spooky_external_auth_error counter\n");
+        out.push_str(&format!(
+            "spooky_external_auth_error {}\n",
+            self.external_auth_error.load(Ordering::Relaxed)
+        ));
+
+        out.push_str(
+            "# HELP spooky_request_rate_limited Total requests rejected by scoped request rate limits.\n",
+        );
+        out.push_str("# TYPE spooky_request_rate_limited counter\n");
+        out.push_str(&format!(
+            "spooky_request_rate_limited {}\n",
+            self.request_rate_limited.load(Ordering::Relaxed)
+        ));
+
         out.push_str("# HELP spooky_early_data_accepted Total requests accepted in early data.\n");
         out.push_str("# TYPE spooky_early_data_accepted counter\n");
         out.push_str(&format!(
@@ -743,6 +788,10 @@ impl Metrics {
                 route, stats.timeout
             ));
             out.push_str(&format!(
+                "spooky_route_rate_limited_total{{route=\"{}\"}} {}\n",
+                route, stats.rate_limited
+            ));
+            out.push_str(&format!(
                 "spooky_route_backend_error_total{{route=\"{}\"}} {}\n",
                 route, stats.backend_error
             ));
@@ -837,11 +886,16 @@ impl Metrics {
 }
 
 fn percentile_ms(stats: &RouteStats, quantile: f64) -> f64 {
-    if stats.requests_total == 0 {
+    // Percentiles are computed over the recorded latency samples, which under
+    // latency sampling (SAMPLE_EVERY > 1) are only a subset of requests_total.
+    // Using requests_total as the denominator would push the target past the
+    // sampled bucket population and always return the sentinel bucket.
+    let sampled: u64 = stats.latency_buckets.iter().sum();
+    if sampled == 0 {
         return 0.0;
     }
 
-    let target = ((stats.requests_total as f64) * quantile).ceil() as u64;
+    let target = ((sampled as f64) * quantile).ceil() as u64;
     let mut running = 0u64;
 
     for (idx, count) in stats.latency_buckets.iter().enumerate() {

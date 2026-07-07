@@ -16,9 +16,9 @@ pub use hash::{stable_hash_socket_addr, stable_hash64};
 pub use metrics::{HealthFailureReason, Metrics, OverloadShedReason, RetryReason, RouteOutcome};
 pub use quic_listener::configure_async_runtime;
 pub use types::{
-    ForwardResult, HealthClassification, HedgeTelemetry, QUICListener, QuicConnection,
-    RequestEnvelope, ResponseChunk, SharedRuntimeState, StreamPhase, UpstreamResult,
-    outcome_from_status,
+    ForwardResult, HealthClassification, HedgeTelemetry, PendingForward, PendingHeaderMutation,
+    QUICListener, QuicConnection, RequestEnvelope, ResponseChunk, SharedRuntimeState,
+    StreamAdmissionState, StreamPhase, UpstreamResult, outcome_from_status,
 };
 #[cfg(test)]
 mod tests {
@@ -182,6 +182,48 @@ mod tests {
         metrics.set_brownout_active(false);
         let output2 = metrics.render_prometheus();
         assert!(output2.contains("spooky_brownout_active 0\n"));
+    }
+
+    #[test]
+    fn metrics_render_includes_external_auth_counters() {
+        let metrics = Metrics::default();
+        metrics.inc_external_auth_allowed();
+        metrics.inc_external_auth_denied();
+        metrics.inc_external_auth_timeout();
+        metrics.inc_external_auth_error();
+
+        let output = metrics.render_prometheus();
+        assert!(output.contains(
+            "spooky_external_auth_allowed 1
+"
+        ));
+        assert!(output.contains(
+            "spooky_external_auth_denied 1
+"
+        ));
+        assert!(output.contains(
+            "spooky_external_auth_timeout 1
+"
+        ));
+        assert!(output.contains(
+            "spooky_external_auth_error 1
+"
+        ));
+    }
+
+    #[test]
+    fn metrics_render_includes_rate_limited_counters() {
+        let metrics = Metrics::new(1, [String::from("api_pool")]);
+        metrics.inc_request_rate_limited();
+        metrics.record_route(
+            "api_pool",
+            Duration::from_millis(8),
+            RouteOutcome::RateLimited,
+        );
+
+        let output = metrics.render_prometheus();
+        assert!(output.contains("spooky_request_rate_limited 1\n"));
+        assert!(output.contains("spooky_route_rate_limited_total{route=\"api_pool\"} 1\n"));
     }
 
     #[test]

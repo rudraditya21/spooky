@@ -18,8 +18,8 @@ use tempfile::tempdir;
 
 use super::is_bodyless_request_mode;
 
-use crate::REQUEST_ID_COUNTER;
 use crate::cid_radix::CidRadix;
+use crate::{REQUEST_ID_COUNTER, StreamAdmissionState};
 use http::{HeaderMap, HeaderValue, StatusCode};
 
 use std::collections::HashSet;
@@ -55,6 +55,7 @@ fn test_upstream_with(lb_type: &str, lb_key: Option<&str>, method: Option<&str>)
             lb_type: lb_type.to_string(),
             key: lb_key.map(str::to_string),
         },
+        auth: Default::default(),
         host_policy: Default::default(),
         forwarded_headers: Default::default(),
         tls: None,
@@ -149,6 +150,7 @@ fn dns_resolution_test_config(cert: String, key: String) -> SpookyConfigConfig {
                 lb_type: "round-robin".to_string(),
                 key: None,
             },
+            auth: Default::default(),
             host_policy: Default::default(),
             forwarded_headers: Default::default(),
             tls: None,
@@ -1188,6 +1190,9 @@ fn non_connect_requires_request_completion_before_upstream_poll() {
 
     req.request_fin_received = true;
     assert!(can_poll_upstream_result(&req));
+
+    req.admission_state = StreamAdmissionState::WaitingForAuth;
+    assert!(!can_poll_upstream_result(&req));
 }
 
 #[test]
@@ -1780,6 +1785,7 @@ fn make_envelope(phase: StreamPhase) -> RequestEnvelope {
         routing_transparency_enabled: false,
         routing_transparency_include_reason: false,
         response_status: None,
+        backend_request_started: false,
         backend_request_finished: false,
         global_inflight_permit: None,
         upstream_inflight_permit: None,
@@ -1790,8 +1796,14 @@ fn make_envelope(phase: StreamPhase) -> RequestEnvelope {
         bodyless_mode: false,
         retry_count: 0,
         error_kind: None,
+        pending_forward: None,
+        auth_result_rx: None,
+        auth_abort: None,
+        auth_fail_open: false,
+        auth_deadline: None,
         tunnel_mode: crate::types::TunnelMode::None,
         phase,
+        admission_state: StreamAdmissionState::ReadyToForward,
         request_fin_received: false,
         upstream_result_rx: None,
         response_chunk_rx: None,
@@ -1851,6 +1863,51 @@ fn abort_stream_receiving_request_releases_permits() {
     assert!(req.body_tx.is_none());
 }
 
+#[test]
+fn abort_stream_waiting_for_auth_clears_async_auth_state() {
+    let metrics = crate::Metrics::default();
+    let (auth_tx, auth_rx) = oneshot::channel::<crate::types::ExternalAuthResult>();
+    let mut req = make_envelope(StreamPhase::ReceivingRequest);
+    req.admission_state = StreamAdmissionState::WaitingForAuth;
+    req.auth_result_rx = Some(auth_rx);
+    req.auth_deadline = Some(Instant::now() + std::time::Duration::from_secs(1));
+    req.pending_forward = Some(Arc::new(crate::PendingForward {
+        method: Arc::<str>::from("POST"),
+        path: Arc::<str>::from("/upload"),
+        authority: Some(Arc::<str>::from("example.com")),
+        headers: Arc::new(vec![quiche::h3::Header::new(b":method", b"POST")]),
+        upstream_name: Arc::<str>::from("api"),
+        route_reason: Arc::<str>::from("path_prefix"),
+        route_path_len: 7,
+        route_host_specific: false,
+        backend_addr: Arc::<str>::from("http://127.0.0.1:8080"),
+        backend_index: 0,
+        backend_lb: None,
+        client_addr: "127.0.0.1:443".parse().expect("client addr"),
+        request_id: 42,
+        trace_id: None,
+        span_id: None,
+        traceparent: None,
+        host_policy: Default::default(),
+        forwarded_header_policy: Default::default(),
+        auth_header_mutations: Vec::new(),
+    }));
+
+    let phase = abort_stream(&mut req, &metrics);
+
+    assert_eq!(phase, StreamPhase::ReceivingRequest);
+    assert!(req.auth_result_rx.is_none());
+    assert!(req.auth_abort.is_none());
+    assert!(req.auth_deadline.is_none());
+    assert!(req.pending_forward.is_none());
+    assert!(
+        auth_tx
+            .send(Ok(crate::types::ExternalAuthDecision::Allow {
+                request_header_mutations: Vec::new(),
+            }))
+            .is_err()
+    );
+}
 /// Path A (variant): client reset while awaiting upstream response.
 /// Dropping upstream_result_rx cancels the oneshot — the upstream task's
 /// send will return Err and it will exit.
@@ -1993,25 +2050,14 @@ fn traceparent_parser_rejects_invalid_value() {
 }
 
 #[test]
-fn inflight_micro_wait_acquires_when_permit_recovers() {
+fn inflight_micro_wait_acquires_available_permit_without_blocking() {
     let semaphore = Arc::new(Semaphore::new(1));
-    let held = semaphore
-        .clone()
-        .try_acquire_owned()
-        .expect("acquire initial permit");
-    let semaphore_for_task = Arc::clone(&semaphore);
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(5));
-        drop(held);
-    });
-
     let acquired = super::QUICListener::try_acquire_owned_with_micro_wait(
-        semaphore_for_task,
+        Arc::clone(&semaphore),
         Duration::from_millis(50),
     );
-    assert!(acquired.is_ok());
-    let (_, waited) = acquired.expect("permit should be acquired");
-    assert!(waited, "acquire should report that it waited");
+    let (_permit, waited) = acquired.expect("permit should be acquired");
+    assert!(!waited, "acquire must never block the worker thread");
 }
 
 #[test]
