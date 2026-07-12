@@ -1,44 +1,9 @@
-use std::sync::{
-    Mutex, MutexGuard,
-    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
-
+use crate::watchdog::time::now_millis;
 use log::warn;
 use spooky_config::config::Watchdog as WatchdogConfig;
-
-#[derive(Debug, Clone)]
-pub struct WatchdogRuntimeConfig {
-    pub enabled: bool,
-    pub check_interval_ms: u64,
-    pub poll_stall_timeout_ms: u64,
-    pub timeout_error_rate_percent: u8,
-    pub min_requests_per_window: u64,
-    pub overload_inflight_percent: u8,
-    pub unhealthy_consecutive_windows: u32,
-    pub drain_grace_ms: u64,
-    pub restart_cooldown_ms: u64,
-    pub restart_command: Vec<String>,
-    pub restart_hook: Option<String>,
-}
-
-impl From<&WatchdogConfig> for WatchdogRuntimeConfig {
-    fn from(value: &WatchdogConfig) -> Self {
-        Self {
-            enabled: value.enabled,
-            check_interval_ms: value.check_interval_ms.max(1),
-            poll_stall_timeout_ms: value.poll_stall_timeout_ms.max(1),
-            timeout_error_rate_percent: value.timeout_error_rate_percent.min(100),
-            min_requests_per_window: value.min_requests_per_window.max(1),
-            overload_inflight_percent: value.overload_inflight_percent.min(100),
-            unhealthy_consecutive_windows: value.unhealthy_consecutive_windows.max(1),
-            drain_grace_ms: value.drain_grace_ms.max(1),
-            restart_cooldown_ms: value.restart_cooldown_ms.max(1),
-            restart_command: value.restart_command.clone(),
-            restart_hook: value.restart_hook.clone(),
-        }
-    }
-}
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard};
+use std::time::Instant;
 
 pub struct WatchdogCoordinator {
     enabled: bool,
@@ -189,109 +154,5 @@ fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, field: &str) -> MutexGuard<'a, T>
             );
             poisoned.into_inner()
         }
-    }
-}
-
-pub fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::panic::{AssertUnwindSafe, catch_unwind};
-
-    #[test]
-    fn restart_request_respects_single_pending_cycle() {
-        let cfg = WatchdogConfig {
-            enabled: true,
-            check_interval_ms: 1000,
-            poll_stall_timeout_ms: 5000,
-            timeout_error_rate_percent: 60,
-            min_requests_per_window: 20,
-            overload_inflight_percent: 90,
-            unhealthy_consecutive_windows: 3,
-            drain_grace_ms: 5_000,
-            restart_cooldown_ms: 60_000,
-            restart_command: Vec::new(),
-            restart_hook: None,
-        };
-        let watchdog = WatchdogCoordinator::new(&cfg);
-        assert!(watchdog.request_restart("overload"));
-        assert!(!watchdog.request_restart("stall"));
-    }
-
-    #[test]
-    fn worker_drain_tracking_uses_expected_worker_count() {
-        let cfg = WatchdogConfig {
-            enabled: true,
-            check_interval_ms: 1000,
-            poll_stall_timeout_ms: 5000,
-            timeout_error_rate_percent: 60,
-            min_requests_per_window: 20,
-            overload_inflight_percent: 90,
-            unhealthy_consecutive_windows: 3,
-            drain_grace_ms: 5_000,
-            restart_cooldown_ms: 60_000,
-            restart_command: Vec::new(),
-            restart_hook: None,
-        };
-        let watchdog = WatchdogCoordinator::new(&cfg);
-        watchdog.set_expected_workers(2);
-        assert!(watchdog.request_restart("stall"));
-        watchdog.mark_worker_drained();
-        assert!(!watchdog.workers_drained());
-        watchdog.mark_worker_drained();
-        assert!(watchdog.workers_drained());
-    }
-
-    #[test]
-    fn restart_cooldown_blocks_immediate_retrigger_after_cycle() {
-        let cfg = WatchdogConfig {
-            enabled: true,
-            check_interval_ms: 1000,
-            poll_stall_timeout_ms: 5000,
-            timeout_error_rate_percent: 60,
-            min_requests_per_window: 20,
-            overload_inflight_percent: 90,
-            unhealthy_consecutive_windows: 3,
-            drain_grace_ms: 5_000,
-            restart_cooldown_ms: 60_000,
-            restart_command: Vec::new(),
-            restart_hook: None,
-        };
-        let watchdog = WatchdogCoordinator::new(&cfg);
-        assert!(watchdog.request_restart("overload"));
-        watchdog.complete_restart_cycle();
-        assert!(!watchdog.request_restart("stall"));
-    }
-
-    #[test]
-    fn poisoned_restart_reason_mutex_preserves_reason_text() {
-        let cfg = WatchdogConfig {
-            enabled: true,
-            check_interval_ms: 1000,
-            poll_stall_timeout_ms: 5000,
-            timeout_error_rate_percent: 60,
-            min_requests_per_window: 20,
-            overload_inflight_percent: 90,
-            unhealthy_consecutive_windows: 3,
-            drain_grace_ms: 5_000,
-            restart_cooldown_ms: 60_000,
-            restart_command: Vec::new(),
-            restart_hook: None,
-        };
-        let watchdog = WatchdogCoordinator::new(&cfg);
-
-        let _ = catch_unwind(AssertUnwindSafe(|| {
-            let mut reason = watchdog.restart_reason.lock().expect("lock");
-            *reason = "poisoned_reason".to_string();
-            panic!("poison restart reason mutex");
-        }));
-
-        assert_eq!(watchdog.restart_reason(), "poisoned_reason");
     }
 }
