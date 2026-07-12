@@ -21,7 +21,7 @@ pub fn current_cpu_micros() -> Option<u64> {
 pub fn current_rss_kb() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
-        let statm = fs::read_to_string("/proc/self/statm").ok()?;
+        let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
         let resident_pages = statm.split_whitespace().nth(1)?.parse::<u64>().ok()?;
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         if page_size <= 0 {
