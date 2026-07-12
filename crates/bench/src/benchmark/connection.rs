@@ -1,6 +1,6 @@
 use crate::benchmark::runner::run_case_aggregate;
 use crate::report::BenchCase;
-use spooky_edge::benchmark::ConnectionLookupBench;
+use spooky_edge::benchmark::connection_lookup::ConnectionLookupBench;
 
 pub fn benchmark_connection_lookup(scale: usize) -> Vec<BenchCase> {
     let bench = ConnectionLookupBench::new(scale);

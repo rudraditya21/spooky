@@ -1,6 +1,6 @@
 use crate::benchmark::runner::run_case_aggregate;
 use crate::report::BenchCase;
-use spooky_edge::benchmark::RouteLookupBench;
+use spooky_edge::benchmark::route_lookup::RouteLookupBench;
 
 pub fn benchmark_route_lookup(scale: usize) -> Vec<BenchCase> {
     let bench = RouteLookupBench::new(scale);

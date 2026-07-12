@@ -4,7 +4,8 @@ use crate::benchmark::runner::run_case_with_latencies;
 use crate::manifest::BenchProfile;
 use crate::manifest::MacroSuiteConfig;
 use crate::report::BenchCase;
-use spooky_edge::benchmark::{ConnectionLookupBench, RouteLookupBench};
+use spooky_edge::benchmark::connection_lookup::ConnectionLookupBench;
+use spooky_edge::benchmark::route_lookup::RouteLookupBench;
 use spooky_lb::upstream_pool::UpstreamPool;
 
 fn benchmark_macro_traffic_mix(
