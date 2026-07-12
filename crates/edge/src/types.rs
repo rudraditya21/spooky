@@ -33,7 +33,7 @@ use crate::resilience::adaptive_admission::AdaptivePermit;
 use crate::resilience::route_queue::RouteQueuePermit;
 use crate::resilience::runtime::RuntimeResilience;
 use crate::route_index;
-use crate::watchdog::WatchdogCoordinator;
+use crate::watchdog::coordinator::WatchdogCoordinator;
 
 pub struct SharedRuntimeState {
     pub(crate) listener_runtime_configs: Arc<HashMap<String, ListenerRuntimeConfig>>,

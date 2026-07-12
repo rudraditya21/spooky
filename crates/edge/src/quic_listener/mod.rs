@@ -90,7 +90,9 @@ use crate::{
         RuntimeBundle, RuntimeBundleHandle, RuntimeLoadedClientAuthCa, RuntimeLoadedTlsIdentity,
         RuntimeTaskRegistration, RuntimeTaskRegistry, RuntimeTlsCertificateMetadata,
     },
-    watchdog::{WatchdogCoordinator, WatchdogRuntimeConfig, now_millis},
+    watchdog::config::WatchdogRuntimeConfig,
+    watchdog::coordinator::WatchdogCoordinator,
+    watchdog::time::now_millis,
 };
 
 mod backend_resolution;
