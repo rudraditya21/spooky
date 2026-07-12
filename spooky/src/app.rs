@@ -59,7 +59,7 @@ pub(crate) fn main_entry() {
         &config_yaml.log.file.path,
         config_yaml.log.format == spooky_config::config::LogFormat::Json,
     );
-    spooky_utils::telemetry::init_tracing(
+    spooky_utils::telemetry::init::init_tracing(
         config_yaml.observability.tracing.enabled,
         &config_yaml.observability.tracing.service_name,
         config_yaml.observability.tracing.otlp_endpoint.as_deref(),
@@ -220,10 +220,10 @@ async fn run(
     }
 
     if worker_failed {
-        spooky_utils::telemetry::shutdown_tracing();
+        spooky_utils::telemetry::init::shutdown_tracing();
         std::process::exit(1);
     }
-    spooky_utils::telemetry::shutdown_tracing();
+    spooky_utils::telemetry::init::shutdown_tracing();
     info!("Spooky shutdown complete");
 }
 
