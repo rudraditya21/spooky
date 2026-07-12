@@ -182,7 +182,7 @@ pub(super) fn validate_request_headers(
         }
     };
 
-    let websocket_tunnel = spooky_bridge::h3_to_h2::h3_websocket_tunnel_requested(&method, list);
+    let websocket_tunnel = spooky_bridge::websocket::h3_websocket_tunnel_requested(&method, list);
     if protocol.is_some() && !websocket_tunnel {
         return Err((
             http::StatusCode::BAD_REQUEST,

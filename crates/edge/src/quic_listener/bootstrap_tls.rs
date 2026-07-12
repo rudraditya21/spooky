@@ -15,11 +15,11 @@ use hyper::service::service_fn;
 use hyper::upgrade;
 use hyper_util::rt::TokioIo;
 use log::{debug, error, info, warn};
+use spooky_bridge::context::{ForwardedContext, ForwardedHeaderChains};
+use spooky_bridge::forwarded::build_forwarded_header_values;
 use spooky_bridge::h3_to_h1::build_h1_request_for_endpoint_with_host_policy;
-use spooky_bridge::h3_to_h2::{
-    ForwardedContext, ForwardedHeaderChains, build_forwarded_header_values,
-    build_h2_request_for_endpoint_with_host_policy, resolve_upstream_host_value,
-};
+use spooky_bridge::h3_to_h2::build_h2_request_for_endpoint_with_host_policy;
+use spooky_bridge::host::resolve_upstream_host_value;
 use spooky_config::{
     backend_endpoint::{BackendEndpoint, BackendScheme},
     runtime::{ListenerRuntimeConfig, RuntimeUpstreamPolicy},
