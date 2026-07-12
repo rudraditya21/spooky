@@ -1,27 +1,17 @@
-mod allocator;
-mod benchmark;
-mod cli;
-mod io;
-mod manifest;
-mod markdown;
-mod profiler;
-mod promotion;
-mod regression;
-mod report;
-mod utils;
-
-use crate::benchmark::macro_bench::run_macro_suite;
-use crate::benchmark::micro_bench::run_micro_suite;
-use crate::cli::{Args, BenchSuite, FailOn};
-use crate::io::{
+use spooky_bench::benchmark::macro_bench::run_macro_suite;
+use spooky_bench::benchmark::micro_bench::run_micro_suite;
+use spooky_bench::cli::{Args, BenchSuite, FailOn};
+use spooky_bench::io::{
     load_release_index, load_report, merge_reports, resolve_baseline_paths, write_report,
 };
-use crate::manifest::load_manifest;
-use crate::markdown::write_markdown;
-use crate::promotion::run_promotion;
-use crate::regression::{RegressionSeverity, compare_reports, format_issue, resolve_gate_config};
-use crate::report::BenchReport;
-use crate::utils::{print_summary, suite_label, unix_now};
+use spooky_bench::manifest::load_manifest;
+use spooky_bench::markdown::write_markdown;
+use spooky_bench::promotion::run_promotion;
+use spooky_bench::regression::{
+    RegressionSeverity, compare_reports, format_issue, resolve_gate_config,
+};
+use spooky_bench::report::BenchReport;
+use spooky_bench::utils::{print_summary, suite_label, unix_now};
 
 use clap::Parser;
 
@@ -112,40 +102,4 @@ fn main() -> Result<(), String> {
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{GateMetric, RegressionSeverity, classify_regression};
-
-    fn gate(
-        warn_pct: f64,
-        severe_pct: f64,
-        zero_baseline_limit: f64,
-        min_delta_abs: f64,
-    ) -> GateMetric {
-        GateMetric {
-            warn_pct,
-            severe_pct,
-            zero_baseline_limit,
-            min_delta_abs,
-        }
-    }
-
-    #[test]
-    fn min_delta_abs_suppresses_small_absolute_memory_drift() {
-        let memory_gate = gate(0.20, 0.40, 128.0, 256.0);
-        let regression = classify_regression(320.0, 200.0, &memory_gate, 128.0);
-        assert!(regression.is_none());
-    }
-
-    #[test]
-    fn min_delta_abs_still_allows_large_absolute_memory_regressions() {
-        let memory_gate = gate(0.20, 0.40, 128.0, 256.0);
-        let regression = classify_regression(520.0, 200.0, &memory_gate, 128.0);
-        assert!(matches!(
-            regression,
-            Some((RegressionSeverity::Severe, _, _))
-        ));
-    }
 }
