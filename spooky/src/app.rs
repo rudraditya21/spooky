@@ -53,7 +53,7 @@ pub(crate) fn main_entry() {
         }
     };
 
-    spooky_utils::logger::init_logger(
+    spooky_utils::logger::init::init_logger(
         &config_yaml.log.level,
         config_yaml.log.file.enabled,
         &config_yaml.log.file.path,
