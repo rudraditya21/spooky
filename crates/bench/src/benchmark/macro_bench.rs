@@ -5,7 +5,7 @@ use crate::manifest::BenchProfile;
 use crate::manifest::MacroSuiteConfig;
 use crate::report::BenchCase;
 use spooky_edge::benchmark::{ConnectionLookupBench, RouteLookupBench};
-use spooky_lb::UpstreamPool;
+use spooky_lb::upstream_pool::UpstreamPool;
 
 fn benchmark_macro_traffic_mix(
     scale: usize,
