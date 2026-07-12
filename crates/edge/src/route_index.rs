@@ -128,7 +128,7 @@ enum RoutePreference {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RouteDecisionReason {
+pub enum RouteDecisionReason {
     HostTrieNoDefault,
     HostPathLongerOrEqual,
     DefaultPathLonger,
@@ -140,7 +140,7 @@ pub(crate) enum RouteDecisionReason {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RouteDecision<'a> {
+pub struct RouteDecision<'a> {
     /// Name of the upstream selected by route matching; auth/policy stays attached to that upstream.
     pub upstream: &'a str,
     pub matched_path_len: usize,
@@ -312,17 +312,17 @@ fn prefix_boundary_matches(path: &str, prefix_len: usize) -> bool {
     path.as_bytes().get(prefix_len) == Some(&b'/')
 }
 
-pub(crate) struct RouteIndex {
+pub struct RouteIndex {
     host_tries: HashMap<String, RouteTrie>,
     wildcard_host_tries: HashMap<String, RouteTrie>,
     default_trie: RouteTrie,
-    default_max_path_len: usize,
-    upstream_names: Vec<String>,
-    upstream_methods: Vec<Option<String>>,
+    pub default_max_path_len: usize,
+    pub upstream_names: Vec<String>,
+    pub upstream_methods: Vec<Option<String>>,
 }
 
 impl RouteIndex {
-    pub(crate) fn from_upstreams(upstreams: &HashMap<String, Upstream>) -> Self {
+    pub fn from_upstreams(upstreams: &HashMap<String, Upstream>) -> Self {
         let mut host_tries = HashMap::new();
         let mut wildcard_host_tries = HashMap::new();
         let mut default_trie = RouteTrie::default();
@@ -390,11 +390,11 @@ impl RouteIndex {
         }
     }
 
-    pub(crate) fn lookup<'a>(&'a self, path: &str, host: Option<&str>) -> Option<&'a str> {
+    pub fn lookup<'a>(&'a self, path: &str, host: Option<&str>) -> Option<&'a str> {
         self.lookup_for_method(path, host, None)
     }
 
-    pub(crate) fn lookup_for_method<'a>(
+    pub fn lookup_for_method<'a>(
         &'a self,
         path: &str,
         host: Option<&str>,
@@ -426,7 +426,7 @@ impl RouteIndex {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn lookup_with_decision<'a>(
+    pub fn lookup_with_decision<'a>(
         &'a self,
         path: &str,
         host: Option<&str>,
@@ -434,7 +434,7 @@ impl RouteIndex {
         self.lookup_with_decision_for_method(path, host, None)
     }
 
-    pub(crate) fn lookup_with_decision_for_method<'a>(
+    pub fn lookup_with_decision_for_method<'a>(
         &'a self,
         path: &str,
         host: Option<&str>,
@@ -732,7 +732,7 @@ fn compare_route(current: IndexedRoute, candidate: IndexedRoute) -> RoutePrefere
     }
 }
 
-pub(crate) fn scan_lookup<'a>(
+pub fn scan_lookup<'a>(
     upstreams: &'a HashMap<String, Upstream>,
     path: &str,
     host: Option<&str>,
@@ -740,7 +740,7 @@ pub(crate) fn scan_lookup<'a>(
     scan_lookup_for_method(upstreams, path, host, None)
 }
 
-pub(crate) fn scan_lookup_for_method<'a>(
+pub fn scan_lookup_for_method<'a>(
     upstreams: &'a HashMap<String, Upstream>,
     path: &str,
     host: Option<&str>,
@@ -881,6 +881,3 @@ pub(crate) fn scan_lookup_for_method<'a>(
 
     best_match.map(|(name, _, _, _, _, _)| name)
 }
-
-#[cfg(test)]
-mod tests;
