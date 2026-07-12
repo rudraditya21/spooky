@@ -1,3 +1,6 @@
+mod report;
+use report::{BenchCase, BenchReport, ReleaseBaselineEntry, ReleaseBaselineIndex};
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::HashMap;
 use std::fs;
@@ -7,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use smallvec::SmallVec;
 use spooky_config::config::{Backend, HealthCheck, LoadBalancing, RouteMatch, Upstream};
 use spooky_edge::benchmark::{ConnectionLookupBench, RouteLookupBench};
@@ -107,56 +110,6 @@ struct Args {
     set_current_release: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BenchCase {
-    #[serde(default = "default_case_kind")]
-    kind: String,
-    name: String,
-    scale: usize,
-    iterations: u64,
-    duration_ns: u128,
-    latency_ns_per_op: f64,
-    #[serde(default)]
-    throughput_ops_per_sec: f64,
-    alloc_calls: u64,
-    alloc_bytes: u64,
-    rss_delta_kb: u64,
-    #[serde(default)]
-    cpu_pct: f64,
-    #[serde(default)]
-    latency_p50_ns: f64,
-    #[serde(default)]
-    latency_p95_ns: f64,
-    #[serde(default)]
-    latency_p99_ns: f64,
-    #[serde(default)]
-    latency_max_ns: f64,
-    #[serde(default)]
-    latency_sampled: bool,
-}
-
-fn default_case_kind() -> String {
-    "micro".to_string()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct BenchReport {
-    #[serde(default)]
-    suite: String,
-    #[serde(default)]
-    report_kind: String,
-    #[serde(default)]
-    profile: String,
-    #[serde(default)]
-    generated_unix_secs: u64,
-    #[serde(default)]
-    cpu_threshold: f64,
-    #[serde(default)]
-    mem_threshold: f64,
-    #[serde(default)]
-    cases: Vec<BenchCase>,
-}
-
 #[derive(Debug, Deserialize)]
 struct BenchManifest {
     version: u32,
@@ -251,21 +204,6 @@ struct GateConfig {
     alloc_calls: GateMetric,
     alloc_bytes: GateMetric,
     tail_p99: GateMetric,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct ReleaseBaselineIndex {
-    #[serde(default)]
-    current_release: String,
-    #[serde(default)]
-    releases: HashMap<String, ReleaseBaselineEntry>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ReleaseBaselineEntry {
-    micro: String,
-    #[serde(rename = "macro")]
-    macro_report: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
