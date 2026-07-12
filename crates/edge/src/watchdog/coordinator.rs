@@ -16,7 +16,7 @@ pub struct WatchdogCoordinator {
     last_restart_at_instant: Mutex<Option<Instant>>,
     expected_workers: AtomicUsize,
     drained_workers: AtomicUsize,
-    restart_reason: Mutex<String>,
+    pub restart_reason: Mutex<String>,
 }
 
 impl WatchdogCoordinator {

@@ -1,3 +1,5 @@
+use spooky_config::config::Watchdog as WatchdogConfig;
+use spooky_edge::watchdog::coordinator::WatchdogCoordinator;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 #[test]

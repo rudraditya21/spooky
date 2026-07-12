@@ -8,7 +8,7 @@ pub mod quic_listener;
 pub mod resilience;
 pub mod route_index;
 pub mod types;
-mod watchdog;
+pub mod watchdog;
 
 pub use body::ChannelBody;
 pub(crate) use hash::REQUEST_ID_COUNTER;
