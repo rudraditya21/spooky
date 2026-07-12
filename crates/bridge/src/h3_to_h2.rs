@@ -10,13 +10,12 @@ use spooky_config::{
     config::{ForwardedHeaderPolicy, UpstreamHostPolicy},
 };
 
-// Re-export shared types so existing `spooky_bridge::h3_to_h2::*` imports keep working.
-pub use crate::{
-    BridgeError, ForwardedContext, ForwardedHeaderChains, ForwardedHeaderValues,
-    H3WebsocketRequestKind, build_forwarded_header_values, h3_websocket_request_kind,
-    h3_websocket_tunnel_requested, resolve_upstream_host_value,
-};
-use crate::{connection_header_tokens, should_strip_request_header};
+use crate::BridgeError;
+use crate::context::{ForwardedContext, ForwardedHeaderChains};
+use crate::forwarded::build_forwarded_header_values;
+use crate::headers::{connection_header_tokens, should_strip_request_header};
+use crate::host::resolve_upstream_host_value;
+use crate::websocket::{H3WebsocketRequestKind, h3_websocket_request_kind};
 
 /// Build an HTTP/2 request with a pre-boxed streaming body.
 /// `content_length` is `Some(n)` only when the full length is known upfront
