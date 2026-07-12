@@ -1654,7 +1654,7 @@ impl QUICListener {
                 let send_once =
                     |backend: String,
                      req: http::Request<BoxBody<Bytes, std::convert::Infallible>>,
-                     cb: Arc<crate::resilience::CircuitBreakers>,
+                     cb: Arc<crate::resilience::circuit_breaker::CircuitBreakers>,
                      transport: Arc<UpstreamTransportPool>| async move {
                         if !cb.allow_request(&backend) {
                             return Err(ProxyError::Pool(PoolError::CircuitOpen(backend)));
@@ -4795,7 +4795,7 @@ impl QUICListener {
     }
 
     pub(super) fn resolve_scoped_rate_limit_key(
-        rule: &crate::resilience::ScopedRateLimitRule,
+        rule: &crate::resilience::scoped_rate_limit::ScopedRateLimitRule,
         route: &str,
         method: &str,
         path: &str,
@@ -5171,24 +5171,28 @@ mod tests {
 
     #[test]
     fn resolve_scoped_rate_limit_key_defaults_match_scope() {
-        let client_rule = crate::resilience::ScopedRateLimitRule::from_config(&ScopedRateLimit {
-            name: "client".to_string(),
-            scope: ScopedRateLimitScope::Client,
-            requests_per_sec: 10,
-            burst: 10,
-            key: None,
-            route_allowlist: Vec::new(),
-            idle_ttl_secs: 300,
-        });
-        let token_rule = crate::resilience::ScopedRateLimitRule::from_config(&ScopedRateLimit {
-            name: "token".to_string(),
-            scope: ScopedRateLimitScope::Token,
-            requests_per_sec: 10,
-            burst: 10,
-            key: None,
-            route_allowlist: Vec::new(),
-            idle_ttl_secs: 300,
-        });
+        let client_rule = crate::resilience::scoped_rate_limit::ScopedRateLimitRule::from_config(
+            &ScopedRateLimit {
+                name: "client".to_string(),
+                scope: ScopedRateLimitScope::Client,
+                requests_per_sec: 10,
+                burst: 10,
+                key: None,
+                route_allowlist: Vec::new(),
+                idle_ttl_secs: 300,
+            },
+        );
+        let token_rule = crate::resilience::scoped_rate_limit::ScopedRateLimitRule::from_config(
+            &ScopedRateLimit {
+                name: "token".to_string(),
+                scope: ScopedRateLimitScope::Token,
+                requests_per_sec: 10,
+                burst: 10,
+                key: None,
+                route_allowlist: Vec::new(),
+                idle_ttl_secs: 300,
+            },
+        );
         let headers = [("authorization".to_string(), "Bearer token-2".to_string())]
             .into_iter()
             .collect::<std::collections::HashMap<_, _>>();

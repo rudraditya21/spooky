@@ -29,7 +29,9 @@ use crate::Metrics;
 use crate::RetryReason;
 use crate::cid_radix::CidRadix;
 use crate::constants::MAX_DATAGRAM_SIZE_BYTES;
-use crate::resilience::{AdaptivePermit, RouteQueuePermit, RuntimeResilience};
+use crate::resilience::adaptive_admission::AdaptivePermit;
+use crate::resilience::route_queue::RouteQueuePermit;
+use crate::resilience::runtime::RuntimeResilience;
 use crate::route_index;
 use crate::watchdog::WatchdogCoordinator;
 

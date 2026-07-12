@@ -1754,7 +1754,8 @@ fn sweep_partial_batch_clears_only_removed_entries() {
 // pending chunks are discarded.
 // -----------------------------------------------------------------------
 
-use crate::resilience::{AdaptiveAdmission, RouteQueueLimiter};
+use crate::resilience::adaptive_admission::AdaptiveAdmission;
+use crate::resilience::route_queue::RouteQueueLimiter;
 use crate::{RequestEnvelope, StreamPhase};
 use std::time::Instant;
 use tokio::sync::{Semaphore, mpsc, oneshot};

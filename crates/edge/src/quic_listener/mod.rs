@@ -81,7 +81,8 @@ use crate::{
         SCID_ROTATION_PACKET_THRESHOLD, UDP_READ_TIMEOUT_MS, scid_rotation_interval,
     },
     outcome_from_status,
-    resilience::{RouteQueueRejection, RuntimeResilience},
+    resilience::route_queue::RouteQueueRejection,
+    resilience::runtime::RuntimeResilience,
     route_index::{RouteDecisionReason, RouteIndex},
     types::{
         ListenerTlsInventory, ListenerTlsReloadState, ListenerTlsReloadStore,

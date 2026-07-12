@@ -30,7 +30,7 @@ use spooky_transport::transport_pool::UpstreamTransportPool;
 
 use crate::{
     Metrics, REQUEST_ID_COUNTER, RouteOutcome, SharedRuntimeState,
-    resilience::RuntimeResilience,
+    resilience::runtime::RuntimeResilience,
     route_index::RouteIndex,
     types::{ListenerTlsReloadStore, RuntimeBackendResolutionStore, RuntimeBundleHandle},
 };
