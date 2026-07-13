@@ -1,8 +1,14 @@
-use crate::health::HealthFailureReason;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
+};
+
 use spooky_config::config::{Backend, HealthCheck};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+
+use crate::health::HealthFailureReason;
 
 #[derive(Clone)]
 pub struct BackendState {

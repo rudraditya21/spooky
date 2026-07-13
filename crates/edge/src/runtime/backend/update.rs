@@ -1,6 +1,6 @@
+use std::{net::SocketAddr, time::SystemTime};
+
 use crate::runtime::backend::resolution::RuntimeBackendAddressKind;
-use std::net::SocketAddr;
-use std::time::SystemTime;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeBackendResolutionUpdate {

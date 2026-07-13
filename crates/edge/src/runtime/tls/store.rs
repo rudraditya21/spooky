@@ -1,8 +1,12 @@
-use crate::runtime::tls::inventory::ListenerTlsInventory;
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
+
 use rustls::ServerConfig as RustlsServerConfig;
 use spooky_errors::ProxyError;
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+
+use crate::runtime::tls::inventory::ListenerTlsInventory;
 
 pub struct ListenerTlsReloadState {
     pub generation: u64,

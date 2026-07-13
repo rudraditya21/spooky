@@ -1,16 +1,17 @@
+use std::{collections::HashMap, sync::Arc, time::Duration};
+
 use spooky_config::config::{
     Resilience as ResilienceConfig, ScopedRateLimit as ScopedRateLimitConfig, ScopedRateLimitScope,
 };
-use spooky_edge::resilience::adaptive_admission::AdaptiveAdmission;
-use spooky_edge::resilience::brownout::BrownoutController;
-use spooky_edge::resilience::circuit_breaker::CircuitBreakers;
-use spooky_edge::resilience::retry_budget::RetryBudget;
-use spooky_edge::resilience::route_queue::{RouteQueueLimiter, RouteQueueRejection};
-use spooky_edge::resilience::runtime::RuntimeResilience;
-use spooky_edge::resilience::scoped_rate_limit::ScopedRateLimiters;
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
+use spooky_edge::resilience::{
+    adaptive_admission::AdaptiveAdmission,
+    brownout::BrownoutController,
+    circuit_breaker::CircuitBreakers,
+    retry_budget::RetryBudget,
+    route_queue::{RouteQueueLimiter, RouteQueueRejection},
+    runtime::RuntimeResilience,
+    scoped_rate_limit::ScopedRateLimiters,
+};
 
 #[test]
 fn adaptive_admission_adjusts_limit() {

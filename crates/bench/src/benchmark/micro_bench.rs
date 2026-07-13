@@ -1,9 +1,11 @@
-use crate::benchmark::connection::benchmark_connection_lookup;
-use crate::benchmark::headers::benchmark_h3_header_collection;
-use crate::benchmark::lb::benchmark_lb;
-use crate::benchmark::route::benchmark_route_lookup;
-use crate::manifest::{BenchProfile, MicroSuiteConfig};
-use crate::report::BenchCase;
+use crate::{
+    benchmark::{
+        connection::benchmark_connection_lookup, headers::benchmark_h3_header_collection,
+        lb::benchmark_lb, route::benchmark_route_lookup,
+    },
+    manifest::{BenchProfile, MicroSuiteConfig},
+    report::BenchCase,
+};
 
 pub fn run_micro_suite(
     profile: &BenchProfile,

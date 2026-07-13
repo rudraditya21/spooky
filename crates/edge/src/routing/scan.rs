@@ -1,9 +1,14 @@
-use crate::routing::host::normalize_host_for_routing;
-use crate::routing::host::{ConfiguredHostPatternRef, parse_configured_host_pattern_ref};
-use crate::routing::route::HostMatchKind;
-use crate::routing::util::prefix_boundary_matches;
-use spooky_config::config::Upstream;
 use std::collections::HashMap;
+
+use spooky_config::config::Upstream;
+
+use crate::routing::{
+    host::{
+        ConfiguredHostPatternRef, normalize_host_for_routing, parse_configured_host_pattern_ref,
+    },
+    route::HostMatchKind,
+    util::prefix_boundary_matches,
+};
 
 pub fn scan_lookup<'a>(
     upstreams: &'a HashMap<String, Upstream>,

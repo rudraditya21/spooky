@@ -1,3 +1,8 @@
+use std::collections::HashMap;
+
+use rcgen::{Certificate, CertificateParams, SanType};
+use tempfile::tempdir;
+
 use super::validate;
 use crate::config::{
     ApiKeyAuth, Backend, ClientAuth, Config, ControlApi, ExternalAuth, ExternalAuthFailureMode,
@@ -6,9 +11,6 @@ use crate::config::{
     ScopedRateLimit, ScopedRateLimitScope, Security, Tls, TlsCertificate, Tracing, Upstream,
     UpstreamTls,
 };
-use rcgen::{Certificate, CertificateParams, SanType};
-use std::collections::HashMap;
-use tempfile::tempdir;
 
 fn write_test_certs(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
     let mut params = CertificateParams::new(vec!["localhost".into()]);

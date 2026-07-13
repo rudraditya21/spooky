@@ -1,25 +1,27 @@
-use std::path::Path;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
-use std::time::Duration;
 
 use clap::Parser;
 use log::{error, info, warn};
-
-use spooky_config::runtime::RuntimeConfig;
-use spooky_config::validator::validate as validate_config;
-use spooky_edge::configure_async_runtime;
-use spooky_edge::runtime::bundle::RuntimeBundleHandle;
-use spooky_edge::runtime::listener::QUICListener;
-
-use crate::listener_group::{
-    ListenerGroupRuntime, allocate_worker_index_base, collect_finished_listener_groups,
-    log_listener_startup, reconcile_listener_groups, spawn_managed_listener_group,
+use spooky_config::{runtime::RuntimeConfig, validator::validate as validate_config};
+use spooky_edge::{
+    configure_async_runtime,
+    runtime::{bundle::RuntimeBundleHandle, listener::QUICListener},
 };
-use crate::privilege_drop;
-use crate::runtime_guard;
+
+use crate::{
+    listener_group::{
+        ListenerGroupRuntime, allocate_worker_index_base, collect_finished_listener_groups,
+        log_listener_startup, reconcile_listener_groups, spawn_managed_listener_group,
+    },
+    privilege_drop, runtime_guard,
+};
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]

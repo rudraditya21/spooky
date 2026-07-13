@@ -1,8 +1,11 @@
-use crate::benchmark::helpers::build_benchmark_upstream;
-use crate::routing::index::RouteIndex;
-use crate::routing::scan::scan_lookup;
-use spooky_config::config::Upstream;
 use std::collections::HashMap;
+
+use spooky_config::config::Upstream;
+
+use crate::{
+    benchmark::helpers::build_benchmark_upstream,
+    routing::{index::RouteIndex, scan::scan_lookup},
+};
 
 pub struct RouteLookupBench {
     upstreams: HashMap<String, Upstream>,

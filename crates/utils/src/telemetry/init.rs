@@ -1,13 +1,15 @@
-use crate::telemetry::endpoint::resolve_otlp_endpoint;
-use log::{info, warn};
-use opentelemetry::KeyValue;
-use opentelemetry::trace::TracerProvider as _;
-use opentelemetry_otlp::WithExportConfig;
-use opentelemetry_sdk::Resource;
-use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
 use std::sync::OnceLock;
-use tracing_subscriber::Registry;
-use tracing_subscriber::layer::SubscriberExt;
+
+use log::{info, warn};
+use opentelemetry::{KeyValue, trace::TracerProvider as _};
+use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk::{
+    Resource,
+    trace::{Sampler, SdkTracerProvider},
+};
+use tracing_subscriber::{Registry, layer::SubscriberExt};
+
+use crate::telemetry::endpoint::resolve_otlp_endpoint;
 
 pub const DEFAULT_OTLP_ENDPOINT: &str = "http://127.0.0.1:4317";
 

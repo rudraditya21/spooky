@@ -1,7 +1,7 @@
 mod common;
+use spooky_lb::{algorithms::round_robin::RoundRobin, backend_pool::BackendPool};
+
 use crate::common::create_backend_state;
-use spooky_lb::algorithms::round_robin::RoundRobin;
-use spooky_lb::backend_pool::BackendPool;
 
 #[test]
 fn round_robin_cycles() {

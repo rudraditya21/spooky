@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 /// Byte-indexed trie node for SCID prefix matching.
 /// Stores Arc<[u8]> references to avoid duplicate CID buffers.

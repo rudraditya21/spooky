@@ -10,12 +10,11 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response, body::Incoming, service::service_fn};
 use hyper_util::rt::TokioIo;
-use tokio::net::TcpListener;
-
 use spooky_transport::{
     h1_pool::{H1Pool, PoolError},
     h2_client::SharedDnsResolver,
 };
+use tokio::net::TcpListener;
 
 struct ConcurrencyTracker {
     current: AtomicUsize,

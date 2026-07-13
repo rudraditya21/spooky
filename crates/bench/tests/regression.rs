@@ -1,5 +1,7 @@
-use spooky_bench::manifest::GateMetric;
-use spooky_bench::regression::{RegressionSeverity, classify_regression};
+use spooky_bench::{
+    manifest::GateMetric,
+    regression::{RegressionSeverity, classify_regression},
+};
 
 fn gate(
     warn_pct: f64,

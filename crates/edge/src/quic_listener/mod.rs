@@ -1,3 +1,4 @@
+use core::net::SocketAddr;
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
@@ -12,53 +13,36 @@ use std::{
     time::{Duration, Instant},
 };
 
-use core::net::SocketAddr;
-
-use boring::pkey::{PKey, Private};
-use boring::ssl::{
-    NameType, SelectCertError, SslContextBuilder, SslFiletype, SslMethod, SslVerifyMode,
+use boring::{
+    pkey::{PKey, Private},
+    ssl::{NameType, SelectCertError, SslContextBuilder, SslFiletype, SslMethod, SslVerifyMode},
+    x509::X509,
 };
-use boring::x509::X509;
 use bytes::Bytes;
 use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
-use hyper::body::{Body, Frame, Incoming};
-use hyper::client::conn::http1 as client_http1;
-use hyper::upgrade;
+use hyper::{
+    body::{Body, Frame, Incoming},
+    client::conn::http1 as client_http1,
+    upgrade,
+};
 use hyper_util::rt::TokioIo;
 use log::{debug, error, info, warn};
-use quiche::Config;
-use quiche::h3::NameValue;
+use quiche::{Config, h3::NameValue};
 use rand::RngCore;
-use rustls::{RootCertStore, ServerConfig as RustlsServerConfig, server::WebPkiClientVerifier};
 use rustls::{
+    RootCertStore, ServerConfig as RustlsServerConfig,
     pki_types::{CertificateDer, PrivateKeyDer},
-    server::{ClientHello, ResolvesServerCert, ResolvesServerCertUsingSni},
+    server::{ClientHello, ResolvesServerCert, ResolvesServerCertUsingSni, WebPkiClientVerifier},
     sign::CertifiedKey,
 };
 use rustls_pki_types::pem::PemObject;
 use serde_json::json;
 use socket2::{Domain, Protocol, Socket, Type};
-use spooky_bridge::context::ForwardedContext;
-use spooky_bridge::h3_to_h1::build_h1_request_for_endpoint_with_host_policy;
-use spooky_bridge::h3_to_h2::build_h2_request_for_endpoint_with_host_policy;
-use spooky_errors::{PoolError, ProxyError, is_retryable};
-use spooky_lb::backend::HealthTransition;
-use spooky_lb::health::HealthFailureReason;
-use spooky_lb::upstream_pool::UpstreamPool;
-use spooky_transport::h2_client::{SharedDnsResolver, TlsClientConfig};
-use spooky_transport::transport_pool::{BackendTransportKind, UpstreamTransportPool};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::runtime::Handle;
-use tokio::sync::{
-    Semaphore, mpsc,
-    mpsc::error::{TryRecvError, TrySendError},
-    oneshot,
+use spooky_bridge::{
+    context::ForwardedContext, h3_to_h1::build_h1_request_for_endpoint_with_host_policy,
+    h3_to_h2::build_h2_request_for_endpoint_with_host_policy,
 };
-#[cfg(test)]
-use tokio_rustls::TlsAcceptor;
-use tracing::{Instrument, info_span};
-
 use spooky_config::{
     backend_endpoint::{BackendEndpoint, BackendScheme},
     config::{ClientAuth, UpstreamTls},
@@ -67,8 +51,27 @@ use spooky_config::{
         RuntimeUpstreamPolicy,
     },
 };
+use spooky_errors::{PoolError, ProxyError, is_retryable};
+use spooky_lb::{
+    backend::HealthTransition, health::HealthFailureReason, upstream_pool::UpstreamPool,
+};
+use spooky_transport::{
+    h2_client::{SharedDnsResolver, TlsClientConfig},
+    transport_pool::{BackendTransportKind, UpstreamTransportPool},
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    runtime::Handle,
+    sync::{
+        Semaphore, mpsc,
+        mpsc::error::{TryRecvError, TrySendError},
+        oneshot,
+    },
+};
+#[cfg(test)]
+use tokio_rustls::TlsAcceptor;
+use tracing::{Instrument, info_span};
 
-use crate::runtime::{connection::response::ForwardSuccess, connection::stream::TunnelMode};
 use crate::{
     ChannelBody, Metrics, OverloadShedReason, REQUEST_ID_COUNTER, RetryReason, RouteOutcome,
     cid_radix::CidRadix,
@@ -78,33 +81,30 @@ use crate::{
         RESPONSE_CHUNK_BYTES_LIMIT, RESPONSE_CHUNK_CHANNEL_CAPACITY,
         SCID_ROTATION_PACKET_THRESHOLD, UDP_READ_TIMEOUT_MS, scid_rotation_interval,
     },
-    resilience::route_queue::RouteQueueRejection,
-    resilience::runtime::RuntimeResilience,
-    routing::decision::RouteDecisionReason,
-    routing::index::RouteIndex,
-    runtime::connection::quic::QuicConnection,
-    runtime::connection::request::RequestEnvelope,
-    runtime::connection::response::ForwardResult,
-    runtime::connection::response::ResponseChunk,
-    runtime::connection::response::UpstreamResult,
-    runtime::connection::stream::StreamAdmissionState,
-    runtime::connection::stream::StreamPhase,
-    runtime::health::HealthClassification,
-    runtime::health::outcome_from_status,
-    runtime::listener::QUICListener,
-    runtime::shared_state::SharedRuntimeState,
+    resilience::{route_queue::RouteQueueRejection, runtime::RuntimeResilience},
+    routing::{decision::RouteDecisionReason, index::RouteIndex},
     runtime::{
-        backend::resolution::RuntimeBackendResolution,
-        backend::store::RuntimeBackendResolutionStore, bundle::RuntimeBundle,
-        bundle::RuntimeBundleHandle, connection::quic::QuicConnectionErrorSnapshot,
-        tasks::RuntimeTaskRegistration, tasks::RuntimeTaskRegistry,
-        tls::inventory::ListenerTlsInventory, tls::inventory::RuntimeLoadedClientAuthCa,
-        tls::inventory::RuntimeLoadedTlsIdentity, tls::inventory::RuntimeTlsCertificateMetadata,
-        tls::store::ListenerTlsReloadState, tls::store::ListenerTlsReloadStore,
+        backend::{resolution::RuntimeBackendResolution, store::RuntimeBackendResolutionStore},
+        bundle::{RuntimeBundle, RuntimeBundleHandle},
+        connection::{
+            quic::{QuicConnection, QuicConnectionErrorSnapshot},
+            request::RequestEnvelope,
+            response::{ForwardResult, ForwardSuccess, ResponseChunk, UpstreamResult},
+            stream::{StreamAdmissionState, StreamPhase, TunnelMode},
+        },
+        health::{HealthClassification, outcome_from_status},
+        listener::QUICListener,
+        shared_state::SharedRuntimeState,
+        tasks::{RuntimeTaskRegistration, RuntimeTaskRegistry},
+        tls::{
+            inventory::{
+                ListenerTlsInventory, RuntimeLoadedClientAuthCa, RuntimeLoadedTlsIdentity,
+                RuntimeTlsCertificateMetadata,
+            },
+            store::{ListenerTlsReloadState, ListenerTlsReloadStore},
+        },
     },
-    watchdog::config::WatchdogRuntimeConfig,
-    watchdog::coordinator::WatchdogCoordinator,
-    watchdog::time::now_millis,
+    watchdog::{config::WatchdogRuntimeConfig, coordinator::WatchdogCoordinator, time::now_millis},
 };
 
 mod backend_resolution;

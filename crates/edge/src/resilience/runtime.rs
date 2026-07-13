@@ -1,14 +1,16 @@
-use crate::resilience::adaptive_admission::AdaptiveAdmission;
-use crate::resilience::brownout::BrownoutController;
-use crate::resilience::circuit_breaker::CircuitBreakers;
-use crate::resilience::connect::{connect_authority_port, normalize_connect_authority};
-use crate::resilience::retry_budget::RetryBudget;
-use crate::resilience::route_queue::RouteQueueLimiter;
-use crate::resilience::scoped_rate_limit::ScopedRateLimiters;
+use std::{collections::HashSet, sync::Arc, time::Duration};
+
 use spooky_config::config::Resilience as ResilienceConfig;
-use std::collections::HashSet;
-use std::sync::Arc;
-use std::time::Duration;
+
+use crate::resilience::{
+    adaptive_admission::AdaptiveAdmission,
+    brownout::BrownoutController,
+    circuit_breaker::CircuitBreakers,
+    connect::{connect_authority_port, normalize_connect_authority},
+    retry_budget::RetryBudget,
+    route_queue::RouteQueueLimiter,
+    scoped_rate_limit::ScopedRateLimiters,
+};
 
 pub struct RuntimeResilience {
     pub adaptive_admission: Arc<AdaptiveAdmission>,

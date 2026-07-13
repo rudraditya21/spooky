@@ -1,11 +1,11 @@
+use std::{collections::HashMap, fs, path::Path};
+
+use serde::Deserialize;
+
 use crate::utils::{
     default_macro_stream_chunk_bytes, default_macro_stream_chunks, default_macro_stream_iterations,
     default_macro_traffic_mix_iterations, default_true,
 };
-use serde::Deserialize;
-use std::collections::HashMap;
-use std::fs;
-use std::path::Path;
 
 #[derive(Debug, Deserialize)]
 pub struct BenchManifest {

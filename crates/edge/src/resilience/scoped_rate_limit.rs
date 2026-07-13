@@ -1,7 +1,10 @@
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+
 use spooky_config::config::{ScopedRateLimit as ScopedRateLimitConfig, ScopedRateLimitScope};
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 struct ScopedRateLimitBucket {
     burst: f64,

@@ -1,6 +1,8 @@
-use crate::config::{CURRENT_CONFIG_VERSION, Config, SUPPORTED_CONFIG_VERSIONS};
-use serde_yaml::{Mapping, Value};
 use std::fs;
+
+use serde_yaml::{Mapping, Value};
+
+use crate::config::{CURRENT_CONFIG_VERSION, Config, SUPPORTED_CONFIG_VERSIONS};
 
 pub fn read_config(filename: &str) -> Result<Config, String> {
     let text = fs::read_to_string(filename)

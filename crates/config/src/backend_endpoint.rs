@@ -1,5 +1,4 @@
-use std::fmt;
-use std::net::IpAddr;
+use std::{fmt, net::IpAddr};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendScheme {

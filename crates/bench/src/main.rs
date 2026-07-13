@@ -1,19 +1,15 @@
-use spooky_bench::benchmark::macro_bench::run_macro_suite;
-use spooky_bench::benchmark::micro_bench::run_micro_suite;
-use spooky_bench::cli::{Args, BenchSuite, FailOn};
-use spooky_bench::io::{
-    load_release_index, load_report, merge_reports, resolve_baseline_paths, write_report,
-};
-use spooky_bench::manifest::load_manifest;
-use spooky_bench::markdown::write_markdown;
-use spooky_bench::promotion::run_promotion;
-use spooky_bench::regression::{
-    RegressionSeverity, compare_reports, format_issue, resolve_gate_config,
-};
-use spooky_bench::report::BenchReport;
-use spooky_bench::utils::{print_summary, suite_label, unix_now};
-
 use clap::Parser;
+use spooky_bench::{
+    benchmark::{macro_bench::run_macro_suite, micro_bench::run_micro_suite},
+    cli::{Args, BenchSuite, FailOn},
+    io::{load_release_index, load_report, merge_reports, resolve_baseline_paths, write_report},
+    manifest::load_manifest,
+    markdown::write_markdown,
+    promotion::run_promotion,
+    regression::{RegressionSeverity, compare_reports, format_issue, resolve_gate_config},
+    report::BenchReport,
+    utils::{print_summary, suite_label, unix_now},
+};
 
 fn main() -> Result<(), String> {
     let args = Args::parse();

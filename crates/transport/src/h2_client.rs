@@ -1,36 +1,36 @@
-use std::convert::Infallible;
-use std::ffi::OsStr;
-use std::future::Future;
-use std::io;
-use std::net::SocketAddr;
-use std::path::Path;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::RwLock;
-use std::time::Duration;
 use std::{
     collections::HashMap,
+    convert::Infallible,
+    ffi::OsStr,
+    future::Future,
+    io,
+    net::SocketAddr,
+    path::Path,
+    pin::Pin,
+    sync::{Arc, RwLock},
     task::{Context, Poll},
+    time::Duration,
 };
 
 use http_body_util::combinators::BoxBody;
-use hyper::body::Bytes;
-use hyper::http::Uri;
-use hyper::{Request, rt::Executor};
+use hyper::{Request, body::Bytes, http::Uri, rt::Executor};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
-use hyper_util::client::legacy::{
-    Client,
-    connect::{
-        HttpConnector,
-        dns::{GaiResolver, Name},
+use hyper_util::{
+    client::legacy::{
+        Client,
+        connect::{
+            HttpConnector,
+            dns::{GaiResolver, Name},
+        },
     },
+    rt::TokioIo,
 };
-use hyper_util::rt::TokioIo;
-
 use log::warn;
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
+use rustls::{
+    ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme,
+    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    pki_types::{CertificateDer, ServerName, UnixTime},
+};
 use rustls_pki_types::pem::PemObject;
 use tower_service::Service;
 
@@ -517,10 +517,12 @@ impl ServerCertVerifier for InsecureServerCertVerifier {
 
 #[cfg(test)]
 mod tests {
-    use super::{DnsCacheUpdate, H2Client, SharedDnsResolver, TlsClientConfig};
-    use hyper_util::client::legacy::connect::dns::Name;
     use std::{net::SocketAddr, str::FromStr, time::Duration};
+
+    use hyper_util::client::legacy::connect::dns::Name;
     use tower_service::Service;
+
+    use super::{DnsCacheUpdate, H2Client, SharedDnsResolver, TlsClientConfig};
 
     #[test]
     fn default_h2_client_does_not_panic() {

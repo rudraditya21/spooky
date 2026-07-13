@@ -1,8 +1,14 @@
-use crate::backend::{BackendState, HealthTransition};
-use crate::health::HealthFailureReason;
+use std::{
+    sync::atomic::Ordering,
+    time::{Duration, Instant},
+};
+
 use spooky_config::config::HealthCheck;
-use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
+
+use crate::{
+    backend::{BackendState, HealthTransition},
+    health::HealthFailureReason,
+};
 
 pub struct BackendPool {
     pub backends: Vec<BackendState>,

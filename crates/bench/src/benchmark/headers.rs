@@ -1,6 +1,6 @@
-use crate::benchmark::runner::run_case_aggregate;
-use crate::report::BenchCase;
 use smallvec::SmallVec;
+
+use crate::{benchmark::runner::run_case_aggregate, report::BenchCase};
 
 pub fn benchmark_h3_header_collection(scale: usize) -> Vec<BenchCase> {
     const INLINE_HEADERS: usize = 16;

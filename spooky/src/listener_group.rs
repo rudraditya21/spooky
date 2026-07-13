@@ -1,19 +1,24 @@
-use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc::{self, RecvTimeoutError, SyncSender, TrySendError},
+    },
+    thread,
+    time::Duration,
 };
-use std::{thread, time::Duration};
 
 use log::{error, info, warn};
-
 use spooky_config::runtime::{ListenerRuntimeConfig, RuntimeConfig};
-use spooky_edge::runtime::bundle::RuntimeBundleHandle;
-use spooky_edge::runtime::listener::QUICListener;
-use spooky_edge::runtime::shared_state::SharedRuntimeState;
-use spooky_edge::{constants::MAX_DATAGRAM_SIZE_BYTES, stable_hash_socket_addr};
+use spooky_edge::{
+    constants::MAX_DATAGRAM_SIZE_BYTES,
+    runtime::{
+        bundle::RuntimeBundleHandle, listener::QUICListener, shared_state::SharedRuntimeState,
+    },
+    stable_hash_socket_addr,
+};
 
 use crate::runtime_guard;
 
@@ -672,9 +677,9 @@ fn group_signature_worker_count(group: &ListenerGroupRuntime) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::{net::SocketAddr, sync::atomic::AtomicUsize};
+
     use super::{release_shard_queue_bytes, shard_index_for_peer, try_reserve_shard_queue_bytes};
-    use std::net::SocketAddr;
-    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn shard_index_is_stable_for_same_peer() {

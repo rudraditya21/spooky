@@ -1,8 +1,7 @@
-use spooky_config::config::{Backend, HealthCheck};
-use spooky_lb::backend::BackendState;
-use spooky_lb::backend_pool::BackendPool;
-use spooky_lb::health::HealthFailureReason;
 use std::time::{Duration, Instant};
+
+use spooky_config::config::{Backend, HealthCheck};
+use spooky_lb::{backend::BackendState, backend_pool::BackendPool, health::HealthFailureReason};
 
 #[test]
 fn passively_ejected_backend_recovers_after_cooldown() {

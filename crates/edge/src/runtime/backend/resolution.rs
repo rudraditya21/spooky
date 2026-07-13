@@ -1,5 +1,4 @@
-use std::net::SocketAddr;
-use std::time::SystemTime;
+use std::{net::SocketAddr, time::SystemTime};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeBackendResolution {

@@ -1,7 +1,7 @@
 mod common;
+use spooky_lb::{algorithms::sticky_cid::StickyCid, backend_pool::BackendPool};
+
 use crate::common::create_backend_state;
-use spooky_lb::algorithms::sticky_cid::StickyCid;
-use spooky_lb::backend_pool::BackendPool;
 
 #[test]
 fn sticky_cid_is_deterministic_for_same_key() {

@@ -1,13 +1,21 @@
-use crate::logger::errors::{build_create_log_dir_error, build_open_log_file_error};
-use crate::logger::formatter::build_json_payload;
+use std::{
+    fs::{OpenOptions, create_dir_all},
+    io::Write,
+    os::unix::fs::OpenOptionsExt,
+    path::Path,
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+
 use env_logger::{Builder, Target};
 use log::LevelFilter;
-use std::fs::{OpenOptions, create_dir_all};
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+
+use crate::logger::{
+    errors::{build_create_log_dir_error, build_open_log_file_error},
+    formatter::build_json_payload,
+};
 
 static LOGGER_INIT_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 static LOGGER_INITIALIZED: AtomicBool = AtomicBool::new(false);

@@ -1,7 +1,12 @@
+use std::{
+    collections::HashMap,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+};
+
 use crate::RetryReason;
-use std::collections::HashMap;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 pub struct RetryBudget {
     enabled: bool,

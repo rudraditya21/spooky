@@ -1,11 +1,12 @@
-use crate::algorithms::consistent_hash::ConsistentHash;
-use crate::algorithms::latency_aware::LatencyAware;
-use crate::algorithms::least_connections::LeastConnections;
-use crate::algorithms::random::Random;
-use crate::algorithms::round_robin::RoundRobin;
-use crate::algorithms::sticky_cid::StickyCid;
-use crate::backend_pool::BackendPool;
-use crate::hash::DEFAULT_REPLICAS;
+use crate::{
+    algorithms::{
+        consistent_hash::ConsistentHash, latency_aware::LatencyAware,
+        least_connections::LeastConnections, random::Random, round_robin::RoundRobin,
+        sticky_cid::StickyCid,
+    },
+    backend_pool::BackendPool,
+    hash::DEFAULT_REPLICAS,
+};
 
 pub enum LoadBalancing {
     RoundRobin(RoundRobin),

@@ -1,12 +1,13 @@
-use crate::benchmark::headers::synth_h3_headers;
-use crate::benchmark::lb::build_lb_pool;
-use crate::benchmark::runner::run_case_with_latencies;
-use crate::manifest::BenchProfile;
-use crate::manifest::MacroSuiteConfig;
-use crate::report::BenchCase;
-use spooky_edge::benchmark::connection_lookup::ConnectionLookupBench;
-use spooky_edge::benchmark::route_lookup::RouteLookupBench;
+use spooky_edge::benchmark::{
+    connection_lookup::ConnectionLookupBench, route_lookup::RouteLookupBench,
+};
 use spooky_lb::upstream_pool::UpstreamPool;
+
+use crate::{
+    benchmark::{headers::synth_h3_headers, lb::build_lb_pool, runner::run_case_with_latencies},
+    manifest::{BenchProfile, MacroSuiteConfig},
+    report::BenchCase,
+};
 
 fn benchmark_macro_traffic_mix(
     scale: usize,

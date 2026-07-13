@@ -1,15 +1,15 @@
-use crate::backend_endpoint::{BackendEndpoint, BackendScheme};
-use crate::config::{
-    CURRENT_CONFIG_VERSION, Config, ExternalAuth, Listen, SUPPORTED_CONFIG_VERSIONS,
-    ScopedRateLimitScope, UpstreamHostPolicyMode, UpstreamTls,
-};
+use std::{cell::RefCell, collections::HashMap, error::Error as StdError, fmt, net::IpAddr};
+
 use log::{info, warn};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::error::Error as StdError;
-use std::fmt;
-use std::net::IpAddr;
+
+use crate::{
+    backend_endpoint::{BackendEndpoint, BackendScheme},
+    config::{
+        CURRENT_CONFIG_VERSION, Config, ExternalAuth, Listen, SUPPORTED_CONFIG_VERSIONS,
+        ScopedRateLimitScope, UpstreamHostPolicyMode, UpstreamTls,
+    },
+};
 
 #[path = "validator/helpers.rs"]
 mod helpers;

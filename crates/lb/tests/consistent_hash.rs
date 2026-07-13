@@ -1,7 +1,7 @@
 mod common;
+use spooky_lb::{algorithms::consistent_hash::ConsistentHash, backend_pool::BackendPool};
+
 use crate::common::create_backend_state;
-use spooky_lb::algorithms::consistent_hash::ConsistentHash;
-use spooky_lb::backend_pool::BackendPool;
 
 #[test]
 fn consistent_hash_is_stable() {

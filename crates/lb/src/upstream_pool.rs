@@ -1,7 +1,6 @@
-use crate::backend::BackendState;
-use crate::backend_pool::BackendPool;
-use crate::load_balancing::LoadBalancing;
 use std::time::Duration;
+
+use crate::{backend::BackendState, backend_pool::BackendPool, load_balancing::LoadBalancing};
 
 pub struct UpstreamPool {
     pub pool: BackendPool,

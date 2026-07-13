@@ -1,13 +1,14 @@
-use super::*;
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
-use spooky_config::config::ControlApi as ControlApiConfig;
-use spooky_config::loader::read_config;
-use spooky_config::runtime::RuntimeConfig;
 use std::ffi::OsString;
+
+use hyper::{server::conn::http1, service::service_fn};
+use hyper_util::rt::TokioIo;
+use spooky_config::{
+    config::ControlApi as ControlApiConfig, loader::read_config, runtime::RuntimeConfig,
+};
 use subtle::ConstantTimeEq;
 use tokio_rustls::TlsAcceptor;
+
+use super::*;
 
 mod http;
 mod reload;

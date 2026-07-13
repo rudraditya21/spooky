@@ -1,25 +1,32 @@
-use super::*;
-use crate::runtime::connection::auth::{
-    ExternalAuthChallengeResponse, ExternalAuthDecision, ExternalAuthDenyResponse,
-    ExternalAuthRedirectResponse, ExternalAuthResult,
+use std::{
+    convert::Infallible,
+    error::Error as StdError,
+    time::{SystemTime, UNIX_EPOCH},
 };
-use crate::runtime::connection::{
-    auth::PendingHeaderMutation, request::PendingForward, stream::StreamAdmissionState,
-};
+
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
 use serde_json::Value;
 use sha2::Sha256;
-use spooky_config::config::ScopedRateLimitScope;
-use spooky_config::runtime::{RuntimeExternalAuth, RuntimeExternalAuthFailureMode};
-use std::convert::Infallible;
-use std::error::Error as StdError;
-use std::time::{SystemTime, UNIX_EPOCH};
+use spooky_config::{
+    config::ScopedRateLimitScope,
+    runtime::{RuntimeExternalAuth, RuntimeExternalAuthFailureMode},
+};
 use subtle::ConstantTimeEq;
 use tokio::task::AbortHandle;
 use tracing::Span;
+
+use super::*;
+use crate::runtime::connection::{
+    auth::{
+        ExternalAuthChallengeResponse, ExternalAuthDecision, ExternalAuthDenyResponse,
+        ExternalAuthRedirectResponse, ExternalAuthResult, PendingHeaderMutation,
+    },
+    request::PendingForward,
+    stream::StreamAdmissionState,
+};
 
 const MAX_AUTH_BODY_BYTES: usize = 64 * 1024;
 
@@ -4845,12 +4852,15 @@ impl QUICListener {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use spooky_config::config::{ScopedRateLimit, ScopedRateLimitScope};
-    use spooky_config::runtime::{
-        RuntimeApiKeyAuth, RuntimeAuthPolicy, RuntimeExternalAuth, RuntimeExternalAuthFailureMode,
-        RuntimeJwtAuth, RuntimeUpstreamPolicy,
+    use spooky_config::{
+        config::{ScopedRateLimit, ScopedRateLimitScope},
+        runtime::{
+            RuntimeApiKeyAuth, RuntimeAuthPolicy, RuntimeExternalAuth,
+            RuntimeExternalAuthFailureMode, RuntimeJwtAuth, RuntimeUpstreamPolicy,
+        },
     };
+
+    use super::*;
 
     fn sample_pending_forward(headers: Vec<quiche::h3::Header>) -> PendingForward {
         PendingForward {

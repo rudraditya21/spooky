@@ -1,20 +1,19 @@
-use std::sync::{Arc, atomic::AtomicUsize};
-use std::time::Duration;
+use std::{
+    sync::{Arc, atomic::AtomicUsize},
+    time::Duration,
+};
 
-use hyper::Request;
-use hyper::body::Incoming;
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
+use hyper::{Request, body::Incoming, server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
 use log::{debug, error, info};
 use spooky_config::config::MetricsEndpoint;
 use spooky_errors::ProxyError;
 
-use crate::Metrics;
-use crate::runtime::bundle::RuntimeBundleHandle;
-
-use super::runtime_endpoint::RuntimeConnectionSlotGuard;
-use super::{QUICListener, runtime_handle, spawn_supervised_async_task};
+use super::{
+    QUICListener, runtime_endpoint::RuntimeConnectionSlotGuard, runtime_handle,
+    spawn_supervised_async_task,
+};
+use crate::{Metrics, runtime::bundle::RuntimeBundleHandle};
 
 struct MetricsEndpointBinding {
     bind: String,

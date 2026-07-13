@@ -1,8 +1,10 @@
-use crate::allocator::{alloc_snapshot, reset_alloc_counters};
-use crate::profiler::{cpu_pct, current_cpu_micros, current_rss_kb, percentile_from_sorted};
-use crate::report::BenchCase;
-use std::hint::black_box;
-use std::time::Instant;
+use std::{hint::black_box, time::Instant};
+
+use crate::{
+    allocator::{alloc_snapshot, reset_alloc_counters},
+    profiler::{cpu_pct, current_cpu_micros, current_rss_kb, percentile_from_sorted},
+    report::BenchCase,
+};
 
 const BENCH_SAMPLES: usize = 3;
 

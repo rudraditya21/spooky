@@ -1,8 +1,10 @@
-use crate::cli::FailOn;
-use crate::regression::{RegressionIssue, RegressionSeverity, format_issue};
-use crate::report::BenchReport;
-use std::fs;
-use std::path::Path;
+use std::{fs, path::Path};
+
+use crate::{
+    cli::FailOn,
+    regression::{RegressionIssue, RegressionSeverity, format_issue},
+    report::BenchReport,
+};
 
 pub fn write_markdown(
     path: &Path,

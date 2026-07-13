@@ -64,8 +64,9 @@ impl TokenBucket {
 
 #[cfg(test)]
 mod tests {
-    use super::TokenBucket;
     use std::time::Duration;
+
+    use super::TokenBucket;
 
     #[test]
     fn long_idle_refill_is_capped_to_burst() {

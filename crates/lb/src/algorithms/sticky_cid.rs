@@ -1,5 +1,4 @@
-use crate::algorithms::consistent_hash::ConsistentHash;
-use crate::backend_pool::BackendPool;
+use crate::{algorithms::consistent_hash::ConsistentHash, backend_pool::BackendPool};
 
 pub struct StickyCid {
     inner: ConsistentHash,

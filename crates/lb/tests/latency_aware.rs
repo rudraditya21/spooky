@@ -1,8 +1,9 @@
 mod common;
-use crate::common::create_backend_state;
-use spooky_lb::algorithms::latency_aware::LatencyAware;
-use spooky_lb::backend_pool::BackendPool;
 use std::time::Duration;
+
+use spooky_lb::{algorithms::latency_aware::LatencyAware, backend_pool::BackendPool};
+
+use crate::common::create_backend_state;
 
 #[test]
 fn latency_aware_prefers_lower_ewma() {

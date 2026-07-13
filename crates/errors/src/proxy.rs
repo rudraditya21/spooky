@@ -1,5 +1,6 @@
-use crate::{BridgeError, PoolError};
 use thiserror::Error;
+
+use crate::{BridgeError, PoolError};
 
 #[derive(Debug, Error)]
 pub enum ProxyError {

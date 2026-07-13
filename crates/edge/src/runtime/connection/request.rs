@@ -1,18 +1,27 @@
-use crate::resilience::adaptive_admission::AdaptivePermit;
-use crate::resilience::route_queue::RouteQueuePermit;
-use crate::runtime::connection::auth::{ExternalAuthResult, PendingHeaderMutation};
-use crate::runtime::connection::response::{ResponseChunk, UpstreamResult};
-use crate::runtime::connection::stream::{StreamAdmissionState, StreamPhase, TunnelMode};
+use std::{
+    collections::VecDeque,
+    net::SocketAddr,
+    sync::{Arc, RwLock},
+    time::Instant,
+};
+
 use bytes::Bytes;
 use spooky_config::config::{ForwardedHeaderPolicy, UpstreamHostPolicy};
 use spooky_lb::upstream_pool::UpstreamPool;
-use std::collections::VecDeque;
-use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
-use std::time::Instant;
-use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot};
-use tokio::task::AbortHandle;
+use tokio::{
+    sync::{OwnedSemaphorePermit, mpsc, oneshot},
+    task::AbortHandle,
+};
 use tracing::Span;
+
+use crate::{
+    resilience::{adaptive_admission::AdaptivePermit, route_queue::RouteQueuePermit},
+    runtime::connection::{
+        auth::{ExternalAuthResult, PendingHeaderMutation},
+        response::{ResponseChunk, UpstreamResult},
+        stream::{StreamAdmissionState, StreamPhase, TunnelMode},
+    },
+};
 
 pub struct RequestEnvelope {
     pub request_id: u64,

@@ -1,5 +1,5 @@
-use super::state::ControlApiState;
-use super::*;
+use std::{collections::HashMap, path::Path, sync::Arc};
+
 use http_body_util::BodyExt;
 use spooky_config::{
     config::{
@@ -8,8 +8,9 @@ use spooky_config::{
     },
     runtime::RuntimeConfig,
 };
-use std::{collections::HashMap, path::Path, sync::Arc};
 use tempfile::tempdir;
+
+use super::{state::ControlApiState, *};
 
 fn write_test_cert_for_name(dir: &Path, cert_name: &str, dns_name: &str) -> (String, String) {
     use rcgen::{Certificate, CertificateParams, SanType};

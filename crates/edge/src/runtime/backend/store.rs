@@ -1,9 +1,13 @@
-use crate::runtime::backend::resolution::RuntimeBackendResolution;
-use crate::runtime::backend::update::RuntimeBackendResolutionUpdate;
-use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
-use std::time::SystemTime;
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::{Arc, RwLock},
+    time::SystemTime,
+};
+
+use crate::runtime::backend::{
+    resolution::RuntimeBackendResolution, update::RuntimeBackendResolutionUpdate,
+};
 
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeBackendResolutionStore {

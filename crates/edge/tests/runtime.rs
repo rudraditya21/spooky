@@ -1,9 +1,12 @@
-use spooky_edge::runtime::backend::resolution::{
-    RuntimeBackendAddressKind, RuntimeBackendResolution,
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    time::SystemTime,
 };
-use spooky_edge::runtime::backend::store::RuntimeBackendResolutionStore;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::time::SystemTime;
+
+use spooky_edge::runtime::backend::{
+    resolution::{RuntimeBackendAddressKind, RuntimeBackendResolution},
+    store::RuntimeBackendResolutionStore,
+};
 
 #[test]
 fn hostname_entries_exclude_ip_literal_backends() {

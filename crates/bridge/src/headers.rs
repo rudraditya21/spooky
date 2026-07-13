@@ -1,5 +1,6 @@
-use http::HeaderName;
 use std::collections::HashSet;
+
+use http::HeaderName;
 
 pub fn connection_header_tokens(headers: &[quiche::h3::Header]) -> HashSet<String> {
     use quiche::h3::NameValue;

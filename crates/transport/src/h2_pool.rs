@@ -6,12 +6,14 @@ use std::{
 };
 
 use http_body_util::combinators::BoxBody;
-use hyper::Request;
-use hyper::body::{Bytes, Incoming};
+use hyper::{
+    Request,
+    body::{Bytes, Incoming},
+};
+pub use spooky_errors::PoolError;
 use tokio::sync::{Semaphore, TryAcquireError};
 
 use crate::h2_client::{ConnectObserver, H2Client, SharedDnsResolver, TlsClientConfig};
-pub use spooky_errors::PoolError;
 
 struct BackendClientState {
     client: Arc<H2Client>,

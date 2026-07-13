@@ -1,10 +1,11 @@
-use bytes::Bytes;
-use hyper::body::{Body, Frame};
 use std::{
     convert::Infallible,
     pin::Pin,
     task::{Context, Poll},
 };
+
+use bytes::Bytes;
+use hyper::body::{Body, Frame};
 use tokio::sync::mpsc;
 
 /// A streaming HTTP body backed by a tokio mpsc channel.

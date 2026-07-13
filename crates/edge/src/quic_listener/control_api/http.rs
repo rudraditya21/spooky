@@ -1,8 +1,9 @@
-use super::state::{
-    ConnectionSlotGuard, ControlApiListenerBinding, ControlApiPaths, ControlApiState,
-};
-use super::*;
 use ::http::{Method, header};
+
+use super::{
+    state::{ConnectionSlotGuard, ControlApiListenerBinding, ControlApiPaths, ControlApiState},
+    *,
+};
 
 impl QUICListener {
     pub(super) fn bearer_token_from_authorization_header(raw: &str) -> Option<&str> {

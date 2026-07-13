@@ -288,8 +288,7 @@ pub struct RuntimeUpstreamPolicy {
 
 #[cfg(test)]
 mod tests {
-    use super::listeners::runtime_listeners;
-    use super::*;
+    use super::{listeners::runtime_listeners, *};
     use crate::config::{
         Config, ForwardedHeaderPolicyMode, Listen, RouteMatch, Tls, TlsCertificate, Upstream,
         UpstreamHostPolicyMode,

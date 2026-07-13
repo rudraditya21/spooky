@@ -1,6 +1,5 @@
 mod common;
 use common::create_backend_state;
-
 use spooky_lb::backend_pool::BackendPool;
 
 #[test]

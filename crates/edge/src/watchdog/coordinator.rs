@@ -1,9 +1,15 @@
-use crate::watchdog::time::now_millis;
+use std::{
+    sync::{
+        Mutex, MutexGuard,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    },
+    time::Instant,
+};
+
 use log::warn;
 use spooky_config::config::Watchdog as WatchdogConfig;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard};
-use std::time::Instant;
+
+use crate::watchdog::time::now_millis;
 
 pub struct WatchdogCoordinator {
     enabled: bool,

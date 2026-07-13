@@ -13,8 +13,10 @@ use std::{
 };
 
 use bytes::Bytes;
-use http::header::{CONTENT_LENGTH, HeaderValue};
-use http::{HeaderMap, StatusCode};
+use http::{
+    HeaderMap, StatusCode,
+    header::{CONTENT_LENGTH, HeaderValue},
+};
 use http_body_util::{BodyExt, Empty, Full, combinators::BoxBody};
 use hyper::{
     Request, Response, Uri,
@@ -41,18 +43,22 @@ use tokio_rustls::{
 
 mod support;
 
-use spooky_config::config::{
-    Backend, ClientAuth, Config, HealthCheck, Listen, LoadBalancing, Log, LogFormat, Security, Tls,
-    TlsCertificate, UpstreamTls,
+use spooky_config::{
+    config::{
+        Backend, ClientAuth, Config, HealthCheck, Listen, LoadBalancing, Log, LogFormat, Security,
+        Tls, TlsCertificate, UpstreamTls,
+    },
+    runtime::RuntimeConfig,
 };
-use spooky_config::runtime::RuntimeConfig;
-use spooky_edge::constants::{
-    BACKEND_TIMEOUT_SECS, MAX_DATAGRAM_SIZE_BYTES, MAX_REQUEST_BODY_BYTES,
-    MAX_STREAMS_PER_CONNECTION, MAX_UDP_PAYLOAD_BYTES, QUIC_IDLE_TIMEOUT_MS, QUIC_INITIAL_MAX_DATA,
-    QUIC_INITIAL_MAX_STREAMS_BIDI, QUIC_INITIAL_MAX_STREAMS_UNI, QUIC_INITIAL_STREAM_DATA,
-    REQUEST_TIMEOUT_SECS, UDP_READ_TIMEOUT_MS,
+use spooky_edge::{
+    constants::{
+        BACKEND_TIMEOUT_SECS, MAX_DATAGRAM_SIZE_BYTES, MAX_REQUEST_BODY_BYTES,
+        MAX_STREAMS_PER_CONNECTION, MAX_UDP_PAYLOAD_BYTES, QUIC_IDLE_TIMEOUT_MS,
+        QUIC_INITIAL_MAX_DATA, QUIC_INITIAL_MAX_STREAMS_BIDI, QUIC_INITIAL_MAX_STREAMS_UNI,
+        QUIC_INITIAL_STREAM_DATA, REQUEST_TIMEOUT_SECS, UDP_READ_TIMEOUT_MS,
+    },
+    runtime::listener::QUICListener,
 };
-use spooky_edge::runtime::listener::QUICListener;
 use support::net::local_listener_bind_available;
 
 type TrailerPairs = Vec<(String, String)>;
@@ -149,8 +155,9 @@ fn write_test_ca_and_client_cert(
 }
 
 fn make_config(port: u32, backend_addr: String, cert: String, key: String) -> Config {
-    use spooky_config::config::{RouteMatch, Upstream};
     use std::collections::HashMap;
+
+    use spooky_config::config::{RouteMatch, Upstream};
 
     let mut upstream = HashMap::new();
     upstream.insert(

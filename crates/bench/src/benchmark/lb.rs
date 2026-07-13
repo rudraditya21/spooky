@@ -1,8 +1,10 @@
-use crate::benchmark::connection::fast_iterations;
-use crate::benchmark::runner::run_case_aggregate;
-use crate::report::BenchCase;
 use spooky_config::config::{Backend, HealthCheck, LoadBalancing, RouteMatch, Upstream};
 use spooky_lb::upstream_pool::UpstreamPool;
+
+use crate::{
+    benchmark::{connection::fast_iterations, runner::run_case_aggregate},
+    report::BenchCase,
+};
 
 pub fn benchmark_lb(scale: usize) -> Result<Vec<BenchCase>, String> {
     let mut rr_pool = build_lb_pool(scale, "round-robin")?;

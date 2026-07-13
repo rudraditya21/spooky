@@ -1,6 +1,5 @@
 use spooky_config::config::{Backend, HealthCheck, RouteMatch};
-use spooky_lb::load_balancing::LoadBalancing;
-use spooky_lb::upstream_pool::UpstreamPool;
+use spooky_lb::{load_balancing::LoadBalancing, upstream_pool::UpstreamPool};
 
 #[test]
 fn upstream_pool_from_config() {

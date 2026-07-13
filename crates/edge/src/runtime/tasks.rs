@@ -1,8 +1,7 @@
+use std::{sync::Mutex, time::Duration};
+
 use log::warn;
-use std::sync::Mutex;
-use std::time::Duration;
-use tokio::sync::oneshot;
-use tokio::task::AbortHandle;
+use tokio::{sync::oneshot, task::AbortHandle};
 
 pub struct RuntimeTaskRegistry {
     state: Mutex<RuntimeTaskRegistryState>,

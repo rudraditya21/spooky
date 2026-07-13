@@ -1,7 +1,11 @@
-use std::any::Any;
-use std::panic::{self, PanicHookInfo};
-use std::sync::Once;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    any::Any,
+    panic::{self, PanicHookInfo},
+    sync::{
+        Once,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use log::error;
 

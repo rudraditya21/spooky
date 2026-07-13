@@ -1,7 +1,8 @@
-use crate::RetryReason;
 use bytes::Bytes;
 use spooky_errors::ProxyError;
 use tokio::sync::mpsc;
+
+use crate::RetryReason;
 
 pub enum ForwardSuccess {
     Response {

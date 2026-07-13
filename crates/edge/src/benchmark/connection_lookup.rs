@@ -1,10 +1,13 @@
+use std::{
+    collections::HashMap,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+};
+
 use crate::constants::{
     BENCH_CONN_ALIAS_SUFFIX, BENCH_CONN_MISS_ID_FILL, BENCH_CONN_MISS_ID_LEN_BYTES,
     BENCH_CONN_MISS_PORT, BENCH_CONN_PEER_BASE_PORT, BENCH_CONN_PEER_PORT_SPAN,
     BENCH_CONN_PRIMARY_ID_LEN_BYTES, BENCH_CONN_PRIMARY_ID_PREFIX_BYTES,
 };
-use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 type PrimaryCid = [u8; BENCH_CONN_PRIMARY_ID_LEN_BYTES];
 

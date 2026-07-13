@@ -1,8 +1,13 @@
-use crate::cli::{Args, BenchSuite};
-use crate::report::{BenchReport, ReleaseBaselineIndex};
-use crate::utils::unix_now;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+
+use crate::{
+    cli::{Args, BenchSuite},
+    report::{BenchReport, ReleaseBaselineIndex},
+    utils::unix_now,
+};
 
 pub fn write_report(path: &Path, report: &BenchReport) -> Result<(), String> {
     if let Some(parent) = path.parent() {

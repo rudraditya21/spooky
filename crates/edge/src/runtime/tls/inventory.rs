@@ -1,5 +1,6 @@
-use spooky_config::runtime::{RuntimeListenerTls, RuntimeTlsIdentity};
 use std::collections::HashMap;
+
+use spooky_config::runtime::{RuntimeListenerTls, RuntimeTlsIdentity};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeTlsCertificateMetadata {

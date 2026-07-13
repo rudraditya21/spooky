@@ -1,9 +1,11 @@
+use std::{io, path::Path};
+
 use serde_json::json;
-use spooky_utils::logger::errors::{build_create_log_dir_error, build_open_log_file_error};
-use spooky_utils::logger::formatter::build_json_payload;
-use spooky_utils::logger::init::{LoggerInitStatus, try_init_logger};
-use std::io;
-use std::path::Path;
+use spooky_utils::logger::{
+    errors::{build_create_log_dir_error, build_open_log_file_error},
+    formatter::build_json_payload,
+    init::{LoggerInitStatus, try_init_logger},
+};
 
 #[test]
 fn logger_init_is_idempotent() {

@@ -10,12 +10,14 @@ use spooky_config::{
     config::{ForwardedHeaderPolicy, UpstreamHostPolicy},
 };
 
-use crate::BridgeError;
-use crate::context::{ForwardedContext, ForwardedHeaderChains};
-use crate::forwarded::build_forwarded_header_values;
-use crate::headers::{connection_header_tokens, should_strip_request_header};
-use crate::host::resolve_upstream_host_value;
-use crate::websocket::{H3WebsocketRequestKind, h3_websocket_request_kind};
+use crate::{
+    BridgeError,
+    context::{ForwardedContext, ForwardedHeaderChains},
+    forwarded::build_forwarded_header_values,
+    headers::{connection_header_tokens, should_strip_request_header},
+    host::resolve_upstream_host_value,
+    websocket::{H3WebsocketRequestKind, h3_websocket_request_kind},
+};
 
 /// Build an HTTP/2 request with a pre-boxed streaming body.
 /// `content_length` is `Some(n)` only when the full length is known upfront

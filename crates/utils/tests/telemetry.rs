@@ -1,5 +1,7 @@
-use spooky_utils::telemetry::endpoint::{OtlpEndpointSource, resolve_otlp_endpoint};
-use spooky_utils::telemetry::init::DEFAULT_OTLP_ENDPOINT;
+use spooky_utils::telemetry::{
+    endpoint::{OtlpEndpointSource, resolve_otlp_endpoint},
+    init::DEFAULT_OTLP_ENDPOINT,
+};
 
 #[test]
 fn config_endpoint_overrides_environment() {

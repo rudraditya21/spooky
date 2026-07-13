@@ -1,5 +1,7 @@
-use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    collections::HashSet,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 pub struct BrownoutController {
     enabled: bool,

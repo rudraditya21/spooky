@@ -617,8 +617,9 @@ pub(super) fn generated_span_id(request_id: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use spooky_config::config::Resilience;
+
+    use super::*;
 
     fn runtime_resilience() -> RuntimeResilience {
         RuntimeResilience::from_config(&Resilience::default(), 1024)

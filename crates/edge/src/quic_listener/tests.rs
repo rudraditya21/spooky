@@ -1,10 +1,12 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
+    net::SocketAddr,
     path::Path,
-    sync::{Arc, RwLock},
+    sync::{Arc, RwLock, atomic::Ordering},
     time::Duration,
 };
 
+use http::{HeaderMap, HeaderValue, StatusCode};
 use rcgen::{Certificate, CertificateParams, SanType};
 use spooky_config::{
     config::{
@@ -14,27 +16,20 @@ use spooky_config::{
     },
     runtime::{ListenerRuntimeConfig, RuntimeConfig},
 };
+use spooky_lb::health::HealthFailureReason;
 use tempfile::tempdir;
-
-use super::is_bodyless_request_mode;
-
-use crate::cid_radix::CidRadix;
-use crate::{REQUEST_ID_COUNTER, runtime::connection::stream::StreamAdmissionState};
-use http::{HeaderMap, HeaderValue, StatusCode};
-
-use std::collections::HashSet;
-use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
 
 use super::{
     ConnectionRoutes, TokenBucket, abort_stream, can_poll_upstream_result,
     classify_active_health_check_response, collect_h3_trailers, connection_header_tokens,
-    is_connect_tunnel_response, purge_connection_routes, resolve_primary_from_radix_prefix,
-    response_size_exceeded_after_chunk, should_strip_bootstrap_request_header,
-    should_strip_bootstrap_response_header, should_strip_h3_response_header,
-    sweep_closed_connections,
+    is_bodyless_request_mode, is_connect_tunnel_response, purge_connection_routes,
+    resolve_primary_from_radix_prefix, response_size_exceeded_after_chunk,
+    should_strip_bootstrap_request_header, should_strip_bootstrap_response_header,
+    should_strip_h3_response_header, sweep_closed_connections,
 };
-use spooky_lb::health::HealthFailureReason;
+use crate::{
+    REQUEST_ID_COUNTER, cid_radix::CidRadix, runtime::connection::stream::StreamAdmissionState,
+};
 type RoutingMaps = (
     HashMap<Arc<[u8]>, Arc<[u8]>>,
     CidRadix,
@@ -1754,11 +1749,14 @@ fn sweep_partial_batch_clears_only_removed_entries() {
 // pending chunks are discarded.
 // -----------------------------------------------------------------------
 
-use crate::resilience::adaptive_admission::AdaptiveAdmission;
-use crate::resilience::route_queue::RouteQueueLimiter;
-use crate::runtime::connection::{request::RequestEnvelope, stream::StreamPhase};
 use std::time::Instant;
+
 use tokio::sync::{Semaphore, mpsc, oneshot};
+
+use crate::{
+    resilience::{adaptive_admission::AdaptiveAdmission, route_queue::RouteQueueLimiter},
+    runtime::connection::{request::RequestEnvelope, stream::StreamPhase},
+};
 
 fn make_envelope(phase: StreamPhase) -> RequestEnvelope {
     RequestEnvelope {

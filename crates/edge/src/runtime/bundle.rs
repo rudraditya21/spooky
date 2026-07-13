@@ -1,9 +1,12 @@
-use crate::runtime::shared_state::SharedRuntimeState;
-use crate::runtime::tasks::RuntimeTaskRegistry;
-use spooky_config::config::Log;
-use spooky_config::runtime::{ListenerRuntimeConfig, RuntimeConfig};
-use spooky_errors::ProxyError;
 use std::sync::{Arc, RwLock};
+
+use spooky_config::{
+    config::Log,
+    runtime::{ListenerRuntimeConfig, RuntimeConfig},
+};
+use spooky_errors::ProxyError;
+
+use crate::runtime::{shared_state::SharedRuntimeState, tasks::RuntimeTaskRegistry};
 
 #[derive(Clone)]
 pub struct RuntimeBundle {

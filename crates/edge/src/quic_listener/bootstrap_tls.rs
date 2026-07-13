@@ -1,25 +1,31 @@
-use std::collections::HashMap;
-use std::sync::{
-    Arc, RwLock,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::Duration,
 };
-use std::time::Duration;
 
 use bytes::Bytes;
 use http::{Request, Response, StatusCode};
 use http_body_util::BodyExt;
-use hyper::body::Incoming;
-use hyper::client::conn::http1 as client_http1;
-use hyper::server::conn::{http1, http2};
-use hyper::service::service_fn;
-use hyper::upgrade;
+use hyper::{
+    body::Incoming,
+    client::conn::http1 as client_http1,
+    server::conn::{http1, http2},
+    service::service_fn,
+    upgrade,
+};
 use hyper_util::rt::TokioIo;
 use log::{debug, error, info, warn};
-use spooky_bridge::context::{ForwardedContext, ForwardedHeaderChains};
-use spooky_bridge::forwarded::build_forwarded_header_values;
-use spooky_bridge::h3_to_h1::build_h1_request_for_endpoint_with_host_policy;
-use spooky_bridge::h3_to_h2::build_h2_request_for_endpoint_with_host_policy;
-use spooky_bridge::host::resolve_upstream_host_value;
+use spooky_bridge::{
+    context::{ForwardedContext, ForwardedHeaderChains},
+    forwarded::build_forwarded_header_values,
+    h3_to_h1::build_h1_request_for_endpoint_with_host_policy,
+    h3_to_h2::build_h2_request_for_endpoint_with_host_policy,
+    host::resolve_upstream_host_value,
+};
 use spooky_config::{
     backend_endpoint::{BackendEndpoint, BackendScheme},
     runtime::{ListenerRuntimeConfig, RuntimeUpstreamPolicy},
@@ -28,19 +34,20 @@ use spooky_errors::ProxyError;
 use spooky_lb::upstream_pool::UpstreamPool;
 use spooky_transport::transport_pool::UpstreamTransportPool;
 
-use crate::{
-    Metrics, REQUEST_ID_COUNTER, RouteOutcome, resilience::runtime::RuntimeResilience,
-    routing::index::RouteIndex, runtime::backend::store::RuntimeBackendResolutionStore,
-    runtime::bundle::RuntimeBundleHandle, runtime::shared_state::SharedRuntimeState,
-    runtime::tls::store::ListenerTlsReloadStore,
-};
-
-use super::runtime_endpoint::RuntimeConnectionSlotGuard;
 use super::{
     BootstrapServiceFuture, BootstrapStreamingBody, QUICListener,
     bootstrap_resolution_error_response, boxed_full, connection_header_tokens, is_head_method,
-    is_websocket_upgrade_request, runtime_handle, should_strip_bootstrap_response_header,
-    spawn_supervised_async_task, validate_http_request,
+    is_websocket_upgrade_request, runtime_endpoint::RuntimeConnectionSlotGuard, runtime_handle,
+    should_strip_bootstrap_response_header, spawn_supervised_async_task, validate_http_request,
+};
+use crate::{
+    Metrics, REQUEST_ID_COUNTER, RouteOutcome,
+    resilience::runtime::RuntimeResilience,
+    routing::index::RouteIndex,
+    runtime::{
+        backend::store::RuntimeBackendResolutionStore, bundle::RuntimeBundleHandle,
+        shared_state::SharedRuntimeState, tls::store::ListenerTlsReloadStore,
+    },
 };
 
 pub(super) struct BootstrapConnectionState {

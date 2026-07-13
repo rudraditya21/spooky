@@ -1,7 +1,8 @@
-use crate::backend_pool::BackendPool;
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
 use std::cell::RefCell;
+
+use rand::{Rng, SeedableRng, rngs::StdRng};
+
+use crate::backend_pool::BackendPool;
 
 thread_local! {
     static LB_RANDOM_RNG: RefCell<StdRng> = RefCell::new(StdRng::from_entropy());

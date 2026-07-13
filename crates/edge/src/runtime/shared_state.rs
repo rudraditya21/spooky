@@ -1,18 +1,26 @@
-use crate::Metrics;
-use crate::resilience::runtime::RuntimeResilience;
-use crate::routing::index::RouteIndex;
-use crate::runtime::backend::store::RuntimeBackendResolutionStore;
-use crate::runtime::tasks::RuntimeTaskRegistry;
-use crate::runtime::tls::store::ListenerTlsReloadStore;
-use crate::watchdog::coordinator::WatchdogCoordinator;
-use spooky_config::backend_endpoint::BackendEndpoint;
-use spooky_config::runtime::{ListenerRuntimeConfig, RuntimeUpstreamPolicy};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
+
+use spooky_config::{
+    backend_endpoint::BackendEndpoint,
+    runtime::{ListenerRuntimeConfig, RuntimeUpstreamPolicy},
+};
 use spooky_lb::upstream_pool::UpstreamPool;
-use spooky_transport::h2_client::SharedDnsResolver;
-use spooky_transport::transport_pool::UpstreamTransportPool;
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use spooky_transport::{h2_client::SharedDnsResolver, transport_pool::UpstreamTransportPool};
 use tokio::sync::Semaphore;
+
+use crate::{
+    Metrics,
+    resilience::runtime::RuntimeResilience,
+    routing::index::RouteIndex,
+    runtime::{
+        backend::store::RuntimeBackendResolutionStore, tasks::RuntimeTaskRegistry,
+        tls::store::ListenerTlsReloadStore,
+    },
+    watchdog::coordinator::WatchdogCoordinator,
+};
 
 pub struct SharedRuntimeState {
     pub(crate) listener_runtime_configs: Arc<HashMap<String, ListenerRuntimeConfig>>,

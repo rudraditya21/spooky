@@ -1,5 +1,4 @@
-use crate::cli::BenchSuite;
-use crate::report::BenchReport;
+use crate::{cli::BenchSuite, report::BenchReport};
 
 pub fn print_summary(report: &BenchReport) {
     println!(

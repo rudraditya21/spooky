@@ -27,12 +27,14 @@ use spooky_config::config::{
     Backend, ClientAuth, Config, ExternalAuth, ExternalAuthFailureMode, ExternalAuthRequestHeader,
     HealthCheck, Listen, LoadBalancing, Log, LogFormat, Security, Tls, UpstreamTls,
 };
-use spooky_edge::constants::{
-    MAX_DATAGRAM_SIZE_BYTES, MAX_UDP_PAYLOAD_BYTES, QUIC_IDLE_TIMEOUT_MS, QUIC_INITIAL_MAX_DATA,
-    QUIC_INITIAL_MAX_STREAMS_BIDI, QUIC_INITIAL_MAX_STREAMS_UNI, QUIC_INITIAL_STREAM_DATA,
-    REQUEST_TIMEOUT_SECS, UDP_READ_TIMEOUT_MS,
+use spooky_edge::{
+    constants::{
+        MAX_DATAGRAM_SIZE_BYTES, MAX_UDP_PAYLOAD_BYTES, QUIC_IDLE_TIMEOUT_MS,
+        QUIC_INITIAL_MAX_DATA, QUIC_INITIAL_MAX_STREAMS_BIDI, QUIC_INITIAL_MAX_STREAMS_UNI,
+        QUIC_INITIAL_STREAM_DATA, REQUEST_TIMEOUT_SECS, UDP_READ_TIMEOUT_MS,
+    },
+    runtime::listener::QUICListener,
 };
-use spooky_edge::runtime::listener::QUICListener;
 use support::net::local_listener_bind_available;
 
 fn write_test_certs(dir: &TempDir) -> (String, String) {
@@ -55,8 +57,9 @@ fn write_test_certs(dir: &TempDir) -> (String, String) {
 }
 
 fn make_config(port: u32, cert: String, key: String, backend_address: String) -> Config {
-    use spooky_config::config::{RouteMatch, Upstream};
     use std::collections::HashMap;
+
+    use spooky_config::config::{RouteMatch, Upstream};
 
     let mut upstream = HashMap::new();
     upstream.insert(
@@ -737,8 +740,9 @@ fn make_config_with_rate_limit(
     new_connections_per_sec: u32,
     new_connections_burst: u32,
 ) -> Config {
-    use spooky_config::config::{Performance, RouteMatch, Upstream};
     use std::collections::HashMap;
+
+    use spooky_config::config::{Performance, RouteMatch, Upstream};
 
     let mut upstream = HashMap::new();
     upstream.insert(

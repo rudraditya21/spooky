@@ -1,5 +1,7 @@
-use std::net::{IpAddr, SocketAddr};
-use std::time::{Duration, SystemTime};
+use std::{
+    net::{IpAddr, SocketAddr},
+    time::{Duration, SystemTime},
+};
 
 use log::{debug, error, info, warn};
 

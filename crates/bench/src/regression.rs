@@ -1,7 +1,10 @@
-use crate::cli::Args;
-use crate::manifest::{GateConfig, GateMetric};
-use crate::report::{BenchCase, BenchReport};
 use std::collections::HashMap;
+
+use crate::{
+    cli::Args,
+    manifest::{GateConfig, GateMetric},
+    report::{BenchCase, BenchReport},
+};
 
 #[derive(Debug, Clone)]
 pub struct RegressionIssue {

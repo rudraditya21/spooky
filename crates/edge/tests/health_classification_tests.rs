@@ -1,8 +1,7 @@
 use http::StatusCode;
 use spooky_config::config::{Backend, HealthCheck};
 use spooky_edge::runtime::health::{HealthClassification, outcome_from_status};
-use spooky_lb::backend::HealthTransition;
-use spooky_lb::backend_pool::BackendPool;
+use spooky_lb::{backend::HealthTransition, backend_pool::BackendPool};
 
 /// Mock setup for backend pool testing
 fn create_test_backend_pool() -> BackendPool {

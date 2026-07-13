@@ -1,5 +1,6 @@
-use crate::backend_pool::BackendPool;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+use crate::backend_pool::BackendPool;
 
 pub struct RoundRobin {
     next: usize,

@@ -1,9 +1,10 @@
-use crate::cli::Args;
-use crate::io::load_release_index;
-use crate::io::write_release_index;
-use crate::report::ReleaseBaselineEntry;
-use std::fs;
-use std::path::PathBuf;
+use std::{fs, path::PathBuf};
+
+use crate::{
+    cli::Args,
+    io::{load_release_index, write_release_index},
+    report::ReleaseBaselineEntry,
+};
 
 pub fn run_promotion(args: &Args) -> Result<(), String> {
     let release = args

@@ -1,6 +1,6 @@
-use crate::routing::decision::RouteDecisionReason;
-use crate::routing::matcher::best_matching_route_with_reason;
-use crate::routing::route::IndexedRoute;
+use crate::routing::{
+    decision::RouteDecisionReason, matcher::best_matching_route_with_reason, route::IndexedRoute,
+};
 
 #[derive(Default)]
 pub struct TrieNode {

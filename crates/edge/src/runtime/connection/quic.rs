@@ -1,8 +1,11 @@
+use std::{
+    collections::{HashMap, HashSet},
+    net::SocketAddr,
+    sync::Arc,
+    time::Instant,
+};
+
 use crate::runtime::connection::request::RequestEnvelope;
-use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Instant;
 
 pub struct QuicConnection {
     pub quic: quiche::Connection,

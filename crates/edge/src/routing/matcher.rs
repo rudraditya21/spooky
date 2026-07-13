@@ -1,6 +1,8 @@
-use crate::routing::decision::{RouteDecisionReason, RoutePreference, route_preference_reason};
-use crate::routing::route::{HostLookupResult, HostMatchKind, IndexedRoute, RouteCandidate};
-use crate::routing::util::prefix_boundary_matches;
+use crate::routing::{
+    decision::{RouteDecisionReason, RoutePreference, route_preference_reason},
+    route::{HostLookupResult, HostMatchKind, IndexedRoute, RouteCandidate},
+    util::prefix_boundary_matches,
+};
 
 #[inline(always)]
 fn compare_route(current: IndexedRoute, candidate: IndexedRoute) -> RoutePreference {

@@ -1,5 +1,7 @@
-use crate::backend_pool::BackendPool;
-use crate::hash::{expected_ring_entries, hash_backend_replica, hash64};
+use crate::{
+    backend_pool::BackendPool,
+    hash::{expected_ring_entries, hash_backend_replica, hash64},
+};
 
 pub struct ConsistentHash {
     pub replicas: u32,

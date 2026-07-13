@@ -1,14 +1,14 @@
-use crate::routing::decision::{RouteDecision, RouteDecisionReason, RoutePreference};
-use crate::routing::host::{
-    ConfiguredHostPattern, normalize_host_for_routing, parse_configured_host_pattern,
-};
-use crate::routing::matcher::{
-    compare_route_candidate, prefer_host_lookup_result, prefer_route_candidate,
-};
-use crate::routing::route::{HostLookupResult, HostMatchKind, IndexedRoute, RouteCandidate};
-use crate::routing::trie::RouteTrie;
-use spooky_config::config::Upstream;
 use std::collections::HashMap;
+
+use spooky_config::config::Upstream;
+
+use crate::routing::{
+    decision::{RouteDecision, RouteDecisionReason, RoutePreference},
+    host::{ConfiguredHostPattern, normalize_host_for_routing, parse_configured_host_pattern},
+    matcher::{compare_route_candidate, prefer_host_lookup_result, prefer_route_candidate},
+    route::{HostLookupResult, HostMatchKind, IndexedRoute, RouteCandidate},
+    trie::RouteTrie,
+};
 pub struct RouteIndex {
     host_tries: HashMap<String, RouteTrie>,
     pub wildcard_host_tries: HashMap<String, RouteTrie>,

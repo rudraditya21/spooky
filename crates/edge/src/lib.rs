@@ -18,10 +18,10 @@ pub use quic_listener::configure_async_runtime;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use core::net::SocketAddr;
-    use std::sync::atomic::Ordering;
-    use std::time::Duration;
+    use std::{sync::atomic::Ordering, time::Duration};
+
+    use super::*;
 
     #[test]
     fn metrics_render_includes_route_percentiles() {

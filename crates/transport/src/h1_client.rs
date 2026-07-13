@@ -1,8 +1,8 @@
-use http_body_util::combinators::BoxBody;
-use hyper::Request;
-use hyper::body::Bytes;
-use hyper_util::client::legacy::Client;
 use std::convert::Infallible;
+
+use http_body_util::combinators::BoxBody;
+use hyper::{Request, body::Bytes};
+use hyper_util::client::legacy::Client;
 
 use crate::h2_client::{
     ConnectObserver, DEFAULT_CONNECT_TIMEOUT, DEFAULT_MAX_IDLE_PER_HOST, DEFAULT_POOL_IDLE_TIMEOUT,

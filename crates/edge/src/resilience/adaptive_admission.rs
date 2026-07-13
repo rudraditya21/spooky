@@ -1,6 +1,10 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 pub struct AdaptiveAdmission {
     enabled: bool,
     min_limit: usize,
