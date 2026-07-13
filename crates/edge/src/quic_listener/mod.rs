@@ -83,7 +83,8 @@ use crate::{
     outcome_from_status,
     resilience::route_queue::RouteQueueRejection,
     resilience::runtime::RuntimeResilience,
-    route_index::{RouteDecisionReason, RouteIndex},
+    routing::decision::RouteDecisionReason,
+    routing::index::RouteIndex,
     types::{
         ListenerTlsInventory, ListenerTlsReloadState, ListenerTlsReloadStore,
         QuicConnectionErrorSnapshot, RuntimeBackendResolution, RuntimeBackendResolutionStore,

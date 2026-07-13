@@ -32,7 +32,7 @@ use crate::constants::MAX_DATAGRAM_SIZE_BYTES;
 use crate::resilience::adaptive_admission::AdaptivePermit;
 use crate::resilience::route_queue::RouteQueuePermit;
 use crate::resilience::runtime::RuntimeResilience;
-use crate::route_index;
+use crate::routing::index::RouteIndex;
 use crate::watchdog::coordinator::WatchdogCoordinator;
 
 pub struct SharedRuntimeState {
@@ -46,7 +46,7 @@ pub struct SharedRuntimeState {
     pub(crate) upstream_pools: HashMap<String, Arc<RwLock<UpstreamPool>>>,
     pub(crate) upstream_inflight: HashMap<String, Arc<Semaphore>>,
     pub(crate) global_inflight: Arc<Semaphore>,
-    pub(crate) routing_index: Arc<route_index::RouteIndex>,
+    pub(crate) routing_index: Arc<RouteIndex>,
     pub(crate) metrics: Arc<Metrics>,
     pub(crate) resilience: Arc<RuntimeResilience>,
     pub(crate) watchdog: Arc<WatchdogCoordinator>,
@@ -202,7 +202,7 @@ pub struct QUICListener {
     pub upstream_pools: HashMap<String, Arc<RwLock<UpstreamPool>>>,
     pub upstream_inflight: HashMap<String, Arc<Semaphore>>,
     pub global_inflight: Arc<Semaphore>,
-    pub(crate) routing_index: Arc<route_index::RouteIndex>,
+    pub(crate) routing_index: Arc<RouteIndex>,
     pub metrics: Arc<Metrics>,
     pub resilience: Arc<RuntimeResilience>,
     pub watchdog: Arc<WatchdogCoordinator>,
