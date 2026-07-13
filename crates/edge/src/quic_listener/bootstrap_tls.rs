@@ -29,10 +29,10 @@ use spooky_lb::upstream_pool::UpstreamPool;
 use spooky_transport::transport_pool::UpstreamTransportPool;
 
 use crate::{
-    Metrics, REQUEST_ID_COUNTER, RouteOutcome, SharedRuntimeState,
-    resilience::runtime::RuntimeResilience,
-    routing::index::RouteIndex,
-    types::{ListenerTlsReloadStore, RuntimeBackendResolutionStore, RuntimeBundleHandle},
+    Metrics, REQUEST_ID_COUNTER, RouteOutcome, resilience::runtime::RuntimeResilience,
+    routing::index::RouteIndex, runtime::backend::store::RuntimeBackendResolutionStore,
+    runtime::bundle::RuntimeBundleHandle, runtime::shared_state::SharedRuntimeState,
+    runtime::tls::store::ListenerTlsReloadStore,
 };
 
 use super::runtime_endpoint::RuntimeConnectionSlotGuard;

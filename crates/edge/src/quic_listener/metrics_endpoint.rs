@@ -11,7 +11,7 @@ use spooky_config::config::MetricsEndpoint;
 use spooky_errors::ProxyError;
 
 use crate::Metrics;
-use crate::types::RuntimeBundleHandle;
+use crate::runtime::bundle::RuntimeBundleHandle;
 
 use super::runtime_endpoint::RuntimeConnectionSlotGuard;
 use super::{QUICListener, runtime_handle, spawn_supervised_async_task};

@@ -19,7 +19,7 @@ use tempfile::tempdir;
 use super::is_bodyless_request_mode;
 
 use crate::cid_radix::CidRadix;
-use crate::{REQUEST_ID_COUNTER, StreamAdmissionState};
+use crate::{REQUEST_ID_COUNTER, runtime::connection::stream::StreamAdmissionState};
 use http::{HeaderMap, HeaderValue, StatusCode};
 
 use std::collections::HashSet;
@@ -946,15 +946,15 @@ fn resolve_backend_uses_configured_header_lb_key() {
 fn active_health_check_classification_matches_shared_policy() {
     assert!(matches!(
         classify_active_health_check_response(StatusCode::MOVED_PERMANENTLY),
-        crate::HealthClassification::Success
+        crate::runtime::health::HealthClassification::Success
     ));
     assert!(matches!(
         classify_active_health_check_response(StatusCode::BAD_REQUEST),
-        crate::HealthClassification::Neutral
+        crate::runtime::health::HealthClassification::Neutral
     ));
     assert!(matches!(
         classify_active_health_check_response(StatusCode::BAD_GATEWAY),
-        crate::HealthClassification::Failure
+        crate::runtime::health::HealthClassification::Failure
     ));
 }
 
@@ -1170,10 +1170,10 @@ fn bodyless_request_mode_only_applies_to_empty_get_and_head() {
 
 #[test]
 fn connect_can_poll_upstream_before_request_fin() {
-    let (_tx, rx) = oneshot::channel::<crate::UpstreamResult>();
+    let (_tx, rx) = oneshot::channel::<crate::runtime::connection::response::UpstreamResult>();
     let mut req = make_envelope(StreamPhase::ReceivingRequest);
     req.method = "CONNECT".to_string();
-    req.tunnel_mode = crate::types::TunnelMode::Connect;
+    req.tunnel_mode = crate::runtime::connection::stream::TunnelMode::Connect;
     req.request_fin_received = false;
     req.upstream_result_rx = Some(rx);
     assert!(can_poll_upstream_result(&req));
@@ -1181,7 +1181,7 @@ fn connect_can_poll_upstream_before_request_fin() {
 
 #[test]
 fn non_connect_requires_request_completion_before_upstream_poll() {
-    let (_tx, rx) = oneshot::channel::<crate::UpstreamResult>();
+    let (_tx, rx) = oneshot::channel::<crate::runtime::connection::response::UpstreamResult>();
     let mut req = make_envelope(StreamPhase::AwaitingUpstream);
     req.method = "GET".to_string();
     req.request_fin_received = false;
@@ -1756,7 +1756,7 @@ fn sweep_partial_batch_clears_only_removed_entries() {
 
 use crate::resilience::adaptive_admission::AdaptiveAdmission;
 use crate::resilience::route_queue::RouteQueueLimiter;
-use crate::{RequestEnvelope, StreamPhase};
+use crate::runtime::connection::{request::RequestEnvelope, stream::StreamPhase};
 use std::time::Instant;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
@@ -1802,7 +1802,7 @@ fn make_envelope(phase: StreamPhase) -> RequestEnvelope {
         auth_abort: None,
         auth_fail_open: false,
         auth_deadline: None,
-        tunnel_mode: crate::types::TunnelMode::None,
+        tunnel_mode: crate::runtime::connection::stream::TunnelMode::None,
         phase,
         admission_state: StreamAdmissionState::ReadyToForward,
         request_fin_received: false,
@@ -1867,32 +1867,35 @@ fn abort_stream_receiving_request_releases_permits() {
 #[test]
 fn abort_stream_waiting_for_auth_clears_async_auth_state() {
     let metrics = crate::Metrics::default();
-    let (auth_tx, auth_rx) = oneshot::channel::<crate::types::ExternalAuthResult>();
+    let (auth_tx, auth_rx) =
+        oneshot::channel::<crate::runtime::connection::auth::ExternalAuthResult>();
     let mut req = make_envelope(StreamPhase::ReceivingRequest);
     req.admission_state = StreamAdmissionState::WaitingForAuth;
     req.auth_result_rx = Some(auth_rx);
     req.auth_deadline = Some(Instant::now() + std::time::Duration::from_secs(1));
-    req.pending_forward = Some(Arc::new(crate::PendingForward {
-        method: Arc::<str>::from("POST"),
-        path: Arc::<str>::from("/upload"),
-        authority: Some(Arc::<str>::from("example.com")),
-        headers: Arc::new(vec![quiche::h3::Header::new(b":method", b"POST")]),
-        upstream_name: Arc::<str>::from("api"),
-        route_reason: Arc::<str>::from("path_prefix"),
-        route_path_len: 7,
-        route_host_specific: false,
-        backend_addr: Arc::<str>::from("http://127.0.0.1:8080"),
-        backend_index: 0,
-        backend_lb: None,
-        client_addr: "127.0.0.1:443".parse().expect("client addr"),
-        request_id: 42,
-        trace_id: None,
-        span_id: None,
-        traceparent: None,
-        host_policy: Default::default(),
-        forwarded_header_policy: Default::default(),
-        auth_header_mutations: Vec::new(),
-    }));
+    req.pending_forward = Some(Arc::new(
+        crate::runtime::connection::request::PendingForward {
+            method: Arc::<str>::from("POST"),
+            path: Arc::<str>::from("/upload"),
+            authority: Some(Arc::<str>::from("example.com")),
+            headers: Arc::new(vec![quiche::h3::Header::new(b":method", b"POST")]),
+            upstream_name: Arc::<str>::from("api"),
+            route_reason: Arc::<str>::from("path_prefix"),
+            route_path_len: 7,
+            route_host_specific: false,
+            backend_addr: Arc::<str>::from("http://127.0.0.1:8080"),
+            backend_index: 0,
+            backend_lb: None,
+            client_addr: "127.0.0.1:443".parse().expect("client addr"),
+            request_id: 42,
+            trace_id: None,
+            span_id: None,
+            traceparent: None,
+            host_policy: Default::default(),
+            forwarded_header_policy: Default::default(),
+            auth_header_mutations: Vec::new(),
+        },
+    ));
 
     let phase = abort_stream(&mut req, &metrics);
 
@@ -1903,9 +1906,11 @@ fn abort_stream_waiting_for_auth_clears_async_auth_state() {
     assert!(req.pending_forward.is_none());
     assert!(
         auth_tx
-            .send(Ok(crate::types::ExternalAuthDecision::Allow {
-                request_header_mutations: Vec::new(),
-            }))
+            .send(Ok(
+                crate::runtime::connection::auth::ExternalAuthDecision::Allow {
+                    request_header_mutations: Vec::new(),
+                }
+            ))
             .is_err()
     );
 }
@@ -1915,7 +1920,8 @@ fn abort_stream_waiting_for_auth_clears_async_auth_state() {
 #[test]
 fn abort_stream_awaiting_upstream_cancels_oneshot() {
     let metrics = crate::Metrics::default();
-    let (result_tx, result_rx) = oneshot::channel::<crate::UpstreamResult>();
+    let (result_tx, result_rx) =
+        oneshot::channel::<crate::runtime::connection::response::UpstreamResult>();
 
     let mut req = make_envelope(StreamPhase::AwaitingUpstream);
     req.upstream_result_rx = Some(result_rx);
@@ -1929,9 +1935,9 @@ fn abort_stream_awaiting_upstream_cancels_oneshot() {
     );
 
     // Sending on the now-orphaned sender should return Err (closed).
-    let send_result = result_tx.send(crate::UpstreamResult {
+    let send_result = result_tx.send(crate::runtime::connection::response::UpstreamResult {
         forward: Err(spooky_errors::ProxyError::Transport("test".into())),
-        hedge: crate::HedgeTelemetry::default(),
+        hedge: crate::runtime::connection::response::HedgeTelemetry::default(),
         retry_count: 0,
         retry_attempt_reason: None,
         retry_denial_reason: None,
@@ -1948,11 +1954,12 @@ fn abort_stream_awaiting_upstream_cancels_oneshot() {
 #[test]
 fn abort_stream_sending_response_closes_chunk_channel() {
     let metrics = crate::Metrics::default();
-    let (chunk_tx, chunk_rx) = mpsc::channel::<crate::ResponseChunk>(4);
+    let (chunk_tx, chunk_rx) =
+        mpsc::channel::<crate::runtime::connection::response::ResponseChunk>(4);
 
     let mut req = make_envelope(StreamPhase::SendingResponse);
     req.response_chunk_rx = Some(chunk_rx);
-    req.pending_chunk = Some(crate::ResponseChunk::End);
+    req.pending_chunk = Some(crate::runtime::connection::response::ResponseChunk::End);
 
     let phase = abort_stream(&mut req, &metrics);
 
@@ -1967,7 +1974,7 @@ fn abort_stream_sending_response_closes_chunk_channel() {
     );
 
     // The body-pump task's sender should observe a closed channel.
-    let send_result = chunk_tx.try_send(crate::ResponseChunk::End);
+    let send_result = chunk_tx.try_send(crate::runtime::connection::response::ResponseChunk::End);
     assert!(
         send_result.is_err(),
         "body-pump task send must fail after receiver dropped"
@@ -1985,15 +1992,17 @@ fn abort_stream_upstream_error_releases_all_resources() {
     let global_permit = global_sem.clone().try_acquire_owned().unwrap();
     let upstream_permit = upstream_sem.clone().try_acquire_owned().unwrap();
 
-    let (_result_tx, result_rx) = oneshot::channel::<crate::UpstreamResult>();
-    let (chunk_tx, chunk_rx) = mpsc::channel::<crate::ResponseChunk>(4);
+    let (_result_tx, result_rx) =
+        oneshot::channel::<crate::runtime::connection::response::UpstreamResult>();
+    let (chunk_tx, chunk_rx) =
+        mpsc::channel::<crate::runtime::connection::response::ResponseChunk>(4);
 
     let mut req = make_envelope(StreamPhase::SendingResponse);
     req.global_inflight_permit = Some(global_permit);
     req.upstream_inflight_permit = Some(upstream_permit);
     req.upstream_result_rx = Some(result_rx);
     req.response_chunk_rx = Some(chunk_rx);
-    req.pending_chunk = Some(crate::ResponseChunk::End);
+    req.pending_chunk = Some(crate::runtime::connection::response::ResponseChunk::End);
 
     let phase = abort_stream(&mut req, &metrics);
 
@@ -2013,7 +2022,11 @@ fn abort_stream_upstream_error_releases_all_resources() {
     assert!(req.pending_chunk.is_none());
 
     // Body-pump task sender sees closed channel.
-    assert!(chunk_tx.try_send(crate::ResponseChunk::End).is_err());
+    assert!(
+        chunk_tx
+            .try_send(crate::runtime::connection::response::ResponseChunk::End)
+            .is_err()
+    );
 }
 
 /// Verify abort_stream is idempotent: calling it twice must not panic or

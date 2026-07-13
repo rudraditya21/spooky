@@ -46,8 +46,8 @@ pub(crate) struct ConnectionRoutes {
     pub peer_address: std::net::SocketAddr,
 }
 
-impl From<&crate::QuicConnection> for ConnectionRoutes {
-    fn from(c: &crate::QuicConnection) -> Self {
+impl From<&crate::runtime::connection::quic::QuicConnection> for ConnectionRoutes {
+    fn from(c: &crate::runtime::connection::quic::QuicConnection) -> Self {
         Self {
             primary_scid: Arc::clone(&c.primary_scid),
             routing_scids: c.routing_scids.clone(),

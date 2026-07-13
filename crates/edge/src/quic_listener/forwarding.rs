@@ -1,9 +1,11 @@
 use super::*;
-use crate::types::{
+use crate::runtime::connection::auth::{
     ExternalAuthChallengeResponse, ExternalAuthDecision, ExternalAuthDenyResponse,
     ExternalAuthRedirectResponse, ExternalAuthResult,
 };
-use crate::{PendingForward, PendingHeaderMutation, StreamAdmissionState};
+use crate::runtime::connection::{
+    auth::PendingHeaderMutation, request::PendingForward, stream::StreamAdmissionState,
+};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use hyper_rustls::HttpsConnectorBuilder;
@@ -1644,7 +1646,8 @@ impl QUICListener {
         let bodyless_mode = req.bodyless_mode;
         let request_id = req.request_id;
         let fut = async move {
-            let mut hedge_telemetry = crate::HedgeTelemetry::default();
+            let mut hedge_telemetry =
+                crate::runtime::connection::response::HedgeTelemetry::default();
             let mut retry_count: u8 = 0;
             let mut retry_attempt_reason: Option<RetryReason> = None;
             let mut retry_denial_reason: Option<RetryReason> = None;
@@ -3403,7 +3406,7 @@ impl QUICListener {
                             forward: Err(ProxyError::Transport(
                                 "upstream task dropped sender".into(),
                             )),
-                            hedge: crate::HedgeTelemetry::default(),
+                            hedge: crate::runtime::connection::response::HedgeTelemetry::default(),
                             retry_count: 0,
                             retry_attempt_reason: None,
                             retry_denial_reason: None,
@@ -3870,16 +3873,18 @@ impl QUICListener {
                             {
                                 let transition = pool.write().ok().and_then(|mut p| {
                                     match outcome_from_status(status) {
-                                        crate::HealthClassification::Success => {
+                                        crate::runtime::health::HealthClassification::Success => {
                                             p.pool.mark_success(idx)
                                         }
-                                        crate::HealthClassification::Failure => {
+                                        crate::runtime::health::HealthClassification::Failure => {
                                             p.pool.mark_request_failure(
                                                 idx,
                                                 HealthFailureReason::HttpStatus5xx,
                                             )
                                         }
-                                        crate::HealthClassification::Neutral => None,
+                                        crate::runtime::health::HealthClassification::Neutral => {
+                                            None
+                                        }
                                     }
                                 });
                                 if let Some(t) = transition {
