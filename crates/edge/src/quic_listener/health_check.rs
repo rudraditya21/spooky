@@ -23,6 +23,7 @@ impl QUICListener {
         }
 
         let mut grouped_jobs: HashMap<u64, Vec<HealthCheckJob>> = HashMap::new();
+        #[allow(clippy::for_kv_map)]
         for (_upstream_name, upstream_pool) in upstream_pools.iter() {
             let pool = match upstream_pool.read() {
                 Ok(pool) => pool,

@@ -1277,7 +1277,7 @@ impl QUICListener {
         // After handshake, client will use server's SCID as DCID in subsequent packets
         debug!(
             "Creating new connection with server SCID: {:02x?}",
-            &scid_bytes
+            scid_bytes
         );
         Some((connection, Arc::from(&scid_bytes[..])))
     }
@@ -1733,7 +1733,7 @@ impl QUICListener {
             let new_primary = self.sync_connection_routes(&mut connection);
             debug!(
                 "Storing connection with key: {:02x?} (previous: {:02x?})",
-                &new_primary, &current_primary
+                new_primary, current_primary
             );
             self.peer_routes
                 .insert(connection.peer_address, Arc::clone(&new_primary));
