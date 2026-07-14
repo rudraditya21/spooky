@@ -655,55 +655,6 @@ pub(super) fn start_external_auth_task(
 }
 
 impl QUICListener {
-    fn send_external_auth_decision_response(
-        h3: &mut quiche::h3::Connection,
-        quic: &mut quiche::Connection,
-        stream_id: u64,
-        decision: &ExternalAuthDecision,
-    ) -> Result<(), quiche::h3::Error> {
-        match decision {
-            ExternalAuthDecision::Allow { .. } => Ok(()),
-            ExternalAuthDecision::Deny(response) => Self::send_response_with_headers(
-                h3,
-                quic,
-                stream_id,
-                response.status,
-                &response.body,
-                &response.headers,
-            ),
-            ExternalAuthDecision::Redirect(response) => {
-                let mut headers = response.headers.clone();
-                headers.push((
-                    http::header::LOCATION.as_str().to_string(),
-                    response.location.clone(),
-                ));
-                Self::send_response_with_headers(
-                    h3,
-                    quic,
-                    stream_id,
-                    response.status,
-                    &[],
-                    &headers,
-                )
-            }
-            ExternalAuthDecision::Challenge(response) => {
-                let mut headers = response.headers.clone();
-                headers.push((
-                    http::header::WWW_AUTHENTICATE.as_str().to_string(),
-                    response.www_authenticate.clone(),
-                ));
-                Self::send_response_with_headers(
-                    h3,
-                    quic,
-                    stream_id,
-                    response.status,
-                    &response.body,
-                    &headers,
-                )
-            }
-        }
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(super) fn complete_auth_result(
         stream_id: u64,
