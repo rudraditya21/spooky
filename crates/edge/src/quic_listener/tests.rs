@@ -2064,7 +2064,7 @@ fn traceparent_parser_rejects_invalid_value() {
 #[test]
 fn inflight_micro_wait_acquires_available_permit_without_blocking() {
     let semaphore = Arc::new(Semaphore::new(1));
-    let acquired = super::QUICListener::try_acquire_owned_with_micro_wait(
+    let acquired = super::admission::try_acquire_owned_with_micro_wait(
         Arc::clone(&semaphore),
         Duration::from_millis(50),
     );
@@ -2080,7 +2080,7 @@ fn inflight_micro_wait_times_out_without_permit() {
         .try_acquire_owned()
         .expect("acquire initial permit");
 
-    let acquired = super::QUICListener::try_acquire_owned_with_micro_wait(
+    let acquired = super::admission::try_acquire_owned_with_micro_wait(
         Arc::clone(&semaphore),
         Duration::from_millis(1),
     );

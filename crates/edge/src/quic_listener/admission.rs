@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::{
     collections::HashMap,
     collections::HashSet,
@@ -32,13 +30,13 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AuthChallengeKind {
+pub(super) enum AuthChallengeKind {
     ApiKey,
     Bearer,
 }
 
 impl AuthChallengeKind {
-    pub(crate) fn as_www_authenticate(self) -> &'static str {
+    pub(super) fn as_www_authenticate(self) -> &'static str {
         match self {
             Self::ApiKey => "ApiKey",
             Self::Bearer => "Bearer",
@@ -47,7 +45,7 @@ impl AuthChallengeKind {
 }
 
 impl OverloadDecisionReason {
-    pub(crate) fn metrics_reason(self) -> OverloadShedReason {
+    pub(super) fn metrics_reason(self) -> OverloadShedReason {
         match self {
             Self::Brownout => OverloadShedReason::Brownout,
             Self::AdaptiveAdmission => OverloadShedReason::AdaptiveAdmission,
@@ -71,23 +69,23 @@ impl OverloadDecisionReason {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct UnauthorizedDecision {
-    pub(crate) challenge: AuthChallengeKind,
-    pub(crate) status: StatusCode,
-    pub(crate) body: &'static [u8],
+pub(super) struct UnauthorizedDecision {
+    pub(super) challenge: AuthChallengeKind,
+    pub(super) status: StatusCode,
+    pub(super) body: &'static [u8],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RateLimitedDecision {
-    pub(crate) rule_name: String,
-    pub(crate) route: String,
-    pub(crate) status: StatusCode,
-    pub(crate) body: &'static [u8],
-    pub(crate) retry_after_seconds: u32,
+pub(super) struct RateLimitedDecision {
+    pub(super) rule_name: String,
+    pub(super) route: String,
+    pub(super) status: StatusCode,
+    pub(super) body: &'static [u8],
+    pub(super) retry_after_seconds: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OverloadDecisionReason {
+pub(super) enum OverloadDecisionReason {
     Brownout,
     AdaptiveAdmission,
     RouteCap,
@@ -97,54 +95,54 @@ pub(crate) enum OverloadDecisionReason {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct OverloadDecision {
-    pub(crate) reason: OverloadDecisionReason,
-    pub(crate) status: StatusCode,
-    pub(crate) body: &'static [u8],
-    pub(crate) retry_after_seconds: u32,
+pub(super) struct OverloadDecision {
+    pub(super) reason: OverloadDecisionReason,
+    pub(super) status: StatusCode,
+    pub(super) body: &'static [u8],
+    pub(super) retry_after_seconds: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AdmissionRejectionResponse {
-    pub(crate) status: StatusCode,
-    pub(crate) body: &'static [u8],
-    pub(crate) www_authenticate: Option<&'static str>,
-    pub(crate) retry_after_seconds: Option<u32>,
+pub(super) struct AdmissionRejectionResponse {
+    pub(super) status: StatusCode,
+    pub(super) body: &'static [u8],
+    pub(super) www_authenticate: Option<&'static str>,
+    pub(super) retry_after_seconds: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct PostAuthAdmissionFailure {
-    pub(crate) status: StatusCode,
-    pub(crate) body: &'static [u8],
-    pub(crate) overload_reason: Option<OverloadDecisionReason>,
-    pub(crate) route_outcome: Option<RouteOutcome>,
-    pub(crate) observe_adaptive_overload: bool,
+pub(super) struct PostAuthAdmissionFailure {
+    pub(super) status: StatusCode,
+    pub(super) body: &'static [u8],
+    pub(super) overload_reason: Option<OverloadDecisionReason>,
+    pub(super) route_outcome: Option<RouteOutcome>,
+    pub(super) observe_adaptive_overload: bool,
 }
 
-pub(crate) struct PostAuthAdmissionReady {
-    pub(crate) backend_index: usize,
-    pub(crate) upstream_pool: Arc<RwLock<UpstreamPool>>,
-    pub(crate) global_permit: OwnedSemaphorePermit,
-    pub(crate) upstream_permit: OwnedSemaphorePermit,
-    pub(crate) adaptive_permit: AdaptivePermit,
-    pub(crate) route_queue_permit: RouteQueuePermit,
-    pub(crate) waited_for_global_permit: bool,
-    pub(crate) waited_for_upstream_permit: bool,
+pub(super) struct PostAuthAdmissionReady {
+    pub(super) backend_index: usize,
+    pub(super) upstream_pool: Arc<RwLock<UpstreamPool>>,
+    pub(super) global_permit: OwnedSemaphorePermit,
+    pub(super) upstream_permit: OwnedSemaphorePermit,
+    pub(super) adaptive_permit: AdaptivePermit,
+    pub(super) route_queue_permit: RouteQueuePermit,
+    pub(super) waited_for_global_permit: bool,
+    pub(super) waited_for_upstream_permit: bool,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) enum PostAuthAdmissionRejection {
+pub(super) enum PostAuthAdmissionRejection {
     Overloaded(OverloadDecision),
     Failed(PostAuthAdmissionFailure),
 }
 
-pub(crate) enum PostAuthAdmissionExecution {
+pub(super) enum PostAuthAdmissionExecution {
     Ready(PostAuthAdmissionReady),
     Rejected(PostAuthAdmissionRejection),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum AdmissionPolicyDecision {
+pub(super) enum AdmissionPolicyDecision {
     AdmitReady,
     Unauthorized(UnauthorizedDecision),
     RateLimited(RateLimitedDecision),
@@ -152,7 +150,7 @@ pub(crate) enum AdmissionPolicyDecision {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn evaluate_forwarding_pre_admission_policy<F>(
+pub(super) fn evaluate_forwarding_pre_admission_policy<F>(
     policy: &RuntimeUpstreamPolicy,
     header_lookup: Option<&LbHeaderLookup<'_>>,
     brownout: &BrownoutController,
@@ -178,7 +176,7 @@ where
     evaluate_scoped_rate_limit_policy(scoped_rate_limits, route, key_for_rule)
 }
 
-pub(crate) fn evaluate_local_auth_policy(
+pub(super) fn evaluate_local_auth_policy(
     policy: &RuntimeUpstreamPolicy,
     header_lookup: Option<&LbHeaderLookup<'_>>,
 ) -> AdmissionPolicyDecision {
@@ -201,7 +199,7 @@ pub(crate) fn evaluate_local_auth_policy(
     AdmissionPolicyDecision::AdmitReady
 }
 
-pub(crate) fn evaluate_scoped_rate_limit_policy<F>(
+pub(super) fn evaluate_scoped_rate_limit_policy<F>(
     scoped_rate_limits: &ScopedRateLimiters,
     route: &str,
     key_for_rule: F,
@@ -222,7 +220,7 @@ where
     })
 }
 
-pub(crate) fn evaluate_brownout_policy(
+pub(super) fn evaluate_brownout_policy(
     brownout: &BrownoutController,
     inflight_percent: u8,
     route: &str,
@@ -236,7 +234,7 @@ pub(crate) fn evaluate_brownout_policy(
     overload_decision(OverloadDecisionReason::Brownout, retry_after_seconds)
 }
 
-pub(crate) fn overload_decision(
+fn overload_decision(
     reason: OverloadDecisionReason,
     retry_after_seconds: u32,
 ) -> AdmissionPolicyDecision {
@@ -248,7 +246,7 @@ pub(crate) fn overload_decision(
     })
 }
 
-pub(crate) fn overload_decision_for_route_queue_rejection(
+fn overload_decision_for_route_queue_rejection(
     rejection: RouteQueueRejection,
     retry_after_seconds: u32,
 ) -> AdmissionPolicyDecision {
@@ -259,7 +257,7 @@ pub(crate) fn overload_decision_for_route_queue_rejection(
     overload_decision(reason, retry_after_seconds)
 }
 
-pub(crate) fn admission_rejection_response(
+pub(super) fn admission_rejection_response(
     decision: &AdmissionPolicyDecision,
 ) -> Option<AdmissionRejectionResponse> {
     match decision {
@@ -286,7 +284,7 @@ pub(crate) fn admission_rejection_response(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn execute_forwarding_post_auth_admission(
+pub(super) fn execute_forwarding_post_auth_admission(
     resilience: &RuntimeResilience,
     upstream_name: &str,
     upstream_pool: Option<&Arc<RwLock<UpstreamPool>>>,
@@ -399,7 +397,7 @@ pub(crate) fn execute_forwarding_post_auth_admission(
     })
 }
 
-pub(crate) fn try_acquire_owned_with_micro_wait(
+pub(super) fn try_acquire_owned_with_micro_wait(
     semaphore: Arc<Semaphore>,
     _wait_budget: Duration,
 ) -> Result<(OwnedSemaphorePermit, bool), TryAcquireError> {
@@ -408,7 +406,7 @@ pub(crate) fn try_acquire_owned_with_micro_wait(
     semaphore.try_acquire_owned().map(|permit| (permit, false))
 }
 
-pub(crate) fn api_key_is_authorized(
+pub(super) fn api_key_is_authorized(
     policy: &RuntimeUpstreamPolicy,
     header_lookup: Option<&LbHeaderLookup<'_>>,
 ) -> bool {
@@ -427,7 +425,7 @@ pub(crate) fn api_key_is_authorized(
             .any(|expected| bool::from(provided.as_bytes().ct_eq(expected.as_bytes())))
 }
 
-pub(crate) fn jwt_is_authorized(
+pub(super) fn jwt_is_authorized(
     policy: &RuntimeUpstreamPolicy,
     header_lookup: Option<&LbHeaderLookup<'_>>,
 ) -> bool {
@@ -447,7 +445,7 @@ pub(crate) fn jwt_is_authorized(
     jwt_claims_satisfy_rbac(policy, &claims)
 }
 
-pub(crate) fn validated_hs256_jwt_claims(
+pub(super) fn validated_hs256_jwt_claims(
     token: &str,
     jwt: &RuntimeJwtAuth,
     now: SystemTime,
@@ -531,7 +529,7 @@ pub(crate) fn validated_hs256_jwt_claims(
     Some(claims)
 }
 
-pub(crate) fn jwt_claims_satisfy_rbac(policy: &RuntimeUpstreamPolicy, claims: &Value) -> bool {
+pub(super) fn jwt_claims_satisfy_rbac(policy: &RuntimeUpstreamPolicy, claims: &Value) -> bool {
     let scopes = jwt_string_claim_values(claims, &["scope", "scp"]);
     let roles = jwt_string_claim_values(claims, &["roles", "role"]);
     policy

@@ -12,11 +12,6 @@ use std::{convert::Infallible, error::Error as StdError};
 
 use spooky_config::config::ScopedRateLimitScope;
 
-#[cfg(test)]
-use serde_json::Value;
-#[cfg(test)]
-use std::time::SystemTime;
-
 use super::*;
 use crate::runtime::connection::{request::PendingForward, stream::StreamAdmissionState};
 
@@ -1058,36 +1053,6 @@ impl QUICListener {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(crate) fn api_key_is_authorized(
-        policy: &RuntimeUpstreamPolicy,
-        header_lookup: Option<&LbHeaderLookup<'_>>,
-    ) -> bool {
-        crate::quic_listener::admission::api_key_is_authorized(policy, header_lookup)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn jwt_is_authorized(
-        policy: &RuntimeUpstreamPolicy,
-        header_lookup: Option<&LbHeaderLookup<'_>>,
-    ) -> bool {
-        crate::quic_listener::admission::jwt_is_authorized(policy, header_lookup)
-    }
-
-    #[cfg(test)]
-    fn validated_hs256_jwt_claims(
-        token: &str,
-        jwt: &spooky_config::runtime::RuntimeJwtAuth,
-        now: SystemTime,
-    ) -> Option<Value> {
-        crate::quic_listener::admission::validated_hs256_jwt_claims(token, jwt, now)
-    }
-
-    #[cfg(test)]
-    fn jwt_claims_satisfy_rbac(policy: &RuntimeUpstreamPolicy, claims: &Value) -> bool {
-        crate::quic_listener::admission::jwt_claims_satisfy_rbac(policy, claims)
-    }
-
     pub(crate) fn resolve_scoped_rate_limit_key(
         rule: &crate::resilience::scoped_rate_limit::ScopedRateLimitRule,
         route: &str,
@@ -1319,12 +1284,17 @@ mod tests {
         let lookup = |name: &str| headers.get(&name.to_ascii_lowercase()).cloned();
         let wrong_lookup = |_: &str| Some("wrong-key".to_string());
 
-        assert!(QUICListener::api_key_is_authorized(&policy, Some(&lookup)));
-        assert!(!QUICListener::api_key_is_authorized(
+        assert!(super::super::admission::api_key_is_authorized(
+            &policy,
+            Some(&lookup)
+        ));
+        assert!(!super::super::admission::api_key_is_authorized(
             &policy,
             Some(&wrong_lookup)
         ));
-        assert!(!QUICListener::api_key_is_authorized(&policy, None));
+        assert!(!super::super::admission::api_key_is_authorized(
+            &policy, None
+        ));
     }
 
     #[test]
@@ -1363,9 +1333,12 @@ mod tests {
             .collect::<std::collections::HashMap<_, _>>();
         let lookup = |name: &str| headers.get(&name.to_ascii_lowercase()).cloned();
 
-        assert!(QUICListener::jwt_is_authorized(&policy, Some(&lookup)));
+        assert!(super::super::admission::jwt_is_authorized(
+            &policy,
+            Some(&lookup)
+        ));
         assert!(
-            QUICListener::validated_hs256_jwt_claims(
+            super::super::admission::validated_hs256_jwt_claims(
                 token.as_str(),
                 policy.upstream_auth.jwt.as_ref().expect("jwt policy"),
                 now
@@ -1380,7 +1353,8 @@ mod tests {
             clock_skew_secs: 30,
         };
         assert!(
-            QUICListener::validated_hs256_jwt_claims(token.as_str(), &wrong_secret, now).is_none()
+            super::super::admission::validated_hs256_jwt_claims(token.as_str(), &wrong_secret, now)
+                .is_none()
         );
 
         let expired = test_hs256_jwt(
@@ -1389,7 +1363,7 @@ mod tests {
             "HS256",
         );
         assert!(
-            QUICListener::validated_hs256_jwt_claims(
+            super::super::admission::validated_hs256_jwt_claims(
                 expired.as_str(),
                 &RuntimeJwtAuth {
                     secret: "jwt-secret".to_string(),
@@ -1426,11 +1400,11 @@ mod tests {
             "roles": ["operator"]
         });
 
-        assert!(QUICListener::jwt_claims_satisfy_rbac(
+        assert!(super::super::admission::jwt_claims_satisfy_rbac(
             &policy,
             &allowed_claims
         ));
-        assert!(!QUICListener::jwt_claims_satisfy_rbac(
+        assert!(!super::super::admission::jwt_claims_satisfy_rbac(
             &policy,
             &denied_claims
         ));

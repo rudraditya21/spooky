@@ -1904,14 +1904,6 @@ impl QUICListener {
         }
     }
 
-    #[cfg(test)]
-    fn try_acquire_owned_with_micro_wait(
-        semaphore: Arc<Semaphore>,
-        wait_budget: Duration,
-    ) -> Result<(tokio::sync::OwnedSemaphorePermit, bool), tokio::sync::TryAcquireError> {
-        admission::try_acquire_owned_with_micro_wait(semaphore, wait_budget)
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn handle_metrics_request(
         req: Request<Incoming>,
