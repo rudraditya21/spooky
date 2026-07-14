@@ -678,7 +678,7 @@ impl QUICListener {
         } else {
             StreamPhase::ReceivingRequest
         };
-        Self::flush_request_buffer(req, &metrics);
+        Self::flush_request_buffer(req, metrics);
         if req.request_fin_received && req.body_buf.is_empty() {
             req.body_tx = None;
             req.phase = StreamPhase::AwaitingUpstream;

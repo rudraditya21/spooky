@@ -54,7 +54,7 @@ impl QUICListener {
                     .adaptive_admission
                     .observe(req.start.elapsed(), true);
                 if let Some(req) = streams.get_mut(&stream_id) {
-                    abort_stream(req, &metrics);
+                    abort_stream(req, metrics);
                 }
                 streams.remove(&stream_id);
                 continue;
@@ -82,14 +82,14 @@ impl QUICListener {
                     .adaptive_admission
                     .observe(req.start.elapsed(), true);
                 if let Some(req) = streams.get_mut(&stream_id) {
-                    abort_stream(req, &metrics);
+                    abort_stream(req, metrics);
                 }
                 streams.remove(&stream_id);
                 continue;
             }
 
             if let Some(req) = streams.get_mut(&stream_id) {
-                Self::flush_request_buffer(req, &metrics);
+                Self::flush_request_buffer(req, metrics);
                 if req.request_fin_received && req.body_buf.is_empty() {
                     req.body_tx = None;
                 }
@@ -137,7 +137,7 @@ impl QUICListener {
                 };
                 if !keep_stream {
                     if let Some(req) = streams.get_mut(&stream_id) {
-                        abort_stream(req, &metrics);
+                        abort_stream(req, metrics);
                     }
                     streams.remove(&stream_id);
                     continue;
@@ -265,7 +265,7 @@ impl QUICListener {
                                 );
                             }
                             if let Some(req) = streams.get_mut(&stream_id) {
-                                abort_stream(req, &metrics);
+                                abort_stream(req, metrics);
                             }
                             streams.remove(&stream_id);
                             continue;
@@ -333,7 +333,7 @@ impl QUICListener {
                                         .observe(req.start.elapsed(), true);
                                 }
                                 if let Some(req) = streams.get_mut(&stream_id) {
-                                    abort_stream(req, &metrics);
+                                    abort_stream(req, metrics);
                                 }
                                 streams.remove(&stream_id);
                                 continue;
@@ -376,7 +376,7 @@ impl QUICListener {
                                             .observe(req.start.elapsed(), true);
                                     }
                                     if let Some(req) = streams.get_mut(&stream_id) {
-                                        abort_stream(req, &metrics);
+                                        abort_stream(req, metrics);
                                     }
                                     streams.remove(&stream_id);
                                     continue;
@@ -645,7 +645,7 @@ impl QUICListener {
                             let route_label = req.upstream_name.as_deref().unwrap_or("unrouted");
                             metrics.record_route(route_label, req.start.elapsed(), route_outcome);
                             Self::record_request_observation(
-                                &metrics,
+                                metrics,
                                 req,
                                 Some(status.as_u16()),
                                 route_outcome,
@@ -657,7 +657,7 @@ impl QUICListener {
                         }
                         if immediate_terminal {
                             if let Some(req) = streams.get_mut(&stream_id) {
-                                abort_stream(req, &metrics);
+                                abort_stream(req, metrics);
                             }
                             streams.remove(&stream_id);
                             continue;
@@ -683,7 +683,7 @@ impl QUICListener {
                                 .observe(req.start.elapsed(), true);
                         }
                         if let Some(req) = streams.get_mut(&stream_id) {
-                            abort_stream(req, &metrics);
+                            abort_stream(req, metrics);
                         }
                         streams.remove(&stream_id);
                         continue;
@@ -699,7 +699,7 @@ impl QUICListener {
 
             if terminal {
                 if let Some(req) = streams.get_mut(&stream_id) {
-                    abort_stream(req, &metrics);
+                    abort_stream(req, metrics);
                 }
                 streams.remove(&stream_id);
             }

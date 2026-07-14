@@ -12,6 +12,7 @@ pub(crate) struct ResolvedBackend {
 }
 
 impl QUICListener {
+    #[allow(clippy::type_complexity)]
     fn resolve_route_target(
         method: &str,
         path: &str,
