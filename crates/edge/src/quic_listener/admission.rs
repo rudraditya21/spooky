@@ -104,6 +104,14 @@ pub(crate) struct OverloadDecision {
     pub(crate) retry_after_seconds: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AdmissionRejectionResponse {
+    pub(crate) status: StatusCode,
+    pub(crate) body: &'static [u8],
+    pub(crate) www_authenticate: Option<&'static str>,
+    pub(crate) retry_after_seconds: Option<u32>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct PostAuthAdmissionFailure {
     pub(crate) status: StatusCode,
@@ -249,6 +257,32 @@ pub(crate) fn overload_decision_for_route_queue_rejection(
         RouteQueueRejection::RouteCap => OverloadDecisionReason::RouteCap,
     };
     overload_decision(reason, retry_after_seconds)
+}
+
+pub(crate) fn admission_rejection_response(
+    decision: &AdmissionPolicyDecision,
+) -> Option<AdmissionRejectionResponse> {
+    match decision {
+        AdmissionPolicyDecision::AdmitReady => None,
+        AdmissionPolicyDecision::Unauthorized(decision) => Some(AdmissionRejectionResponse {
+            status: decision.status,
+            body: decision.body,
+            www_authenticate: Some(decision.challenge.as_www_authenticate()),
+            retry_after_seconds: None,
+        }),
+        AdmissionPolicyDecision::RateLimited(decision) => Some(AdmissionRejectionResponse {
+            status: decision.status,
+            body: decision.body,
+            www_authenticate: None,
+            retry_after_seconds: Some(decision.retry_after_seconds.max(1)),
+        }),
+        AdmissionPolicyDecision::Overloaded(decision) => Some(AdmissionRejectionResponse {
+            status: decision.status,
+            body: decision.body,
+            www_authenticate: None,
+            retry_after_seconds: Some(decision.retry_after_seconds.max(1)),
+        }),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

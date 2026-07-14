@@ -36,7 +36,10 @@ use spooky_transport::transport_pool::UpstreamTransportPool;
 
 use super::{
     BootstrapServiceFuture, BootstrapStreamingBody, QUICListener,
-    admission::{AdmissionPolicyDecision, evaluate_forwarding_pre_admission_policy},
+    admission::{
+        AdmissionPolicyDecision, admission_rejection_response,
+        evaluate_forwarding_pre_admission_policy,
+    },
     bootstrap_resolution_error_response, boxed_full, connection_header_tokens, is_head_method,
     is_websocket_upgrade_request,
     runtime_endpoint::RuntimeConnectionSlotGuard,
@@ -444,9 +447,10 @@ impl QUICListener {
                                     },
                                 );
                                 metrics.set_brownout_active(resilience.brownout.is_active());
+                                let rejection_response = admission_rejection_response(&admission);
                                 match admission {
                                     AdmissionPolicyDecision::AdmitReady => {}
-                                    AdmissionPolicyDecision::Unauthorized(decision) => {
+                                    AdmissionPolicyDecision::Unauthorized(_) => {
                                         metrics.inc_failure();
                                         metrics.inc_policy_denied();
                                         metrics.record_route(
@@ -458,14 +462,19 @@ impl QUICListener {
                                             "Bootstrap request route={} denied by auth policy",
                                             upstream_name
                                         );
+                                        let response = rejection_response.as_ref().expect(
+                                            "unauthorized admission must map to rejection response",
+                                        );
                                         return Ok(Response::builder()
-                                            .status(decision.status)
+                                            .status(response.status)
                                             .header("alt-svc", &alt)
                                             .header(
                                                 "www-authenticate",
-                                                decision.challenge.as_www_authenticate(),
+                                                response.www_authenticate.expect(
+                                                    "unauthorized response must include challenge",
+                                                ),
                                             )
-                                            .body(boxed_full(Bytes::from_static(decision.body)))
+                                            .body(boxed_full(Bytes::from_static(response.body)))
                                             .unwrap_or_else(|_| {
                                                 Response::new(boxed_full(Bytes::from_static(
                                                     b"error\n",
@@ -484,14 +493,20 @@ impl QUICListener {
                                             "Bootstrap request route={} scoped rate limit exceeded by rule={}",
                                             decision.route, decision.rule_name
                                         );
+                                        let response = rejection_response.as_ref().expect(
+                                            "rate-limited admission must map to rejection response",
+                                        );
                                         return Ok(Response::builder()
-                                            .status(decision.status)
+                                            .status(response.status)
                                             .header("alt-svc", &alt)
                                             .header(
                                                 "retry-after",
-                                                decision.retry_after_seconds.max(1).to_string(),
+                                                response
+                                                    .retry_after_seconds
+                                                    .expect("rate-limited response must include retry-after")
+                                                    .to_string(),
                                             )
-                                            .body(boxed_full(Bytes::from_static(decision.body)))
+                                            .body(boxed_full(Bytes::from_static(response.body)))
                                             .unwrap_or_else(|_| {
                                                 Response::new(boxed_full(Bytes::from_static(
                                                     b"error\n",
@@ -511,14 +526,20 @@ impl QUICListener {
                                         resilience
                                             .adaptive_admission
                                             .observe(Duration::from_millis(0), true);
+                                        let response = rejection_response.as_ref().expect(
+                                            "overloaded admission must map to rejection response",
+                                        );
                                         return Ok(Response::builder()
-                                            .status(decision.status)
+                                            .status(response.status)
                                             .header("alt-svc", &alt)
                                             .header(
                                                 "retry-after",
-                                                decision.retry_after_seconds.max(1).to_string(),
+                                                response
+                                                    .retry_after_seconds
+                                                    .expect("overload response must include retry-after")
+                                                    .to_string(),
                                             )
-                                            .body(boxed_full(Bytes::from_static(decision.body)))
+                                            .body(boxed_full(Bytes::from_static(response.body)))
                                             .unwrap_or_else(|_| {
                                                 Response::new(boxed_full(Bytes::from_static(
                                                     b"error\n",

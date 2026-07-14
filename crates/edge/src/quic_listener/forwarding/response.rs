@@ -353,48 +353,36 @@ impl QUICListener {
         Ok(())
     }
 
-    pub(super) fn send_rate_limited_response(
+    pub(super) fn send_admission_rejection_response(
         h3: &mut quiche::h3::Connection,
         quic: &mut quiche::Connection,
         stream_id: u64,
-        body: &[u8],
-        retry_after_seconds: u32,
+        response: &crate::quic_listener::admission::AdmissionRejectionResponse,
     ) -> Result<(), quiche::h3::Error> {
-        let retry_after = retry_after_seconds.max(1).to_string();
-        let resp_headers = vec![
-            quiche::h3::Header::new(
-                b":status",
-                http::StatusCode::TOO_MANY_REQUESTS.as_str().as_bytes(),
-            ),
+        let mut headers = vec![
+            quiche::h3::Header::new(b":status", response.status.as_str().as_bytes()),
             quiche::h3::Header::new(b"content-type", b"text/plain"),
-            quiche::h3::Header::new(b"retry-after", retry_after.as_bytes()),
-            quiche::h3::Header::new(b"content-length", body.len().to_string().as_bytes()),
         ];
+        if let Some(challenge) = response.www_authenticate {
+            headers.push(quiche::h3::Header::new(
+                b"www-authenticate",
+                challenge.as_bytes(),
+            ));
+        }
+        if let Some(retry_after_seconds) = response.retry_after_seconds {
+            let retry_after = retry_after_seconds.max(1).to_string();
+            headers.push(quiche::h3::Header::new(
+                b"retry-after",
+                retry_after.as_bytes(),
+            ));
+        }
+        headers.push(quiche::h3::Header::new(
+            b"content-length",
+            response.body.len().to_string().as_bytes(),
+        ));
 
-        h3.send_response(quic, stream_id, &resp_headers, false)?;
-        h3.send_body(quic, stream_id, body, true)?;
-        Ok(())
-    }
-
-    pub(super) fn send_unauthorized_response(
-        h3: &mut quiche::h3::Connection,
-        quic: &mut quiche::Connection,
-        stream_id: u64,
-        body: &[u8],
-        challenge: &[u8],
-    ) -> Result<(), quiche::h3::Error> {
-        let resp_headers = vec![
-            quiche::h3::Header::new(
-                b":status",
-                http::StatusCode::UNAUTHORIZED.as_str().as_bytes(),
-            ),
-            quiche::h3::Header::new(b"content-type", b"text/plain"),
-            quiche::h3::Header::new(b"www-authenticate", challenge),
-            quiche::h3::Header::new(b"content-length", body.len().to_string().as_bytes()),
-        ];
-
-        h3.send_response(quic, stream_id, &resp_headers, false)?;
-        h3.send_body(quic, stream_id, body, true)?;
+        h3.send_response(quic, stream_id, &headers, false)?;
+        h3.send_body(quic, stream_id, response.body, true)?;
         Ok(())
     }
 

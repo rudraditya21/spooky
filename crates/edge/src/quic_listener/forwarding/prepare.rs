@@ -7,7 +7,10 @@ use super::auth::{AuthStart, auth_failure_mode, fail_open, start_external_auth_t
 use super::resolve::ResolvedBackend;
 use super::*;
 use crate::{
-    quic_listener::admission::{AdmissionPolicyDecision, evaluate_forwarding_pre_admission_policy},
+    quic_listener::admission::{
+        AdmissionPolicyDecision, admission_rejection_response,
+        evaluate_forwarding_pre_admission_policy,
+    },
     runtime::connection::{auth::PendingHeaderMutation, request::PendingForward},
 };
 
@@ -225,9 +228,10 @@ impl QUICListener {
                     },
                 );
                 metrics.set_brownout_active(resilience.brownout.is_active());
+                let rejection_response = admission_rejection_response(&admission);
                 match admission {
                     AdmissionPolicyDecision::AdmitReady => {}
-                    AdmissionPolicyDecision::Unauthorized(decision) => {
+                    AdmissionPolicyDecision::Unauthorized(_) => {
                         metrics.inc_failure();
                         metrics.inc_policy_denied();
                         metrics.record_route(
@@ -239,13 +243,10 @@ impl QUICListener {
                             "request_id=unassigned route={} denied by local auth policy",
                             upstream_name
                         );
-                        Self::send_unauthorized_response(
-                            h3,
-                            quic,
-                            stream_id,
-                            decision.body,
-                            decision.challenge.as_www_authenticate().as_bytes(),
-                        )?;
+                        let response = rejection_response
+                            .as_ref()
+                            .expect("unauthorized admission must map to rejection response");
+                        Self::send_admission_rejection_response(h3, quic, stream_id, response)?;
                         return Ok(None);
                     }
                     AdmissionPolicyDecision::RateLimited(decision) => {
@@ -260,13 +261,10 @@ impl QUICListener {
                             "request_id=unassigned route={} scoped rate limit exceeded by rule={}",
                             decision.route, decision.rule_name
                         );
-                        Self::send_rate_limited_response(
-                            h3,
-                            quic,
-                            stream_id,
-                            decision.body,
-                            decision.retry_after_seconds,
-                        )?;
+                        let response = rejection_response
+                            .as_ref()
+                            .expect("rate-limited admission must map to rejection response");
+                        Self::send_admission_rejection_response(h3, quic, stream_id, response)?;
                         return Ok(None);
                     }
                     AdmissionPolicyDecision::Overloaded(decision) => {
@@ -277,13 +275,10 @@ impl QUICListener {
                             request_start.elapsed(),
                             RouteOutcome::OverloadShed,
                         );
-                        Self::send_overload_response(
-                            h3,
-                            quic,
-                            stream_id,
-                            decision.body,
-                            decision.retry_after_seconds,
-                        )?;
+                        let response = rejection_response
+                            .as_ref()
+                            .expect("overloaded admission must map to rejection response");
+                        Self::send_admission_rejection_response(h3, quic, stream_id, response)?;
                         resilience
                             .adaptive_admission
                             .observe(request_start.elapsed(), true);
