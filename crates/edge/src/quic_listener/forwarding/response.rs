@@ -1,4 +1,6 @@
 use super::*;
+use crate::runtime::connection::auth::ExternalAuthDecision;
+use tokio::sync::mpsc::error::TryRecvError;
 
 impl QUICListener {
     /// Handle an already-resolved `ForwardResult`, applying health transitions

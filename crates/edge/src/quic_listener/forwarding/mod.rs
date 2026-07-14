@@ -18,23 +18,13 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use serde_json::Value;
 use sha2::Sha256;
-use spooky_config::{
-    config::ScopedRateLimitScope,
-    runtime::{RuntimeExternalAuth, RuntimeExternalAuthFailureMode},
-};
+use spooky_config::config::ScopedRateLimitScope;
 use subtle::ConstantTimeEq;
 
 use super::*;
-use crate::runtime::connection::{
-    auth::{
-        ExternalAuthChallengeResponse, ExternalAuthDecision, ExternalAuthDenyResponse,
-        ExternalAuthRedirectResponse, ExternalAuthResult, PendingHeaderMutation,
-    },
-    request::PendingForward,
-    stream::StreamAdmissionState,
-};
+use crate::runtime::connection::{request::PendingForward, stream::StreamAdmissionState};
 
-pub(crate) fn abort_stream(req: &mut RequestEnvelope, metrics: &Metrics) -> StreamPhase {
+pub(super) fn abort_stream(req: &mut RequestEnvelope, metrics: &Metrics) -> StreamPhase {
     let phase = req.phase.clone();
     if req.backend_request_started && !req.backend_request_finished {
         if let (Some(pool), Some(index)) = (&req.upstream_pool, req.backend_index)
@@ -70,6 +60,7 @@ pub(crate) fn abort_stream(req: &mut RequestEnvelope, metrics: &Metrics) -> Stre
     phase
 }
 
+// Shared forwarding dependencies passed through extracted submodules.
 struct ForwardingSharedCtx<'a> {
     metrics: Arc<Metrics>,
     resilience: &'a RuntimeResilience,
@@ -97,7 +88,7 @@ struct StreamProgressConfig {
 }
 
 impl QUICListener {
-    pub(super) fn classify_upstream_failure_reason(
+    fn classify_upstream_failure_reason(
         is_connect: bool,
         detail: &str,
     ) -> (HealthFailureReason, &'static str) {
@@ -140,14 +131,14 @@ impl QUICListener {
         (HealthFailureReason::Transport, "transport")
     }
 
-    pub(super) fn send_error_health_failure_reason(
+    fn send_error_health_failure_reason(
         err: &hyper_util::client::legacy::Error,
     ) -> (HealthFailureReason, &'static str) {
         let detail = Self::format_error_chain(err);
         Self::classify_upstream_failure_reason(err.is_connect(), &detail)
     }
 
-    pub(super) fn format_error_chain(err: &(dyn StdError + 'static)) -> String {
+    fn format_error_chain(err: &(dyn StdError + 'static)) -> String {
         let mut detail = err.to_string();
         let mut source = err.source();
         while let Some(cause) = source {
@@ -173,7 +164,7 @@ impl QUICListener {
         }
     }
 
-    pub(super) fn log_access(req: &RequestEnvelope, status: u16) {
+    fn log_access(req: &RequestEnvelope, status: u16) {
         let trace_id = req.trace_id.as_deref().unwrap_or("-");
         let span_id = req.span_id.as_deref().unwrap_or("-");
         let latency_ms = req.start.elapsed().as_millis() as u64;
@@ -727,7 +718,7 @@ impl QUICListener {
         }
     }
 
-    pub(super) fn log_health_transition(addr: &str, transition: HealthTransition) {
+    fn log_health_transition(addr: &str, transition: HealthTransition) {
         match transition {
             HealthTransition::BecameHealthy => {
                 info!("Backend {} became healthy", addr);
@@ -1263,7 +1254,7 @@ impl QUICListener {
         Ok(())
     }
 
-    pub(super) fn api_key_is_authorized(
+    fn api_key_is_authorized(
         policy: &RuntimeUpstreamPolicy,
         header_lookup: Option<&LbHeaderLookup<'_>>,
     ) -> bool {
@@ -1282,7 +1273,7 @@ impl QUICListener {
                 .any(|expected| bool::from(provided.as_bytes().ct_eq(expected.as_bytes())))
     }
 
-    pub(super) fn jwt_is_authorized(
+    fn jwt_is_authorized(
         policy: &RuntimeUpstreamPolicy,
         header_lookup: Option<&LbHeaderLookup<'_>>,
     ) -> bool {
@@ -1435,7 +1426,7 @@ impl QUICListener {
         values
     }
 
-    pub(super) fn resolve_scoped_rate_limit_key(
+    fn resolve_scoped_rate_limit_key(
         rule: &crate::resilience::scoped_rate_limit::ScopedRateLimitRule,
         route: &str,
         method: &str,
@@ -1495,6 +1486,7 @@ mod tests {
         oidc_scope_satisfied,
     };
     use super::*;
+    use crate::runtime::connection::auth::{ExternalAuthDecision, PendingHeaderMutation};
 
     fn sample_pending_forward(headers: Vec<quiche::h3::Header>) -> PendingForward {
         PendingForward {

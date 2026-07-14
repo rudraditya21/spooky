@@ -1,10 +1,12 @@
 use std::convert::Infallible;
 
+use spooky_config::runtime::RuntimeExternalAuth;
 use tracing::Span;
 
 use super::auth::{AuthStart, auth_failure_mode, fail_open, start_external_auth_task};
 use super::resolve::ResolvedBackend;
 use super::*;
+use crate::runtime::connection::{auth::PendingHeaderMutation, request::PendingForward};
 
 pub(super) struct PreparedRequest {
     pub(super) upstream_name: String,

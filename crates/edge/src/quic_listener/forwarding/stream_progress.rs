@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime::connection::auth::ExternalAuthResult;
 
 impl QUICListener {
     /// Advance all in-flight streams without blocking.
