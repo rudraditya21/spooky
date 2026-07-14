@@ -292,91 +292,42 @@ impl QUICListener {
             return Ok(false);
         };
 
-        let adaptive_permit = match resilience.adaptive_admission.try_acquire() {
-            Some(permit) => permit,
-            None => {
-                let crate::quic_listener::admission::AdmissionPolicyDecision::Overloaded(decision) =
-                    crate::quic_listener::admission::overload_decision(
-                        crate::quic_listener::admission::OverloadDecisionReason::AdaptiveAdmission,
-                        resilience.shed_retry_after_seconds,
-                    )
-                else {
-                    unreachable!("overload decision helper always returns overloaded");
-                };
-                metrics.inc_failure();
-                metrics.inc_overload_shed_reason(decision.reason.metrics_reason());
-                metrics.record_route(
-                    &upstream_name,
-                    req.start.elapsed(),
-                    RouteOutcome::OverloadShed,
-                );
-                Self::send_overload_response(
-                    h3,
-                    quic,
-                    stream_id,
-                    decision.body,
-                    decision.retry_after_seconds,
-                )?;
-                resilience
-                    .adaptive_admission
-                    .observe(req.start.elapsed(), true);
-                return Ok(false);
-            }
-        };
-
-        let route_queue_permit = match resilience.route_queue.try_acquire(&upstream_name) {
-            Ok(permit) => permit,
-            Err(rejection) => {
-                let crate::quic_listener::admission::AdmissionPolicyDecision::Overloaded(decision) =
-                    crate::quic_listener::admission::overload_decision_for_route_queue_rejection(
-                        rejection,
-                        resilience.shed_retry_after_seconds,
-                    )
-                else {
-                    unreachable!("route queue overload helper always returns overloaded");
-                };
-                metrics.inc_failure();
-                metrics.inc_overload_shed_reason(decision.reason.metrics_reason());
-                metrics.record_route(
-                    &upstream_name,
-                    req.start.elapsed(),
-                    RouteOutcome::OverloadShed,
-                );
-                Self::send_overload_response(
-                    h3,
-                    quic,
-                    stream_id,
-                    decision.body,
-                    decision.retry_after_seconds,
-                )?;
-                resilience
-                    .adaptive_admission
-                    .observe(req.start.elapsed(), true);
-                return Ok(false);
-            }
-        };
-
-        let global_permit = match Self::try_acquire_owned_with_micro_wait(
+        let (
+            backend_index,
+            upstream_pool,
+            global_permit,
+            upstream_permit,
+            adaptive_permit,
+            route_queue_permit,
+        ) = match crate::quic_listener::admission::execute_forwarding_post_auth_admission(
+            resilience,
+            &upstream_name,
+            req.upstream_pool.as_ref(),
+            req.backend_index,
+            pending_forward.backend_index,
+            exec_ctx.upstream_inflight,
             Arc::clone(&exec_ctx.global_inflight),
             exec_ctx.inflight_acquire_wait,
         ) {
-            Ok((permit, waited)) => {
-                if waited {
+            crate::quic_listener::admission::PostAuthAdmissionExecution::Ready(ready) => {
+                if ready.waited_for_global_permit {
                     metrics.inc_inflight_wait_admit_global();
                 }
-                permit
+                if ready.waited_for_upstream_permit {
+                    metrics.inc_inflight_wait_admit_upstream();
+                }
+                (
+                    ready.backend_index,
+                    ready.upstream_pool,
+                    ready.global_permit,
+                    ready.upstream_permit,
+                    ready.adaptive_permit,
+                    ready.route_queue_permit,
+                )
             }
-            Err(_) => {
-                let crate::quic_listener::admission::AdmissionPolicyDecision::Overloaded(decision) =
-                    crate::quic_listener::admission::overload_decision(
-                        crate::quic_listener::admission::OverloadDecisionReason::GlobalInflight,
-                        resilience.shed_retry_after_seconds,
-                    )
-                else {
-                    unreachable!("overload decision helper always returns overloaded");
-                };
-                drop(route_queue_permit);
-                drop(adaptive_permit);
+            crate::quic_listener::admission::PostAuthAdmissionExecution::Rejected(
+                crate::quic_listener::admission::PostAuthAdmissionRejection::Overloaded(decision),
+            ) => {
                 metrics.inc_failure();
                 metrics.inc_overload_shed_reason(decision.reason.metrics_reason());
                 metrics.record_route(
@@ -396,125 +347,34 @@ impl QUICListener {
                     .observe(req.start.elapsed(), true);
                 return Ok(false);
             }
-        };
-
-        let upstream_permit = match exec_ctx.upstream_inflight.get(&upstream_name).cloned() {
-            Some(semaphore) => {
-                match Self::try_acquire_owned_with_micro_wait(
-                    semaphore,
-                    exec_ctx.inflight_acquire_wait,
-                ) {
-                    Ok((permit, waited)) => {
-                        if waited {
-                            metrics.inc_inflight_wait_admit_upstream();
-                        }
-                        permit
-                    }
-                    Err(_) => {
-                        let crate::quic_listener::admission::AdmissionPolicyDecision::Overloaded(
-                            decision,
-                        ) = crate::quic_listener::admission::overload_decision(
-                            crate::quic_listener::admission::OverloadDecisionReason::UpstreamInflight,
-                            resilience.shed_retry_after_seconds,
-                        )
-                        else {
-                            unreachable!("overload decision helper always returns overloaded");
-                        };
-                        drop(global_permit);
-                        drop(route_queue_permit);
-                        drop(adaptive_permit);
-                        metrics.inc_failure();
-                        metrics.inc_overload_shed_reason(decision.reason.metrics_reason());
-                        metrics.record_route(
-                            &upstream_name,
-                            req.start.elapsed(),
-                            RouteOutcome::OverloadShed,
-                        );
-                        Self::send_overload_response(
-                            h3,
-                            quic,
-                            stream_id,
-                            decision.body,
-                            decision.retry_after_seconds,
-                        )?;
-                        resilience
-                            .adaptive_admission
-                            .observe(req.start.elapsed(), true);
-                        return Ok(false);
-                    }
-                }
-            }
-            None => {
-                drop(global_permit);
-                drop(route_queue_permit);
-                drop(adaptive_permit);
+            crate::quic_listener::admission::PostAuthAdmissionExecution::Rejected(
+                crate::quic_listener::admission::PostAuthAdmissionRejection::Failed(decision),
+            ) => {
                 metrics.inc_failure();
-                metrics.inc_overload_shed_reason(OverloadShedReason::UpstreamInflight);
-                metrics.record_route(
-                    &upstream_name,
-                    req.start.elapsed(),
-                    RouteOutcome::OverloadShed,
-                );
-                Self::send_simple_response(
-                    h3,
-                    quic,
-                    stream_id,
-                    http::StatusCode::SERVICE_UNAVAILABLE,
-                    b"upstream admission limiter unavailable\n",
-                )?;
-                resilience
-                    .adaptive_admission
-                    .observe(req.start.elapsed(), true);
+                if let Some(reason) = decision.overload_reason {
+                    metrics.inc_overload_shed_reason(reason.metrics_reason());
+                }
+                if let Some(route_outcome) = decision.route_outcome {
+                    metrics.record_route(&upstream_name, req.start.elapsed(), route_outcome);
+                }
+                Self::send_simple_response(h3, quic, stream_id, decision.status, decision.body)?;
+                if decision.observe_adaptive_overload {
+                    resilience
+                        .adaptive_admission
+                        .observe(req.start.elapsed(), true);
+                }
                 return Ok(false);
             }
         };
 
-        let backend_index = req.backend_index.unwrap_or(pending_forward.backend_index);
-        let Some(upstream_pool) = req.upstream_pool.as_ref().cloned() else {
-            drop(upstream_permit);
-            drop(global_permit);
-            drop(route_queue_permit);
-            drop(adaptive_permit);
-            metrics.inc_failure();
-            Self::send_simple_response(
-                h3,
-                quic,
-                stream_id,
-                http::StatusCode::INTERNAL_SERVER_ERROR,
-                b"missing upstream pool\n",
-            )?;
-            return Ok(false);
-        };
-        let request_started = upstream_pool
-            .read()
-            .ok()
-            .is_some_and(|pool| pool.begin_request_if_healthy(backend_index));
-        if !request_started {
-            drop(upstream_permit);
-            drop(global_permit);
-            drop(route_queue_permit);
-            drop(adaptive_permit);
-            metrics.inc_failure();
-            metrics.record_route(&upstream_name, req.start.elapsed(), RouteOutcome::Failure);
-            Self::send_simple_response(
-                h3,
-                quic,
-                stream_id,
-                http::StatusCode::SERVICE_UNAVAILABLE,
-                b"selected backend no longer healthy\n",
-            )?;
-            return Ok(false);
-        }
-
-        let backend_addr = pending_forward.backend_addr.to_string();
-        let Some(backend_endpoint) = exec_ctx.backend_endpoints.get(&backend_addr).cloned() else {
+        let Some(backend_endpoint) = exec_ctx
+            .backend_endpoints
+            .get(pending_forward.backend_addr.as_ref())
+            .cloned()
+        else {
             if let Ok(mut guard) = upstream_pool.write() {
                 guard.finish_request(backend_index, req.start.elapsed(), Some(503));
             }
-            drop(upstream_permit);
-            drop(global_permit);
-            drop(route_queue_permit);
-            drop(adaptive_permit);
             metrics.inc_failure();
             metrics.record_route(&upstream_name, req.start.elapsed(), RouteOutcome::Failure);
             Self::send_simple_response(

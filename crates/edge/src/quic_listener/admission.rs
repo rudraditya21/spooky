@@ -1,8 +1,10 @@
 #![allow(dead_code)]
 
 use std::{
+    collections::HashMap,
     collections::HashSet,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{Arc, RwLock},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -11,14 +13,20 @@ use http::StatusCode;
 use serde_json::Value;
 use sha2::Sha256;
 use spooky_config::runtime::{RuntimeJwtAuth, RuntimeUpstreamPolicy};
+use spooky_lb::upstream_pool::UpstreamPool;
 use subtle::ConstantTimeEq;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 use super::LbHeaderLookup;
 use crate::{
+    RouteOutcome,
     metrics::OverloadShedReason,
     resilience::{
+        adaptive_admission::AdaptivePermit,
         brownout::BrownoutController,
+        route_queue::RouteQueuePermit,
         route_queue::RouteQueueRejection,
+        runtime::RuntimeResilience,
         scoped_rate_limit::{ScopedRateLimitRule, ScopedRateLimiters},
     },
 };
@@ -94,6 +102,37 @@ pub(crate) struct OverloadDecision {
     pub(crate) status: StatusCode,
     pub(crate) body: &'static [u8],
     pub(crate) retry_after_seconds: u32,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PostAuthAdmissionFailure {
+    pub(crate) status: StatusCode,
+    pub(crate) body: &'static [u8],
+    pub(crate) overload_reason: Option<OverloadDecisionReason>,
+    pub(crate) route_outcome: Option<RouteOutcome>,
+    pub(crate) observe_adaptive_overload: bool,
+}
+
+pub(crate) struct PostAuthAdmissionReady {
+    pub(crate) backend_index: usize,
+    pub(crate) upstream_pool: Arc<RwLock<UpstreamPool>>,
+    pub(crate) global_permit: OwnedSemaphorePermit,
+    pub(crate) upstream_permit: OwnedSemaphorePermit,
+    pub(crate) adaptive_permit: AdaptivePermit,
+    pub(crate) route_queue_permit: RouteQueuePermit,
+    pub(crate) waited_for_global_permit: bool,
+    pub(crate) waited_for_upstream_permit: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum PostAuthAdmissionRejection {
+    Overloaded(OverloadDecision),
+    Failed(PostAuthAdmissionFailure),
+}
+
+pub(crate) enum PostAuthAdmissionExecution {
+    Ready(PostAuthAdmissionReady),
+    Rejected(PostAuthAdmissionRejection),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,6 +249,129 @@ pub(crate) fn overload_decision_for_route_queue_rejection(
         RouteQueueRejection::RouteCap => OverloadDecisionReason::RouteCap,
     };
     overload_decision(reason, retry_after_seconds)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_forwarding_post_auth_admission(
+    resilience: &RuntimeResilience,
+    upstream_name: &str,
+    upstream_pool: Option<&Arc<RwLock<UpstreamPool>>>,
+    backend_index: Option<usize>,
+    pending_forward_backend_index: usize,
+    upstream_inflight: &HashMap<String, Arc<Semaphore>>,
+    global_inflight: Arc<Semaphore>,
+    inflight_acquire_wait: Duration,
+) -> PostAuthAdmissionExecution {
+    let adaptive_permit = match resilience.adaptive_admission.try_acquire() {
+        Some(permit) => permit,
+        None => {
+            return PostAuthAdmissionExecution::Rejected(PostAuthAdmissionRejection::Overloaded(
+                overloaded(
+                    OverloadDecisionReason::AdaptiveAdmission,
+                    resilience.shed_retry_after_seconds,
+                ),
+            ));
+        }
+    };
+
+    let route_queue_permit = match resilience.route_queue.try_acquire(upstream_name) {
+        Ok(permit) => permit,
+        Err(rejection) => {
+            return PostAuthAdmissionExecution::Rejected(PostAuthAdmissionRejection::Overloaded(
+                overload_from_route_queue_rejection(rejection, resilience.shed_retry_after_seconds),
+            ));
+        }
+    };
+
+    let (global_permit, waited_for_global_permit) =
+        match try_acquire_owned_with_micro_wait(global_inflight, inflight_acquire_wait) {
+            Ok(value) => value,
+            Err(_) => {
+                return PostAuthAdmissionExecution::Rejected(
+                    PostAuthAdmissionRejection::Overloaded(overloaded(
+                        OverloadDecisionReason::GlobalInflight,
+                        resilience.shed_retry_after_seconds,
+                    )),
+                );
+            }
+        };
+
+    let (upstream_permit, waited_for_upstream_permit) =
+        match upstream_inflight.get(upstream_name).cloned() {
+            Some(semaphore) => {
+                match try_acquire_owned_with_micro_wait(semaphore, inflight_acquire_wait) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return PostAuthAdmissionExecution::Rejected(
+                            PostAuthAdmissionRejection::Overloaded(overloaded(
+                                OverloadDecisionReason::UpstreamInflight,
+                                resilience.shed_retry_after_seconds,
+                            )),
+                        );
+                    }
+                }
+            }
+            None => {
+                return PostAuthAdmissionExecution::Rejected(PostAuthAdmissionRejection::Failed(
+                    PostAuthAdmissionFailure {
+                        status: StatusCode::SERVICE_UNAVAILABLE,
+                        body: b"upstream admission limiter unavailable\n",
+                        overload_reason: Some(OverloadDecisionReason::UpstreamInflight),
+                        route_outcome: Some(RouteOutcome::OverloadShed),
+                        observe_adaptive_overload: true,
+                    },
+                ));
+            }
+        };
+
+    let backend_index = backend_index.unwrap_or(pending_forward_backend_index);
+    let Some(upstream_pool) = upstream_pool.cloned() else {
+        return PostAuthAdmissionExecution::Rejected(PostAuthAdmissionRejection::Failed(
+            PostAuthAdmissionFailure {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                body: b"missing upstream pool\n",
+                overload_reason: None,
+                route_outcome: None,
+                observe_adaptive_overload: false,
+            },
+        ));
+    };
+
+    let request_started = upstream_pool
+        .read()
+        .ok()
+        .is_some_and(|pool| pool.begin_request_if_healthy(backend_index));
+    if !request_started {
+        return PostAuthAdmissionExecution::Rejected(PostAuthAdmissionRejection::Failed(
+            PostAuthAdmissionFailure {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                body: b"selected backend no longer healthy\n",
+                overload_reason: None,
+                route_outcome: Some(RouteOutcome::Failure),
+                observe_adaptive_overload: false,
+            },
+        ));
+    }
+
+    PostAuthAdmissionExecution::Ready(PostAuthAdmissionReady {
+        backend_index,
+        upstream_pool,
+        global_permit,
+        upstream_permit,
+        adaptive_permit,
+        route_queue_permit,
+        waited_for_global_permit,
+        waited_for_upstream_permit,
+    })
+}
+
+pub(crate) fn try_acquire_owned_with_micro_wait(
+    semaphore: Arc<Semaphore>,
+    _wait_budget: Duration,
+) -> Result<(OwnedSemaphorePermit, bool), TryAcquireError> {
+    // Never block the synchronous QUIC worker thread: acquire immediately or
+    // shed. A blocking wait here stalls every connection on the shard.
+    semaphore.try_acquire_owned().map(|permit| (permit, false))
 }
 
 pub(crate) fn api_key_is_authorized(
@@ -362,6 +524,23 @@ fn bearer_token_from_authorization_value(raw: &str) -> Option<String> {
         return None;
     }
     Some(token.to_string())
+}
+
+fn overloaded(reason: OverloadDecisionReason, retry_after_seconds: u32) -> OverloadDecision {
+    match overload_decision(reason, retry_after_seconds) {
+        AdmissionPolicyDecision::Overloaded(decision) => decision,
+        _ => unreachable!("overload decision helper always returns overloaded"),
+    }
+}
+
+fn overload_from_route_queue_rejection(
+    rejection: RouteQueueRejection,
+    retry_after_seconds: u32,
+) -> OverloadDecision {
+    match overload_decision_for_route_queue_rejection(rejection, retry_after_seconds) {
+        AdmissionPolicyDecision::Overloaded(decision) => decision,
+        _ => unreachable!("route queue overload helper always returns overloaded"),
+    }
 }
 
 fn jwt_string_claim_values(claims: &Value, claim_names: &[&str]) -> HashSet<String> {
