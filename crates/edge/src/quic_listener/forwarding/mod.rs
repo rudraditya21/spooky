@@ -300,13 +300,17 @@ impl QUICListener {
                 .map(str::to_string)
         };
 
-        resilience
-            .brownout
-            .observe_admission_pressure(resilience.adaptive_admission.inflight_percent());
-        metrics.set_brownout_active(resilience.brownout.is_active());
-        if !resilience.brownout.route_allowed(&upstream_name) {
+        if let crate::quic_listener::admission::AdmissionPolicyDecision::Overloaded(decision) =
+            crate::quic_listener::admission::evaluate_brownout_policy(
+                &resilience.brownout,
+                resilience.adaptive_admission.inflight_percent(),
+                &upstream_name,
+                resilience.shed_retry_after_seconds,
+            )
+        {
+            metrics.set_brownout_active(resilience.brownout.is_active());
             metrics.inc_failure();
-            metrics.inc_overload_shed_reason(OverloadShedReason::Brownout);
+            metrics.inc_overload_shed_reason(decision.reason.metrics_reason());
             metrics.record_route(
                 &upstream_name,
                 req.start.elapsed(),
@@ -316,14 +320,15 @@ impl QUICListener {
                 h3,
                 quic,
                 stream_id,
-                b"brownout active, non-core route shed\n",
-                resilience.shed_retry_after_seconds,
+                decision.body,
+                decision.retry_after_seconds,
             )?;
             resilience
                 .adaptive_admission
                 .observe(req.start.elapsed(), true);
             return Ok(false);
         }
+        metrics.set_brownout_active(resilience.brownout.is_active());
 
         if let crate::quic_listener::admission::AdmissionPolicyDecision::RateLimited(decision) =
             crate::quic_listener::admission::evaluate_scoped_rate_limit_policy(
@@ -366,8 +371,16 @@ impl QUICListener {
         let adaptive_permit = match resilience.adaptive_admission.try_acquire() {
             Some(permit) => permit,
             None => {
+                let crate::quic_listener::admission::AdmissionPolicyDecision::Overloaded(decision) =
+                    crate::quic_listener::admission::overload_decision(
+                        crate::quic_listener::admission::OverloadDecisionReason::AdaptiveAdmission,
+                        resilience.shed_retry_after_seconds,
+                    )
+                else {
+                    unreachable!("overload decision helper always returns overloaded");
+                };
                 metrics.inc_failure();
-                metrics.inc_overload_shed_reason(OverloadShedReason::AdaptiveAdmission);
+                metrics.inc_overload_shed_reason(decision.reason.metrics_reason());
                 metrics.record_route(
                     &upstream_name,
                     req.start.elapsed(),
@@ -377,8 +390,8 @@ impl QUICListener {
                     h3,
                     quic,
                     stream_id,
-                    b"adaptive admission overload\n",
-                    resilience.shed_retry_after_seconds,
+                    decision.body,
+                    decision.retry_after_seconds,
                 )?;
                 resilience
                     .adaptive_admission
@@ -389,9 +402,17 @@ impl QUICListener {
 
         let route_queue_permit = match resilience.route_queue.try_acquire(&upstream_name) {
             Ok(permit) => permit,
-            Err(RouteQueueRejection::RouteCap) => {
+            Err(rejection) => {
+                let crate::quic_listener::admission::AdmissionPolicyDecision::Overloaded(decision) =
+                    crate::quic_listener::admission::overload_decision_for_route_queue_rejection(
+                        rejection,
+                        resilience.shed_retry_after_seconds,
+                    )
+                else {
+                    unreachable!("route queue overload helper always returns overloaded");
+                };
                 metrics.inc_failure();
-                metrics.inc_overload_shed_reason(OverloadShedReason::RouteCap);
+                metrics.inc_overload_shed_reason(decision.reason.metrics_reason());
                 metrics.record_route(
                     &upstream_name,
                     req.start.elapsed(),
@@ -401,28 +422,8 @@ impl QUICListener {
                     h3,
                     quic,
                     stream_id,
-                    b"route queue cap exceeded\n",
-                    resilience.shed_retry_after_seconds,
-                )?;
-                resilience
-                    .adaptive_admission
-                    .observe(req.start.elapsed(), true);
-                return Ok(false);
-            }
-            Err(RouteQueueRejection::GlobalCap) => {
-                metrics.inc_failure();
-                metrics.inc_overload_shed_reason(OverloadShedReason::RouteGlobalCap);
-                metrics.record_route(
-                    &upstream_name,
-                    req.start.elapsed(),
-                    RouteOutcome::OverloadShed,
-                );
-                Self::send_overload_response(
-                    h3,
-                    quic,
-                    stream_id,
-                    b"global queue cap exceeded\n",
-                    resilience.shed_retry_after_seconds,
+                    decision.body,
+                    decision.retry_after_seconds,
                 )?;
                 resilience
                     .adaptive_admission
@@ -442,10 +443,18 @@ impl QUICListener {
                 permit
             }
             Err(_) => {
+                let crate::quic_listener::admission::AdmissionPolicyDecision::Overloaded(decision) =
+                    crate::quic_listener::admission::overload_decision(
+                        crate::quic_listener::admission::OverloadDecisionReason::GlobalInflight,
+                        resilience.shed_retry_after_seconds,
+                    )
+                else {
+                    unreachable!("overload decision helper always returns overloaded");
+                };
                 drop(route_queue_permit);
                 drop(adaptive_permit);
                 metrics.inc_failure();
-                metrics.inc_overload_shed_reason(OverloadShedReason::GlobalInflight);
+                metrics.inc_overload_shed_reason(decision.reason.metrics_reason());
                 metrics.record_route(
                     &upstream_name,
                     req.start.elapsed(),
@@ -455,8 +464,8 @@ impl QUICListener {
                     h3,
                     quic,
                     stream_id,
-                    b"overloaded, retry later\n",
-                    resilience.shed_retry_after_seconds,
+                    decision.body,
+                    decision.retry_after_seconds,
                 )?;
                 resilience
                     .adaptive_admission
@@ -478,11 +487,20 @@ impl QUICListener {
                         permit
                     }
                     Err(_) => {
+                        let crate::quic_listener::admission::AdmissionPolicyDecision::Overloaded(
+                            decision,
+                        ) = crate::quic_listener::admission::overload_decision(
+                            crate::quic_listener::admission::OverloadDecisionReason::UpstreamInflight,
+                            resilience.shed_retry_after_seconds,
+                        )
+                        else {
+                            unreachable!("overload decision helper always returns overloaded");
+                        };
                         drop(global_permit);
                         drop(route_queue_permit);
                         drop(adaptive_permit);
                         metrics.inc_failure();
-                        metrics.inc_overload_shed_reason(OverloadShedReason::UpstreamInflight);
+                        metrics.inc_overload_shed_reason(decision.reason.metrics_reason());
                         metrics.record_route(
                             &upstream_name,
                             req.start.elapsed(),
@@ -492,8 +510,8 @@ impl QUICListener {
                             h3,
                             quic,
                             stream_id,
-                            b"upstream overloaded, retry later\n",
-                            resilience.shed_retry_after_seconds,
+                            decision.body,
+                            decision.retry_after_seconds,
                         )?;
                         resilience
                             .adaptive_admission

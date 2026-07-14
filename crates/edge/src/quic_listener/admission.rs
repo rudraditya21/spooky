@@ -14,7 +14,14 @@ use spooky_config::runtime::{RuntimeJwtAuth, RuntimeUpstreamPolicy};
 use subtle::ConstantTimeEq;
 
 use super::LbHeaderLookup;
-use crate::resilience::scoped_rate_limit::{ScopedRateLimitRule, ScopedRateLimiters};
+use crate::{
+    metrics::OverloadShedReason,
+    resilience::{
+        brownout::BrownoutController,
+        route_queue::RouteQueueRejection,
+        scoped_rate_limit::{ScopedRateLimitRule, ScopedRateLimiters},
+    },
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AuthChallengeKind {
@@ -27,6 +34,30 @@ impl AuthChallengeKind {
         match self {
             Self::ApiKey => "ApiKey",
             Self::Bearer => "Bearer",
+        }
+    }
+}
+
+impl OverloadDecisionReason {
+    pub(crate) fn metrics_reason(self) -> OverloadShedReason {
+        match self {
+            Self::Brownout => OverloadShedReason::Brownout,
+            Self::AdaptiveAdmission => OverloadShedReason::AdaptiveAdmission,
+            Self::RouteCap => OverloadShedReason::RouteCap,
+            Self::RouteGlobalCap => OverloadShedReason::RouteGlobalCap,
+            Self::GlobalInflight => OverloadShedReason::GlobalInflight,
+            Self::UpstreamInflight => OverloadShedReason::UpstreamInflight,
+        }
+    }
+
+    fn response_body(self) -> &'static [u8] {
+        match self {
+            Self::Brownout => b"brownout active, non-core route shed\n",
+            Self::AdaptiveAdmission => b"adaptive admission overload\n",
+            Self::RouteCap => b"route queue cap exceeded\n",
+            Self::RouteGlobalCap => b"global queue cap exceeded\n",
+            Self::GlobalInflight => b"overloaded, retry later\n",
+            Self::UpstreamInflight => b"upstream overloaded, retry later\n",
         }
     }
 }
@@ -115,6 +146,43 @@ where
         body: b"request rate limited\n",
         retry_after_seconds: rejection.retry_after_seconds,
     })
+}
+
+pub(crate) fn evaluate_brownout_policy(
+    brownout: &BrownoutController,
+    inflight_percent: u8,
+    route: &str,
+    retry_after_seconds: u32,
+) -> AdmissionPolicyDecision {
+    brownout.observe_admission_pressure(inflight_percent);
+    if brownout.route_allowed(route) {
+        return AdmissionPolicyDecision::AdmitReady;
+    }
+
+    overload_decision(OverloadDecisionReason::Brownout, retry_after_seconds)
+}
+
+pub(crate) fn overload_decision(
+    reason: OverloadDecisionReason,
+    retry_after_seconds: u32,
+) -> AdmissionPolicyDecision {
+    AdmissionPolicyDecision::Overloaded(OverloadDecision {
+        reason,
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        body: reason.response_body(),
+        retry_after_seconds: retry_after_seconds.max(1),
+    })
+}
+
+pub(crate) fn overload_decision_for_route_queue_rejection(
+    rejection: RouteQueueRejection,
+    retry_after_seconds: u32,
+) -> AdmissionPolicyDecision {
+    let reason = match rejection {
+        RouteQueueRejection::GlobalCap => OverloadDecisionReason::RouteGlobalCap,
+        RouteQueueRejection::RouteCap => OverloadDecisionReason::RouteCap,
+    };
+    overload_decision(reason, retry_after_seconds)
 }
 
 pub(crate) fn api_key_is_authorized(

@@ -77,7 +77,7 @@ use crate::{
         RESPONSE_CHUNK_BYTES_LIMIT, RESPONSE_CHUNK_CHANNEL_CAPACITY,
         SCID_ROTATION_PACKET_THRESHOLD, UDP_READ_TIMEOUT_MS, scid_rotation_interval,
     },
-    resilience::{route_queue::RouteQueueRejection, runtime::RuntimeResilience},
+    resilience::runtime::RuntimeResilience,
     routing::{decision::RouteDecisionReason, index::RouteIndex},
     runtime::{
         backend::{resolution::RuntimeBackendResolution, store::RuntimeBackendResolutionStore},
