@@ -6,12 +6,11 @@ mod resolve;
 mod response;
 mod stream_progress;
 
-use self::prepare::{PreparedRequest, StartedAuthRequest};
-
 use std::{convert::Infallible, error::Error as StdError};
 
 use spooky_config::config::ScopedRateLimitScope;
 
+use self::prepare::{PreparedRequest, StartedAuthRequest};
 use super::*;
 use crate::runtime::connection::{request::PendingForward, stream::StreamAdmissionState};
 
@@ -1107,12 +1106,14 @@ mod tests {
         },
     };
 
-    use super::auth::{
-        allowed_auth_headers, append_auth_request_headers, auth_allow_mutations, auth_failure_mode,
-        auth_timeout_ms, fail_open, map_http_external_auth_response, oidc_audience_matches,
-        oidc_scope_satisfied,
+    use super::{
+        auth::{
+            allowed_auth_headers, append_auth_request_headers, auth_allow_mutations,
+            auth_failure_mode, auth_timeout_ms, fail_open, map_http_external_auth_response,
+            oidc_audience_matches, oidc_scope_satisfied,
+        },
+        *,
     };
-    use super::*;
     use crate::runtime::connection::auth::{ExternalAuthDecision, PendingHeaderMutation};
 
     fn sample_pending_forward(headers: Vec<quiche::h3::Header>) -> PendingForward {

@@ -1,6 +1,5 @@
 use std::{
-    collections::HashMap,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{Arc, RwLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -22,8 +21,7 @@ use crate::{
     resilience::{
         adaptive_admission::AdaptivePermit,
         brownout::BrownoutController,
-        route_queue::RouteQueuePermit,
-        route_queue::RouteQueueRejection,
+        route_queue::{RouteQueuePermit, RouteQueueRejection},
         runtime::RuntimeResilience,
         scoped_rate_limit::{ScopedRateLimitRule, ScopedRateLimiters},
     },

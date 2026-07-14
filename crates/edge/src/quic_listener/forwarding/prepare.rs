@@ -3,9 +3,11 @@ use std::convert::Infallible;
 use spooky_config::runtime::RuntimeExternalAuth;
 use tracing::Span;
 
-use super::auth::{AuthStart, auth_failure_mode, fail_open, start_external_auth_task};
-use super::resolve::ResolvedBackend;
-use super::*;
+use super::{
+    auth::{AuthStart, auth_failure_mode, fail_open, start_external_auth_task},
+    resolve::ResolvedBackend,
+    *,
+};
 use crate::{
     quic_listener::admission::{
         AdmissionPolicyDecision, admission_rejection_response,
