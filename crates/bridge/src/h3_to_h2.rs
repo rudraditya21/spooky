@@ -1,7 +1,7 @@
 use std::convert::Infallible;
 
 use bytes::Bytes;
-use http::{HeaderName, HeaderValue, Method, Request, Uri, Version};
+use http::{Method, Request, Uri, Version};
 use http_body_util::combinators::BoxBody;
 use hyper::ext::Protocol;
 use spooky_config::{
@@ -13,8 +13,9 @@ use crate::{
     BridgeError,
     context::ForwardedContext,
     request::{
-        RequestBuildInput, RequestBuildPolicies, RequestBuildTarget, RequestHeaderPolicyInput,
-        RequestTraceContext, apply_request_header_policies,
+        RequestBuildInput, RequestBuildPolicies, RequestBuildTarget, RequestHeaderAssembly,
+        RequestHeaderPolicyInput, RequestTraceContext, apply_request_header_assembly,
+        apply_request_header_policies,
     },
     websocket::{H3WebsocketRequestKind, h3_websocket_request_kind},
 };
@@ -123,50 +124,18 @@ pub fn build_h2_request_for_target(
         builder = builder
             .version(Version::HTTP_2)
             .extension(Protocol::from_static("websocket"));
-    } else {
-        builder = builder.header(http::header::HOST, host_value);
     }
-
-    if let Some(len) = content_length
-        && len > 0
-        && !websocket_extended_connect
-    {
-        builder = builder.header(http::header::CONTENT_LENGTH, len);
-    }
-
-    let has_request_id = builder
-        .headers_ref()
-        .is_some_and(|h| h.contains_key("x-request-id"));
-    if !has_request_id {
-        builder = builder.header(
-            HeaderName::from_static("x-request-id"),
-            HeaderValue::from_str(&trace.request_id.to_string())
-                .map_err(|_| BridgeError::InvalidHeader)?,
-        );
-    }
-
-    let has_traceparent = builder
-        .headers_ref()
-        .is_some_and(|h| h.contains_key("traceparent"));
-    if !has_traceparent && let Some(traceparent) = trace.traceparent {
-        builder = builder.header(
-            HeaderName::from_static("traceparent"),
-            HeaderValue::from_str(traceparent).map_err(|_| BridgeError::InvalidHeader)?,
-        );
-    }
-
-    if let Some(value) = resolved_headers.forwarded_values.forwarded {
-        builder = builder.header(HeaderName::from_static("forwarded"), value);
-    }
-    if let Some(value) = resolved_headers.forwarded_values.x_forwarded_for {
-        builder = builder.header(HeaderName::from_static("x-forwarded-for"), value);
-    }
-    if let Some(value) = resolved_headers.forwarded_values.x_forwarded_proto {
-        builder = builder.header(HeaderName::from_static("x-forwarded-proto"), value);
-    }
-    if let Some(value) = resolved_headers.forwarded_values.x_forwarded_host {
-        builder = builder.header(HeaderName::from_static("x-forwarded-host"), value);
-    }
+    builder = apply_request_header_assembly(
+        builder,
+        RequestHeaderAssembly {
+            resolved_headers,
+            trace,
+            content_length,
+            include_content_length: !websocket_extended_connect,
+            include_host_header: !websocket_extended_connect,
+            add_te_trailers: false,
+        },
+    )?;
 
     builder.body(body).map_err(BridgeError::Build)
 }

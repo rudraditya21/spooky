@@ -74,6 +74,15 @@ pub struct ResolvedRequestHeaderPolicy {
     pub forwarded_values: ForwardedHeaderValues,
 }
 
+pub struct RequestHeaderAssembly<'a> {
+    pub resolved_headers: ResolvedRequestHeaderPolicy,
+    pub trace: RequestTraceContext<'a>,
+    pub content_length: Option<usize>,
+    pub include_content_length: bool,
+    pub include_host_header: bool,
+    pub add_te_trailers: bool,
+}
+
 impl<'a, B> RequestBuildInput<'a, B> {
     pub fn body_mode_for_length(content_length: Option<usize>) -> RequestBodyMode {
         match content_length {
@@ -165,4 +174,73 @@ pub fn apply_request_header_policies(
         host_value,
         forwarded_values,
     })
+}
+
+pub fn apply_request_header_assembly(
+    mut builder: http::request::Builder,
+    assembly: RequestHeaderAssembly<'_>,
+) -> Result<http::request::Builder, BridgeError> {
+    let RequestHeaderAssembly {
+        resolved_headers,
+        trace,
+        content_length,
+        include_content_length,
+        include_host_header,
+        add_te_trailers,
+    } = assembly;
+
+    for (header_name, header_value) in resolved_headers.passthrough_headers {
+        builder = builder.header(header_name, header_value);
+    }
+
+    if include_host_header {
+        builder = builder.header(http::header::HOST, resolved_headers.host_value.as_str());
+    }
+
+    if include_content_length
+        && let Some(len) = content_length
+        && len > 0
+    {
+        builder = builder.header(http::header::CONTENT_LENGTH, len);
+    }
+
+    let has_request_id = builder
+        .headers_ref()
+        .is_some_and(|h| h.contains_key("x-request-id"));
+    if !has_request_id {
+        builder = builder.header(
+            HeaderName::from_static("x-request-id"),
+            HeaderValue::from_str(&trace.request_id.to_string())
+                .map_err(|_| BridgeError::InvalidHeader)?,
+        );
+    }
+
+    let has_traceparent = builder
+        .headers_ref()
+        .is_some_and(|h| h.contains_key("traceparent"));
+    if !has_traceparent && let Some(traceparent) = trace.traceparent {
+        builder = builder.header(
+            HeaderName::from_static("traceparent"),
+            HeaderValue::from_str(traceparent).map_err(|_| BridgeError::InvalidHeader)?,
+        );
+    }
+
+    if let Some(value) = resolved_headers.forwarded_values.forwarded {
+        builder = builder.header(HeaderName::from_static("forwarded"), value);
+    }
+    if let Some(value) = resolved_headers.forwarded_values.x_forwarded_for {
+        builder = builder.header(HeaderName::from_static("x-forwarded-for"), value);
+    }
+    if let Some(value) = resolved_headers.forwarded_values.x_forwarded_proto {
+        builder = builder.header(HeaderName::from_static("x-forwarded-proto"), value);
+    }
+    if let Some(value) = resolved_headers.forwarded_values.x_forwarded_host {
+        builder = builder.header(HeaderName::from_static("x-forwarded-host"), value);
+    }
+
+    if add_te_trailers {
+        builder = builder.header(http::header::TE, "trailers");
+    }
+
+    Ok(builder)
 }
