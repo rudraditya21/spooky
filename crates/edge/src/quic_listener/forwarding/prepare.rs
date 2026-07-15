@@ -14,7 +14,10 @@ use crate::{
         evaluate_forwarding_pre_admission_policy,
     },
     runtime::connection::{
-        auth::{ExternalAuthExecutionPolicy, apply_auth_request_mutations},
+        auth::{
+            ExternalAuthCompletion, ExternalAuthFailureDisposition, ExternalAuthTaskConfig,
+            apply_auth_request_mutations, evaluate_external_auth_completion,
+        },
         request::PendingForward,
     },
 };
@@ -359,8 +362,8 @@ impl QUICListener {
                 let auth_fail_open = external_auth
                     .as_ref()
                     .map(|auth| {
-                        ExternalAuthExecutionPolicy::from_external_auth(auth)
-                            .disposition()
+                        ExternalAuthTaskConfig::from_external_auth(auth)
+                            .disposition
                             .fail_open()
                     })
                     .unwrap_or(false);
@@ -448,34 +451,62 @@ impl QUICListener {
         let auth_start = if let Some(external_auth) = external_auth {
             match start_external_auth_task(Arc::clone(&request.pending_forward), external_auth) {
                 Ok(start) => Some(start),
-                Err(err) if auth_fail_open => {
-                    metrics.inc_external_auth_error();
-                    warn!(
-                        "request_id={} route={} external auth startup failed open: {:?}",
-                        request.request_id, request.upstream_name, err
-                    );
-                    None
-                }
                 Err(err) => {
-                    metrics.inc_failure();
-                    metrics.inc_external_auth_error();
-                    metrics.record_route(
-                        &request.upstream_name,
-                        request_start.elapsed(),
-                        RouteOutcome::Failure,
-                    );
-                    error!(
-                        "request_id={} route={} external auth startup failed: {:?}",
-                        request.request_id, request.upstream_name, err
-                    );
-                    Self::send_simple_response(
-                        h3,
-                        quic,
-                        stream_id,
-                        http::StatusCode::SERVICE_UNAVAILABLE,
-                        b"external auth unavailable\n",
-                    )?;
-                    return Ok(None);
+                    match evaluate_external_auth_completion(
+                        Err(err),
+                        ExternalAuthFailureDisposition::from_fail_open(auth_fail_open),
+                    ) {
+                        ExternalAuthCompletion::FailOpen { timed_out, error } => {
+                            metrics.inc_external_auth_error();
+                            if timed_out {
+                                warn!(
+                                    "request_id={} route={} external auth startup failed open: timeout",
+                                    request.request_id, request.upstream_name
+                                );
+                            } else if let Some(error) = error {
+                                warn!(
+                                    "request_id={} route={} external auth startup failed open: {:?}",
+                                    request.request_id, request.upstream_name, error
+                                );
+                            }
+                            None
+                        }
+                        ExternalAuthCompletion::Reject {
+                            status,
+                            body,
+                            timed_out,
+                            error,
+                        } => {
+                            metrics.inc_failure();
+                            metrics.inc_external_auth_error();
+                            metrics.record_route(
+                                &request.upstream_name,
+                                request_start.elapsed(),
+                                if timed_out {
+                                    RouteOutcome::Timeout
+                                } else {
+                                    RouteOutcome::Failure
+                                },
+                            );
+                            if let Some(error) = error {
+                                error!(
+                                    "request_id={} route={} external auth startup failed: {:?}",
+                                    request.request_id, request.upstream_name, error
+                                );
+                            } else {
+                                error!(
+                                    "request_id={} route={} external auth startup failed",
+                                    request.request_id, request.upstream_name
+                                );
+                            }
+                            Self::send_simple_response(h3, quic, stream_id, status, body)?;
+                            return Ok(None);
+                        }
+                        ExternalAuthCompletion::Allow { .. }
+                        | ExternalAuthCompletion::Respond(_) => {
+                            unreachable!("startup failure must resolve to fail-open or rejection")
+                        }
+                    }
                 }
             }
         } else {
