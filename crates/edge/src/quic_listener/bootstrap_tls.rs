@@ -390,15 +390,17 @@ impl QUICListener {
                                 };
                                 let (backend_addr, upstream_name, upstream_policy) =
                                     match Self::resolve_bootstrap_target(
-                                        &method,
-                                        &path,
-                                        authority.as_deref(),
-                                        Some(&lb_header_lookup),
-                                        &routing_index,
-                                        &upstream_pools,
-                                        &upstream_policies,
-                                        &metrics,
-                                        Duration::from_millis(0),
+                                        super::forwarding::BootstrapResolutionInput {
+                                            method: &method,
+                                            path: &path,
+                                            authority: authority.as_deref(),
+                                            header_lookup: Some(&lb_header_lookup),
+                                            routing_index: &routing_index,
+                                            upstream_pools: &upstream_pools,
+                                            upstream_policies: &upstream_policies,
+                                            metrics: &metrics,
+                                            elapsed: Duration::from_millis(0),
+                                        },
                                     ) {
                                         Ok(value) => (
                                             value.backend_addr,

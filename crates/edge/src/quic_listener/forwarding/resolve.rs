@@ -66,6 +66,18 @@ pub(in crate::quic_listener) struct BootstrapResolvedTarget {
     pub(in crate::quic_listener) backend_addr: String,
 }
 
+pub(in crate::quic_listener) struct BootstrapResolutionInput<'a> {
+    pub(in crate::quic_listener) method: &'a str,
+    pub(in crate::quic_listener) path: &'a str,
+    pub(in crate::quic_listener) authority: Option<&'a str>,
+    pub(in crate::quic_listener) header_lookup: Option<&'a LbHeaderLookup<'a>>,
+    pub(in crate::quic_listener) routing_index: &'a RouteIndex,
+    pub(in crate::quic_listener) upstream_pools: &'a HashMap<String, Arc<RwLock<UpstreamPool>>>,
+    pub(in crate::quic_listener) upstream_policies: &'a HashMap<String, RuntimeUpstreamPolicy>,
+    pub(in crate::quic_listener) metrics: &'a Metrics,
+    pub(in crate::quic_listener) elapsed: Duration,
+}
+
 struct BackendSelectionPlan {
     lb_type: String,
     lb_key: String,
@@ -237,16 +249,19 @@ impl QUICListener {
     }
 
     pub(in crate::quic_listener) fn resolve_bootstrap_target(
-        method: &str,
-        path: &str,
-        authority: Option<&str>,
-        header_lookup: Option<&LbHeaderLookup<'_>>,
-        routing_index: &RouteIndex,
-        upstream_pools: &HashMap<String, Arc<RwLock<UpstreamPool>>>,
-        upstream_policies: &HashMap<String, RuntimeUpstreamPolicy>,
-        metrics: &Metrics,
-        elapsed: Duration,
+        input: BootstrapResolutionInput<'_>,
     ) -> Result<BootstrapResolvedTarget, ProxyError> {
+        let BootstrapResolutionInput {
+            method,
+            path,
+            authority,
+            header_lookup,
+            routing_index,
+            upstream_pools,
+            upstream_policies,
+            metrics,
+            elapsed,
+        } = input;
         let resolution_request =
             RouteResolutionRequest::new(method, path, authority, None, header_lookup);
         let ResolvedBackend { route, backend } = match Self::resolve_backend_internal(
