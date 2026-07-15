@@ -1,4 +1,24 @@
 use super::*;
+use spooky_errors::{
+    RetryPolicyDecision, RetryPolicyDenial, RetryPolicyInput, UpstreamRetryReason,
+    evaluate_retry_policy,
+};
+
+fn metrics_retry_reason(reason: UpstreamRetryReason) -> RetryReason {
+    match reason {
+        UpstreamRetryReason::Timeout => RetryReason::BackendTimeout,
+        UpstreamRetryReason::Transport => RetryReason::BackendTransport,
+        UpstreamRetryReason::Pool => RetryReason::BackendPool,
+    }
+}
+
+fn metrics_retry_denial(reason: RetryPolicyDenial) -> RetryReason {
+    match reason {
+        RetryPolicyDenial::NotBodylessMode => RetryReason::NotBodylessMode,
+        RetryPolicyDenial::BudgetDenied => RetryReason::BudgetDenied,
+        RetryPolicyDenial::NoAlternateBackend => RetryReason::NoAlternateBackend,
+    }
+}
 
 impl QUICListener {
     #[allow(clippy::too_many_arguments)]
@@ -279,25 +299,21 @@ impl QUICListener {
                         {
                             Ok(response) => response,
                             Err(primary_err) => {
-                                let retry_reason = classify_retry_reason(&primary_err);
-                                let is_retryable_err = is_retryable(&primary_err);
-                                let budget_ok = retry_budget.allow_retry(&route_name).is_ok();
-                                let can_retry = bodyless_mode
-                                    && is_retryable_err
-                                    && budget_ok
-                                    && alternate_backend.is_some();
-                                if !can_retry {
-                                    if !bodyless_mode {
-                                        retry_denial_reason = Some(RetryReason::NotBodylessMode);
-                                    } else if !is_retryable_err {
-                                        retry_denial_reason = None;
-                                    } else if !budget_ok {
-                                        retry_denial_reason = Some(RetryReason::BudgetDenied);
-                                    } else {
-                                        retry_denial_reason = Some(RetryReason::NoAlternateBackend);
+                                let retry_decision = evaluate_retry_policy(RetryPolicyInput {
+                                    retryability: spooky_errors::classify_retryability(&primary_err),
+                                    bodyless_mode,
+                                    budget_available: retry_budget.allow_retry(&route_name).is_ok(),
+                                    alternate_backend_available: alternate_backend.is_some(),
+                                });
+                                let retry_reason = match retry_decision {
+                                    RetryPolicyDecision::Retry { reason } => {
+                                        metrics_retry_reason(reason)
                                     }
-                                    return Err(primary_err);
-                                }
+                                    RetryPolicyDecision::DoNotRetry { denial } => {
+                                        retry_denial_reason = denial.map(metrics_retry_denial);
+                                        return Err(primary_err);
+                                    }
+                                };
                                 if let Some((retry_backend, _)) = alternate_backend.clone()
                                     && let Some(endpoint) = backend_endpoints.get(&retry_backend)
                                     && let Ok(retry_request) =

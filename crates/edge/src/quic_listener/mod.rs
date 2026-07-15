@@ -51,7 +51,7 @@ use spooky_config::{
         RuntimeUpstreamPolicy,
     },
 };
-use spooky_errors::{PoolError, ProxyError, is_retryable};
+use spooky_errors::{PoolError, ProxyError};
 use spooky_lb::{
     backend::HealthTransition, health::HealthFailureReason, upstream_pool::UpstreamPool,
 };
@@ -1906,15 +1906,6 @@ impl QUICListener {
             Ok(resp) => resp,
             Err(_) => Response::new(Full::new(Bytes::from_static(b"failed to render metrics\n"))),
         }
-    }
-}
-
-fn classify_retry_reason(err: &ProxyError) -> RetryReason {
-    match err {
-        ProxyError::Timeout => RetryReason::BackendTimeout,
-        ProxyError::Transport(_) => RetryReason::BackendTransport,
-        ProxyError::Pool(_) => RetryReason::BackendPool,
-        _ => RetryReason::BackendTransport,
     }
 }
 
