@@ -1132,14 +1132,11 @@ mod tests {
         },
     };
 
-    use super::{
-        auth::{append_auth_request_headers, oidc_audience_matches, oidc_scope_satisfied},
-        *,
-    };
+    use super::{auth::append_auth_request_headers, *};
     use crate::runtime::connection::auth::{
         ExternalAuthDecision, ExternalAuthExecutionPolicy, ExternalAuthResponseMetadata,
         PendingHeaderMutation, allowed_auth_headers, auth_allow_mutations,
-        map_http_external_auth_response,
+        map_http_external_auth_response, oidc_audience_matches, oidc_scope_satisfied,
     };
 
     fn sample_pending_forward(headers: Vec<quiche::h3::Header>) -> PendingForward {

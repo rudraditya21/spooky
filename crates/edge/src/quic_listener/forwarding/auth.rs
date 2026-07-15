@@ -9,9 +9,11 @@ use tokio::task::AbortHandle;
 use super::*;
 use crate::runtime::connection::{
     auth::{
-        ExternalAuthChallengeResponse, ExternalAuthDecision, ExternalAuthDecisionOutcome,
-        ExternalAuthDenyResponse, ExternalAuthExecutionPolicy, ExternalAuthFailureResolution,
-        ExternalAuthResponseMetadata, ExternalAuthResult, merge_auth_request_mutations,
+        ExternalAuthDecision, ExternalAuthDecisionOutcome, ExternalAuthDenyResponse,
+        ExternalAuthExecutionPolicy, ExternalAuthFailureResolution, ExternalAuthResponseMetadata,
+        ExternalAuthResult, OidcAuthorizationCheck, merge_auth_request_mutations,
+        oidc_audience_matches, oidc_authorization_check, oidc_discovery_target,
+        oidc_scope_satisfied, validate_oidc_provider_metadata,
     },
     request::PendingForward,
     stream::StreamAdmissionState,
@@ -246,56 +248,6 @@ async fn fetch_json_document(uri: String, timeout: Duration) -> Result<Value, Pr
     serde_json::from_slice(&body).map_err(|err| ProxyError::Transport(err.to_string()))
 }
 
-/// Auth endpoints must use https; http is permitted only to loopback hosts,
-/// which are not reachable by on-path attackers (local development/testing).
-fn auth_uri_scheme_permitted(uri: &http::Uri) -> bool {
-    match uri.scheme_str() {
-        Some("https") => uri.authority().is_some(),
-        Some("http") => uri.host().is_some_and(uri_host_is_loopback),
-        _ => false,
-    }
-}
-
-fn uri_host_is_loopback(host: &str) -> bool {
-    let host = host
-        .strip_prefix('[')
-        .and_then(|inner| inner.strip_suffix(']'))
-        .unwrap_or(host);
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
-}
-
-fn oidc_discovery_url(discovery_url: Option<String>, issuer_url: Option<String>) -> Option<String> {
-    discovery_url.or_else(|| {
-        issuer_url.map(|issuer| {
-            format!(
-                "{}/.well-known/openid-configuration",
-                issuer.trim_end_matches('/')
-            )
-        })
-    })
-}
-
-pub(super) fn oidc_scope_satisfied(required_scopes: &[String], granted_scopes: &str) -> bool {
-    let granted: std::collections::HashSet<&str> = granted_scopes.split_whitespace().collect();
-    required_scopes
-        .iter()
-        .all(|scope| granted.contains(scope.as_str()))
-}
-
-pub(super) fn oidc_audience_matches(expected: Option<&str>, value: Option<&Value>) -> bool {
-    let Some(expected) = expected else {
-        return true;
-    };
-    match value {
-        Some(Value::String(single)) => single == expected,
-        Some(Value::Array(values)) => values.iter().any(|value| value.as_str() == Some(expected)),
-        _ => false,
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn run_oidc_external_auth(
     pending_forward: Arc<PendingForward>,
@@ -308,51 +260,17 @@ async fn run_oidc_external_auth(
     request_headers: Vec<spooky_config::runtime::RuntimeExternalAuthRequestHeader>,
     timeout: Duration,
 ) -> ExternalAuthResult {
-    let Some(authorization) = authorization_header_from_pending_forward(&pending_forward) else {
-        return Ok(ExternalAuthDecision::Challenge(
-            ExternalAuthChallengeResponse {
-                status: http::StatusCode::UNAUTHORIZED,
-                headers: Vec::new(),
-                www_authenticate: "Bearer".to_string(),
-                body: b"missing bearer token\n".to_vec(),
-            },
-        ));
+    let token = match oidc_authorization_check(
+        authorization_header_from_pending_forward(&pending_forward).as_deref(),
+    ) {
+        OidcAuthorizationCheck::Token(token) => token,
+        OidcAuthorizationCheck::Challenge(response) => {
+            return Ok(ExternalAuthDecision::Challenge(response));
+        }
     };
-    let Some(token) = QUICListener::bearer_token_from_authorization_value(&authorization) else {
-        return Ok(ExternalAuthDecision::Challenge(
-            ExternalAuthChallengeResponse {
-                status: http::StatusCode::UNAUTHORIZED,
-                headers: Vec::new(),
-                www_authenticate: "Bearer".to_string(),
-                body: b"invalid bearer token\n".to_vec(),
-            },
-        ));
-    };
-    let discovery = oidc_discovery_url(discovery_url, issuer_url.clone())
-        .ok_or_else(|| ProxyError::Transport("oidc auth missing discovery metadata".into()))?;
-    let discovery_uri = discovery
-        .parse::<http::Uri>()
-        .map_err(|err| ProxyError::Transport(err.to_string()))?;
-    if !auth_uri_scheme_permitted(&discovery_uri) {
-        return Err(ProxyError::Transport(
-            "oidc discovery endpoint must use https (http allowed only for loopback)".into(),
-        ));
-    }
-    let document = fetch_json_document(discovery, timeout).await?;
-    let introspection_endpoint = document
-        .get("introspection_endpoint")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            ProxyError::Transport("oidc discovery missing introspection_endpoint".into())
-        })?;
-    let introspection_uri = introspection_endpoint
-        .parse::<http::Uri>()
-        .map_err(|err| ProxyError::Transport(err.to_string()))?;
-    if !auth_uri_scheme_permitted(&introspection_uri) {
-        return Err(ProxyError::Transport(
-            "oidc introspection endpoint must use https (http allowed only for loopback)".into(),
-        ));
-    }
+    let discovery = oidc_discovery_target(discovery_url.as_deref(), issuer_url.as_deref())?;
+    let document = fetch_json_document(discovery.url, timeout).await?;
+    let metadata = validate_oidc_provider_metadata(&document)?;
 
     let mut body = format!(
         "token={}&client_id={}",
@@ -370,7 +288,7 @@ async fn run_oidc_external_auth(
 
     let mut builder = Request::builder()
         .method(http::Method::POST)
-        .uri(introspection_endpoint)
+        .uri(metadata.introspection_endpoint)
         .header(
             http::header::CONTENT_TYPE,
             http::header::HeaderValue::from_static("application/x-www-form-urlencoded"),

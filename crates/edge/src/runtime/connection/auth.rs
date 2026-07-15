@@ -167,6 +167,24 @@ pub struct ExternalAuthResponseMetadata<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OidcAuthorizationCheck {
+    Token(String),
+    Challenge(ExternalAuthChallengeResponse),
+}
+
+#[derive(Debug, Clone)]
+pub struct OidcDiscoveryTarget {
+    pub url: String,
+    pub uri: http::Uri,
+}
+
+#[derive(Debug, Clone)]
+pub struct OidcProviderMetadata {
+    pub introspection_endpoint: String,
+    pub introspection_uri: http::Uri,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExternalAuthMutationIntent {
     Upsert { name: Vec<u8>, value: Vec<u8> },
     Remove { name: Vec<u8> },
@@ -273,6 +291,123 @@ impl ExternalAuthDecisionOutcome {
             }),
             _ => None,
         }
+    }
+}
+
+pub fn oidc_authorization_check(authorization: Option<&str>) -> OidcAuthorizationCheck {
+    let Some(authorization) = authorization else {
+        return OidcAuthorizationCheck::Challenge(ExternalAuthChallengeResponse {
+            status: http::StatusCode::UNAUTHORIZED,
+            headers: Vec::new(),
+            www_authenticate: "Bearer".to_string(),
+            body: b"missing bearer token\n".to_vec(),
+        });
+    };
+    let Some(token) = bearer_token_from_authorization_value(authorization) else {
+        return OidcAuthorizationCheck::Challenge(ExternalAuthChallengeResponse {
+            status: http::StatusCode::UNAUTHORIZED,
+            headers: Vec::new(),
+            www_authenticate: "Bearer".to_string(),
+            body: b"invalid bearer token\n".to_vec(),
+        });
+    };
+    OidcAuthorizationCheck::Token(token.to_string())
+}
+
+fn bearer_token_from_authorization_value(raw: &str) -> Option<&str> {
+    let (scheme, value) = raw.split_once(char::is_whitespace)?;
+    scheme
+        .eq_ignore_ascii_case("bearer")
+        .then_some(value.trim())
+}
+
+pub fn auth_uri_scheme_permitted(uri: &http::Uri) -> bool {
+    match uri.scheme_str() {
+        Some("https") => uri.authority().is_some(),
+        Some("http") => uri.host().is_some_and(uri_host_is_loopback),
+        _ => false,
+    }
+}
+
+fn uri_host_is_loopback(host: &str) -> bool {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host);
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+pub fn oidc_discovery_target(
+    discovery_url: Option<&str>,
+    issuer_url: Option<&str>,
+) -> Result<OidcDiscoveryTarget, ProxyError> {
+    let Some(url) = discovery_url.map(str::to_string).or_else(|| {
+        issuer_url.map(|issuer| {
+            format!(
+                "{}/.well-known/openid-configuration",
+                issuer.trim_end_matches('/')
+            )
+        })
+    }) else {
+        return Err(ProxyError::Transport(
+            "oidc auth missing discovery metadata".into(),
+        ));
+    };
+    let uri = url
+        .parse::<http::Uri>()
+        .map_err(|err| ProxyError::Transport(err.to_string()))?;
+    if !auth_uri_scheme_permitted(&uri) {
+        return Err(ProxyError::Transport(
+            "oidc discovery endpoint must use https (http allowed only for loopback)".into(),
+        ));
+    }
+    Ok(OidcDiscoveryTarget { url, uri })
+}
+
+pub fn validate_oidc_provider_metadata(
+    document: &serde_json::Value,
+) -> Result<OidcProviderMetadata, ProxyError> {
+    let introspection_endpoint = document
+        .get("introspection_endpoint")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            ProxyError::Transport("oidc discovery missing introspection_endpoint".into())
+        })?
+        .to_string();
+    let introspection_uri = introspection_endpoint
+        .parse::<http::Uri>()
+        .map_err(|err| ProxyError::Transport(err.to_string()))?;
+    if !auth_uri_scheme_permitted(&introspection_uri) {
+        return Err(ProxyError::Transport(
+            "oidc introspection endpoint must use https (http allowed only for loopback)".into(),
+        ));
+    }
+    Ok(OidcProviderMetadata {
+        introspection_endpoint,
+        introspection_uri,
+    })
+}
+
+pub fn oidc_scope_satisfied(required_scopes: &[String], granted_scopes: &str) -> bool {
+    let granted: std::collections::HashSet<&str> = granted_scopes.split_whitespace().collect();
+    required_scopes
+        .iter()
+        .all(|scope| granted.contains(scope.as_str()))
+}
+
+pub fn oidc_audience_matches(expected: Option<&str>, value: Option<&serde_json::Value>) -> bool {
+    let Some(expected) = expected else {
+        return true;
+    };
+    match value {
+        Some(serde_json::Value::String(single)) => single == expected,
+        Some(serde_json::Value::Array(values)) => {
+            values.iter().any(|value| value.as_str() == Some(expected))
+        }
+        _ => false,
     }
 }
 
@@ -530,6 +665,7 @@ pub enum PendingHeaderMutation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn canonicalize_auth_request_mutations_drops_protected_and_invalid_names() {
@@ -625,5 +761,96 @@ mod tests {
                 .any(|header| header.name() == b"x-user" && header.value() == b"alice")
         );
         assert!(!headers.iter().any(|header| header.name() == b"x-team"));
+    }
+
+    #[test]
+    fn oidc_authorization_check_maps_missing_and_invalid_bearer_tokens_to_challenges() {
+        assert!(matches!(
+            oidc_authorization_check(None),
+            OidcAuthorizationCheck::Challenge(ExternalAuthChallengeResponse {
+                status: http::StatusCode::UNAUTHORIZED,
+                ..
+            })
+        ));
+
+        let invalid = oidc_authorization_check(Some("Basic abc123"));
+        match invalid {
+            OidcAuthorizationCheck::Challenge(response) => {
+                assert_eq!(response.www_authenticate, "Bearer");
+                assert_eq!(response.body, b"invalid bearer token\n".to_vec());
+            }
+            other => panic!("unexpected authorization result: {other:?}"),
+        }
+
+        assert_eq!(
+            oidc_authorization_check(Some("Bearer token-1")),
+            OidcAuthorizationCheck::Token("token-1".to_string())
+        );
+    }
+
+    #[test]
+    fn oidc_discovery_target_derives_and_validates_provider_metadata_url() {
+        let derived = oidc_discovery_target(None, Some("https://issuer.example.com/base/"))
+            .expect("derived discovery target");
+        assert_eq!(
+            derived.url,
+            "https://issuer.example.com/base/.well-known/openid-configuration"
+        );
+
+        let http_loopback = oidc_discovery_target(Some("http://127.0.0.1:9000/oidc"), None)
+            .expect("loopback discovery should be allowed");
+        assert_eq!(http_loopback.uri.scheme_str(), Some("http"));
+
+        let err = oidc_discovery_target(Some("http://example.com/oidc"), None)
+            .expect_err("non-loopback http discovery must be rejected");
+        assert!(matches!(err, ProxyError::Transport(_)));
+    }
+
+    #[test]
+    fn validate_oidc_provider_metadata_requires_safe_introspection_endpoint() {
+        let valid = validate_oidc_provider_metadata(&json!({
+            "introspection_endpoint": "https://issuer.example.com/oauth2/introspect"
+        }))
+        .expect("valid metadata");
+        assert_eq!(
+            valid.introspection_endpoint,
+            "https://issuer.example.com/oauth2/introspect"
+        );
+
+        let missing = validate_oidc_provider_metadata(&json!({}))
+            .expect_err("metadata without introspection endpoint must fail");
+        assert!(matches!(missing, ProxyError::Transport(_)));
+
+        let invalid = validate_oidc_provider_metadata(&json!({
+            "introspection_endpoint": "http://example.com/oauth2/introspect"
+        }))
+        .expect_err("non-loopback http introspection endpoint must fail");
+        assert!(matches!(invalid, ProxyError::Transport(_)));
+    }
+
+    #[test]
+    fn oidc_helper_predicates_match_expected_scope_and_audience_shapes() {
+        assert!(oidc_scope_satisfied(
+            &["read".to_string(), "write".to_string()],
+            "read write admin"
+        ));
+        assert!(!oidc_scope_satisfied(
+            &["read".to_string(), "write".to_string()],
+            "read"
+        ));
+
+        assert!(oidc_audience_matches(
+            Some("api://edge"),
+            Some(&json!("api://edge"))
+        ));
+        assert!(oidc_audience_matches(
+            Some("api://edge"),
+            Some(&json!(["other", "api://edge"]))
+        ));
+        assert!(!oidc_audience_matches(
+            Some("api://edge"),
+            Some(&json!("api://other"))
+        ));
+        assert!(oidc_audience_matches(None, None));
     }
 }
