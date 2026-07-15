@@ -1,20 +1,15 @@
 use std::convert::Infallible;
 
 use bytes::Bytes;
-use http::{HeaderName, HeaderValue, Method, Request, Uri};
+use http::{Method, Request, Uri};
 use http_body_util::combinators::BoxBody;
-use quiche::h3::NameValue;
-use spooky_config::{
-    backend_endpoint::BackendEndpoint,
-    config::{ForwardedHeaderPolicy, UpstreamHostPolicy},
-};
 
 use crate::{
     BridgeError,
-    context::{ForwardedContext, ForwardedHeaderChains},
-    forwarded::build_forwarded_header_values,
-    headers::{connection_header_tokens, should_strip_request_header},
-    host::resolve_upstream_host_value,
+    request::{
+        RequestBuildInput, RequestBuildTarget, RequestHeaderAssembly, RequestHeaderPolicyInput,
+        apply_request_header_assembly, apply_request_header_policies,
+    },
     websocket::{H3WebsocketRequestKind, h3_websocket_request_kind},
 };
 
@@ -23,133 +18,339 @@ use crate::{
 /// For plain requests: strips hop-by-hop headers and adds `TE: trailers`.
 /// For WebSocket legacy upgrades (`GET` + `Upgrade: websocket`): preserves
 /// `Connection` and `Upgrade` so the H1 upstream can complete the handshake.
-#[allow(clippy::too_many_arguments)]
-pub fn build_h1_request_for_endpoint_with_host_policy(
-    endpoint: &BackendEndpoint,
-    host_policy: &UpstreamHostPolicy,
-    forwarded_policy: &ForwardedHeaderPolicy,
-    method: &str,
-    path: &str,
-    headers: &[quiche::h3::Header],
-    body: BoxBody<Bytes, Infallible>,
-    content_length: Option<usize>,
-    forwarded_ctx: ForwardedContext<'_>,
+pub fn build_h1_request(
+    target: RequestBuildTarget<'_>,
+    input: RequestBuildInput<'_, BoxBody<Bytes, Infallible>>,
 ) -> Result<Request<BoxBody<Bytes, Infallible>>, BridgeError> {
+    let RequestBuildTarget { endpoint, policies } = target;
+    let RequestBuildInput {
+        method,
+        path,
+        authority,
+        headers,
+        body,
+        content_length,
+        body_mode: _body_mode,
+        trace,
+        forwarded,
+    } = input;
+
     let method = Method::from_bytes(method.as_bytes()).map_err(|_| BridgeError::InvalidMethod)?;
     let websocket_kind = h3_websocket_request_kind(method.as_str(), headers);
     let preserve_upgrade = websocket_kind == H3WebsocketRequestKind::LegacyUpgrade;
 
     let mut builder = Request::builder().method(method.clone());
-    let connection_tokens = connection_header_tokens(headers);
-    let mut host_from_headers: Option<String> = None;
-    let mut forwarded_from_headers: Vec<Vec<u8>> = Vec::new();
-    let mut x_forwarded_for_from_headers: Vec<Vec<u8>> = Vec::new();
-    let mut x_forwarded_proto_from_headers: Vec<Vec<u8>> = Vec::new();
-    let mut x_forwarded_host_from_headers: Vec<Vec<u8>> = Vec::new();
-
-    for header in headers {
-        let name = header.name();
-        if name.starts_with(b":") {
-            continue;
-        }
-        if name.eq_ignore_ascii_case(b"forwarded") {
-            forwarded_from_headers.push(header.value().to_vec());
-            continue;
-        }
-        if name.eq_ignore_ascii_case(b"x-forwarded-for") {
-            x_forwarded_for_from_headers.push(header.value().to_vec());
-            continue;
-        }
-        if name.eq_ignore_ascii_case(b"x-forwarded-proto") {
-            x_forwarded_proto_from_headers.push(header.value().to_vec());
-            continue;
-        }
-        if name.eq_ignore_ascii_case(b"x-forwarded-host") {
-            x_forwarded_host_from_headers.push(header.value().to_vec());
-            continue;
-        }
-
-        let header_name = HeaderName::from_bytes(name).map_err(|_| BridgeError::InvalidHeader)?;
-        if should_strip_request_header(&header_name, &connection_tokens, preserve_upgrade) {
-            continue;
-        }
-
-        let header_value =
-            HeaderValue::from_bytes(header.value()).map_err(|_| BridgeError::InvalidHeader)?;
-        if header_name == http::header::HOST {
-            host_from_headers = header_value.to_str().ok().map(str::to_string);
-            continue;
-        }
+    let resolved_headers = apply_request_header_policies(RequestHeaderPolicyInput {
+        target: RequestBuildTarget { endpoint, policies },
+        authority,
+        headers,
+        preserve_upgrade,
+        forwarded,
+    })?;
+    for (header_name, header_value) in &resolved_headers.passthrough_headers {
         builder = builder.header(header_name, header_value);
     }
-
-    let host_value = resolve_upstream_host_value(
-        endpoint,
-        host_policy,
-        forwarded_ctx.request_authority,
-        host_from_headers.as_deref(),
-    )?;
 
     let request_path = if path.is_empty() { "/" } else { path };
     let uri =
         Uri::try_from(endpoint.uri_for_path(request_path)).map_err(|_| BridgeError::InvalidUri)?;
-    builder = builder.uri(uri).header(http::header::HOST, host_value);
-
-    if let Some(len) = content_length
-        && len > 0
-    {
-        builder = builder.header(http::header::CONTENT_LENGTH, len);
-    }
-
-    let has_request_id = builder
-        .headers_ref()
-        .is_some_and(|h| h.contains_key("x-request-id"));
-    if !has_request_id {
-        builder = builder.header(
-            HeaderName::from_static("x-request-id"),
-            HeaderValue::from_str(&forwarded_ctx.request_id.to_string())
-                .map_err(|_| BridgeError::InvalidHeader)?,
-        );
-    }
-
-    let has_traceparent = builder
-        .headers_ref()
-        .is_some_and(|h| h.contains_key("traceparent"));
-    if !has_traceparent && let Some(traceparent) = forwarded_ctx.traceparent {
-        builder = builder.header(
-            HeaderName::from_static("traceparent"),
-            HeaderValue::from_str(traceparent).map_err(|_| BridgeError::InvalidHeader)?,
-        );
-    }
-
-    let forwarded_values = build_forwarded_header_values(
-        forwarded_policy,
-        ForwardedHeaderChains {
-            forwarded: &forwarded_from_headers,
-            x_forwarded_for: &x_forwarded_for_from_headers,
-            x_forwarded_proto: &x_forwarded_proto_from_headers,
-            x_forwarded_host: &x_forwarded_host_from_headers,
+    builder = builder.uri(uri);
+    builder = apply_request_header_assembly(
+        builder,
+        RequestHeaderAssembly {
+            resolved_headers,
+            trace,
+            content_length,
+            include_content_length: true,
+            include_host_header: true,
+            add_te_trailers: !preserve_upgrade,
         },
-        forwarded_ctx.client_addr.ip(),
-        host_value,
     )?;
-    if let Some(value) = forwarded_values.forwarded {
-        builder = builder.header(HeaderName::from_static("forwarded"), value);
-    }
-    if let Some(value) = forwarded_values.x_forwarded_for {
-        builder = builder.header(HeaderName::from_static("x-forwarded-for"), value);
-    }
-    if let Some(value) = forwarded_values.x_forwarded_proto {
-        builder = builder.header(HeaderName::from_static("x-forwarded-proto"), value);
-    }
-    if let Some(value) = forwarded_values.x_forwarded_host {
-        builder = builder.header(HeaderName::from_static("x-forwarded-host"), value);
-    }
-
-    // Plain H1 requests advertise trailer support; upgrade tunnels must not add this.
-    if !preserve_upgrade {
-        builder = builder.header(http::header::TE, "trailers");
-    }
 
     builder.body(body).map_err(BridgeError::Build)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{convert::Infallible, net::SocketAddr};
+
+    use bytes::Bytes;
+    use http::{
+        HeaderMap, HeaderValue,
+        header::{CONTENT_LENGTH, HOST, TE},
+    };
+    use http_body_util::{BodyExt, Empty, combinators::BoxBody};
+    use quiche::h3::Header;
+    use spooky_config::{
+        backend_endpoint::BackendEndpoint,
+        config::{ForwardedHeaderPolicy, UpstreamHostPolicy},
+    };
+
+    use super::build_h1_request;
+    use crate::request::{
+        RequestBuildInput, RequestBuildPolicies, RequestBuildTarget, RequestForwardedContext,
+        RequestTraceContext,
+    };
+
+    #[derive(Clone, Copy)]
+    struct RequestInputMeta<'a> {
+        authority: Option<&'a str>,
+        content_length: Option<usize>,
+        request_id: u64,
+        traceparent: Option<&'a str>,
+        client_addr: SocketAddr,
+    }
+
+    fn request_target<'a>(
+        endpoint: &'a BackendEndpoint,
+        host_policy: &'a UpstreamHostPolicy,
+        forwarded_header_policy: &'a ForwardedHeaderPolicy,
+    ) -> RequestBuildTarget<'a> {
+        RequestBuildTarget {
+            endpoint,
+            policies: RequestBuildPolicies {
+                host_policy,
+                forwarded_header_policy,
+            },
+        }
+    }
+
+    fn request_input<'a>(
+        method: &'a str,
+        path: &'a str,
+        headers: &'a [Header],
+        meta: RequestInputMeta<'a>,
+    ) -> RequestBuildInput<'a, BoxBody<Bytes, Infallible>> {
+        RequestBuildInput {
+            method,
+            path,
+            authority: meta.authority,
+            headers,
+            body: Empty::<Bytes>::new().boxed(),
+            content_length: meta.content_length,
+            body_mode: RequestBuildInput::<BoxBody<Bytes, Infallible>>::body_mode_for_length(
+                meta.content_length,
+            ),
+            trace: RequestTraceContext {
+                request_id: meta.request_id,
+                traceparent: meta.traceparent,
+            },
+            forwarded: RequestForwardedContext {
+                client_addr: meta.client_addr,
+            },
+        }
+    }
+
+    fn bootstrap_headers(headers: &HeaderMap) -> Vec<Header> {
+        headers
+            .iter()
+            .map(|(name, value)| Header::new(name.as_str().as_bytes(), value.as_bytes()))
+            .collect()
+    }
+
+    #[test]
+    fn plain_requests_strip_hop_headers_and_add_te_trailers() {
+        let endpoint = BackendEndpoint::parse("backend.internal:443").expect("endpoint");
+        let headers = vec![
+            Header::new(b"host", b"spoofed.example.com"),
+            Header::new(b"forwarded", b"for=1.2.3.4"),
+            Header::new(b"x-forwarded-for", b"1.2.3.4"),
+            Header::new(b"connection", b"keep-alive, x-secret"),
+            Header::new(b"x-secret", b"drop-me"),
+            Header::new(b"x-keep", b"ok"),
+            Header::new(b"content-length", b"999"),
+        ];
+
+        let req = build_h1_request(
+            request_target(
+                &endpoint,
+                &UpstreamHostPolicy::default(),
+                &ForwardedHeaderPolicy::default(),
+            ),
+            request_input(
+                "POST",
+                "/submit",
+                &headers,
+                RequestInputMeta {
+                    authority: Some("api.example.com"),
+                    content_length: Some(12),
+                    request_id: 42,
+                    traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+                    client_addr: "203.0.113.10:44321".parse().expect("client"),
+                },
+            ),
+        )
+        .expect("request");
+
+        assert_eq!(req.uri().to_string(), "https://backend.internal:443/submit");
+        assert_eq!(
+            req.headers()
+                .get(HOST)
+                .and_then(|value| value.to_str().ok()),
+            Some("api.example.com")
+        );
+        assert_eq!(
+            req.headers().get(TE).and_then(|value| value.to_str().ok()),
+            Some("trailers")
+        );
+        assert_eq!(
+            req.headers()
+                .get(CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok()),
+            Some("12")
+        );
+        assert_eq!(
+            req.headers()
+                .get("x-forwarded-for")
+                .and_then(|value| value.to_str().ok()),
+            Some("203.0.113.10")
+        );
+        assert_eq!(
+            req.headers()
+                .get("forwarded")
+                .and_then(|value| value.to_str().ok()),
+            Some("for=203.0.113.10;proto=https;host=\"api.example.com\"")
+        );
+        assert_eq!(
+            req.headers()
+                .get("traceparent")
+                .and_then(|value| value.to_str().ok()),
+            Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+        );
+        assert_eq!(
+            req.headers()
+                .get("x-request-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("42")
+        );
+        assert_eq!(
+            req.headers()
+                .get("x-keep")
+                .and_then(|value| value.to_str().ok()),
+            Some("ok")
+        );
+        assert!(req.headers().get("x-secret").is_none());
+    }
+
+    #[test]
+    fn legacy_websocket_requests_preserve_upgrade_headers() {
+        let endpoint = BackendEndpoint::parse("http://backend.internal:8080").expect("endpoint");
+        let headers = vec![
+            Header::new(b"host", b"socket.example.com"),
+            Header::new(b"connection", b"upgrade"),
+            Header::new(b"upgrade", b"websocket"),
+            Header::new(b"sec-websocket-key", b"dGhlIHNhbXBsZSBub25jZQ=="),
+        ];
+
+        let req = build_h1_request(
+            request_target(
+                &endpoint,
+                &UpstreamHostPolicy::default(),
+                &ForwardedHeaderPolicy::default(),
+            ),
+            request_input(
+                "GET",
+                "/ws",
+                &headers,
+                RequestInputMeta {
+                    authority: Some("socket.example.com"),
+                    content_length: None,
+                    request_id: 7,
+                    traceparent: None,
+                    client_addr: "198.51.100.12:5555".parse().expect("client"),
+                },
+            ),
+        )
+        .expect("request");
+
+        assert_eq!(req.method(), http::Method::GET);
+        assert_eq!(req.uri().to_string(), "http://backend.internal:8080/ws");
+        assert_eq!(
+            req.headers()
+                .get("connection")
+                .and_then(|value| value.to_str().ok()),
+            Some("upgrade")
+        );
+        assert_eq!(
+            req.headers()
+                .get("upgrade")
+                .and_then(|value| value.to_str().ok()),
+            Some("websocket")
+        );
+        assert_eq!(
+            req.headers()
+                .get("sec-websocket-key")
+                .and_then(|value| value.to_str().ok()),
+            Some("dGhlIHNhbXBsZSBub25jZQ==")
+        );
+        assert!(req.headers().get(TE).is_none());
+        assert!(req.headers().get(CONTENT_LENGTH).is_none());
+    }
+
+    #[test]
+    fn bootstrap_and_forwarding_header_shapes_match_for_h1() {
+        let endpoint = BackendEndpoint::parse("backend.internal:443").expect("endpoint");
+        let forwarding_headers = vec![
+            Header::new(b"host", b"api.example.com"),
+            Header::new(b"x-custom", b"ok"),
+            Header::new(b"x-forwarded-for", b"1.2.3.4"),
+        ];
+
+        let mut bootstrap_headers_map = HeaderMap::new();
+        bootstrap_headers_map.insert(HOST, HeaderValue::from_static("api.example.com"));
+        bootstrap_headers_map.insert("x-custom", HeaderValue::from_static("ok"));
+        bootstrap_headers_map.insert("x-forwarded-for", HeaderValue::from_static("1.2.3.4"));
+        let bootstrap_headers = bootstrap_headers(&bootstrap_headers_map);
+
+        let build = |headers: &[Header]| {
+            build_h1_request(
+                request_target(
+                    &endpoint,
+                    &UpstreamHostPolicy::default(),
+                    &ForwardedHeaderPolicy::default(),
+                ),
+                request_input(
+                    "GET",
+                    "/",
+                    headers,
+                    RequestInputMeta {
+                        authority: Some("api.example.com"),
+                        content_length: None,
+                        request_id: 99,
+                        traceparent: Some(
+                            "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01",
+                        ),
+                        client_addr: "203.0.113.88:8080".parse().expect("client"),
+                    },
+                ),
+            )
+            .expect("request")
+        };
+
+        let forwarding_req = build(&forwarding_headers);
+        let bootstrap_req = build(&bootstrap_headers);
+
+        for name in [
+            HOST.as_str(),
+            "x-custom",
+            "x-forwarded-for",
+            "x-forwarded-proto",
+            "x-forwarded-host",
+            "forwarded",
+            "x-request-id",
+            "traceparent",
+        ] {
+            assert_eq!(
+                forwarding_req
+                    .headers()
+                    .get(name)
+                    .and_then(|value| value.to_str().ok()),
+                bootstrap_req
+                    .headers()
+                    .get(name)
+                    .and_then(|value| value.to_str().ok()),
+                "header mismatch for {name}"
+            );
+        }
+    }
 }

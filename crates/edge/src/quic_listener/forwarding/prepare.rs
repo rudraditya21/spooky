@@ -64,12 +64,42 @@ impl PendingForward {
         headers
     }
 
-    fn forwarded_context(&self) -> ForwardedContext<'_> {
-        ForwardedContext {
-            client_addr: self.client_addr,
-            request_authority: self.authority.as_deref(),
-            request_id: self.request_id,
-            traceparent: self.traceparent.as_deref(),
+    fn request_build_target<'a>(
+        &'a self,
+        endpoint: &'a BackendEndpoint,
+    ) -> spooky_bridge::request::RequestBuildTarget<'a> {
+        spooky_bridge::request::RequestBuildTarget {
+            endpoint,
+            policies: spooky_bridge::request::RequestBuildPolicies {
+                host_policy: &self.host_policy,
+                forwarded_header_policy: &self.forwarded_header_policy,
+            },
+        }
+    }
+
+    fn request_build_input<'a>(
+        &'a self,
+        method: &'a str,
+        headers: &'a [quiche::h3::Header],
+        body: BoxBody<Bytes, Infallible>,
+        content_length: Option<usize>,
+    ) -> spooky_bridge::request::RequestBuildInput<'a, BoxBody<Bytes, Infallible>> {
+        spooky_bridge::request::RequestBuildInput {
+            method,
+            path: &self.path,
+            authority: self.authority.as_deref(),
+            headers,
+            body,
+            content_length,
+            body_mode:
+                spooky_bridge::request::RequestBuildInput::<BoxBody<Bytes, Infallible>>::body_mode_for_length(content_length),
+            trace: spooky_bridge::request::RequestTraceContext {
+                request_id: self.request_id,
+                traceparent: self.traceparent.as_deref(),
+            },
+            forwarded: spooky_bridge::request::RequestForwardedContext {
+                client_addr: self.client_addr,
+            },
         }
     }
 
@@ -81,29 +111,15 @@ impl PendingForward {
     ) -> Result<Request<BoxBody<Bytes, Infallible>>, ProxyError> {
         let headers = self.request_headers();
         if endpoint.scheme() == BackendScheme::Http {
-            build_h1_request_for_endpoint_with_host_policy(
-                endpoint,
-                &self.host_policy,
-                &self.forwarded_header_policy,
-                &self.method,
-                &self.path,
-                &headers,
-                body,
-                content_length,
-                self.forwarded_context(),
+            spooky_bridge::h3_to_h1::build_h1_request(
+                self.request_build_target(endpoint),
+                self.request_build_input(&self.method, &headers, body, content_length),
             )
             .map_err(ProxyError::from)
         } else {
-            build_h2_request_for_endpoint_with_host_policy(
-                endpoint,
-                &self.host_policy,
-                &self.forwarded_header_policy,
-                &self.method,
-                &self.path,
-                &headers,
-                body,
-                content_length,
-                self.forwarded_context(),
+            spooky_bridge::h3_to_h2::build_h2_request_for_target(
+                self.request_build_target(endpoint),
+                self.request_build_input(&self.method, &headers, body, content_length),
             )
             .map_err(ProxyError::from)
         }
@@ -134,16 +150,14 @@ impl PendingForward {
             request_headers.push(quiche::h3::Header::new(b"connection", b"upgrade"));
         }
 
-        build_h1_request_for_endpoint_with_host_policy(
-            endpoint,
-            &self.host_policy,
-            &self.forwarded_header_policy,
-            "GET",
-            &self.path,
-            &request_headers,
-            BoxBody::new(Full::new(Bytes::new())),
-            None,
-            self.forwarded_context(),
+        spooky_bridge::h3_to_h1::build_h1_request(
+            self.request_build_target(endpoint),
+            self.request_build_input(
+                "GET",
+                &request_headers,
+                BoxBody::new(Full::new(Bytes::new())),
+                None,
+            ),
         )
         .map_err(ProxyError::from)
     }

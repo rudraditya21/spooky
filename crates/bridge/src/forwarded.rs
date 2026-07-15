@@ -3,10 +3,23 @@ use std::net::IpAddr;
 use http::HeaderValue;
 use spooky_config::config::{ForwardedHeaderPolicy, ForwardedHeaderPolicyMode};
 
-use crate::{
-    BridgeError,
-    context::{ForwardedHeaderChains, ForwardedHeaderValues},
-};
+use crate::BridgeError;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ForwardedHeaderChains<'a> {
+    pub(crate) forwarded: &'a [Vec<u8>],
+    pub(crate) x_forwarded_for: &'a [Vec<u8>],
+    pub(crate) x_forwarded_proto: &'a [Vec<u8>],
+    pub(crate) x_forwarded_host: &'a [Vec<u8>],
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ForwardedHeaderValues {
+    pub(crate) forwarded: Option<HeaderValue>,
+    pub(crate) x_forwarded_for: Option<HeaderValue>,
+    pub(crate) x_forwarded_proto: Option<HeaderValue>,
+    pub(crate) x_forwarded_host: Option<HeaderValue>,
+}
 
 pub fn build_forwarded_header_values(
     policy: &ForwardedHeaderPolicy,

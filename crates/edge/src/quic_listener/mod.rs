@@ -39,10 +39,6 @@ use rustls::{
 use rustls_pki_types::pem::PemObject;
 use serde_json::json;
 use socket2::{Domain, Protocol, Socket, Type};
-use spooky_bridge::{
-    context::ForwardedContext, h3_to_h1::build_h1_request_for_endpoint_with_host_policy,
-    h3_to_h2::build_h2_request_for_endpoint_with_host_policy,
-};
 use spooky_config::{
     backend_endpoint::{BackendEndpoint, BackendScheme},
     config::{ClientAuth, UpstreamTls},
