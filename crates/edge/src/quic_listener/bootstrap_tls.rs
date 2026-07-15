@@ -28,6 +28,10 @@ use spooky_bridge::{
         RequestBuildInput, RequestBuildPolicies, RequestBuildTarget, RequestForwardedContext,
         RequestTraceContext,
     },
+    response::{
+        ResponseBodyMode, ResponseBodyPolicy, ResponseNormalizationInput,
+        ResponseNormalizationProtocol, ResponseProtocolConstraints, normalize_upstream_response,
+    },
 };
 use spooky_config::{
     backend_endpoint::{BackendEndpoint, BackendScheme},
@@ -43,10 +47,9 @@ use super::{
         AdmissionPolicyDecision, admission_rejection_response,
         evaluate_forwarding_pre_admission_policy,
     },
-    boxed_full, connection_header_tokens, is_head_method, is_websocket_upgrade_request,
+    boxed_full, is_head_method, is_websocket_upgrade_request,
     runtime_endpoint::RuntimeConnectionSlotGuard,
-    runtime_handle, should_strip_bootstrap_response_header, spawn_supervised_async_task,
-    validate_http_request,
+    runtime_handle, spawn_supervised_async_task, validate_http_request,
 };
 use crate::{
     Metrics, REQUEST_ID_COUNTER, RouteOutcome,
@@ -1094,23 +1097,30 @@ impl QUICListener {
                                 }
 
                                 let status = upstream_resp.status();
-                                let mut resp_builder = Response::builder().status(status);
-                                let response_connection_tokens =
-                                    connection_header_tokens(upstream_resp.headers());
-                                let preserve_upgrade_response_headers = is_websocket_upgrade
-                                    && status == StatusCode::SWITCHING_PROTOCOLS;
-                                for (name, value) in upstream_resp.headers() {
-                                    let preserve_upgrade_header = preserve_upgrade_response_headers
-                                        && (*name == http::header::CONNECTION
-                                            || *name == http::header::UPGRADE);
-                                    if should_strip_bootstrap_response_header(
-                                        name,
-                                        &response_connection_tokens,
-                                    ) && !preserve_upgrade_header
-                                    {
-                                        continue;
-                                    }
-                                    resp_builder = resp_builder.header(name, value);
+                                let normalized_response =
+                                    normalize_upstream_response(ResponseNormalizationInput {
+                                        upstream: spooky_bridge::response::UpstreamResponseView {
+                                            status,
+                                            headers: upstream_resp.headers(),
+                                            trailers: None,
+                                        },
+                                        body_mode: if suppress_downstream_body {
+                                            ResponseBodyMode::HeadRequest
+                                        } else {
+                                            ResponseBodyMode::Normal
+                                        },
+                                        constraints: ResponseProtocolConstraints {
+                                            protocol: ResponseNormalizationProtocol::Http1,
+                                            strip_connection_headers: true,
+                                            allow_trailers: false,
+                                            preserve_upgrade: is_websocket_upgrade
+                                                && status == StatusCode::SWITCHING_PROTOCOLS,
+                                        },
+                                    });
+                                let mut resp_builder =
+                                    Response::builder().status(normalized_response.head.status);
+                                for header in &normalized_response.head.headers {
+                                    resp_builder = resp_builder.header(&header.name, &header.value);
                                 }
                                 resp_builder = resp_builder.header("alt-svc", &alt);
                                 if is_websocket_upgrade
@@ -1161,7 +1171,10 @@ impl QUICListener {
                                             Response::new(boxed_full(Bytes::new()))
                                         }));
                                 }
-                                let resp_body = if suppress_downstream_body {
+                                let resp_body = if matches!(
+                                    normalized_response.emission.body,
+                                    ResponseBodyPolicy::Suppress
+                                ) {
                                     boxed_full(Bytes::new())
                                 } else {
                                     BootstrapStreamingBody::with_max_bytes(

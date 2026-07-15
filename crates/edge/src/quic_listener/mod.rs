@@ -42,8 +42,10 @@ use socket2::{Domain, Protocol, Socket, Type};
 use spooky_bridge::response::{
     ResponseBodyMode, ResponseBodyPolicy, ResponseNormalizationInput,
     ResponseNormalizationProtocol, ResponseProtocolConstraints, normalize_response_trailers,
-    normalize_upstream_response, should_strip_response_header,
+    normalize_upstream_response,
 };
+#[cfg(test)]
+use spooky_bridge::response::should_strip_response_header;
 use spooky_config::{
     backend_endpoint::{BackendEndpoint, BackendScheme},
     config::{ClientAuth, UpstreamTls},
@@ -131,6 +133,7 @@ use validation::{
 };
 use x509_parser::{extensions::GeneralName, parse_x509_certificate};
 
+#[cfg(test)]
 fn connection_header_tokens(headers: &http::HeaderMap) -> HashSet<String> {
     let mut tokens = HashSet::new();
     for value in headers.get_all(http::header::CONNECTION) {
@@ -218,6 +221,7 @@ fn collect_h3_trailers(trailers: &http::HeaderMap) -> Vec<(Vec<u8>, Vec<u8>)> {
     .collect()
 }
 
+#[cfg(test)]
 fn should_strip_bootstrap_response_header(
     name: &http::header::HeaderName,
     connection_tokens: &HashSet<String>,
