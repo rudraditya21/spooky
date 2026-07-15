@@ -9,11 +9,12 @@ use tokio::task::AbortHandle;
 use super::*;
 use crate::runtime::connection::{
     auth::{
-        ExternalAuthDecision, ExternalAuthDecisionOutcome, ExternalAuthDenyResponse,
-        ExternalAuthExecutionPolicy, ExternalAuthFailureResolution, ExternalAuthResponseMetadata,
-        ExternalAuthResult, OidcAuthorizationCheck, merge_auth_request_mutations,
-        oidc_audience_matches, oidc_authorization_check, oidc_discovery_target,
-        oidc_scope_satisfied, validate_oidc_provider_metadata,
+        ExternalAuthCompletion, ExternalAuthDecision, ExternalAuthDenyResponse,
+        ExternalAuthExecutionPolicy, ExternalAuthFailureDisposition, ExternalAuthResponseMetadata,
+        ExternalAuthResult, ExternalAuthTaskConfig, OidcAuthorizationCheck,
+        evaluate_external_auth_completion, merge_auth_request_mutations, oidc_audience_matches,
+        oidc_authorization_check, oidc_discovery_target, oidc_scope_satisfied,
+        validate_oidc_provider_metadata,
     },
     request::PendingForward,
     stream::StreamAdmissionState,
@@ -414,11 +415,12 @@ pub(super) fn start_external_auth_task(
     pending_forward: Arc<PendingForward>,
     external_auth: RuntimeExternalAuth,
 ) -> Result<AuthStart, ProxyError> {
-    let policy = ExternalAuthExecutionPolicy::from_external_auth(&external_auth);
-    let timeout = policy.timeout;
+    let task_config = ExternalAuthTaskConfig::from_external_auth(&external_auth);
     let (tx, rx) = oneshot::channel();
     let fut = async move {
-        let result = run_external_auth_with_timeout(pending_forward, external_auth, timeout).await;
+        let result =
+            run_external_auth_with_timeout(pending_forward, external_auth, task_config.timeout)
+                .await;
         let _ = tx.send(result);
     };
     let Some(handle) = runtime_handle() else {
@@ -430,8 +432,8 @@ pub(super) fn start_external_auth_task(
     Ok(AuthStart {
         rx,
         abort: join.abort_handle(),
-        deadline: Instant::now() + timeout,
-        fail_open: policy.disposition().fail_open(),
+        deadline: Instant::now() + task_config.timeout,
+        fail_open: task_config.disposition.fail_open(),
     })
 }
 
@@ -451,16 +453,12 @@ impl QUICListener {
             abort.abort();
         }
         req.auth_deadline = None;
-        let outcome = ExternalAuthDecisionOutcome::from_result(
+        let completion = evaluate_external_auth_completion(
             result,
-            if req.auth_fail_open {
-                crate::runtime::connection::auth::ExternalAuthFailureDisposition::FailOpen
-            } else {
-                crate::runtime::connection::auth::ExternalAuthFailureDisposition::FailClosed
-            },
+            ExternalAuthFailureDisposition::from_fail_open(req.auth_fail_open),
         );
-        match outcome {
-            ExternalAuthDecisionOutcome::Allow {
+        match completion {
+            ExternalAuthCompletion::Allow {
                 request_header_mutations,
             } => {
                 metrics.inc_external_auth_allowed();
@@ -472,9 +470,9 @@ impl QUICListener {
                 }
                 Self::materialize_forward_after_auth(stream_id, req, h3, quic, exec_ctx, shared_ctx)
             }
-            ExternalAuthDecisionOutcome::Deny(response) => {
+            ExternalAuthCompletion::Respond(decision) => {
                 req.admission_state = StreamAdmissionState::Denied;
-                req.response_status = Some(response.status.as_u16());
+                req.response_status = Some(decision.status().as_u16());
                 metrics.inc_failure();
                 metrics.inc_policy_denied();
                 metrics.inc_external_auth_denied();
@@ -489,113 +487,55 @@ impl QUICListener {
                     req.upstream_name.as_deref().unwrap_or("unrouted"),
                     req.response_status.unwrap_or(0)
                 );
-                Self::send_external_auth_decision_response(
-                    h3,
-                    quic,
-                    stream_id,
-                    &ExternalAuthDecision::Deny(response),
-                )?;
+                Self::send_external_auth_decision_response(h3, quic, stream_id, &decision)?;
                 Ok(false)
             }
-            ExternalAuthDecisionOutcome::Redirect(response) => {
-                req.admission_state = StreamAdmissionState::Denied;
-                req.response_status = Some(response.status.as_u16());
-                metrics.inc_failure();
-                metrics.inc_policy_denied();
-                metrics.inc_external_auth_denied();
-                metrics.record_route(
-                    req.upstream_name.as_deref().unwrap_or("unrouted"),
-                    req.start.elapsed(),
-                    RouteOutcome::Failure,
-                );
-                warn!(
-                    "request_id={} route={} external auth denied with status={}",
-                    req.request_id,
-                    req.upstream_name.as_deref().unwrap_or("unrouted"),
-                    req.response_status.unwrap_or(0)
-                );
-                Self::send_external_auth_decision_response(
-                    h3,
-                    quic,
-                    stream_id,
-                    &ExternalAuthDecision::Redirect(response),
-                )?;
-                Ok(false)
-            }
-            ExternalAuthDecisionOutcome::Challenge(response) => {
-                req.admission_state = StreamAdmissionState::Denied;
-                req.response_status = Some(response.status.as_u16());
-                metrics.inc_failure();
-                metrics.inc_policy_denied();
-                metrics.inc_external_auth_denied();
-                metrics.record_route(
-                    req.upstream_name.as_deref().unwrap_or("unrouted"),
-                    req.start.elapsed(),
-                    RouteOutcome::Failure,
-                );
-                warn!(
-                    "request_id={} route={} external auth denied with status={}",
-                    req.request_id,
-                    req.upstream_name.as_deref().unwrap_or("unrouted"),
-                    req.response_status.unwrap_or(0)
-                );
-                Self::send_external_auth_decision_response(
-                    h3,
-                    quic,
-                    stream_id,
-                    &ExternalAuthDecision::Challenge(response),
-                )?;
-                Ok(false)
-            }
-            ExternalAuthDecisionOutcome::Timeout { .. }
-            | ExternalAuthDecisionOutcome::Error { .. } => {
-                let Some(failure) = outcome.failure_resolution() else {
-                    return Ok(false);
-                };
-                match &outcome {
-                    ExternalAuthDecisionOutcome::Timeout { .. } => {
-                        metrics.inc_external_auth_timeout();
-                    }
-                    ExternalAuthDecisionOutcome::Error { .. } => {
-                        metrics.inc_external_auth_error();
-                    }
-                    _ => {}
-                }
-                if matches!(failure, ExternalAuthFailureResolution::FailOpen) {
-                    if let ExternalAuthDecisionOutcome::Error { error, .. } = &outcome {
+            ExternalAuthCompletion::FailOpen { timed_out, error } => {
+                if timed_out {
+                    metrics.inc_external_auth_timeout();
+                    warn!(
+                        "request_id={} route={} external auth failed open: timeout",
+                        req.request_id,
+                        req.upstream_name.as_deref().unwrap_or("unrouted"),
+                    );
+                } else {
+                    metrics.inc_external_auth_error();
+                    if let Some(error) = error {
                         warn!(
                             "request_id={} route={} external auth failed open: {:?}",
                             req.request_id,
                             req.upstream_name.as_deref().unwrap_or("unrouted"),
                             error
                         );
-                    } else {
-                        warn!(
-                            "request_id={} route={} external auth failed open: timeout",
+                    }
+                }
+                Self::materialize_forward_after_auth(stream_id, req, h3, quic, exec_ctx, shared_ctx)
+            }
+            ExternalAuthCompletion::Reject {
+                status,
+                body,
+                timed_out,
+                error,
+            } => {
+                if timed_out {
+                    metrics.inc_external_auth_timeout();
+                } else {
+                    metrics.inc_external_auth_error();
+                    if let Some(error) = &error {
+                        debug!(
+                            "request_id={} route={} external auth rejected after error: {:?}",
                             req.request_id,
                             req.upstream_name.as_deref().unwrap_or("unrouted"),
+                            error
                         );
                     }
-                    return Self::materialize_forward_after_auth(
-                        stream_id, req, h3, quic, exec_ctx, shared_ctx,
-                    );
                 }
                 metrics.inc_failure();
                 let route_label = req.upstream_name.as_deref().unwrap_or("unrouted");
-                let (status, body, route_outcome) = match failure {
-                    ExternalAuthFailureResolution::Reject {
-                        status,
-                        body,
-                        timed_out,
-                    } => {
-                        let outcome = if timed_out {
-                            RouteOutcome::Timeout
-                        } else {
-                            RouteOutcome::Failure
-                        };
-                        (status, body, outcome)
-                    }
-                    ExternalAuthFailureResolution::FailOpen => unreachable!(),
+                let route_outcome = if timed_out {
+                    RouteOutcome::Timeout
+                } else {
+                    RouteOutcome::Failure
                 };
                 req.admission_state = StreamAdmissionState::Denied;
                 req.response_status = Some(status.as_u16());

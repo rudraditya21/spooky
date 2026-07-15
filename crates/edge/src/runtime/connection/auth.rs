@@ -26,6 +26,14 @@ impl ExternalAuthFailureDisposition {
         }
     }
 
+    pub fn from_fail_open(fail_open: bool) -> Self {
+        if fail_open {
+            Self::FailOpen
+        } else {
+            Self::FailClosed
+        }
+    }
+
     pub fn fail_open(self) -> bool {
         matches!(self, Self::FailOpen)
     }
@@ -58,6 +66,22 @@ impl ExternalAuthExecutionPolicy {
 
     pub fn disposition(self) -> ExternalAuthFailureDisposition {
         ExternalAuthFailureDisposition::from_failure_mode(self.failure_mode)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExternalAuthTaskConfig {
+    pub timeout: Duration,
+    pub disposition: ExternalAuthFailureDisposition,
+}
+
+impl ExternalAuthTaskConfig {
+    pub fn from_external_auth(value: &RuntimeExternalAuth) -> Self {
+        let policy = ExternalAuthExecutionPolicy::from_external_auth(value);
+        Self {
+            timeout: policy.timeout,
+            disposition: policy.disposition(),
+        }
     }
 }
 
@@ -247,6 +271,24 @@ pub enum ExternalAuthFailureResolution {
     },
 }
 
+#[derive(Debug)]
+pub enum ExternalAuthCompletion {
+    Allow {
+        request_header_mutations: Vec<PendingHeaderMutation>,
+    },
+    Respond(ExternalAuthDecision),
+    FailOpen {
+        timed_out: bool,
+        error: Option<ProxyError>,
+    },
+    Reject {
+        status: http::StatusCode,
+        body: &'static [u8],
+        timed_out: bool,
+        error: Option<ProxyError>,
+    },
+}
+
 impl ExternalAuthDecisionOutcome {
     pub fn from_result(
         result: ExternalAuthResult,
@@ -291,6 +333,76 @@ impl ExternalAuthDecisionOutcome {
             }),
             _ => None,
         }
+    }
+}
+
+impl ExternalAuthDecision {
+    pub fn status(&self) -> http::StatusCode {
+        match self {
+            Self::Allow { .. } => http::StatusCode::OK,
+            Self::Deny(response) => response.status,
+            Self::Redirect(response) => response.status,
+            Self::Challenge(response) => response.status,
+        }
+    }
+}
+
+pub fn evaluate_external_auth_completion(
+    result: ExternalAuthResult,
+    disposition: ExternalAuthFailureDisposition,
+) -> ExternalAuthCompletion {
+    let outcome = ExternalAuthDecisionOutcome::from_result(result, disposition);
+    let failure = outcome.failure_resolution();
+    match outcome {
+        ExternalAuthDecisionOutcome::Allow {
+            request_header_mutations,
+        } => ExternalAuthCompletion::Allow {
+            request_header_mutations: request_header_mutations
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+        },
+        ExternalAuthDecisionOutcome::Deny(response) => {
+            ExternalAuthCompletion::Respond(ExternalAuthDecision::Deny(response))
+        }
+        ExternalAuthDecisionOutcome::Redirect(response) => {
+            ExternalAuthCompletion::Respond(ExternalAuthDecision::Redirect(response))
+        }
+        ExternalAuthDecisionOutcome::Challenge(response) => {
+            ExternalAuthCompletion::Respond(ExternalAuthDecision::Challenge(response))
+        }
+        ExternalAuthDecisionOutcome::Timeout { .. } => match failure {
+            Some(ExternalAuthFailureResolution::FailOpen) => ExternalAuthCompletion::FailOpen {
+                timed_out: true,
+                error: None,
+            },
+            Some(ExternalAuthFailureResolution::Reject { status, body, .. }) => {
+                ExternalAuthCompletion::Reject {
+                    status,
+                    body,
+                    timed_out: true,
+                    error: None,
+                }
+            }
+            None => unreachable!("timeout outcome must resolve"),
+        },
+        ExternalAuthDecisionOutcome::Error { error, .. } => match failure {
+            Some(ExternalAuthFailureResolution::FailOpen) => ExternalAuthCompletion::FailOpen {
+                timed_out: false,
+                error: Some(error),
+            },
+            Some(ExternalAuthFailureResolution::Reject {
+                status,
+                body,
+                timed_out,
+            }) => ExternalAuthCompletion::Reject {
+                status,
+                body,
+                timed_out,
+                error: Some(error),
+            },
+            None => unreachable!("error outcome must resolve"),
+        },
     }
 }
 
@@ -852,5 +964,48 @@ mod tests {
             Some(&json!("api://other"))
         ));
         assert!(oidc_audience_matches(None, None));
+    }
+
+    #[test]
+    fn external_auth_task_config_tracks_timeout_and_disposition() {
+        let auth = RuntimeExternalAuth::Http {
+            endpoint: "http://127.0.0.1:9000/auth".to_string(),
+            request_headers: Vec::new(),
+            response_header_allowlist: Vec::new(),
+            timeout_ms: 250,
+            failure_mode: RuntimeExternalAuthFailureMode::FailOpen,
+        };
+
+        let config = ExternalAuthTaskConfig::from_external_auth(&auth);
+        assert_eq!(config.timeout, Duration::from_millis(250));
+        assert_eq!(config.disposition, ExternalAuthFailureDisposition::FailOpen);
+    }
+
+    #[test]
+    fn evaluate_external_auth_completion_maps_fail_open_and_fail_closed_outcomes() {
+        let fail_open = evaluate_external_auth_completion(
+            Err(ProxyError::Transport("unavailable".into())),
+            ExternalAuthFailureDisposition::FailOpen,
+        );
+        assert!(matches!(
+            fail_open,
+            ExternalAuthCompletion::FailOpen {
+                timed_out: false,
+                error: Some(ProxyError::Transport(_)),
+            }
+        ));
+
+        let fail_closed = evaluate_external_auth_completion(
+            Err(ProxyError::Timeout),
+            ExternalAuthFailureDisposition::FailClosed,
+        );
+        assert!(matches!(
+            fail_closed,
+            ExternalAuthCompletion::Reject {
+                status: http::StatusCode::GATEWAY_TIMEOUT,
+                timed_out: true,
+                ..
+            }
+        ));
     }
 }
