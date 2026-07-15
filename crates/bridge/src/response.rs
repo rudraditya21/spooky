@@ -121,7 +121,7 @@ pub(crate) fn response_connection_tokens(headers: &HeaderMap) -> HashSet<String>
     tokens
 }
 
-pub(crate) fn should_strip_response_header(
+pub fn should_strip_response_header(
     name: &HeaderName,
     connection_tokens: &HashSet<String>,
     constraints: ResponseProtocolConstraints,
