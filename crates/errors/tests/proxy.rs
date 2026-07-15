@@ -1,7 +1,8 @@
 use spooky_errors::{
     PoolError, ProxyError, RetryPolicyDecision, RetryPolicyDenial, RetryPolicyInput,
-    UpstreamRetryReason, UpstreamRetryability, UpstreamTerminalErrorKind, classify_retryability,
-    evaluate_retry_policy,
+    UpstreamErrorClassification, UpstreamHealthFailureMapping, UpstreamProxyErrorKind,
+    UpstreamRetryReason, UpstreamRetryability, UpstreamTerminalErrorKind, UpstreamTlsReason,
+    classify_retryability, classify_upstream_proxy_error, evaluate_retry_policy,
 };
 
 #[test]
@@ -85,5 +86,45 @@ fn retry_policy_evaluation_preserves_existing_denial_behavior() {
         RetryPolicyDecision::Retry {
             reason: UpstreamRetryReason::Timeout,
         }
+    );
+}
+
+#[test]
+fn upstream_proxy_error_classification_preserves_tls_error_details() {
+    let err = ProxyError::Tls("tls handshake failed: unknown issuer".to_string());
+    let classified = classify_upstream_proxy_error(&err).expect("classified upstream error");
+
+    assert_eq!(classified.kind, UpstreamProxyErrorKind::Tls);
+    assert_eq!(
+        classified.classification,
+        UpstreamErrorClassification::tls(UpstreamTlsReason::UnknownIssuer)
+    );
+    assert!(classified.health_failure.is_none());
+    assert_eq!(
+        classified.retryability,
+        UpstreamRetryability::Terminal(UpstreamTerminalErrorKind::Tls)
+    );
+}
+
+#[test]
+fn upstream_proxy_error_classification_marks_timeout_as_retryable_health_failure() {
+    let classified =
+        classify_upstream_proxy_error(&ProxyError::Timeout).expect("classified timeout");
+
+    assert_eq!(classified.kind, UpstreamProxyErrorKind::Timeout);
+    assert_eq!(
+        classified.classification,
+        UpstreamErrorClassification::timeout()
+    );
+    assert_eq!(
+        classified.health_failure,
+        Some(UpstreamHealthFailureMapping {
+            failure_reason: spooky_lb::health::HealthFailureReason::Timeout,
+            metrics_reason: "timeout",
+        })
+    );
+    assert_eq!(
+        classified.retryability,
+        UpstreamRetryability::Retryable(UpstreamRetryReason::Timeout)
     );
 }

@@ -6,7 +6,9 @@ pub mod upstream;
 
 pub use bridge::BridgeError;
 pub use pool::PoolError;
-pub use proxy::ProxyError;
+pub use proxy::{
+    ClassifiedUpstreamProxyError, ProxyError, UpstreamProxyErrorKind, classify_upstream_proxy_error,
+};
 pub use retry::{
     RetryPolicyDecision, RetryPolicyDenial, RetryPolicyInput, UpstreamRetryReason,
     UpstreamRetryability, UpstreamTerminalErrorKind, classify_retryability, evaluate_retry_policy,
