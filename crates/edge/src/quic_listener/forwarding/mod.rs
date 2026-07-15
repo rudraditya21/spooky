@@ -10,6 +10,9 @@ use std::{convert::Infallible, error::Error as StdError};
 
 use spooky_config::config::ScopedRateLimitScope;
 
+pub(in crate::quic_listener) use self::lb_key::{
+    LbKeyRequestParts, LbKeyResolutionInput, ResolvedLbKey,
+};
 use self::prepare::{PreparedRequest, StartedAuthRequest};
 pub(in crate::quic_listener) use self::resolve::BootstrapResolutionInput;
 #[cfg(test)]

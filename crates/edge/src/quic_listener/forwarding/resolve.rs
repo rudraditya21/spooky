@@ -324,15 +324,22 @@ impl QUICListener {
         pool: &UpstreamPool,
     ) -> BackendSelectionPlan {
         let lb_type = pool.lb_name().to_string();
-        let lb_key = Self::resolve_lb_request_key(
-            &lb_type,
-            pool.lb_key(),
+        let lb_request = LbKeyRequestParts::new(
             request.method,
             request.path,
             request.authority,
             request.cid_key,
+            None,
             request.header_lookup,
         );
+        let ResolvedLbKey {
+            value: lb_key,
+            source: _lb_key_source,
+        } = Self::resolve_lb_key_for_input(&LbKeyResolutionInput::new(
+            &lb_type,
+            pool.lb_key(),
+            lb_request,
+        ));
         BackendSelectionPlan { lb_type, lb_key }
     }
 
