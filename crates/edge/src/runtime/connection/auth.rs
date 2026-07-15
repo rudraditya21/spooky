@@ -876,6 +876,147 @@ mod tests {
     }
 
     #[test]
+    fn allowed_auth_headers_is_case_insensitive_and_auth_allow_mutations_keep_safe_values() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-auth-user", http::HeaderValue::from_static("alice"));
+        headers.insert("x-auth-group", http::HeaderValue::from_static("admin"));
+        headers.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer blocked"),
+        );
+
+        assert_eq!(
+            allowed_auth_headers(
+                &headers,
+                &[
+                    "X-Auth-User".to_string(),
+                    "x-auth-group".to_string(),
+                    "authorization".to_string(),
+                ],
+            ),
+            vec![
+                ("x-auth-user".to_string(), "alice".to_string()),
+                ("x-auth-group".to_string(), "admin".to_string()),
+                ("authorization".to_string(), "Bearer blocked".to_string()),
+            ]
+        );
+
+        assert_eq!(
+            auth_allow_mutations(
+                &headers,
+                &[
+                    "X-Auth-User".to_string(),
+                    "x-auth-group".to_string(),
+                    "authorization".to_string(),
+                ],
+            ),
+            vec![
+                PendingHeaderMutation::Upsert {
+                    name: b"x-auth-user".to_vec(),
+                    value: b"alice".to_vec(),
+                },
+                PendingHeaderMutation::Upsert {
+                    name: b"x-auth-group".to_vec(),
+                    value: b"admin".to_vec(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn map_http_external_auth_response_covers_allow_deny_redirect_and_challenge() {
+        let mut allow_headers = http::HeaderMap::new();
+        allow_headers.insert("x-auth-user", http::HeaderValue::from_static("alice"));
+        allow_headers.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer blocked"),
+        );
+        let allow = map_http_external_auth_response(
+            ExternalAuthResponseMetadata {
+                status: http::StatusCode::OK,
+                headers: &allow_headers,
+                body: &[],
+            },
+            &["x-auth-user".to_string(), "authorization".to_string()],
+        )
+        .expect("allow decision");
+        assert_eq!(
+            allow,
+            ExternalAuthDecision::Allow {
+                request_header_mutations: vec![PendingHeaderMutation::Upsert {
+                    name: b"x-auth-user".to_vec(),
+                    value: b"alice".to_vec(),
+                }],
+            }
+        );
+
+        let mut deny_headers = http::HeaderMap::new();
+        deny_headers.insert("x-auth-reason", http::HeaderValue::from_static("policy"));
+        let deny = map_http_external_auth_response(
+            ExternalAuthResponseMetadata {
+                status: http::StatusCode::FORBIDDEN,
+                headers: &deny_headers,
+                body: b"denied\n",
+            },
+            &["x-auth-reason".to_string()],
+        )
+        .expect("deny decision");
+        assert!(matches!(
+            deny,
+            ExternalAuthDecision::Deny(ExternalAuthDenyResponse {
+                status: http::StatusCode::FORBIDDEN,
+                ..
+            })
+        ));
+
+        let mut redirect_headers = http::HeaderMap::new();
+        redirect_headers.insert(
+            http::header::LOCATION,
+            http::HeaderValue::from_static("https://login.example.com/"),
+        );
+        redirect_headers.insert("x-auth-reason", http::HeaderValue::from_static("login"));
+        let redirect = map_http_external_auth_response(
+            ExternalAuthResponseMetadata {
+                status: http::StatusCode::FOUND,
+                headers: &redirect_headers,
+                body: &[],
+            },
+            &["location".to_string(), "x-auth-reason".to_string()],
+        )
+        .expect("redirect decision");
+        assert!(matches!(
+            redirect,
+            ExternalAuthDecision::Redirect(ExternalAuthRedirectResponse {
+                status: http::StatusCode::FOUND,
+                ..
+            })
+        ));
+
+        let mut challenge_headers = http::HeaderMap::new();
+        challenge_headers.insert(
+            http::header::WWW_AUTHENTICATE,
+            http::HeaderValue::from_static("Bearer realm=\"spooky\""),
+        );
+        challenge_headers.insert("x-auth-reason", http::HeaderValue::from_static("expired"));
+        let challenge = map_http_external_auth_response(
+            ExternalAuthResponseMetadata {
+                status: http::StatusCode::UNAUTHORIZED,
+                headers: &challenge_headers,
+                body: b"challenge\n",
+            },
+            &["www-authenticate".to_string(), "x-auth-reason".to_string()],
+        )
+        .expect("challenge decision");
+        assert!(matches!(
+            challenge,
+            ExternalAuthDecision::Challenge(ExternalAuthChallengeResponse {
+                status: http::StatusCode::UNAUTHORIZED,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn oidc_authorization_check_maps_missing_and_invalid_bearer_tokens_to_challenges() {
         assert!(matches!(
             oidc_authorization_check(None),
@@ -897,6 +1038,10 @@ mod tests {
         assert_eq!(
             oidc_authorization_check(Some("Bearer token-1")),
             OidcAuthorizationCheck::Token("token-1".to_string())
+        );
+        assert_eq!(
+            oidc_authorization_check(Some("bearer token-2")),
+            OidcAuthorizationCheck::Token("token-2".to_string())
         );
     }
 
@@ -1006,6 +1151,102 @@ mod tests {
                 timed_out: true,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn evaluate_external_auth_completion_maps_allow_and_response_decisions() {
+        let allow = evaluate_external_auth_completion(
+            Ok(ExternalAuthDecision::Allow {
+                request_header_mutations: vec![PendingHeaderMutation::Upsert {
+                    name: b"x-auth-user".to_vec(),
+                    value: b"alice".to_vec(),
+                }],
+            }),
+            ExternalAuthFailureDisposition::FailClosed,
+        );
+        assert!(matches!(
+            allow,
+            ExternalAuthCompletion::Allow {
+                request_header_mutations,
+            } if request_header_mutations == vec![PendingHeaderMutation::Upsert {
+                name: b"x-auth-user".to_vec(),
+                value: b"alice".to_vec(),
+            }]
+        ));
+
+        let deny = evaluate_external_auth_completion(
+            Ok(ExternalAuthDecision::Deny(ExternalAuthDenyResponse {
+                status: http::StatusCode::FORBIDDEN,
+                headers: vec![("x-auth-reason".to_string(), "policy".to_string())],
+                body: b"denied\n".to_vec(),
+            })),
+            ExternalAuthFailureDisposition::FailClosed,
+        );
+        assert!(matches!(
+            deny,
+            ExternalAuthCompletion::Respond(ExternalAuthDecision::Deny(ExternalAuthDenyResponse {
+                status: http::StatusCode::FORBIDDEN,
+                ..
+            }))
+        ));
+
+        let redirect = evaluate_external_auth_completion(
+            Ok(ExternalAuthDecision::Redirect(
+                ExternalAuthRedirectResponse {
+                    status: http::StatusCode::FOUND,
+                    headers: vec![("x-auth-reason".to_string(), "login".to_string())],
+                    location: "https://login.example.com/".to_string(),
+                },
+            )),
+            ExternalAuthFailureDisposition::FailClosed,
+        );
+        assert!(matches!(
+            redirect,
+            ExternalAuthCompletion::Respond(ExternalAuthDecision::Redirect(
+                ExternalAuthRedirectResponse {
+                    status: http::StatusCode::FOUND,
+                    ..
+                }
+            ))
+        ));
+
+        let challenge = evaluate_external_auth_completion(
+            Ok(ExternalAuthDecision::Challenge(
+                ExternalAuthChallengeResponse {
+                    status: http::StatusCode::UNAUTHORIZED,
+                    headers: vec![("x-auth-reason".to_string(), "expired".to_string())],
+                    www_authenticate: "Bearer realm=\"spooky\"".to_string(),
+                    body: b"challenge\n".to_vec(),
+                },
+            )),
+            ExternalAuthFailureDisposition::FailClosed,
+        );
+        assert!(matches!(
+            challenge,
+            ExternalAuthCompletion::Respond(ExternalAuthDecision::Challenge(
+                ExternalAuthChallengeResponse {
+                    status: http::StatusCode::UNAUTHORIZED,
+                    ..
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn evaluate_external_auth_completion_fail_closed_transport_error_maps_to_unavailable() {
+        let rejected = evaluate_external_auth_completion(
+            Err(ProxyError::Transport("connect failed".into())),
+            ExternalAuthFailureDisposition::FailClosed,
+        );
+        assert!(matches!(
+            rejected,
+            ExternalAuthCompletion::Reject {
+                status: http::StatusCode::SERVICE_UNAVAILABLE,
+                body,
+                timed_out: false,
+                error: Some(ProxyError::Transport(_)),
+            } if body == b"external auth unavailable\n"
         ));
     }
 }
