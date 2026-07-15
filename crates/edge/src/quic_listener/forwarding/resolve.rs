@@ -1,3 +1,4 @@
+use super::lb_key::ResolvedLbKey;
 use spooky_config::runtime::RuntimeUpstreamPolicy;
 
 use super::*;

@@ -1,16 +1,16 @@
 use super::*;
 
-pub(in crate::quic_listener) struct LbKeyRequestParts<'a> {
-    pub(in crate::quic_listener) method: &'a str,
-    pub(in crate::quic_listener) path: &'a str,
-    pub(in crate::quic_listener) authority: Option<&'a str>,
-    pub(in crate::quic_listener) cid_key: Option<&'a str>,
-    pub(in crate::quic_listener) client_addr: Option<SocketAddr>,
-    pub(in crate::quic_listener) header_lookup: Option<&'a LbHeaderLookup<'a>>,
+struct LbKeyRequestParts<'a> {
+    method: &'a str,
+    path: &'a str,
+    authority: Option<&'a str>,
+    cid_key: Option<&'a str>,
+    client_addr: Option<SocketAddr>,
+    header_lookup: Option<&'a LbHeaderLookup<'a>>,
 }
 
 impl<'a> LbKeyRequestParts<'a> {
-    pub(in crate::quic_listener) fn new(
+    fn new(
         method: &'a str,
         path: &'a str,
         authority: Option<&'a str>,
@@ -29,18 +29,14 @@ impl<'a> LbKeyRequestParts<'a> {
     }
 }
 
-pub(in crate::quic_listener) struct LbKeyResolutionInput<'a> {
-    pub(in crate::quic_listener) lb_type: &'a str,
-    pub(in crate::quic_listener) lb_key_spec: Option<&'a str>,
-    pub(in crate::quic_listener) request: LbKeyRequestParts<'a>,
+struct LbKeyResolutionInput<'a> {
+    lb_type: &'a str,
+    lb_key_spec: Option<&'a str>,
+    request: LbKeyRequestParts<'a>,
 }
 
 impl<'a> LbKeyResolutionInput<'a> {
-    pub(in crate::quic_listener) fn new(
-        lb_type: &'a str,
-        lb_key_spec: Option<&'a str>,
-        request: LbKeyRequestParts<'a>,
-    ) -> Self {
+    fn new(lb_type: &'a str, lb_key_spec: Option<&'a str>, request: LbKeyRequestParts<'a>) -> Self {
         Self {
             lb_type,
             lb_key_spec,
@@ -50,15 +46,15 @@ impl<'a> LbKeyResolutionInput<'a> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::quic_listener) enum LbKeySource {
+pub(super) enum LbKeySource {
     ConfiguredSpec,
     StickyCidFallback,
     DefaultFallback,
 }
 
-pub(in crate::quic_listener) struct ResolvedLbKey {
-    pub(in crate::quic_listener) value: String,
-    pub(in crate::quic_listener) source: LbKeySource,
+pub(super) struct ResolvedLbKey {
+    pub(super) value: String,
+    pub(super) source: LbKeySource,
 }
 
 fn extract_cookie_value(cookie_header: &str, cookie_name: &str) -> Option<String> {
@@ -96,7 +92,7 @@ fn extract_query_param(path: &str, param: &str) -> Option<String> {
 
 impl QUICListener {
     #[allow(clippy::too_many_arguments)]
-    pub(in crate::quic_listener) fn resolve_lb_key(
+    pub(in crate::quic_listener::forwarding) fn resolve_lb_key(
         lb_type: &str,
         lb_key_spec: Option<&str>,
         method: &str,
@@ -111,7 +107,7 @@ impl QUICListener {
         Self::resolve_lb_key_for_input(&LbKeyResolutionInput::new(lb_type, lb_key_spec, request))
     }
 
-    pub(in crate::quic_listener) fn resolve_lb_key_for_route_request(
+    pub(in crate::quic_listener::forwarding) fn resolve_lb_key_for_route_request(
         lb_type: &str,
         lb_key_spec: Option<&str>,
         request: &super::resolve::RouteResolutionRequest<'_>,
@@ -128,7 +124,7 @@ impl QUICListener {
         )
     }
 
-    pub(in crate::quic_listener) fn resolve_lb_key_from_parts(
+    fn resolve_lb_key_from_parts(
         lb_key_spec: &str,
         request: &LbKeyRequestParts<'_>,
     ) -> Option<String> {
@@ -188,9 +184,7 @@ impl QUICListener {
         None
     }
 
-    pub(in crate::quic_listener) fn default_lb_request_key_for_parts(
-        request: &LbKeyRequestParts<'_>,
-    ) -> String {
+    fn default_lb_request_key_for_parts(request: &LbKeyRequestParts<'_>) -> String {
         request
             .authority
             .unwrap_or(if !request.path.is_empty() {
@@ -201,9 +195,7 @@ impl QUICListener {
             .to_string()
     }
 
-    pub(in crate::quic_listener) fn resolve_lb_key_for_input(
-        input: &LbKeyResolutionInput<'_>,
-    ) -> ResolvedLbKey {
+    fn resolve_lb_key_for_input(input: &LbKeyResolutionInput<'_>) -> ResolvedLbKey {
         let default_key = Self::default_lb_request_key_for_parts(&input.request);
 
         if let Some(spec) = input.lb_key_spec

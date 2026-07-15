@@ -10,9 +10,6 @@ use std::{convert::Infallible, error::Error as StdError};
 
 use spooky_config::config::ScopedRateLimitScope;
 
-pub(in crate::quic_listener) use self::lb_key::ResolvedLbKey;
-#[cfg(test)]
-pub(in crate::quic_listener) use self::lb_key::{LbKeyRequestParts, LbKeyResolutionInput};
 use self::prepare::{PreparedRequest, StartedAuthRequest};
 pub(in crate::quic_listener) use self::resolve::BootstrapResolutionInput;
 #[cfg(test)]
@@ -1434,28 +1431,40 @@ mod tests {
     }
 
     #[test]
-    fn resolve_lb_key_from_parts_supports_peer_ip_and_bearer_token() {
+    fn resolve_lb_key_supports_peer_ip_and_bearer_token() {
         let headers = [("authorization".to_string(), "Bearer token-1".to_string())]
             .into_iter()
             .collect::<std::collections::HashMap<_, _>>();
         let lookup = |name: &str| headers.get(&name.to_ascii_lowercase()).cloned();
         let client_addr = "203.0.113.9:443".parse().expect("client addr");
-        let request = LbKeyRequestParts::new(
-            "GET",
-            "/",
-            Some("api.example.com"),
-            None,
-            Some(client_addr),
-            Some(&lookup),
-        );
 
         assert_eq!(
-            QUICListener::resolve_lb_key_from_parts("peer_ip", &request).as_deref(),
-            Some("203.0.113.9")
+            QUICListener::resolve_lb_key(
+                "",
+                Some("peer_ip"),
+                "GET",
+                "/",
+                Some("api.example.com"),
+                None,
+                Some(client_addr),
+                Some(&lookup),
+            )
+            .value,
+            "203.0.113.9"
         );
         assert_eq!(
-            QUICListener::resolve_lb_key_from_parts("bearer_token", &request).as_deref(),
-            Some("token-1")
+            QUICListener::resolve_lb_key(
+                "",
+                Some("bearer_token"),
+                "GET",
+                "/",
+                Some("api.example.com"),
+                None,
+                Some(client_addr),
+                Some(&lookup),
+            )
+            .value,
+            "token-1"
         );
     }
 
@@ -1714,8 +1723,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_lb_key_for_input_uses_sticky_cid_before_default_fallback() {
-        let request = LbKeyRequestParts::new(
+    fn resolve_lb_key_uses_sticky_cid_before_default_fallback() {
+        let resolved = QUICListener::resolve_lb_key(
+            "sticky-cid",
+            Some("header:x-user-id"),
             "GET",
             "/resource",
             Some("api.example.com"),
@@ -1723,12 +1734,6 @@ mod tests {
             None,
             None,
         );
-
-        let resolved = QUICListener::resolve_lb_key_for_input(&LbKeyResolutionInput::new(
-            "sticky-cid",
-            Some("header:x-user-id"),
-            request,
-        ));
 
         assert_eq!(resolved.value, "cid-123");
         assert!(matches!(
