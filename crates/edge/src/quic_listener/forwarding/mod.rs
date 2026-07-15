@@ -6,7 +6,7 @@ mod resolve;
 mod response;
 mod stream_progress;
 
-use std::{convert::Infallible, error::Error as StdError};
+use std::convert::Infallible;
 
 use spooky_config::config::ScopedRateLimitScope;
 use spooky_errors::{
@@ -19,6 +19,8 @@ pub(in crate::quic_listener) use self::resolve::BootstrapResolutionInput;
 pub(in crate::quic_listener) use self::resolve::RouteResolutionRequest as TestRouteResolutionRequest;
 use super::*;
 use crate::runtime::connection::{request::PendingForward, stream::StreamAdmissionState};
+#[cfg(test)]
+use std::error::Error as StdError;
 
 pub(super) fn abort_stream(req: &mut RequestEnvelope, metrics: &Metrics) -> StreamPhase {
     let phase = req.phase.clone();
@@ -88,51 +90,14 @@ impl QUICListener {
         is_connect: bool,
         detail: &str,
     ) -> UpstreamErrorClassification {
-        let normalized = detail.to_ascii_lowercase();
-        if normalized.contains("timeout") || normalized.contains("timed out") {
-            return UpstreamErrorClassification::timeout();
-        }
-
-        if is_connect {
-            if normalized.contains("unknownissuer") || normalized.contains("unknown issuer") {
-                return UpstreamErrorClassification::tls(UpstreamTlsReason::UnknownIssuer);
-            }
-            if normalized.contains("expired")
-                || normalized.contains("not yet valid")
-                || normalized.contains("validity")
-            {
-                return UpstreamErrorClassification::tls(UpstreamTlsReason::ExpiredCertificate);
-            }
-            if normalized.contains("hostname")
-                || normalized.contains("dns name")
-                || normalized.contains("subjectaltname")
-                || normalized.contains("not valid for")
-            {
-                return UpstreamErrorClassification::tls(UpstreamTlsReason::HostnameMismatch);
-            }
-            if normalized.contains("alpn") {
-                return UpstreamErrorClassification::tls(UpstreamTlsReason::Alpn);
-            }
-            if normalized.contains("invalidcertificate")
-                || normalized.contains("certificate")
-                || normalized.contains("x509")
-                || normalized.contains("rustls")
-                || normalized.contains("webpki")
-                || normalized.contains("tls")
-            {
-                return UpstreamErrorClassification::tls(UpstreamTlsReason::Handshake);
-            }
-        }
-
-        UpstreamErrorClassification::transport()
+        UpstreamErrorDetails::new(detail.to_string(), is_connect).classify()
     }
 
     pub(crate) fn classify_send_error(
         err: &hyper_util::client::legacy::Error,
     ) -> (UpstreamErrorDetails, UpstreamErrorClassification) {
-        let details = UpstreamErrorDetails::new(Self::format_error_chain(err), err.is_connect());
-        let classification =
-            Self::classify_upstream_failure_reason(details.is_connect, &details.detail);
+        let details = UpstreamErrorDetails::from_error_chain(err, err.is_connect());
+        let classification = details.classify();
         (details, classification)
     }
 
@@ -159,17 +124,6 @@ impl QUICListener {
                 (HealthFailureReason::Transport, "transport")
             }
         }
-    }
-
-    pub(crate) fn format_error_chain(err: &(dyn StdError + 'static)) -> String {
-        let mut detail = err.to_string();
-        let mut source = err.source();
-        while let Some(cause) = source {
-            detail.push_str(": ");
-            detail.push_str(&cause.to_string());
-            source = cause.source();
-        }
-        detail
     }
 
     fn is_internal_pool_control_error(error: &PoolError) -> bool {
@@ -1309,7 +1263,7 @@ mod tests {
 
     #[test]
     fn format_error_chain_includes_nested_causes() {
-        let msg = QUICListener::format_error_chain(&OuterErr(InnerErr));
+        let msg = spooky_errors::format_error_chain(&OuterErr(InnerErr));
         assert_eq!(msg, "outer: inner");
     }
 

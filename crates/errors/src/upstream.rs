@@ -1,3 +1,5 @@
+use std::error::Error as StdError;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UpstreamErrorDetails {
     pub detail: String,
@@ -8,6 +10,61 @@ impl UpstreamErrorDetails {
     pub fn new(detail: String, is_connect: bool) -> Self {
         Self { detail, is_connect }
     }
+
+    pub fn from_error_chain(err: &(dyn StdError + 'static), is_connect: bool) -> Self {
+        Self::new(format_error_chain(err), is_connect)
+    }
+
+    pub fn classify(&self) -> UpstreamErrorClassification {
+        let normalized = self.detail.to_ascii_lowercase();
+        if normalized.contains("timeout") || normalized.contains("timed out") {
+            return UpstreamErrorClassification::timeout();
+        }
+
+        if self.is_connect {
+            if normalized.contains("unknownissuer") || normalized.contains("unknown issuer") {
+                return UpstreamErrorClassification::tls(UpstreamTlsReason::UnknownIssuer);
+            }
+            if normalized.contains("expired")
+                || normalized.contains("not yet valid")
+                || normalized.contains("validity")
+            {
+                return UpstreamErrorClassification::tls(UpstreamTlsReason::ExpiredCertificate);
+            }
+            if normalized.contains("hostname")
+                || normalized.contains("dns name")
+                || normalized.contains("subjectaltname")
+                || normalized.contains("not valid for")
+            {
+                return UpstreamErrorClassification::tls(UpstreamTlsReason::HostnameMismatch);
+            }
+            if normalized.contains("alpn") {
+                return UpstreamErrorClassification::tls(UpstreamTlsReason::Alpn);
+            }
+            if normalized.contains("invalidcertificate")
+                || normalized.contains("certificate")
+                || normalized.contains("x509")
+                || normalized.contains("rustls")
+                || normalized.contains("webpki")
+                || normalized.contains("tls")
+            {
+                return UpstreamErrorClassification::tls(UpstreamTlsReason::Handshake);
+            }
+        }
+
+        UpstreamErrorClassification::transport()
+    }
+}
+
+pub fn format_error_chain(err: &(dyn StdError + 'static)) -> String {
+    let mut detail = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        detail.push_str(": ");
+        detail.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    detail
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

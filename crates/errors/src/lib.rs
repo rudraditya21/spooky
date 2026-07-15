@@ -10,4 +10,5 @@ pub use proxy::ProxyError;
 pub use retry::is_retryable;
 pub use upstream::{
     UpstreamErrorCategory, UpstreamErrorClassification, UpstreamErrorDetails, UpstreamTlsReason,
+    format_error_chain,
 };
