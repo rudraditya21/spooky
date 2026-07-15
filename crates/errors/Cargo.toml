@@ -9,3 +9,4 @@ thiserror = { workspace = true }
 http = { workspace = true }
 hyper-util = { workspace = true }
 quiche = { workspace = true }
+spooky-lb = { path = "../lb" }

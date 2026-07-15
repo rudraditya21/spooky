@@ -6,9 +6,10 @@ mod resolve;
 mod response;
 mod stream_progress;
 
-use std::{convert::Infallible, error::Error as StdError};
+use std::convert::Infallible;
 
 use spooky_config::config::ScopedRateLimitScope;
+use spooky_errors::ClassifiedUpstreamProxyError;
 
 use self::prepare::{PreparedRequest, StartedAuthRequest};
 pub(in crate::quic_listener) use self::resolve::BootstrapResolutionInput;
@@ -81,65 +82,71 @@ pub(crate) struct StreamProgressConfig {
 }
 
 impl QUICListener {
-    pub fn classify_upstream_failure_reason(
-        is_connect: bool,
-        detail: &str,
-    ) -> (HealthFailureReason, &'static str) {
-        let normalized = detail.to_ascii_lowercase();
-        if normalized.contains("timeout") || normalized.contains("timed out") {
-            return (HealthFailureReason::Timeout, "timeout");
+    pub(super) fn log_classified_upstream_failure(
+        phase: &str,
+        request_id: Option<u64>,
+        upstream_name: Option<&str>,
+        backend_addr: &str,
+        classified: &ClassifiedUpstreamProxyError,
+    ) {
+        let request_id = request_id
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let upstream_name = upstream_name.unwrap_or("-");
+        match classified.health_failure {
+            Some(health_mapping) => error!(
+                "phase={} request_id={} upstream={} backend={} upstream failure kind={:?} retryability={:?} health_reason={:?} metrics_reason={} detail={}",
+                phase,
+                request_id,
+                upstream_name,
+                backend_addr,
+                classified.kind,
+                classified.retryability,
+                health_mapping.failure_reason,
+                health_mapping.metrics_reason,
+                classified.detail
+            ),
+            None => error!(
+                "phase={} request_id={} upstream={} backend={} upstream failure kind={:?} retryability={:?} detail={}",
+                phase,
+                request_id,
+                upstream_name,
+                backend_addr,
+                classified.kind,
+                classified.retryability,
+                classified.detail
+            ),
         }
-
-        if is_connect {
-            if normalized.contains("unknownissuer") || normalized.contains("unknown issuer") {
-                return (HealthFailureReason::Tls, "unknown_issuer");
-            }
-            if normalized.contains("expired")
-                || normalized.contains("not yet valid")
-                || normalized.contains("validity")
-            {
-                return (HealthFailureReason::Tls, "expired_certificate");
-            }
-            if normalized.contains("hostname")
-                || normalized.contains("dns name")
-                || normalized.contains("subjectaltname")
-                || normalized.contains("not valid for")
-            {
-                return (HealthFailureReason::Tls, "hostname_mismatch");
-            }
-            if normalized.contains("alpn") {
-                return (HealthFailureReason::Tls, "alpn");
-            }
-            if normalized.contains("invalidcertificate")
-                || normalized.contains("certificate")
-                || normalized.contains("x509")
-                || normalized.contains("rustls")
-                || normalized.contains("webpki")
-                || normalized.contains("tls")
-            {
-                return (HealthFailureReason::Tls, "handshake");
-            }
-        }
-
-        (HealthFailureReason::Transport, "transport")
     }
 
-    pub(crate) fn send_error_health_failure_reason(
-        err: &hyper_util::client::legacy::Error,
-    ) -> (HealthFailureReason, &'static str) {
-        let detail = Self::format_error_chain(err);
-        Self::classify_upstream_failure_reason(err.is_connect(), &detail)
-    }
+    pub(super) fn mark_classified_upstream_health_failure(
+        metrics_phase: &str,
+        backend_addr: &str,
+        backend_index: usize,
+        upstream_pool: Option<&Arc<RwLock<UpstreamPool>>>,
+        metrics: &Metrics,
+        classified: &ClassifiedUpstreamProxyError,
+    ) {
+        let Some(health_mapping) = classified.health_failure else {
+            return;
+        };
 
-    pub(crate) fn format_error_chain(err: &(dyn StdError + 'static)) -> String {
-        let mut detail = err.to_string();
-        let mut source = err.source();
-        while let Some(cause) = source {
-            detail.push_str(": ");
-            detail.push_str(&cause.to_string());
-            source = cause.source();
+        metrics.inc_health_failure(health_mapping.failure_reason);
+        if health_mapping.failure_reason == HealthFailureReason::Tls {
+            metrics.record_upstream_tls_failure(
+                backend_addr,
+                metrics_phase,
+                health_mapping.metrics_reason,
+            );
         }
-        detail
+        if let Some(pool) = upstream_pool
+            && let Some(transition) = pool.write().ok().and_then(|mut p| {
+                p.pool
+                    .mark_request_failure(backend_index, health_mapping.failure_reason)
+            })
+        {
+            Self::log_health_transition(backend_addr, transition);
+        }
     }
 
     fn is_internal_pool_control_error(error: &PoolError) -> bool {
@@ -1200,30 +1207,32 @@ mod tests {
     #[test]
     fn send_connect_error_with_tls_details_maps_to_tls_health_failure() {
         assert_eq!(
-            QUICListener::classify_upstream_failure_reason(
+            spooky_errors::classify_upstream_error_detail(
+                "client error (Connect): tls handshake failed: invalid certificate",
                 true,
-                "client error (Connect): tls handshake failed: invalid certificate"
             ),
-            (HealthFailureReason::Tls, "handshake")
+            spooky_errors::UpstreamErrorClassification::tls(
+                spooky_errors::UpstreamTlsReason::Handshake,
+            )
         );
     }
 
     #[test]
     fn send_connect_error_without_tls_details_maps_to_transport_health_failure() {
         assert_eq!(
-            QUICListener::classify_upstream_failure_reason(
+            spooky_errors::classify_upstream_error_detail(
+                "client error (Connect): connection refused",
                 true,
-                "client error (Connect): connection refused"
             ),
-            (HealthFailureReason::Transport, "transport")
+            spooky_errors::UpstreamErrorClassification::transport()
         );
     }
 
     #[test]
     fn send_error_with_timeout_detail_maps_to_timeout_health_failure() {
         assert_eq!(
-            QUICListener::classify_upstream_failure_reason(false, "request timed out"),
-            (HealthFailureReason::Timeout, "timeout")
+            spooky_errors::classify_upstream_error_detail("request timed out", false),
+            spooky_errors::UpstreamErrorClassification::timeout()
         );
     }
 
@@ -1247,38 +1256,6 @@ mod tests {
             RouteOutcome::Success => {}
             _ => panic!("unexpected route outcome"),
         }
-    }
-
-    #[derive(Debug)]
-    struct OuterErr(InnerErr);
-
-    #[derive(Debug)]
-    struct InnerErr;
-
-    impl std::fmt::Display for OuterErr {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "outer")
-        }
-    }
-
-    impl std::fmt::Display for InnerErr {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "inner")
-        }
-    }
-
-    impl StdError for OuterErr {
-        fn source(&self) -> Option<&(dyn StdError + 'static)> {
-            Some(&self.0)
-        }
-    }
-
-    impl StdError for InnerErr {}
-
-    #[test]
-    fn format_error_chain_includes_nested_causes() {
-        let msg = QUICListener::format_error_chain(&OuterErr(InnerErr));
-        assert_eq!(msg, "outer: inner");
     }
 
     #[test]

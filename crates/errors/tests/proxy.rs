@@ -1,4 +1,9 @@
-use spooky_errors::{PoolError, ProxyError};
+use spooky_errors::{
+    PoolError, ProxyError, RetryPolicyDecision, RetryPolicyDenial, RetryPolicyInput,
+    UpstreamErrorClassification, UpstreamHealthFailureMapping, UpstreamProxyErrorKind,
+    UpstreamRetryReason, UpstreamRetryability, UpstreamTerminalErrorKind, UpstreamTlsReason,
+    classify_retryability, classify_upstream_proxy_error, evaluate_retry_policy, is_retryable,
+};
 
 #[test]
 fn pool_and_transport_errors_have_distinct_display_text() {
@@ -14,4 +19,180 @@ fn overloaded_pool_error_keeps_pool_specific_prefix() {
     let err = ProxyError::Pool(PoolError::BackendOverloaded("api-b".to_string()));
 
     assert_eq!(err.to_string(), "pool error: backend overloaded: api-b");
+}
+
+#[test]
+fn retryability_classification_distinguishes_retryable_and_terminal_errors() {
+    assert_eq!(
+        classify_retryability(&ProxyError::Timeout),
+        UpstreamRetryability::Retryable(UpstreamRetryReason::Timeout)
+    );
+    assert_eq!(
+        classify_retryability(&ProxyError::Transport("reset".to_string())),
+        UpstreamRetryability::Retryable(UpstreamRetryReason::Transport)
+    );
+    assert_eq!(
+        classify_retryability(&ProxyError::Pool(PoolError::UnknownBackend(
+            "api-a".to_string()
+        ))),
+        UpstreamRetryability::Retryable(UpstreamRetryReason::Pool)
+    );
+    assert_eq!(
+        classify_retryability(&ProxyError::Tls("bad cert".to_string())),
+        UpstreamRetryability::Terminal(UpstreamTerminalErrorKind::Tls)
+    );
+    assert_eq!(
+        classify_retryability(&ProxyError::Protocol("bad frame".to_string())),
+        UpstreamRetryability::Terminal(UpstreamTerminalErrorKind::Protocol)
+    );
+}
+
+#[test]
+fn retry_policy_evaluation_preserves_existing_denial_behavior() {
+    assert_eq!(
+        evaluate_retry_policy(RetryPolicyInput {
+            retryability: UpstreamRetryability::Terminal(UpstreamTerminalErrorKind::Protocol),
+            bodyless_mode: true,
+            budget_available: true,
+            alternate_backend_available: true,
+        }),
+        RetryPolicyDecision::DoNotRetry { denial: None }
+    );
+    assert_eq!(
+        evaluate_retry_policy(RetryPolicyInput {
+            retryability: UpstreamRetryability::Retryable(UpstreamRetryReason::Transport),
+            bodyless_mode: false,
+            budget_available: true,
+            alternate_backend_available: true,
+        }),
+        RetryPolicyDecision::DoNotRetry {
+            denial: Some(RetryPolicyDenial::NotBodylessMode),
+        }
+    );
+    assert_eq!(
+        evaluate_retry_policy(RetryPolicyInput {
+            retryability: UpstreamRetryability::Retryable(UpstreamRetryReason::Pool),
+            bodyless_mode: true,
+            budget_available: false,
+            alternate_backend_available: true,
+        }),
+        RetryPolicyDecision::DoNotRetry {
+            denial: Some(RetryPolicyDenial::BudgetDenied),
+        }
+    );
+    assert_eq!(
+        evaluate_retry_policy(RetryPolicyInput {
+            retryability: UpstreamRetryability::Retryable(UpstreamRetryReason::Timeout),
+            bodyless_mode: true,
+            budget_available: true,
+            alternate_backend_available: true,
+        }),
+        RetryPolicyDecision::Retry {
+            reason: UpstreamRetryReason::Timeout,
+        }
+    );
+}
+
+#[test]
+fn upstream_proxy_error_classification_preserves_tls_error_details() {
+    let err = ProxyError::Tls("tls handshake failed: unknown issuer".to_string());
+    let classified = classify_upstream_proxy_error(&err).expect("classified upstream error");
+
+    assert_eq!(classified.kind, UpstreamProxyErrorKind::Tls);
+    assert_eq!(
+        classified.classification,
+        UpstreamErrorClassification::tls(UpstreamTlsReason::UnknownIssuer)
+    );
+    assert!(classified.health_failure.is_none());
+    assert_eq!(
+        classified.retryability,
+        UpstreamRetryability::Terminal(UpstreamTerminalErrorKind::Tls)
+    );
+}
+
+#[test]
+fn upstream_proxy_error_classification_marks_timeout_as_retryable_health_failure() {
+    let classified =
+        classify_upstream_proxy_error(&ProxyError::Timeout).expect("classified timeout");
+
+    assert_eq!(classified.kind, UpstreamProxyErrorKind::Timeout);
+    assert_eq!(
+        classified.classification,
+        UpstreamErrorClassification::timeout()
+    );
+    assert_eq!(
+        classified.health_failure,
+        Some(UpstreamHealthFailureMapping {
+            failure_reason: spooky_lb::health::HealthFailureReason::Timeout,
+            metrics_reason: "timeout",
+        })
+    );
+    assert_eq!(
+        classified.retryability,
+        UpstreamRetryability::Retryable(UpstreamRetryReason::Timeout)
+    );
+}
+
+#[test]
+fn upstream_proxy_error_classification_covers_protocol_and_transport_cases() {
+    let transport =
+        classify_upstream_proxy_error(&ProxyError::Transport("connection reset".into()))
+            .expect("classified transport");
+    assert_eq!(transport.kind, UpstreamProxyErrorKind::Transport);
+    assert_eq!(
+        transport.classification,
+        UpstreamErrorClassification::transport()
+    );
+    assert_eq!(
+        transport.health_failure,
+        Some(UpstreamHealthFailureMapping {
+            failure_reason: spooky_lb::health::HealthFailureReason::Transport,
+            metrics_reason: "transport",
+        })
+    );
+    assert_eq!(
+        transport.retryability,
+        UpstreamRetryability::Retryable(UpstreamRetryReason::Transport)
+    );
+
+    let protocol = classify_upstream_proxy_error(&ProxyError::Protocol("bad frame".into()))
+        .expect("classified protocol");
+    assert_eq!(protocol.kind, UpstreamProxyErrorKind::Protocol);
+    assert_eq!(
+        protocol.classification,
+        UpstreamErrorClassification::protocol()
+    );
+    assert!(protocol.health_failure.is_none());
+    assert_eq!(
+        protocol.retryability,
+        UpstreamRetryability::Terminal(UpstreamTerminalErrorKind::Protocol)
+    );
+}
+
+#[test]
+fn retryability_boolean_matches_typed_retryability_contract() {
+    let retryable_errors = [
+        ProxyError::Timeout,
+        ProxyError::Transport("reset".into()),
+        ProxyError::Pool(PoolError::UnknownBackend("api-a".into())),
+    ];
+    for err in retryable_errors {
+        assert!(is_retryable(&err));
+        assert!(matches!(
+            classify_retryability(&err),
+            UpstreamRetryability::Retryable(_)
+        ));
+    }
+
+    let terminal_errors = [
+        ProxyError::Tls("bad cert".into()),
+        ProxyError::Protocol("bad frame".into()),
+    ];
+    for err in terminal_errors {
+        assert!(!is_retryable(&err));
+        assert!(matches!(
+            classify_retryability(&err),
+            UpstreamRetryability::Terminal(_)
+        ));
+    }
 }

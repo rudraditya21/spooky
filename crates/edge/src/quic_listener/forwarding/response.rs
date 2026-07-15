@@ -1,3 +1,4 @@
+use spooky_errors::{UpstreamProxyErrorKind, classify_upstream_proxy_error};
 use tokio::sync::mpsc::error::TryRecvError;
 
 use super::*;
@@ -140,77 +141,6 @@ impl QUICListener {
                     overload_retry_after_seconds,
                 )
             }
-            Err(ProxyError::Pool(PoolError::Send(ref send_err))) => {
-                let send_err_detail = Self::format_error_chain(send_err);
-                let (failure_reason, tls_reason) = Self::send_error_health_failure_reason(send_err);
-                error!(
-                    "Upstream send failed for {} (health_reason={:?}, tls_reason={}): {}",
-                    backend_addr, failure_reason, tls_reason, send_err_detail
-                );
-                metrics.inc_health_failure(failure_reason);
-                if failure_reason == HealthFailureReason::Tls {
-                    metrics.record_upstream_tls_failure(backend_addr, "data_plane", tls_reason);
-                }
-                if let Some(pool) = &upstream_pool
-                    && let Some(t) = pool.write().ok().and_then(|mut p| {
-                        p.pool.mark_request_failure(backend_index, failure_reason)
-                    })
-                {
-                    Self::log_health_transition(backend_addr, t);
-                }
-                metrics.inc_failure();
-                metrics.inc_backend_error();
-                metrics.record_route(route_label, start.elapsed(), RouteOutcome::BackendError);
-                Self::record_request_observation(
-                    metrics,
-                    req,
-                    Some(http::StatusCode::BAD_GATEWAY.as_u16()),
-                    RouteOutcome::BackendError,
-                );
-                Self::log_access(req, 502);
-                Self::send_simple_response(
-                    h3,
-                    quic,
-                    stream_id,
-                    http::StatusCode::BAD_GATEWAY,
-                    b"upstream error\n",
-                )
-            }
-            Err(ProxyError::Transport(err)) => {
-                error!(
-                    "request_id={} upstream={} backend={} Upstream transport error: {}",
-                    req.request_id,
-                    req.upstream_name.as_deref().unwrap_or("-"),
-                    backend_addr,
-                    err
-                );
-                metrics.inc_health_failure(HealthFailureReason::Transport);
-                if let Some(pool) = &upstream_pool
-                    && let Some(t) = pool.write().ok().and_then(|mut p| {
-                        p.pool
-                            .mark_request_failure(backend_index, HealthFailureReason::Transport)
-                    })
-                {
-                    Self::log_health_transition(backend_addr, t);
-                }
-                metrics.inc_failure();
-                metrics.inc_backend_error();
-                metrics.record_route(route_label, start.elapsed(), RouteOutcome::BackendError);
-                Self::record_request_observation(
-                    metrics,
-                    req,
-                    Some(http::StatusCode::BAD_GATEWAY.as_u16()),
-                    RouteOutcome::BackendError,
-                );
-                Self::log_access(req, 502);
-                Self::send_simple_response(
-                    h3,
-                    quic,
-                    stream_id,
-                    http::StatusCode::BAD_GATEWAY,
-                    b"upstream error\n",
-                )
-            }
             Err(ProxyError::Pool(pool_err @ PoolError::InflightLimiterClosed))
             | Err(ProxyError::Pool(pool_err @ PoolError::UnknownBackend(_))) => {
                 debug_assert!(Self::is_internal_pool_control_error(&pool_err));
@@ -241,74 +171,134 @@ impl QUICListener {
                     b"upstream error\n",
                 )
             }
-            Err(ProxyError::Protocol(err)) => {
-                error!("request_id={} Protocol error: {}", req.request_id, err);
-                metrics.inc_failure();
-                metrics.inc_backend_error();
-                metrics.record_route(route_label, start.elapsed(), RouteOutcome::BackendError);
-                Self::record_request_observation(
-                    metrics,
-                    req,
-                    Some(http::StatusCode::BAD_GATEWAY.as_u16()),
-                    RouteOutcome::BackendError,
+            Err(err) => {
+                let Some(classified) = classify_upstream_proxy_error(&err) else {
+                    error!(
+                        "request_id={} upstream={} backend={} unclassified forward error: {:?}",
+                        req.request_id,
+                        req.upstream_name.as_deref().unwrap_or("-"),
+                        backend_addr,
+                        err
+                    );
+                    metrics.inc_failure();
+                    metrics.inc_backend_error();
+                    metrics.record_route(route_label, start.elapsed(), RouteOutcome::BackendError);
+                    Self::record_request_observation(
+                        metrics,
+                        req,
+                        Some(http::StatusCode::BAD_GATEWAY.as_u16()),
+                        RouteOutcome::BackendError,
+                    );
+                    Self::log_access(req, 502);
+                    return Self::send_simple_response(
+                        h3,
+                        quic,
+                        stream_id,
+                        http::StatusCode::BAD_GATEWAY,
+                        b"upstream error\n",
+                    );
+                };
+                Self::log_classified_upstream_failure(
+                    "data_plane",
+                    Some(req.request_id),
+                    req.upstream_name.as_deref(),
+                    backend_addr,
+                    &classified,
                 );
-                Self::log_access(req, 502);
-                Self::send_simple_response(
-                    h3,
-                    quic,
-                    stream_id,
-                    http::StatusCode::BAD_GATEWAY,
-                    b"upstream protocol error\n",
-                )
-            }
-            Err(ProxyError::Timeout) => {
-                error!("request_id={} Upstream request timed out", req.request_id);
-                metrics.inc_health_failure(HealthFailureReason::Timeout);
-                if let Some(pool) = &upstream_pool
-                    && let Some(t) = pool.write().ok().and_then(|mut p| {
-                        p.pool
-                            .mark_request_failure(backend_index, HealthFailureReason::Timeout)
-                    })
-                {
-                    Self::log_health_transition(backend_addr, t);
+                Self::mark_classified_upstream_health_failure(
+                    "data_plane",
+                    backend_addr,
+                    backend_index,
+                    upstream_pool.as_ref(),
+                    metrics,
+                    &classified,
+                );
+
+                match classified.kind {
+                    UpstreamProxyErrorKind::Timeout => {
+                        metrics.inc_failure();
+                        metrics.inc_timeout();
+                        metrics.record_route(route_label, start.elapsed(), RouteOutcome::Timeout);
+                        Self::record_request_observation(
+                            metrics,
+                            req,
+                            Some(http::StatusCode::SERVICE_UNAVAILABLE.as_u16()),
+                            RouteOutcome::Timeout,
+                        );
+                        Self::log_access(req, 503);
+                        Self::send_simple_response(
+                            h3,
+                            quic,
+                            stream_id,
+                            http::StatusCode::SERVICE_UNAVAILABLE,
+                            b"upstream timeout\n",
+                        )
+                    }
+                    UpstreamProxyErrorKind::Tls => {
+                        metrics.inc_failure();
+                        metrics.record_route(route_label, start.elapsed(), RouteOutcome::Failure);
+                        Self::record_request_observation(
+                            metrics,
+                            req,
+                            Some(http::StatusCode::INTERNAL_SERVER_ERROR.as_u16()),
+                            RouteOutcome::Failure,
+                        );
+                        Self::log_access(req, 500);
+                        Self::send_simple_response(
+                            h3,
+                            quic,
+                            stream_id,
+                            http::StatusCode::INTERNAL_SERVER_ERROR,
+                            b"internal server error\n",
+                        )
+                    }
+                    UpstreamProxyErrorKind::Protocol => {
+                        metrics.inc_failure();
+                        metrics.inc_backend_error();
+                        metrics.record_route(
+                            route_label,
+                            start.elapsed(),
+                            RouteOutcome::BackendError,
+                        );
+                        Self::record_request_observation(
+                            metrics,
+                            req,
+                            Some(http::StatusCode::BAD_GATEWAY.as_u16()),
+                            RouteOutcome::BackendError,
+                        );
+                        Self::log_access(req, 502);
+                        Self::send_simple_response(
+                            h3,
+                            quic,
+                            stream_id,
+                            http::StatusCode::BAD_GATEWAY,
+                            b"upstream protocol error\n",
+                        )
+                    }
+                    UpstreamProxyErrorKind::Send | UpstreamProxyErrorKind::Transport => {
+                        metrics.inc_failure();
+                        metrics.inc_backend_error();
+                        metrics.record_route(
+                            route_label,
+                            start.elapsed(),
+                            RouteOutcome::BackendError,
+                        );
+                        Self::record_request_observation(
+                            metrics,
+                            req,
+                            Some(http::StatusCode::BAD_GATEWAY.as_u16()),
+                            RouteOutcome::BackendError,
+                        );
+                        Self::log_access(req, 502);
+                        Self::send_simple_response(
+                            h3,
+                            quic,
+                            stream_id,
+                            http::StatusCode::BAD_GATEWAY,
+                            b"upstream error\n",
+                        )
+                    }
                 }
-                metrics.inc_failure();
-                metrics.inc_timeout();
-                metrics.record_route(route_label, start.elapsed(), RouteOutcome::Timeout);
-                Self::record_request_observation(
-                    metrics,
-                    req,
-                    Some(http::StatusCode::SERVICE_UNAVAILABLE.as_u16()),
-                    RouteOutcome::Timeout,
-                );
-                Self::log_access(req, 503);
-                Self::send_simple_response(
-                    h3,
-                    quic,
-                    stream_id,
-                    http::StatusCode::SERVICE_UNAVAILABLE,
-                    b"upstream timeout\n",
-                )
-            }
-            Err(ProxyError::Tls(err)) => {
-                error!("TLS error: {}", err);
-                metrics.inc_health_failure(HealthFailureReason::Tls);
-                metrics.inc_failure();
-                metrics.record_route(route_label, start.elapsed(), RouteOutcome::Failure);
-                Self::record_request_observation(
-                    metrics,
-                    req,
-                    Some(http::StatusCode::INTERNAL_SERVER_ERROR.as_u16()),
-                    RouteOutcome::Failure,
-                );
-                Self::log_access(req, 500);
-                Self::send_simple_response(
-                    h3,
-                    quic,
-                    stream_id,
-                    http::StatusCode::INTERNAL_SERVER_ERROR,
-                    b"internal server error\n",
-                )
             }
         }
     }
@@ -658,30 +648,47 @@ impl QUICListener {
                     }
                 },
                 ResponseChunk::Error(err) => {
+                    let classified = classify_upstream_proxy_error(&err);
                     if !req.response_headers_sent {
-                        let (status, body): (http::StatusCode, &[u8]) = match &err {
-                            ProxyError::Timeout => {
-                                (http::StatusCode::SERVICE_UNAVAILABLE, b"upstream timeout\n")
-                            }
-                            ProxyError::Pool(PoolError::BackendOverloaded(_)) => (
-                                http::StatusCode::SERVICE_UNAVAILABLE,
-                                b"upstream response body too large\n",
-                            ),
-                            _ => (http::StatusCode::BAD_GATEWAY, b"upstream error\n"),
-                        };
+                        let (status, body): (http::StatusCode, &[u8]) =
+                            match (&err, classified.as_ref()) {
+                                (ProxyError::Pool(PoolError::BackendOverloaded(_)), _) => (
+                                    http::StatusCode::SERVICE_UNAVAILABLE,
+                                    b"upstream response body too large\n",
+                                ),
+                                (_, Some(classified))
+                                    if classified.kind == UpstreamProxyErrorKind::Timeout =>
+                                {
+                                    (http::StatusCode::SERVICE_UNAVAILABLE, b"upstream timeout\n")
+                                }
+                                _ => (http::StatusCode::BAD_GATEWAY, b"upstream error\n"),
+                            };
                         let _ = Self::send_simple_response(h3, quic, stream_id, status, body);
                     } else {
                         let _ = h3.send_body(quic, stream_id, b"", true);
                     }
                     req.phase = StreamPhase::Failed;
                     let upstream_name = routing_index.lookup(&req.path, req.authority.as_deref());
-                    if let (Some(idx), Some(pool)) = (
+                    let upstream_pool = upstream_name.and_then(|n| upstream_pools.get(n));
+                    if let (Some(addr), Some(idx), Some(classified)) = (
+                        req.backend_addr.as_deref(),
                         req.backend_index,
-                        upstream_name.and_then(|n| upstream_pools.get(n)),
-                    ) && let Some(t) = pool.write().ok().and_then(|mut p| {
-                        p.pool
-                            .mark_request_failure(idx, HealthFailureReason::HttpStatus5xx)
-                    }) && let Some(addr) = &req.backend_addr
+                        classified.as_ref(),
+                    ) {
+                        Self::mark_classified_upstream_health_failure(
+                            "data_plane",
+                            addr,
+                            idx,
+                            upstream_pool,
+                            metrics,
+                            classified,
+                        );
+                    } else if let (Some(idx), Some(pool)) = (req.backend_index, upstream_pool)
+                        && let Some(t) = pool.write().ok().and_then(|mut p| {
+                            p.pool
+                                .mark_request_failure(idx, HealthFailureReason::HttpStatus5xx)
+                        })
+                        && let Some(addr) = &req.backend_addr
                     {
                         Self::log_health_transition(addr, t);
                     }
@@ -763,11 +770,23 @@ impl QUICListener {
                             resilience
                                 .adaptive_admission
                                 .observe(req.start.elapsed(), true);
-                            error!(
-                                "Upstream {} body error: {:?}",
-                                req.backend_addr.as_deref().unwrap_or("?"),
-                                err
-                            );
+                            if let (Some(addr), Some(classified)) =
+                                (req.backend_addr.as_deref(), classified.as_ref())
+                            {
+                                Self::log_classified_upstream_failure(
+                                    "data_plane",
+                                    Some(req.request_id),
+                                    req.upstream_name.as_deref(),
+                                    addr,
+                                    classified,
+                                );
+                            } else {
+                                error!(
+                                    "Upstream {} body error: {:?}",
+                                    req.backend_addr.as_deref().unwrap_or("?"),
+                                    err
+                                );
+                            }
                         }
                     }
                     terminal = true;

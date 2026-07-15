@@ -1,6 +1,10 @@
 use thiserror::Error;
 
-use crate::{BridgeError, PoolError};
+use crate::{
+    BridgeError, PoolError, UpstreamErrorCategory, UpstreamErrorClassification,
+    UpstreamHealthFailureMapping, UpstreamRetryability, UpstreamTerminalErrorKind,
+    UpstreamTlsReason, classify_retryability, upstream::UpstreamErrorDetails,
+};
 
 #[derive(Debug, Error)]
 pub enum ProxyError {
@@ -21,4 +25,90 @@ pub enum ProxyError {
 
     #[error("TLS error: {0}")]
     Tls(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UpstreamProxyErrorKind {
+    Send,
+    Transport,
+    Timeout,
+    Protocol,
+    Tls,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClassifiedUpstreamProxyError {
+    pub kind: UpstreamProxyErrorKind,
+    pub detail: String,
+    pub classification: UpstreamErrorClassification,
+    pub health_failure: Option<UpstreamHealthFailureMapping>,
+    pub retryability: UpstreamRetryability,
+}
+
+fn classify_tls_detail(detail: &str) -> UpstreamErrorClassification {
+    let classification = crate::classify_upstream_error_detail(detail, true);
+    if matches!(classification.category, UpstreamErrorCategory::Transport) {
+        UpstreamErrorClassification::tls(UpstreamTlsReason::Handshake)
+    } else {
+        classification
+    }
+}
+
+pub fn classify_upstream_send_error(
+    err: &hyper_util::client::legacy::Error,
+) -> ClassifiedUpstreamProxyError {
+    let details = UpstreamErrorDetails::from_error_chain(err, err.is_connect());
+    let classification = details.classify();
+    ClassifiedUpstreamProxyError {
+        kind: UpstreamProxyErrorKind::Send,
+        detail: details.detail,
+        classification,
+        health_failure: Some(classification.health_failure_mapping()),
+        retryability: UpstreamRetryability::Terminal(UpstreamTerminalErrorKind::PoolSend),
+    }
+}
+
+pub fn classify_upstream_proxy_error(err: &ProxyError) -> Option<ClassifiedUpstreamProxyError> {
+    match err {
+        ProxyError::Pool(PoolError::Send(send_err)) => Some(classify_upstream_send_error(send_err)),
+        ProxyError::Transport(detail) => {
+            let classification = UpstreamErrorClassification::transport();
+            Some(ClassifiedUpstreamProxyError {
+                kind: UpstreamProxyErrorKind::Transport,
+                detail: detail.clone(),
+                classification,
+                health_failure: Some(classification.health_failure_mapping()),
+                retryability: classify_retryability(err),
+            })
+        }
+        ProxyError::Timeout => {
+            let classification = UpstreamErrorClassification::timeout();
+            Some(ClassifiedUpstreamProxyError {
+                kind: UpstreamProxyErrorKind::Timeout,
+                detail: err.to_string(),
+                classification,
+                health_failure: Some(classification.health_failure_mapping()),
+                retryability: classify_retryability(err),
+            })
+        }
+        ProxyError::Protocol(detail) => Some(ClassifiedUpstreamProxyError {
+            kind: UpstreamProxyErrorKind::Protocol,
+            detail: detail.clone(),
+            classification: UpstreamErrorClassification::protocol(),
+            health_failure: None,
+            retryability: classify_retryability(err),
+        }),
+        ProxyError::Tls(detail) => Some(ClassifiedUpstreamProxyError {
+            kind: UpstreamProxyErrorKind::Tls,
+            detail: detail.clone(),
+            classification: classify_tls_detail(detail),
+            health_failure: None,
+            retryability: classify_retryability(err),
+        }),
+        ProxyError::Bridge(_)
+        | ProxyError::Pool(PoolError::UnknownBackend(_))
+        | ProxyError::Pool(PoolError::BackendOverloaded(_))
+        | ProxyError::Pool(PoolError::CircuitOpen(_))
+        | ProxyError::Pool(PoolError::InflightLimiterClosed) => None,
+    }
 }

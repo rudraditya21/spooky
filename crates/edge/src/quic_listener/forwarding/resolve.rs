@@ -62,8 +62,10 @@ pub(super) struct ForwardingResolvedTarget {
 
 pub(in crate::quic_listener) struct BootstrapResolvedTarget {
     pub(in crate::quic_listener) upstream_name: String,
+    pub(in crate::quic_listener) upstream_pool: Arc<RwLock<UpstreamPool>>,
     pub(in crate::quic_listener) upstream_policy: RuntimeUpstreamPolicy,
     pub(in crate::quic_listener) backend_addr: String,
+    pub(in crate::quic_listener) backend_index: usize,
 }
 
 pub(in crate::quic_listener) struct BootstrapResolutionInput<'a> {
@@ -280,8 +282,10 @@ impl QUICListener {
 
         Ok(BootstrapResolvedTarget {
             upstream_name: route.upstream_name,
+            upstream_pool: route.upstream_pool,
             upstream_policy: route.upstream_policy,
             backend_addr: backend.backend_addr,
+            backend_index: backend.backend_index,
         })
     }
 
