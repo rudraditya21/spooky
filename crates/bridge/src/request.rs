@@ -1,10 +1,19 @@
 use std::{convert::Infallible, net::SocketAddr};
 
 use bytes::Bytes;
+use http::{HeaderName, HeaderValue};
 use http_body_util::combinators::BoxBody;
 use spooky_config::{
     backend_endpoint::BackendEndpoint,
     config::{ForwardedHeaderPolicy, UpstreamHostPolicy},
+};
+
+use crate::{
+    BridgeError,
+    context::{ForwardedHeaderChains, ForwardedHeaderValues},
+    forwarded::build_forwarded_header_values,
+    headers::{connection_header_tokens, should_strip_request_header},
+    host::resolve_upstream_host_value,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -49,6 +58,22 @@ pub struct RequestBuildInput<'a, B = BoxBody<Bytes, Infallible>> {
     pub forwarded: RequestForwardedContext,
 }
 
+#[derive(Debug)]
+pub struct RequestHeaderPolicyInput<'a> {
+    pub target: RequestBuildTarget<'a>,
+    pub authority: Option<&'a str>,
+    pub headers: &'a [quiche::h3::Header],
+    pub preserve_upgrade: bool,
+    pub forwarded: RequestForwardedContext,
+}
+
+#[derive(Debug)]
+pub struct ResolvedRequestHeaderPolicy {
+    pub passthrough_headers: Vec<(HeaderName, HeaderValue)>,
+    pub host_value: String,
+    pub forwarded_values: ForwardedHeaderValues,
+}
+
 impl<'a, B> RequestBuildInput<'a, B> {
     pub fn body_mode_for_length(content_length: Option<usize>) -> RequestBodyMode {
         match content_length {
@@ -57,4 +82,87 @@ impl<'a, B> RequestBuildInput<'a, B> {
             None => RequestBodyMode::Streaming,
         }
     }
+}
+
+pub fn apply_request_header_policies(
+    input: RequestHeaderPolicyInput<'_>,
+) -> Result<ResolvedRequestHeaderPolicy, BridgeError> {
+    use quiche::h3::NameValue;
+
+    let RequestHeaderPolicyInput {
+        target,
+        authority,
+        headers,
+        preserve_upgrade,
+        forwarded,
+    } = input;
+    let RequestBuildTarget { endpoint, policies } = target;
+    let connection_tokens = connection_header_tokens(headers);
+    let mut passthrough_headers = Vec::new();
+    let mut host_from_headers: Option<String> = None;
+    let mut forwarded_from_headers: Vec<Vec<u8>> = Vec::new();
+    let mut x_forwarded_for_from_headers: Vec<Vec<u8>> = Vec::new();
+    let mut x_forwarded_proto_from_headers: Vec<Vec<u8>> = Vec::new();
+    let mut x_forwarded_host_from_headers: Vec<Vec<u8>> = Vec::new();
+
+    for header in headers {
+        let name = header.name();
+        if name.starts_with(b":") {
+            continue;
+        }
+        if name.eq_ignore_ascii_case(b"forwarded") {
+            forwarded_from_headers.push(header.value().to_vec());
+            continue;
+        }
+        if name.eq_ignore_ascii_case(b"x-forwarded-for") {
+            x_forwarded_for_from_headers.push(header.value().to_vec());
+            continue;
+        }
+        if name.eq_ignore_ascii_case(b"x-forwarded-proto") {
+            x_forwarded_proto_from_headers.push(header.value().to_vec());
+            continue;
+        }
+        if name.eq_ignore_ascii_case(b"x-forwarded-host") {
+            x_forwarded_host_from_headers.push(header.value().to_vec());
+            continue;
+        }
+
+        let header_name = HeaderName::from_bytes(name).map_err(|_| BridgeError::InvalidHeader)?;
+        if should_strip_request_header(&header_name, &connection_tokens, preserve_upgrade) {
+            continue;
+        }
+
+        let header_value =
+            HeaderValue::from_bytes(header.value()).map_err(|_| BridgeError::InvalidHeader)?;
+        if header_name == http::header::HOST {
+            host_from_headers = header_value.to_str().ok().map(str::to_string);
+            continue;
+        }
+        passthrough_headers.push((header_name, header_value));
+    }
+
+    let host_value = resolve_upstream_host_value(
+        endpoint,
+        policies.host_policy,
+        authority,
+        host_from_headers.as_deref(),
+    )?
+    .to_string();
+    let forwarded_values = build_forwarded_header_values(
+        policies.forwarded_header_policy,
+        ForwardedHeaderChains {
+            forwarded: &forwarded_from_headers,
+            x_forwarded_for: &x_forwarded_for_from_headers,
+            x_forwarded_proto: &x_forwarded_proto_from_headers,
+            x_forwarded_host: &x_forwarded_host_from_headers,
+        },
+        forwarded.client_addr.ip(),
+        &host_value,
+    )?;
+
+    Ok(ResolvedRequestHeaderPolicy {
+        passthrough_headers,
+        host_value,
+        forwarded_values,
+    })
 }

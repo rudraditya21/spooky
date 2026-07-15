@@ -3,7 +3,6 @@ use std::convert::Infallible;
 use bytes::Bytes;
 use http::{HeaderName, HeaderValue, Method, Request, Uri};
 use http_body_util::combinators::BoxBody;
-use quiche::h3::NameValue;
 use spooky_config::{
     backend_endpoint::BackendEndpoint,
     config::{ForwardedHeaderPolicy, UpstreamHostPolicy},
@@ -11,11 +10,11 @@ use spooky_config::{
 
 use crate::{
     BridgeError,
-    context::{ForwardedContext, ForwardedHeaderChains},
-    forwarded::build_forwarded_header_values,
-    headers::{connection_header_tokens, should_strip_request_header},
-    host::resolve_upstream_host_value,
-    request::{RequestBuildInput, RequestBuildPolicies, RequestBuildTarget},
+    context::ForwardedContext,
+    request::{
+        RequestBuildInput, RequestBuildPolicies, RequestBuildTarget, RequestHeaderPolicyInput,
+        RequestTraceContext, apply_request_header_policies,
+    },
     websocket::{H3WebsocketRequestKind, h3_websocket_request_kind},
 };
 
@@ -29,10 +28,6 @@ pub fn build_h1_request(
     input: RequestBuildInput<'_, BoxBody<Bytes, Infallible>>,
 ) -> Result<Request<BoxBody<Bytes, Infallible>>, BridgeError> {
     let RequestBuildTarget { endpoint, policies } = target;
-    let RequestBuildPolicies {
-        host_policy,
-        forwarded_header_policy,
-    } = policies;
     let RequestBuildInput {
         method,
         path,
@@ -50,55 +45,17 @@ pub fn build_h1_request(
     let preserve_upgrade = websocket_kind == H3WebsocketRequestKind::LegacyUpgrade;
 
     let mut builder = Request::builder().method(method.clone());
-    let connection_tokens = connection_header_tokens(headers);
-    let mut host_from_headers: Option<String> = None;
-    let mut forwarded_from_headers: Vec<Vec<u8>> = Vec::new();
-    let mut x_forwarded_for_from_headers: Vec<Vec<u8>> = Vec::new();
-    let mut x_forwarded_proto_from_headers: Vec<Vec<u8>> = Vec::new();
-    let mut x_forwarded_host_from_headers: Vec<Vec<u8>> = Vec::new();
-
-    for header in headers {
-        let name = header.name();
-        if name.starts_with(b":") {
-            continue;
-        }
-        if name.eq_ignore_ascii_case(b"forwarded") {
-            forwarded_from_headers.push(header.value().to_vec());
-            continue;
-        }
-        if name.eq_ignore_ascii_case(b"x-forwarded-for") {
-            x_forwarded_for_from_headers.push(header.value().to_vec());
-            continue;
-        }
-        if name.eq_ignore_ascii_case(b"x-forwarded-proto") {
-            x_forwarded_proto_from_headers.push(header.value().to_vec());
-            continue;
-        }
-        if name.eq_ignore_ascii_case(b"x-forwarded-host") {
-            x_forwarded_host_from_headers.push(header.value().to_vec());
-            continue;
-        }
-
-        let header_name = HeaderName::from_bytes(name).map_err(|_| BridgeError::InvalidHeader)?;
-        if should_strip_request_header(&header_name, &connection_tokens, preserve_upgrade) {
-            continue;
-        }
-
-        let header_value =
-            HeaderValue::from_bytes(header.value()).map_err(|_| BridgeError::InvalidHeader)?;
-        if header_name == http::header::HOST {
-            host_from_headers = header_value.to_str().ok().map(str::to_string);
-            continue;
-        }
+    let resolved_headers = apply_request_header_policies(RequestHeaderPolicyInput {
+        target: RequestBuildTarget { endpoint, policies },
+        authority,
+        headers,
+        preserve_upgrade,
+        forwarded,
+    })?;
+    for (header_name, header_value) in &resolved_headers.passthrough_headers {
         builder = builder.header(header_name, header_value);
     }
-
-    let host_value = resolve_upstream_host_value(
-        endpoint,
-        host_policy,
-        authority,
-        host_from_headers.as_deref(),
-    )?;
+    let host_value = resolved_headers.host_value.as_str();
 
     let request_path = if path.is_empty() { "/" } else { path };
     let uri =
@@ -132,27 +89,16 @@ pub fn build_h1_request(
         );
     }
 
-    let forwarded_values = build_forwarded_header_values(
-        forwarded_header_policy,
-        ForwardedHeaderChains {
-            forwarded: &forwarded_from_headers,
-            x_forwarded_for: &x_forwarded_for_from_headers,
-            x_forwarded_proto: &x_forwarded_proto_from_headers,
-            x_forwarded_host: &x_forwarded_host_from_headers,
-        },
-        forwarded.client_addr.ip(),
-        host_value,
-    )?;
-    if let Some(value) = forwarded_values.forwarded {
+    if let Some(value) = resolved_headers.forwarded_values.forwarded {
         builder = builder.header(HeaderName::from_static("forwarded"), value);
     }
-    if let Some(value) = forwarded_values.x_forwarded_for {
+    if let Some(value) = resolved_headers.forwarded_values.x_forwarded_for {
         builder = builder.header(HeaderName::from_static("x-forwarded-for"), value);
     }
-    if let Some(value) = forwarded_values.x_forwarded_proto {
+    if let Some(value) = resolved_headers.forwarded_values.x_forwarded_proto {
         builder = builder.header(HeaderName::from_static("x-forwarded-proto"), value);
     }
-    if let Some(value) = forwarded_values.x_forwarded_host {
+    if let Some(value) = resolved_headers.forwarded_values.x_forwarded_host {
         builder = builder.header(HeaderName::from_static("x-forwarded-host"), value);
     }
 
@@ -194,7 +140,7 @@ pub fn build_h1_request_for_endpoint_with_host_policy(
             body_mode: RequestBuildInput::<BoxBody<Bytes, Infallible>>::body_mode_for_length(
                 content_length,
             ),
-            trace: crate::request::RequestTraceContext {
+            trace: RequestTraceContext {
                 request_id: forwarded_ctx.request_id,
                 traceparent: forwarded_ctx.traceparent,
             },
