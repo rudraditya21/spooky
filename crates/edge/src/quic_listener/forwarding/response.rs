@@ -1,8 +1,8 @@
+use spooky_errors::{UpstreamProxyErrorKind, classify_upstream_proxy_error};
 use tokio::sync::mpsc::error::TryRecvError;
 
 use super::*;
 use crate::runtime::connection::auth::ExternalAuthDecision;
-use spooky_errors::{UpstreamProxyErrorKind, classify_upstream_proxy_error};
 
 impl QUICListener {
     /// Handle an already-resolved `ForwardResult`, applying health transitions

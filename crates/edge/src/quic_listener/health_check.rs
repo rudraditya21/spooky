@@ -1,5 +1,6 @@
-use super::*;
 use spooky_errors::{classify_upstream_proxy_error, classify_upstream_send_error};
+
+use super::*;
 
 impl QUICListener {
     pub(super) fn spawn_health_checks(

@@ -1,8 +1,9 @@
-use super::*;
 use spooky_errors::{
     RetryPolicyDecision, RetryPolicyDenial, RetryPolicyInput, UpstreamRetryReason,
     evaluate_retry_policy,
 };
+
+use super::*;
 
 fn metrics_retry_reason(reason: UpstreamRetryReason) -> RetryReason {
     match reason {
