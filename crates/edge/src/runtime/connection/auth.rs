@@ -1,5 +1,6 @@
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
+use quiche::h3::NameValue;
 use spooky_config::runtime::{
     RuntimeExternalAuth, RuntimeExternalAuthFailureMode, RuntimeExternalAuthRequestHeader,
 };
@@ -296,6 +297,102 @@ fn is_safe_auth_request_mutation_header(name: &str) -> bool {
         && !name.eq_ignore_ascii_case("proxy-connection")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthRequestMutationNameValidation {
+    Allowed,
+    Protected,
+    Invalid,
+}
+
+fn validate_auth_request_mutation_name(name: &[u8]) -> AuthRequestMutationNameValidation {
+    let Ok(name) = http::header::HeaderName::from_bytes(name) else {
+        return AuthRequestMutationNameValidation::Invalid;
+    };
+    if is_safe_auth_request_mutation_header(name.as_str()) {
+        AuthRequestMutationNameValidation::Allowed
+    } else {
+        AuthRequestMutationNameValidation::Protected
+    }
+}
+
+fn normalize_auth_request_mutation(
+    mutation: PendingHeaderMutation,
+) -> Option<(String, PendingHeaderMutation)> {
+    let (name, value) = match mutation {
+        PendingHeaderMutation::Upsert { name, value } => (name, Some(value)),
+        PendingHeaderMutation::Remove { name } => (name, None),
+    };
+    match validate_auth_request_mutation_name(&name) {
+        AuthRequestMutationNameValidation::Allowed => {
+            let normalized = http::header::HeaderName::from_bytes(&name)
+                .ok()?
+                .as_str()
+                .to_string();
+            let mutation = match value {
+                Some(value) => PendingHeaderMutation::Upsert {
+                    name: normalized.as_bytes().to_vec(),
+                    value,
+                },
+                None => PendingHeaderMutation::Remove {
+                    name: normalized.as_bytes().to_vec(),
+                },
+            };
+            Some((normalized, mutation))
+        }
+        AuthRequestMutationNameValidation::Protected
+        | AuthRequestMutationNameValidation::Invalid => None,
+    }
+}
+
+pub fn canonicalize_auth_request_mutations<I>(mutations: I) -> Vec<PendingHeaderMutation>
+where
+    I: IntoIterator<Item = PendingHeaderMutation>,
+{
+    let normalized = mutations
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, mutation)| {
+            normalize_auth_request_mutation(mutation).map(|(name, mutation)| (idx, name, mutation))
+        })
+        .collect::<Vec<_>>();
+    let last_seen = normalized
+        .iter()
+        .map(|(idx, name, _)| (name.clone(), *idx))
+        .collect::<HashMap<_, _>>();
+    normalized
+        .into_iter()
+        .filter_map(|(idx, name, mutation)| {
+            (last_seen.get(&name) == Some(&idx)).then_some(mutation)
+        })
+        .collect()
+}
+
+pub fn merge_auth_request_mutations<I>(existing: &mut Vec<PendingHeaderMutation>, incoming: I)
+where
+    I: IntoIterator<Item = PendingHeaderMutation>,
+{
+    existing.extend(incoming);
+    let merged = canonicalize_auth_request_mutations(std::mem::take(existing));
+    *existing = merged;
+}
+
+pub fn apply_auth_request_mutations(
+    headers: &mut Vec<quiche::h3::Header>,
+    mutations: &[PendingHeaderMutation],
+) {
+    for mutation in canonicalize_auth_request_mutations(mutations.iter().cloned()) {
+        match mutation {
+            PendingHeaderMutation::Upsert { name, value } => {
+                headers.retain(|header| !header.name().eq_ignore_ascii_case(name.as_slice()));
+                headers.push(quiche::h3::Header::new(name.as_slice(), value.as_slice()));
+            }
+            PendingHeaderMutation::Remove { name } => {
+                headers.retain(|header| !header.name().eq_ignore_ascii_case(name.as_slice()));
+            }
+        }
+    }
+}
+
 pub fn allowed_auth_headers(
     headers: &http::HeaderMap,
     allowlist: &[String],
@@ -321,14 +418,12 @@ pub fn auth_allow_mutations(
     headers: &http::HeaderMap,
     allowlist: &[String],
 ) -> Vec<PendingHeaderMutation> {
-    allowed_auth_headers(headers, allowlist)
-        .into_iter()
-        .filter(|(name, _)| is_safe_auth_request_mutation_header(name))
-        .map(|(name, value)| PendingHeaderMutation::Upsert {
+    canonicalize_auth_request_mutations(allowed_auth_headers(headers, allowlist).into_iter().map(
+        |(name, value)| PendingHeaderMutation::Upsert {
             name: name.into_bytes(),
             value: value.into_bytes(),
-        })
-        .collect()
+        },
+    ))
 }
 
 pub fn map_http_external_auth_response(
@@ -430,4 +525,105 @@ pub struct ExternalAuthChallengeResponse {
 pub enum PendingHeaderMutation {
     Upsert { name: Vec<u8>, value: Vec<u8> },
     Remove { name: Vec<u8> },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonicalize_auth_request_mutations_drops_protected_and_invalid_names() {
+        let mutations = canonicalize_auth_request_mutations(vec![
+            PendingHeaderMutation::Upsert {
+                name: b"x-auth-user".to_vec(),
+                value: b"alice".to_vec(),
+            },
+            PendingHeaderMutation::Upsert {
+                name: b"authorization".to_vec(),
+                value: b"Bearer blocked".to_vec(),
+            },
+            PendingHeaderMutation::Remove {
+                name: b"bad name".to_vec(),
+            },
+        ]);
+
+        assert_eq!(
+            mutations,
+            vec![PendingHeaderMutation::Upsert {
+                name: b"x-auth-user".to_vec(),
+                value: b"alice".to_vec(),
+            }]
+        );
+    }
+
+    #[test]
+    fn canonicalize_auth_request_mutations_keeps_last_mutation_per_header() {
+        let mutations = canonicalize_auth_request_mutations(vec![
+            PendingHeaderMutation::Upsert {
+                name: b"X-User".to_vec(),
+                value: b"one".to_vec(),
+            },
+            PendingHeaderMutation::Upsert {
+                name: b"x-team".to_vec(),
+                value: b"red".to_vec(),
+            },
+            PendingHeaderMutation::Remove {
+                name: b"x-user".to_vec(),
+            },
+            PendingHeaderMutation::Upsert {
+                name: b"X-Team".to_vec(),
+                value: b"blue".to_vec(),
+            },
+        ]);
+
+        assert_eq!(
+            mutations,
+            vec![
+                PendingHeaderMutation::Remove {
+                    name: b"x-user".to_vec(),
+                },
+                PendingHeaderMutation::Upsert {
+                    name: b"x-team".to_vec(),
+                    value: b"blue".to_vec(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_auth_request_mutations_resolves_conflicts_before_header_rewrite() {
+        let mut headers = vec![
+            quiche::h3::Header::new(b":method", b"GET"),
+            quiche::h3::Header::new(b"x-user", b"stale"),
+            quiche::h3::Header::new(b"x-team", b"green"),
+        ];
+        let mutations = vec![
+            PendingHeaderMutation::Upsert {
+                name: b"X-User".to_vec(),
+                value: b"alice".to_vec(),
+            },
+            PendingHeaderMutation::Remove {
+                name: b"x-team".to_vec(),
+            },
+            PendingHeaderMutation::Upsert {
+                name: b"x-user".to_vec(),
+                value: b"fresh".to_vec(),
+            },
+        ];
+
+        apply_auth_request_mutations(&mut headers, &mutations);
+
+        assert!(headers.iter().any(|header| header.name() == b":method"));
+        assert!(
+            headers
+                .iter()
+                .any(|header| header.name() == b"x-user" && header.value() == b"fresh")
+        );
+        assert!(
+            !headers
+                .iter()
+                .any(|header| header.name() == b"x-user" && header.value() == b"alice")
+        );
+        assert!(!headers.iter().any(|header| header.name() == b"x-team"));
+    }
 }

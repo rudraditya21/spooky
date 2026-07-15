@@ -11,7 +11,7 @@ use crate::runtime::connection::{
     auth::{
         ExternalAuthChallengeResponse, ExternalAuthDecision, ExternalAuthDecisionOutcome,
         ExternalAuthDenyResponse, ExternalAuthExecutionPolicy, ExternalAuthFailureResolution,
-        ExternalAuthResponseMetadata, ExternalAuthResult,
+        ExternalAuthResponseMetadata, ExternalAuthResult, merge_auth_request_mutations,
     },
     request::PendingForward,
     stream::StreamAdmissionState,
@@ -547,9 +547,10 @@ impl QUICListener {
             } => {
                 metrics.inc_external_auth_allowed();
                 if let Some(pending_forward) = req.pending_forward.as_mut() {
-                    Arc::make_mut(pending_forward)
-                        .auth_header_mutations
-                        .extend(request_header_mutations.into_iter().map(Into::into));
+                    merge_auth_request_mutations(
+                        &mut Arc::make_mut(pending_forward).auth_header_mutations,
+                        request_header_mutations.into_iter().map(Into::into),
+                    );
                 }
                 Self::materialize_forward_after_auth(stream_id, req, h3, quic, exec_ctx, shared_ctx)
             }

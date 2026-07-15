@@ -14,7 +14,7 @@ use crate::{
         evaluate_forwarding_pre_admission_policy,
     },
     runtime::connection::{
-        auth::{ExternalAuthExecutionPolicy, PendingHeaderMutation},
+        auth::{ExternalAuthExecutionPolicy, apply_auth_request_mutations},
         request::PendingForward,
     },
 };
@@ -53,17 +53,7 @@ pub(super) struct StartedAuthRequest {
 impl PendingForward {
     pub(super) fn request_headers(&self) -> Vec<quiche::h3::Header> {
         let mut headers = self.headers.as_ref().clone();
-        for mutation in &self.auth_header_mutations {
-            match mutation {
-                PendingHeaderMutation::Upsert { name, value } => {
-                    headers.retain(|header| !header.name().eq_ignore_ascii_case(name.as_slice()));
-                    headers.push(quiche::h3::Header::new(name.as_slice(), value.as_slice()));
-                }
-                PendingHeaderMutation::Remove { name } => {
-                    headers.retain(|header| !header.name().eq_ignore_ascii_case(name.as_slice()));
-                }
-            }
-        }
+        apply_auth_request_mutations(&mut headers, &self.auth_header_mutations);
         headers
     }
 
