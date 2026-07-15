@@ -9,7 +9,6 @@ mod stream_progress;
 use std::convert::Infallible;
 
 use spooky_config::config::ScopedRateLimitScope;
-use spooky_errors::{UpstreamErrorClassification, UpstreamErrorDetails};
 
 use self::prepare::{PreparedRequest, StartedAuthRequest};
 pub(in crate::quic_listener) use self::resolve::BootstrapResolutionInput;
@@ -84,21 +83,6 @@ pub(crate) struct StreamProgressConfig {
 }
 
 impl QUICListener {
-    pub fn classify_upstream_failure_reason(
-        is_connect: bool,
-        detail: &str,
-    ) -> UpstreamErrorClassification {
-        UpstreamErrorDetails::new(detail.to_string(), is_connect).classify()
-    }
-
-    pub(crate) fn classify_send_error(
-        err: &hyper_util::client::legacy::Error,
-    ) -> (UpstreamErrorDetails, UpstreamErrorClassification) {
-        let details = UpstreamErrorDetails::from_error_chain(err, err.is_connect());
-        let classification = details.classify();
-        (details, classification)
-    }
-
     fn is_internal_pool_control_error(error: &PoolError) -> bool {
         matches!(
             error,
@@ -1157,9 +1141,9 @@ mod tests {
     #[test]
     fn send_connect_error_with_tls_details_maps_to_tls_health_failure() {
         assert_eq!(
-            QUICListener::classify_upstream_failure_reason(
+            spooky_errors::classify_upstream_error_detail(
+                "client error (Connect): tls handshake failed: invalid certificate",
                 true,
-                "client error (Connect): tls handshake failed: invalid certificate"
             ),
             spooky_errors::UpstreamErrorClassification::tls(
                 spooky_errors::UpstreamTlsReason::Handshake,
@@ -1170,9 +1154,9 @@ mod tests {
     #[test]
     fn send_connect_error_without_tls_details_maps_to_transport_health_failure() {
         assert_eq!(
-            QUICListener::classify_upstream_failure_reason(
+            spooky_errors::classify_upstream_error_detail(
+                "client error (Connect): connection refused",
                 true,
-                "client error (Connect): connection refused"
             ),
             spooky_errors::UpstreamErrorClassification::transport()
         );
@@ -1181,7 +1165,7 @@ mod tests {
     #[test]
     fn send_error_with_timeout_detail_maps_to_timeout_health_failure() {
         assert_eq!(
-            QUICListener::classify_upstream_failure_reason(false, "request timed out"),
+            spooky_errors::classify_upstream_error_detail("request timed out", false),
             spooky_errors::UpstreamErrorClassification::timeout()
         );
     }

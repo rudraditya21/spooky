@@ -1,4 +1,5 @@
 use super::*;
+use spooky_errors::{classify_upstream_proxy_error, classify_upstream_send_error};
 
 impl QUICListener {
     pub(super) fn spawn_health_checks(
@@ -127,9 +128,10 @@ impl QUICListener {
                                     classify_active_health_check_response(response.status())
                                 }
                                 Ok(Err(PoolError::Send(send_err))) => {
-                                    let (send_err_details, classification) =
-                                        Self::classify_send_error(&send_err);
-                                    let health_mapping = classification.health_failure_mapping();
+                                    let classified = classify_upstream_send_error(&send_err);
+                                    let health_mapping = classified
+                                        .health_failure
+                                        .expect("send errors must include health mapping");
                                     if health_mapping.failure_reason == HealthFailureReason::Tls {
                                         task_metrics.record_upstream_tls_failure(
                                             &job.backend_identity,
@@ -140,18 +142,34 @@ impl QUICListener {
                                             "Health check upstream TLS failure for {} (tls_reason={}): {}",
                                             job.backend_identity,
                                             health_mapping.metrics_reason,
-                                            send_err_details.detail
+                                            classified.detail
                                         );
                                     }
                                     task_metrics.inc_health_failure(health_mapping.failure_reason);
                                     HealthClassification::Failure
                                 }
-                                Ok(Err(_)) => {
-                                    task_metrics.inc_health_failure(HealthFailureReason::Transport);
+                                Ok(Err(pool_err)) => {
+                                    let proxy_err = ProxyError::Pool(pool_err);
+                                    if let Some(classified) =
+                                        classify_upstream_proxy_error(&proxy_err)
+                                        && let Some(health_mapping) = classified.health_failure
+                                    {
+                                        task_metrics
+                                            .inc_health_failure(health_mapping.failure_reason);
+                                    } else {
+                                        task_metrics
+                                            .inc_health_failure(HealthFailureReason::Transport);
+                                    }
                                     HealthClassification::Failure
                                 }
                                 Err(_) => {
-                                    task_metrics.inc_health_failure(HealthFailureReason::Timeout);
+                                    let classified =
+                                        classify_upstream_proxy_error(&ProxyError::Timeout)
+                                            .expect("timeout must classify");
+                                    let health_mapping = classified
+                                        .health_failure
+                                        .expect("timeout must include health mapping");
+                                    task_metrics.inc_health_failure(health_mapping.failure_reason);
                                     HealthClassification::Failure
                                 }
                             };

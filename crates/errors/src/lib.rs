@@ -7,7 +7,8 @@ pub mod upstream;
 pub use bridge::BridgeError;
 pub use pool::PoolError;
 pub use proxy::{
-    ClassifiedUpstreamProxyError, ProxyError, UpstreamProxyErrorKind, classify_upstream_proxy_error,
+    ClassifiedUpstreamProxyError, ProxyError, UpstreamProxyErrorKind,
+    classify_upstream_proxy_error, classify_upstream_send_error,
 };
 pub use retry::{
     RetryPolicyDecision, RetryPolicyDenial, RetryPolicyInput, UpstreamRetryReason,
@@ -16,5 +17,6 @@ pub use retry::{
 };
 pub use upstream::{
     UpstreamErrorCategory, UpstreamErrorClassification, UpstreamErrorDetails,
-    UpstreamHealthFailureMapping, UpstreamTlsReason, format_error_chain,
+    UpstreamHealthFailureMapping, UpstreamTlsReason, classify_upstream_error_detail,
+    format_error_chain,
 };

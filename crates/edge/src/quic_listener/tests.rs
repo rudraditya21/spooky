@@ -16,7 +16,10 @@ use spooky_config::{
     },
     runtime::{ListenerRuntimeConfig, RuntimeConfig},
 };
-use spooky_errors::{UpstreamErrorCategory, UpstreamErrorClassification, UpstreamTlsReason};
+use spooky_errors::{
+    UpstreamErrorCategory, UpstreamErrorClassification, UpstreamTlsReason,
+    classify_upstream_error_detail,
+};
 use tempfile::tempdir;
 
 use super::{
@@ -657,36 +660,27 @@ fn certificate_name_matches_single_label_wildcards_only() {
 #[test]
 fn classify_upstream_failure_reason_distinguishes_tls_causes() {
     assert_eq!(
-        super::QUICListener::classify_upstream_failure_reason(
-            true,
-            "tls handshake failed: UnknownIssuer"
-        ),
+        classify_upstream_error_detail("tls handshake failed: UnknownIssuer", true),
         UpstreamErrorClassification::tls(UpstreamTlsReason::UnknownIssuer)
     );
     assert_eq!(
-        super::QUICListener::classify_upstream_failure_reason(
-            true,
-            "certificate expired while verifying backend"
-        ),
+        classify_upstream_error_detail("certificate expired while verifying backend", true),
         UpstreamErrorClassification::tls(UpstreamTlsReason::ExpiredCertificate)
     );
     assert_eq!(
-        super::QUICListener::classify_upstream_failure_reason(
-            true,
-            "certificate not valid for dns name api.example.com"
-        ),
+        classify_upstream_error_detail("certificate not valid for dns name api.example.com", true,),
         UpstreamErrorClassification::tls(UpstreamTlsReason::HostnameMismatch)
     );
     assert_eq!(
-        super::QUICListener::classify_upstream_failure_reason(true, "ALPN negotiation failed"),
+        classify_upstream_error_detail("ALPN negotiation failed", true),
         UpstreamErrorClassification::tls(UpstreamTlsReason::Alpn)
     );
     assert_eq!(
-        super::QUICListener::classify_upstream_failure_reason(false, "backend timed out"),
+        classify_upstream_error_detail("backend timed out", false),
         UpstreamErrorClassification::timeout()
     );
     assert_eq!(
-        super::QUICListener::classify_upstream_failure_reason(false, "connection reset"),
+        classify_upstream_error_detail("connection reset", false),
         UpstreamErrorClassification {
             category: UpstreamErrorCategory::Transport,
             tls_reason: None,

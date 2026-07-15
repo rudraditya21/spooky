@@ -30,7 +30,7 @@ use spooky_config::{
     backend_endpoint::{BackendEndpoint, BackendScheme},
     runtime::{ListenerRuntimeConfig, RuntimeUpstreamPolicy},
 };
-use spooky_errors::ProxyError;
+use spooky_errors::{ProxyError, classify_upstream_proxy_error};
 use spooky_lb::upstream_pool::UpstreamPool;
 use spooky_transport::transport_pool::UpstreamTransportPool;
 
@@ -388,33 +388,38 @@ impl QUICListener {
                                         .and_then(|value| value.to_str().ok())
                                         .map(str::to_string)
                                 };
-                                let (backend_addr, upstream_name, upstream_policy) =
-                                    match Self::resolve_bootstrap_target(
-                                        super::forwarding::BootstrapResolutionInput {
-                                            method: &method,
-                                            path: &path,
-                                            authority: authority.as_deref(),
-                                            header_lookup: Some(&lb_header_lookup),
-                                            routing_index: &routing_index,
-                                            upstream_pools: &upstream_pools,
-                                            upstream_policies: &upstream_policies,
-                                            metrics: &metrics,
-                                            elapsed: Duration::from_millis(0),
-                                        },
-                                    ) {
-                                        Ok(value) => (
-                                            value.backend_addr,
-                                            value.upstream_name,
-                                            value.upstream_policy,
-                                        ),
-                                        Err(err) => {
-                                            let (status, body) =
-                                                Self::bootstrap_route_resolution_error_response(
-                                                    &err,
-                                                );
-                                            return bootstrap_error(status, body);
-                                        }
-                                    };
+                                let (
+                                    backend_addr,
+                                    backend_index,
+                                    upstream_name,
+                                    upstream_policy,
+                                    upstream_pool,
+                                ) = match Self::resolve_bootstrap_target(
+                                    super::forwarding::BootstrapResolutionInput {
+                                        method: &method,
+                                        path: &path,
+                                        authority: authority.as_deref(),
+                                        header_lookup: Some(&lb_header_lookup),
+                                        routing_index: &routing_index,
+                                        upstream_pools: &upstream_pools,
+                                        upstream_policies: &upstream_policies,
+                                        metrics: &metrics,
+                                        elapsed: Duration::from_millis(0),
+                                    },
+                                ) {
+                                    Ok(value) => (
+                                        value.backend_addr,
+                                        value.backend_index,
+                                        value.upstream_name,
+                                        value.upstream_policy,
+                                        value.upstream_pool,
+                                    ),
+                                    Err(err) => {
+                                        let (status, body) =
+                                            Self::bootstrap_route_resolution_error_response(&err);
+                                        return bootstrap_error(status, body);
+                                    }
+                                };
 
                                 let admission = evaluate_forwarding_pre_admission_policy(
                                     &upstream_policy,
@@ -994,7 +999,55 @@ impl QUICListener {
                                     {
                                         Ok(Ok(resp)) => resp,
                                         Ok(Err(err)) => {
-                                            warn!("Bootstrap WebSocket upstream error: {}", err);
+                                            let proxy_err = ProxyError::Transport(err.to_string());
+                                            if let Some(classified) =
+                                                classify_upstream_proxy_error(&proxy_err)
+                                            {
+                                                if let Some(health_mapping) =
+                                                    classified.health_failure
+                                                {
+                                                    metrics.inc_health_failure(
+                                                        health_mapping.failure_reason,
+                                                    );
+                                                    if health_mapping.failure_reason
+                                                        == spooky_lb::health::HealthFailureReason::Tls
+                                                    {
+                                                        metrics.record_upstream_tls_failure(
+                                                            &backend_addr,
+                                                            "bootstrap",
+                                                            health_mapping.metrics_reason,
+                                                        );
+                                                    }
+                                                    if let Some(transition) = upstream_pool
+                                                        .write()
+                                                        .ok()
+                                                        .and_then(|mut pool| {
+                                                            pool.pool.mark_request_failure(
+                                                                backend_index,
+                                                                health_mapping.failure_reason,
+                                                            )
+                                                        })
+                                                    {
+                                                        Self::log_health_transition(
+                                                            &backend_addr,
+                                                            transition,
+                                                        );
+                                                    }
+                                                }
+                                                warn!(
+                                                    "Bootstrap WebSocket upstream failure route={} backend={} kind={:?} retryability={:?} detail={}",
+                                                    upstream_name,
+                                                    backend_addr,
+                                                    classified.kind,
+                                                    classified.retryability,
+                                                    classified.detail
+                                                );
+                                            } else {
+                                                warn!(
+                                                    "Bootstrap WebSocket upstream error route={} backend={}: {}",
+                                                    upstream_name, backend_addr, err
+                                                );
+                                            }
                                             return Ok(Response::builder()
                                                 .status(StatusCode::BAD_GATEWAY)
                                                 .header("alt-svc", &alt)
@@ -1008,6 +1061,38 @@ impl QUICListener {
                                                 }));
                                         }
                                         Err(_) => {
+                                            if let Some(classified) =
+                                                classify_upstream_proxy_error(&ProxyError::Timeout)
+                                                && let Some(health_mapping) =
+                                                    classified.health_failure
+                                            {
+                                                metrics.inc_health_failure(
+                                                    health_mapping.failure_reason,
+                                                );
+                                                if let Some(transition) = upstream_pool
+                                                    .write()
+                                                    .ok()
+                                                    .and_then(|mut pool| {
+                                                        pool.pool.mark_request_failure(
+                                                            backend_index,
+                                                            health_mapping.failure_reason,
+                                                        )
+                                                    })
+                                                {
+                                                    Self::log_health_transition(
+                                                        &backend_addr,
+                                                        transition,
+                                                    );
+                                                }
+                                                warn!(
+                                                    "Bootstrap WebSocket upstream failure route={} backend={} kind={:?} retryability={:?} detail={}",
+                                                    upstream_name,
+                                                    backend_addr,
+                                                    classified.kind,
+                                                    classified.retryability,
+                                                    classified.detail
+                                                );
+                                            }
                                             return Ok(Response::builder()
                                                 .status(StatusCode::GATEWAY_TIMEOUT)
                                                 .header("alt-svc", &alt)
@@ -1030,7 +1115,55 @@ impl QUICListener {
                                     {
                                         Ok(Ok(resp)) => resp,
                                         Ok(Err(err)) => {
-                                            warn!("Bootstrap proxy upstream error: {}", err);
+                                            let proxy_err = ProxyError::Pool(err);
+                                            if let Some(classified) =
+                                                classify_upstream_proxy_error(&proxy_err)
+                                            {
+                                                if let Some(health_mapping) =
+                                                    classified.health_failure
+                                                {
+                                                    metrics.inc_health_failure(
+                                                        health_mapping.failure_reason,
+                                                    );
+                                                    if health_mapping.failure_reason
+                                                        == spooky_lb::health::HealthFailureReason::Tls
+                                                    {
+                                                        metrics.record_upstream_tls_failure(
+                                                            &backend_addr,
+                                                            "bootstrap",
+                                                            health_mapping.metrics_reason,
+                                                        );
+                                                    }
+                                                    if let Some(transition) = upstream_pool
+                                                        .write()
+                                                        .ok()
+                                                        .and_then(|mut pool| {
+                                                            pool.pool.mark_request_failure(
+                                                                backend_index,
+                                                                health_mapping.failure_reason,
+                                                            )
+                                                        })
+                                                    {
+                                                        Self::log_health_transition(
+                                                            &backend_addr,
+                                                            transition,
+                                                        );
+                                                    }
+                                                }
+                                                warn!(
+                                                    "Bootstrap proxy upstream failure route={} backend={} kind={:?} retryability={:?} detail={}",
+                                                    upstream_name,
+                                                    backend_addr,
+                                                    classified.kind,
+                                                    classified.retryability,
+                                                    classified.detail
+                                                );
+                                            } else {
+                                                warn!(
+                                                    "Bootstrap proxy upstream error route={} backend={}: {}",
+                                                    upstream_name, backend_addr, proxy_err
+                                                );
+                                            }
                                             return Ok(Response::builder()
                                                 .status(StatusCode::BAD_GATEWAY)
                                                 .header("alt-svc", &alt)
@@ -1044,6 +1177,38 @@ impl QUICListener {
                                                 }));
                                         }
                                         Err(_) => {
+                                            if let Some(classified) =
+                                                classify_upstream_proxy_error(&ProxyError::Timeout)
+                                                && let Some(health_mapping) =
+                                                    classified.health_failure
+                                            {
+                                                metrics.inc_health_failure(
+                                                    health_mapping.failure_reason,
+                                                );
+                                                if let Some(transition) = upstream_pool
+                                                    .write()
+                                                    .ok()
+                                                    .and_then(|mut pool| {
+                                                        pool.pool.mark_request_failure(
+                                                            backend_index,
+                                                            health_mapping.failure_reason,
+                                                        )
+                                                    })
+                                                {
+                                                    Self::log_health_transition(
+                                                        &backend_addr,
+                                                        transition,
+                                                    );
+                                                }
+                                                warn!(
+                                                    "Bootstrap proxy upstream failure route={} backend={} kind={:?} retryability={:?} detail={}",
+                                                    upstream_name,
+                                                    backend_addr,
+                                                    classified.kind,
+                                                    classified.retryability,
+                                                    classified.detail
+                                                );
+                                            }
                                             return Ok(Response::builder()
                                                 .status(StatusCode::GATEWAY_TIMEOUT)
                                                 .header("alt-svc", &alt)

@@ -7,7 +7,7 @@ use spooky_errors::{
 };
 
 impl QUICListener {
-    fn log_classified_upstream_error(
+    pub(in crate::quic_listener) fn log_classified_upstream_error(
         req: &RequestEnvelope,
         backend_addr: &str,
         classified: &ClassifiedUpstreamProxyError,
@@ -37,7 +37,7 @@ impl QUICListener {
         }
     }
 
-    fn mark_classified_upstream_health_failure(
+    pub(in crate::quic_listener) fn mark_classified_upstream_health_failure(
         backend_addr: &str,
         backend_index: usize,
         upstream_pool: Option<&Arc<RwLock<UpstreamPool>>>,
