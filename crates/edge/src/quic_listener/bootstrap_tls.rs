@@ -462,18 +462,44 @@ impl QUICListener {
                                             "Bootstrap request route={} denied by auth policy",
                                             upstream_name
                                         );
-                                        let response = rejection_response.as_ref().expect(
-                                            "unauthorized admission must map to rejection response",
-                                        );
+                                        let Some(response) = rejection_response.as_ref() else {
+                                            warn!(
+                                                "Bootstrap request route={} missing admission rejection response for unauthorized decision",
+                                                upstream_name
+                                            );
+                                            return Ok(Response::builder()
+                                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                .header("alt-svc", &alt)
+                                                .body(boxed_full(Bytes::from_static(
+                                                    b"internal proxy error\n",
+                                                )))
+                                                .unwrap_or_else(|_| {
+                                                    Response::new(boxed_full(Bytes::from_static(
+                                                        b"error\n",
+                                                    )))
+                                                }));
+                                        };
+                                        let Some(challenge) = response.www_authenticate else {
+                                            warn!(
+                                                "Bootstrap request route={} missing auth challenge in admission rejection response",
+                                                upstream_name
+                                            );
+                                            return Ok(Response::builder()
+                                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                .header("alt-svc", &alt)
+                                                .body(boxed_full(Bytes::from_static(
+                                                    b"internal proxy error\n",
+                                                )))
+                                                .unwrap_or_else(|_| {
+                                                    Response::new(boxed_full(Bytes::from_static(
+                                                        b"error\n",
+                                                    )))
+                                                }));
+                                        };
                                         return Ok(Response::builder()
                                             .status(response.status)
                                             .header("alt-svc", &alt)
-                                            .header(
-                                                "www-authenticate",
-                                                response.www_authenticate.expect(
-                                                    "unauthorized response must include challenge",
-                                                ),
-                                            )
+                                            .header("www-authenticate", challenge)
                                             .body(boxed_full(Bytes::from_static(response.body)))
                                             .unwrap_or_else(|_| {
                                                 Response::new(boxed_full(Bytes::from_static(
@@ -493,19 +519,46 @@ impl QUICListener {
                                             "Bootstrap request route={} scoped rate limit exceeded by rule={}",
                                             decision.route, decision.rule_name
                                         );
-                                        let response = rejection_response.as_ref().expect(
-                                            "rate-limited admission must map to rejection response",
-                                        );
+                                        let Some(response) = rejection_response.as_ref() else {
+                                            warn!(
+                                                "Bootstrap request route={} missing admission rejection response for rate-limited decision",
+                                                upstream_name
+                                            );
+                                            return Ok(Response::builder()
+                                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                .header("alt-svc", &alt)
+                                                .body(boxed_full(Bytes::from_static(
+                                                    b"internal proxy error\n",
+                                                )))
+                                                .unwrap_or_else(|_| {
+                                                    Response::new(boxed_full(Bytes::from_static(
+                                                        b"error\n",
+                                                    )))
+                                                }));
+                                        };
+                                        let Some(retry_after_seconds) =
+                                            response.retry_after_seconds
+                                        else {
+                                            warn!(
+                                                "Bootstrap request route={} missing retry-after in rate-limited admission rejection response",
+                                                upstream_name
+                                            );
+                                            return Ok(Response::builder()
+                                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                .header("alt-svc", &alt)
+                                                .body(boxed_full(Bytes::from_static(
+                                                    b"internal proxy error\n",
+                                                )))
+                                                .unwrap_or_else(|_| {
+                                                    Response::new(boxed_full(Bytes::from_static(
+                                                        b"error\n",
+                                                    )))
+                                                }));
+                                        };
                                         return Ok(Response::builder()
                                             .status(response.status)
                                             .header("alt-svc", &alt)
-                                            .header(
-                                                "retry-after",
-                                                response
-                                                    .retry_after_seconds
-                                                    .expect("rate-limited response must include retry-after")
-                                                    .to_string(),
-                                            )
+                                            .header("retry-after", retry_after_seconds.to_string())
                                             .body(boxed_full(Bytes::from_static(response.body)))
                                             .unwrap_or_else(|_| {
                                                 Response::new(boxed_full(Bytes::from_static(
@@ -526,19 +579,46 @@ impl QUICListener {
                                         resilience
                                             .adaptive_admission
                                             .observe(Duration::from_millis(0), true);
-                                        let response = rejection_response.as_ref().expect(
-                                            "overloaded admission must map to rejection response",
-                                        );
+                                        let Some(response) = rejection_response.as_ref() else {
+                                            warn!(
+                                                "Bootstrap request route={} missing admission rejection response for overload decision",
+                                                upstream_name
+                                            );
+                                            return Ok(Response::builder()
+                                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                .header("alt-svc", &alt)
+                                                .body(boxed_full(Bytes::from_static(
+                                                    b"internal proxy error\n",
+                                                )))
+                                                .unwrap_or_else(|_| {
+                                                    Response::new(boxed_full(Bytes::from_static(
+                                                        b"error\n",
+                                                    )))
+                                                }));
+                                        };
+                                        let Some(retry_after_seconds) =
+                                            response.retry_after_seconds
+                                        else {
+                                            warn!(
+                                                "Bootstrap request route={} missing retry-after in overload admission rejection response",
+                                                upstream_name
+                                            );
+                                            return Ok(Response::builder()
+                                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                .header("alt-svc", &alt)
+                                                .body(boxed_full(Bytes::from_static(
+                                                    b"internal proxy error\n",
+                                                )))
+                                                .unwrap_or_else(|_| {
+                                                    Response::new(boxed_full(Bytes::from_static(
+                                                        b"error\n",
+                                                    )))
+                                                }));
+                                        };
                                         return Ok(Response::builder()
                                             .status(response.status)
                                             .header("alt-svc", &alt)
-                                            .header(
-                                                "retry-after",
-                                                response
-                                                    .retry_after_seconds
-                                                    .expect("overload response must include retry-after")
-                                                    .to_string(),
-                                            )
+                                            .header("retry-after", retry_after_seconds.to_string())
                                             .body(boxed_full(Bytes::from_static(response.body)))
                                             .unwrap_or_else(|_| {
                                                 Response::new(boxed_full(Bytes::from_static(

@@ -245,9 +245,20 @@ impl QUICListener {
                             "request_id=unassigned route={} denied by local auth policy",
                             upstream_name
                         );
-                        let response = rejection_response
-                            .as_ref()
-                            .expect("unauthorized admission must map to rejection response");
+                        let Some(response) = rejection_response.as_ref() else {
+                            warn!(
+                                "request_id=unassigned route={} missing admission rejection response for unauthorized decision",
+                                upstream_name
+                            );
+                            Self::send_simple_response(
+                                h3,
+                                quic,
+                                stream_id,
+                                http::StatusCode::INTERNAL_SERVER_ERROR,
+                                b"internal proxy error\n",
+                            )?;
+                            return Ok(None);
+                        };
                         Self::send_admission_rejection_response(h3, quic, stream_id, response)?;
                         return Ok(None);
                     }
@@ -263,9 +274,20 @@ impl QUICListener {
                             "request_id=unassigned route={} scoped rate limit exceeded by rule={}",
                             decision.route, decision.rule_name
                         );
-                        let response = rejection_response
-                            .as_ref()
-                            .expect("rate-limited admission must map to rejection response");
+                        let Some(response) = rejection_response.as_ref() else {
+                            warn!(
+                                "request_id=unassigned route={} missing admission rejection response for rate-limited decision",
+                                upstream_name
+                            );
+                            Self::send_simple_response(
+                                h3,
+                                quic,
+                                stream_id,
+                                http::StatusCode::INTERNAL_SERVER_ERROR,
+                                b"internal proxy error\n",
+                            )?;
+                            return Ok(None);
+                        };
                         Self::send_admission_rejection_response(h3, quic, stream_id, response)?;
                         return Ok(None);
                     }
@@ -277,9 +299,20 @@ impl QUICListener {
                             request_start.elapsed(),
                             RouteOutcome::OverloadShed,
                         );
-                        let response = rejection_response
-                            .as_ref()
-                            .expect("overloaded admission must map to rejection response");
+                        let Some(response) = rejection_response.as_ref() else {
+                            warn!(
+                                "request_id=unassigned route={} missing admission rejection response for overload decision",
+                                upstream_name
+                            );
+                            Self::send_simple_response(
+                                h3,
+                                quic,
+                                stream_id,
+                                http::StatusCode::INTERNAL_SERVER_ERROR,
+                                b"internal proxy error\n",
+                            )?;
+                            return Ok(None);
+                        };
                         Self::send_admission_rejection_response(h3, quic, stream_id, response)?;
                         resilience
                             .adaptive_admission
