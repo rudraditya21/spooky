@@ -1,7 +1,6 @@
-use super::lb_key::ResolvedLbKey;
 use spooky_config::runtime::RuntimeUpstreamPolicy;
 
-use super::*;
+use super::{lb_key::ResolvedLbKey, *};
 
 pub(in crate::quic_listener) struct RouteResolutionRequest<'a> {
     pub(in crate::quic_listener) method: &'a str,
