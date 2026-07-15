@@ -155,20 +155,6 @@ impl QUICListener {
         None
     }
 
-    pub(super) fn resolve_lb_key_from_spec(
-        lb_key_spec: &str,
-        method: &str,
-        path: &str,
-        authority: Option<&str>,
-        cid_key: Option<&str>,
-        client_addr: Option<SocketAddr>,
-        header_lookup: Option<&LbHeaderLookup<'_>>,
-    ) -> Option<String> {
-        let request =
-            LbKeyRequestParts::new(method, path, authority, cid_key, client_addr, header_lookup);
-        Self::resolve_lb_key_from_parts(lb_key_spec, &request)
-    }
-
     pub(in crate::quic_listener) fn default_lb_request_key_for_parts(
         request: &LbKeyRequestParts<'_>,
     ) -> String {
@@ -212,7 +198,9 @@ impl QUICListener {
         }
     }
 
-    pub(super) fn bearer_token_from_authorization_value(raw: &str) -> Option<String> {
+    pub(in crate::quic_listener) fn bearer_token_from_authorization_value(
+        raw: &str,
+    ) -> Option<String> {
         let raw = raw.trim();
         let split = raw.find(char::is_whitespace)?;
         let (scheme, rest) = raw.split_at(split);

@@ -1067,37 +1067,25 @@ impl QUICListener {
         client_addr: SocketAddr,
         header_lookup: Option<&LbHeaderLookup<'_>>,
     ) -> Option<String> {
+        let request = LbKeyRequestParts::new(
+            method,
+            path,
+            authority,
+            None,
+            Some(client_addr),
+            header_lookup,
+        );
         match rule.scope() {
             ScopedRateLimitScope::Route => Some(route.to_string()),
-            ScopedRateLimitScope::Client => Self::resolve_lb_key_from_spec(
-                rule.key_spec().unwrap_or("peer_ip"),
-                method,
-                path,
-                authority,
-                None,
-                Some(client_addr),
-                header_lookup,
-            ),
-            ScopedRateLimitScope::Tenant => rule.key_spec().and_then(|key_spec| {
-                Self::resolve_lb_key_from_spec(
-                    key_spec,
-                    method,
-                    path,
-                    authority,
-                    None,
-                    Some(client_addr),
-                    header_lookup,
-                )
-            }),
-            ScopedRateLimitScope::Token => Self::resolve_lb_key_from_spec(
-                rule.key_spec().unwrap_or("bearer_token"),
-                method,
-                path,
-                authority,
-                None,
-                Some(client_addr),
-                header_lookup,
-            ),
+            ScopedRateLimitScope::Client => {
+                Self::resolve_lb_key_from_parts(rule.key_spec().unwrap_or("peer_ip"), &request)
+            }
+            ScopedRateLimitScope::Tenant => rule
+                .key_spec()
+                .and_then(|key_spec| Self::resolve_lb_key_from_parts(key_spec, &request)),
+            ScopedRateLimitScope::Token => {
+                Self::resolve_lb_key_from_parts(rule.key_spec().unwrap_or("bearer_token"), &request)
+            }
         }
     }
 }
@@ -1424,37 +1412,27 @@ mod tests {
     }
 
     #[test]
-    fn resolve_lb_key_from_spec_supports_peer_ip_and_bearer_token() {
+    fn resolve_lb_key_from_parts_supports_peer_ip_and_bearer_token() {
         let headers = [("authorization".to_string(), "Bearer token-1".to_string())]
             .into_iter()
             .collect::<std::collections::HashMap<_, _>>();
         let lookup = |name: &str| headers.get(&name.to_ascii_lowercase()).cloned();
         let client_addr = "203.0.113.9:443".parse().expect("client addr");
+        let request = LbKeyRequestParts::new(
+            "GET",
+            "/",
+            Some("api.example.com"),
+            None,
+            Some(client_addr),
+            Some(&lookup),
+        );
 
         assert_eq!(
-            QUICListener::resolve_lb_key_from_spec(
-                "peer_ip",
-                "GET",
-                "/",
-                Some("api.example.com"),
-                None,
-                Some(client_addr),
-                Some(&lookup),
-            )
-            .as_deref(),
+            QUICListener::resolve_lb_key_from_parts("peer_ip", &request).as_deref(),
             Some("203.0.113.9")
         );
         assert_eq!(
-            QUICListener::resolve_lb_key_from_spec(
-                "bearer_token",
-                "GET",
-                "/",
-                Some("api.example.com"),
-                None,
-                Some(client_addr),
-                Some(&lookup),
-            )
-            .as_deref(),
+            QUICListener::resolve_lb_key_from_parts("bearer_token", &request).as_deref(),
             Some("token-1")
         );
     }

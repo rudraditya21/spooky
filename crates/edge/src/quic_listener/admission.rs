@@ -14,7 +14,7 @@ use spooky_lb::upstream_pool::UpstreamPool;
 use subtle::ConstantTimeEq;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
-use super::LbHeaderLookup;
+use super::{LbHeaderLookup, QUICListener};
 use crate::{
     RouteOutcome,
     metrics::OverloadShedReason,
@@ -434,7 +434,7 @@ pub(super) fn jwt_is_authorized(
     else {
         return false;
     };
-    let Some(token) = bearer_token_from_authorization_value(&raw) else {
+    let Some(token) = QUICListener::bearer_token_from_authorization_value(&raw) else {
         return false;
     };
     let Some(claims) = validated_hs256_jwt_claims(token.as_str(), jwt, SystemTime::now()) else {
@@ -540,20 +540,6 @@ pub(super) fn jwt_claims_satisfy_rbac(policy: &RuntimeUpstreamPolicy, claims: &V
             .required_roles
             .iter()
             .all(|required| roles.contains(required))
-}
-
-fn bearer_token_from_authorization_value(raw: &str) -> Option<String> {
-    let raw = raw.trim();
-    let split = raw.find(char::is_whitespace)?;
-    let (scheme, rest) = raw.split_at(split);
-    if !scheme.eq_ignore_ascii_case("bearer") {
-        return None;
-    }
-    let token = rest.trim_start();
-    if token.is_empty() {
-        return None;
-    }
-    Some(token.to_string())
 }
 
 fn overloaded(reason: OverloadDecisionReason, retry_after_seconds: u32) -> OverloadDecision {
