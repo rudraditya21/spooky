@@ -225,6 +225,13 @@ impl QUICListener {
                         let tunnel_response = streams
                             .get(&stream_id)
                             .is_some_and(|req| is_tunnel_response(req.tunnel_mode, status));
+                        let response_body_mode = if tunnel_response {
+                            ResponseBodyMode::TunnelSuccess
+                        } else if suppress_downstream_body {
+                            ResponseBodyMode::HeadRequest
+                        } else {
+                            ResponseBodyMode::Normal
+                        };
                         let upstream_content_length = resp_headers
                             .get(http::header::CONTENT_LENGTH)
                             .and_then(|v| v.to_str().ok())
@@ -271,15 +278,26 @@ impl QUICListener {
                             continue;
                         }
 
+                        let normalized_response =
+                            normalize_upstream_response(ResponseNormalizationInput {
+                                upstream: spooky_bridge::response::UpstreamResponseView {
+                                    status,
+                                    headers: &resp_headers,
+                                    trailers: None,
+                                },
+                                body_mode: response_body_mode,
+                                constraints: ResponseProtocolConstraints {
+                                    protocol: ResponseNormalizationProtocol::Http3,
+                                    strip_connection_headers: true,
+                                    allow_trailers: true,
+                                    preserve_upgrade: false,
+                                },
+                            });
                         let mut owned_h3_headers: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-                        let response_connection_tokens = connection_header_tokens(&resp_headers);
-                        for (name, value) in resp_headers.iter() {
-                            if should_strip_h3_response_header(name, &response_connection_tokens) {
-                                continue;
-                            }
+                        for header in &normalized_response.head.headers {
                             owned_h3_headers.push((
-                                name.as_str().as_bytes().to_vec(),
-                                value.as_bytes().to_vec(),
+                                header.name.as_str().as_bytes().to_vec(),
+                                header.value.as_bytes().to_vec(),
                             ));
                         }
                         owned_h3_headers.push((
@@ -290,19 +308,19 @@ impl QUICListener {
 
                         let defer_headers_until_body_validated = upstream_content_length.is_none()
                             && !tunnel_response
-                            && !suppress_downstream_body;
-                        let immediate_end = suppress_downstream_body
-                            || (!tunnel_response
-                                && (upstream_content_length == Some(0)
-                                    || status == http::StatusCode::NO_CONTENT
-                                    || status == http::StatusCode::NOT_MODIFIED));
+                            && matches!(
+                                normalized_response.emission.body,
+                                ResponseBodyPolicy::Forward
+                            )
+                            && !normalized_response.emission.emit_end_stream_on_headers;
+                        let immediate_end = normalized_response.emission.emit_end_stream_on_headers;
                         let mut immediate_terminal = false;
 
                         if !defer_headers_until_body_validated {
                             let mut h3_headers = Vec::with_capacity(owned_h3_headers.len() + 1);
                             h3_headers.push(quiche::h3::Header::new(
                                 b":status",
-                                status.as_str().as_bytes(),
+                                normalized_response.head.status.as_str().as_bytes(),
                             ));
                             for (name, value) in &owned_h3_headers {
                                 h3_headers.push(quiche::h3::Header::new(name, value));
@@ -345,7 +363,7 @@ impl QUICListener {
                                 let mut h3_headers = Vec::with_capacity(owned_h3_headers.len() + 1);
                                 h3_headers.push(quiche::h3::Header::new(
                                     b":status",
-                                    status.as_str().as_bytes(),
+                                    normalized_response.head.status.as_str().as_bytes(),
                                 ));
                                 for (name, value) in &owned_h3_headers {
                                     h3_headers.push(quiche::h3::Header::new(name, value));

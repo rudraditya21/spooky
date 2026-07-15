@@ -40,8 +40,9 @@ use rustls_pki_types::pem::PemObject;
 use serde_json::json;
 use socket2::{Domain, Protocol, Socket, Type};
 use spooky_bridge::response::{
+    ResponseBodyMode, ResponseBodyPolicy, ResponseNormalizationInput,
     ResponseNormalizationProtocol, ResponseProtocolConstraints, normalize_response_trailers,
-    should_strip_response_header,
+    normalize_upstream_response, should_strip_response_header,
 };
 use spooky_config::{
     backend_endpoint::{BackendEndpoint, BackendScheme},
@@ -180,6 +181,7 @@ fn should_strip_bootstrap_request_header(
     false
 }
 
+#[cfg(test)]
 fn should_strip_h3_response_header(
     name: &http::header::HeaderName,
     connection_tokens: &HashSet<String>,
