@@ -275,6 +275,133 @@ impl ExternalAuthDecisionOutcome {
     }
 }
 
+fn is_safe_auth_request_mutation_header(name: &str) -> bool {
+    !name.eq_ignore_ascii_case(http::header::HOST.as_str())
+        && !name.eq_ignore_ascii_case(http::header::CONNECTION.as_str())
+        && !name.eq_ignore_ascii_case(http::header::CONTENT_LENGTH.as_str())
+        && !name.eq_ignore_ascii_case(http::header::TRANSFER_ENCODING.as_str())
+        && !name.eq_ignore_ascii_case(http::header::UPGRADE.as_str())
+        && !name.eq_ignore_ascii_case(http::header::TE.as_str())
+        && !name.eq_ignore_ascii_case(http::header::TRAILER.as_str())
+        && !name.eq_ignore_ascii_case(http::header::EXPECT.as_str())
+        && !name.eq_ignore_ascii_case(http::header::AUTHORIZATION.as_str())
+        && !name.eq_ignore_ascii_case(http::header::LOCATION.as_str())
+        && !name.eq_ignore_ascii_case(http::header::WWW_AUTHENTICATE.as_str())
+        && !name.eq_ignore_ascii_case(http::header::FORWARDED.as_str())
+        && !name.eq_ignore_ascii_case("x-forwarded-for")
+        && !name.eq_ignore_ascii_case("x-forwarded-host")
+        && !name.eq_ignore_ascii_case("x-forwarded-port")
+        && !name.eq_ignore_ascii_case("x-forwarded-proto")
+        && !name.eq_ignore_ascii_case("keep-alive")
+        && !name.eq_ignore_ascii_case("proxy-connection")
+}
+
+pub fn allowed_auth_headers(
+    headers: &http::HeaderMap,
+    allowlist: &[String],
+) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            allowlist
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(name.as_str()))
+                .then(|| {
+                    value
+                        .to_str()
+                        .ok()
+                        .map(|value| (name.as_str().to_string(), value.to_string()))
+                })
+                .flatten()
+        })
+        .collect()
+}
+
+pub fn auth_allow_mutations(
+    headers: &http::HeaderMap,
+    allowlist: &[String],
+) -> Vec<PendingHeaderMutation> {
+    allowed_auth_headers(headers, allowlist)
+        .into_iter()
+        .filter(|(name, _)| is_safe_auth_request_mutation_header(name))
+        .map(|(name, value)| PendingHeaderMutation::Upsert {
+            name: name.into_bytes(),
+            value: value.into_bytes(),
+        })
+        .collect()
+}
+
+pub fn map_http_external_auth_response(
+    metadata: ExternalAuthResponseMetadata<'_>,
+    response_header_allowlist: &[String],
+) -> ExternalAuthResult {
+    let ExternalAuthResponseMetadata {
+        status,
+        headers,
+        body,
+    } = metadata;
+    let location = headers
+        .get(http::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let challenge = headers
+        .get(http::header::WWW_AUTHENTICATE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let allowed_headers = allowed_auth_headers(headers, response_header_allowlist);
+    if status.is_success() {
+        return Ok(ExternalAuthDecision::Allow {
+            request_header_mutations: auth_allow_mutations(headers, response_header_allowlist),
+        });
+    }
+    if status.is_redirection() {
+        if let Some(location) = location {
+            return Ok(ExternalAuthDecision::Redirect(
+                ExternalAuthRedirectResponse {
+                    status,
+                    headers: allowed_headers
+                        .into_iter()
+                        .filter(|(name, _)| {
+                            !name.eq_ignore_ascii_case(http::header::LOCATION.as_str())
+                        })
+                        .collect(),
+                    location,
+                },
+            ));
+        }
+        return Err(ProxyError::Transport(
+            "external auth redirect missing location header".into(),
+        ));
+    }
+    if status == http::StatusCode::UNAUTHORIZED
+        && let Some(www_authenticate) = challenge
+    {
+        return Ok(ExternalAuthDecision::Challenge(
+            ExternalAuthChallengeResponse {
+                status,
+                headers: allowed_headers
+                    .into_iter()
+                    .filter(|(name, _)| {
+                        !name.eq_ignore_ascii_case(http::header::WWW_AUTHENTICATE.as_str())
+                    })
+                    .collect(),
+                www_authenticate,
+                body: body.to_vec(),
+            },
+        ));
+    }
+    if status.is_client_error() {
+        return Ok(ExternalAuthDecision::Deny(ExternalAuthDenyResponse {
+            status,
+            headers: allowed_headers,
+            body: body.to_vec(),
+        }));
+    }
+    Err(ProxyError::Transport(format!(
+        "external auth endpoint returned {status}"
+    )))
+}
+
 /// Result type returned by the in-flight upstream forwarding task.
 
 #[derive(Debug, Clone, PartialEq, Eq)]

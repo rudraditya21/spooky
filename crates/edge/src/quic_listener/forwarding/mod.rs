@@ -1133,14 +1133,13 @@ mod tests {
     };
 
     use super::{
-        auth::{
-            allowed_auth_headers, append_auth_request_headers, auth_allow_mutations,
-            map_http_external_auth_response, oidc_audience_matches, oidc_scope_satisfied,
-        },
+        auth::{append_auth_request_headers, oidc_audience_matches, oidc_scope_satisfied},
         *,
     };
     use crate::runtime::connection::auth::{
-        ExternalAuthDecision, ExternalAuthExecutionPolicy, PendingHeaderMutation,
+        ExternalAuthDecision, ExternalAuthExecutionPolicy, ExternalAuthResponseMetadata,
+        PendingHeaderMutation, allowed_auth_headers, auth_allow_mutations,
+        map_http_external_auth_response,
     };
 
     fn sample_pending_forward(headers: Vec<quiche::h3::Header>) -> PendingForward {
@@ -1853,11 +1852,11 @@ mod tests {
         headers.insert("x-drop", http::HeaderValue::from_static("secret"));
 
         let decision = map_http_external_auth_response(
-            http::StatusCode::FORBIDDEN,
-            &headers,
-            b"denied
-"
-            .to_vec(),
+            ExternalAuthResponseMetadata {
+                status: http::StatusCode::FORBIDDEN,
+                headers: &headers,
+                body: b"denied\n",
+            },
             &["x-auth-reason".to_string()],
         )
         .expect("deny decision");
@@ -1885,9 +1884,11 @@ mod tests {
         headers.insert("x-auth-reason", http::HeaderValue::from_static("expired"));
 
         let decision = map_http_external_auth_response(
-            http::StatusCode::UNAUTHORIZED,
-            &headers,
-            b"challenge\n".to_vec(),
+            ExternalAuthResponseMetadata {
+                status: http::StatusCode::UNAUTHORIZED,
+                headers: &headers,
+                body: b"challenge\n",
+            },
             &["x-auth-reason".to_string()],
         )
         .expect("challenge decision");
@@ -1914,9 +1915,11 @@ mod tests {
             http::HeaderValue::from_static("https://login.example.com/"),
         );
         let redirect = map_http_external_auth_response(
-            http::StatusCode::FOUND,
-            &redirect_headers,
-            Vec::new(),
+            ExternalAuthResponseMetadata {
+                status: http::StatusCode::FOUND,
+                headers: &redirect_headers,
+                body: &[],
+            },
             &["location".to_string()],
         )
         .expect("redirect decision");
@@ -1934,9 +1937,11 @@ mod tests {
             http::HeaderValue::from_static("Bearer realm=\"spooky\""),
         );
         let challenge = map_http_external_auth_response(
-            http::StatusCode::UNAUTHORIZED,
-            &challenge_headers,
-            b"challenge\n".to_vec(),
+            ExternalAuthResponseMetadata {
+                status: http::StatusCode::UNAUTHORIZED,
+                headers: &challenge_headers,
+                body: b"challenge\n",
+            },
             &["www-authenticate".to_string()],
         )
         .expect("challenge decision");
@@ -1952,9 +1957,15 @@ mod tests {
     #[test]
     fn http_external_auth_response_mapping_requires_redirect_location() {
         let headers = http::HeaderMap::new();
-        let err =
-            map_http_external_auth_response(http::StatusCode::FOUND, &headers, Vec::new(), &[])
-                .expect_err("redirect without location must fail");
+        let err = map_http_external_auth_response(
+            ExternalAuthResponseMetadata {
+                status: http::StatusCode::FOUND,
+                headers: &headers,
+                body: &[],
+            },
+            &[],
+        )
+        .expect_err("redirect without location must fail");
         assert!(matches!(err, ProxyError::Transport(_)));
     }
 
