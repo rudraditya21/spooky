@@ -95,20 +95,37 @@ fn extract_query_param(path: &str, param: &str) -> Option<String> {
 }
 
 impl QUICListener {
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::quic_listener) fn resolve_lb_key(
+        lb_type: &str,
+        lb_key_spec: Option<&str>,
+        method: &str,
+        path: &str,
+        authority: Option<&str>,
+        cid_key: Option<&str>,
+        client_addr: Option<SocketAddr>,
+        header_lookup: Option<&LbHeaderLookup<'_>>,
+    ) -> ResolvedLbKey {
+        let request =
+            LbKeyRequestParts::new(method, path, authority, cid_key, client_addr, header_lookup);
+        Self::resolve_lb_key_for_input(&LbKeyResolutionInput::new(lb_type, lb_key_spec, request))
+    }
+
     pub(in crate::quic_listener) fn resolve_lb_key_for_route_request(
         lb_type: &str,
         lb_key_spec: Option<&str>,
         request: &super::resolve::RouteResolutionRequest<'_>,
     ) -> ResolvedLbKey {
-        let request = LbKeyRequestParts::new(
+        Self::resolve_lb_key(
+            lb_type,
+            lb_key_spec,
             request.method,
             request.path,
             request.authority,
             request.cid_key,
             None,
             request.header_lookup,
-        );
-        Self::resolve_lb_key_for_input(&LbKeyResolutionInput::new(lb_type, lb_key_spec, request))
+        )
     }
 
     pub(in crate::quic_listener) fn resolve_lb_key_from_parts(

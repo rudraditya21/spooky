@@ -10,9 +10,9 @@ use std::{convert::Infallible, error::Error as StdError};
 
 use spooky_config::config::ScopedRateLimitScope;
 
-pub(in crate::quic_listener) use self::lb_key::{
-    LbKeyRequestParts, LbKeyResolutionInput, ResolvedLbKey,
-};
+pub(in crate::quic_listener) use self::lb_key::ResolvedLbKey;
+#[cfg(test)]
+pub(in crate::quic_listener) use self::lb_key::{LbKeyRequestParts, LbKeyResolutionInput};
 use self::prepare::{PreparedRequest, StartedAuthRequest};
 pub(in crate::quic_listener) use self::resolve::BootstrapResolutionInput;
 #[cfg(test)]
@@ -1067,38 +1067,45 @@ impl QUICListener {
         client_addr: SocketAddr,
         header_lookup: Option<&LbHeaderLookup<'_>>,
     ) -> Option<String> {
-        let request = LbKeyRequestParts::new(
-            method,
-            path,
-            authority,
-            None,
-            Some(client_addr),
-            header_lookup,
-        );
         match rule.scope() {
             ScopedRateLimitScope::Route => Some(route.to_string()),
             ScopedRateLimitScope::Client => Some(
-                Self::resolve_lb_key_for_input(&LbKeyResolutionInput::new(
+                Self::resolve_lb_key(
                     "",
                     Some(rule.key_spec().unwrap_or("peer_ip")),
-                    request,
-                ))
+                    method,
+                    path,
+                    authority,
+                    None,
+                    Some(client_addr),
+                    header_lookup,
+                )
                 .value,
             ),
             ScopedRateLimitScope::Tenant => rule.key_spec().map(|key_spec| {
-                Self::resolve_lb_key_for_input(&LbKeyResolutionInput::new(
+                Self::resolve_lb_key(
                     "",
                     Some(key_spec),
-                    request,
-                ))
+                    method,
+                    path,
+                    authority,
+                    None,
+                    Some(client_addr),
+                    header_lookup,
+                )
                 .value
             }),
             ScopedRateLimitScope::Token => Some(
-                Self::resolve_lb_key_for_input(&LbKeyResolutionInput::new(
+                Self::resolve_lb_key(
                     "",
                     Some(rule.key_spec().unwrap_or("bearer_token")),
-                    request,
-                ))
+                    method,
+                    path,
+                    authority,
+                    None,
+                    Some(client_addr),
+                    header_lookup,
+                )
                 .value,
             ),
         }
