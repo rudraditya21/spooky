@@ -16,6 +16,7 @@ use crate::{
     forwarded::build_forwarded_header_values,
     headers::{connection_header_tokens, should_strip_request_header},
     host::resolve_upstream_host_value,
+    request::{RequestBuildInput, RequestBuildPolicies, RequestBuildTarget},
     websocket::{H3WebsocketRequestKind, h3_websocket_request_kind},
 };
 
@@ -66,17 +67,27 @@ pub fn build_h2_request_for_endpoint(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn build_h2_request_for_endpoint_with_host_policy(
-    endpoint: &BackendEndpoint,
-    host_policy: &UpstreamHostPolicy,
-    forwarded_policy: &ForwardedHeaderPolicy,
-    method: &str,
-    path: &str,
-    headers: &[quiche::h3::Header],
-    body: BoxBody<Bytes, Infallible>,
-    content_length: Option<usize>,
-    forwarded_ctx: ForwardedContext<'_>,
+pub fn build_h2_request_for_target(
+    target: RequestBuildTarget<'_>,
+    input: RequestBuildInput<'_, BoxBody<Bytes, Infallible>>,
 ) -> Result<Request<BoxBody<Bytes, Infallible>>, BridgeError> {
+    let RequestBuildTarget { endpoint, policies } = target;
+    let RequestBuildPolicies {
+        host_policy,
+        forwarded_header_policy,
+    } = policies;
+    let RequestBuildInput {
+        method,
+        path,
+        authority,
+        headers,
+        body,
+        content_length,
+        body_mode: _body_mode,
+        trace,
+        forwarded,
+    } = input;
+
     let method = Method::from_bytes(method.as_bytes()).map_err(|_| BridgeError::InvalidMethod)?;
     let websocket_kind = h3_websocket_request_kind(method.as_str(), headers);
     // Extended CONNECT is the H2 websocket path (RFC 8441).
@@ -136,7 +147,7 @@ pub fn build_h2_request_for_endpoint_with_host_policy(
     let host_value = resolve_upstream_host_value(
         endpoint,
         host_policy,
-        forwarded_ctx.request_authority,
+        authority,
         host_from_headers.as_deref(),
     )?;
 
@@ -173,7 +184,7 @@ pub fn build_h2_request_for_endpoint_with_host_policy(
     if !has_request_id {
         builder = builder.header(
             HeaderName::from_static("x-request-id"),
-            HeaderValue::from_str(&forwarded_ctx.request_id.to_string())
+            HeaderValue::from_str(&trace.request_id.to_string())
                 .map_err(|_| BridgeError::InvalidHeader)?,
         );
     }
@@ -181,7 +192,7 @@ pub fn build_h2_request_for_endpoint_with_host_policy(
     let has_traceparent = builder
         .headers_ref()
         .is_some_and(|h| h.contains_key("traceparent"));
-    if !has_traceparent && let Some(traceparent) = forwarded_ctx.traceparent {
+    if !has_traceparent && let Some(traceparent) = trace.traceparent {
         builder = builder.header(
             HeaderName::from_static("traceparent"),
             HeaderValue::from_str(traceparent).map_err(|_| BridgeError::InvalidHeader)?,
@@ -189,14 +200,14 @@ pub fn build_h2_request_for_endpoint_with_host_policy(
     }
 
     let forwarded_values = build_forwarded_header_values(
-        forwarded_policy,
+        forwarded_header_policy,
         ForwardedHeaderChains {
             forwarded: &forwarded_from_headers,
             x_forwarded_for: &x_forwarded_for_from_headers,
             x_forwarded_proto: &x_forwarded_proto_from_headers,
             x_forwarded_host: &x_forwarded_host_from_headers,
         },
-        forwarded_ctx.client_addr.ip(),
+        forwarded.client_addr.ip(),
         host_value,
     )?;
     if let Some(value) = forwarded_values.forwarded {
@@ -213,6 +224,47 @@ pub fn build_h2_request_for_endpoint_with_host_policy(
     }
 
     builder.body(body).map_err(BridgeError::Build)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_h2_request_for_endpoint_with_host_policy(
+    endpoint: &BackendEndpoint,
+    host_policy: &UpstreamHostPolicy,
+    forwarded_policy: &ForwardedHeaderPolicy,
+    method: &str,
+    path: &str,
+    headers: &[quiche::h3::Header],
+    body: BoxBody<Bytes, Infallible>,
+    content_length: Option<usize>,
+    forwarded_ctx: ForwardedContext<'_>,
+) -> Result<Request<BoxBody<Bytes, Infallible>>, BridgeError> {
+    build_h2_request_for_target(
+        RequestBuildTarget {
+            endpoint,
+            policies: RequestBuildPolicies {
+                host_policy,
+                forwarded_header_policy: forwarded_policy,
+            },
+        },
+        RequestBuildInput {
+            method,
+            path,
+            authority: forwarded_ctx.request_authority,
+            headers,
+            body,
+            content_length,
+            body_mode: RequestBuildInput::<BoxBody<Bytes, Infallible>>::body_mode_for_length(
+                content_length,
+            ),
+            trace: crate::request::RequestTraceContext {
+                request_id: forwarded_ctx.request_id,
+                traceparent: forwarded_ctx.traceparent,
+            },
+            forwarded: crate::request::RequestForwardedContext {
+                client_addr: forwarded_ctx.client_addr,
+            },
+        },
+    )
 }
 
 #[cfg(test)]
