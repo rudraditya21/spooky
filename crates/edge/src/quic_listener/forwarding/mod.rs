@@ -1099,6 +1099,8 @@ impl QUICListener {
 #[cfg(test)]
 mod tests {
 
+    use std::time::UNIX_EPOCH;
+
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
@@ -1109,7 +1111,6 @@ mod tests {
             RuntimeExternalAuthFailureMode, RuntimeJwtAuth, RuntimeUpstreamPolicy,
         },
     };
-    use std::time::UNIX_EPOCH;
 
     use super::{
         auth::{
