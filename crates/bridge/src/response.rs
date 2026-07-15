@@ -230,11 +230,12 @@ pub fn apply_response_header_defaults(
     if matches!(emission.content_length, ContentLengthPolicy::Strip) {
         headers.retain(|header| header.name != http::header::CONTENT_LENGTH);
     } else if !has_content_length {
-        headers.push(NormalizedHeader {
-            name: http::header::CONTENT_LENGTH,
-            value: HeaderValue::from_str(&body_len.to_string())
-                .expect("synthesized content-length must be valid"),
-        });
+        if let Ok(value) = HeaderValue::from_str(&body_len.to_string()) {
+            headers.push(NormalizedHeader {
+                name: http::header::CONTENT_LENGTH,
+                value,
+            });
+        }
     }
 
     if matches!(
