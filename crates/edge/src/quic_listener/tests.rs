@@ -762,17 +762,17 @@ fn resolve_backend_round_robin_is_not_pinned_to_first_backend() {
 
     let mut picks = Vec::new();
     for _ in 0..4 {
-        let resolved = super::QUICListener::resolve_backend(
+        let request = super::forwarding::SharedRouteResolutionRequest::new(
             "GET",
             "/api/items",
             None,
             None,
-            &upstream_pools,
-            &routing_index,
             None,
-        )
-        .expect("resolve backend");
-        picks.push(resolved.backend_addr);
+        );
+        let resolved =
+            super::QUICListener::resolve_backend_request(&request, &upstream_pools, &routing_index)
+                .expect("resolve backend");
+        picks.push(resolved.backend.backend_addr);
     }
 
     assert!(
@@ -793,19 +793,14 @@ fn resolve_backend_skips_unhealthy_backends() {
         guard.pool.mark_failure(0);
     }
 
-    let resolved = super::QUICListener::resolve_backend(
-        "GET",
-        "/api/items",
-        None,
-        None,
-        &upstream_pools,
-        &routing_index,
-        None,
-    )
-    .expect("resolve backend");
+    let request =
+        super::forwarding::SharedRouteResolutionRequest::new("GET", "/api/items", None, None, None);
+    let resolved =
+        super::QUICListener::resolve_backend_request(&request, &upstream_pools, &routing_index)
+            .expect("resolve backend");
 
     assert_eq!(
-        resolved.backend_addr, "127.0.0.1:7002",
+        resolved.backend.backend_addr, "127.0.0.1:7002",
         "unhealthy backend must be excluded from bootstrap backend selection"
     );
 }
@@ -819,19 +814,14 @@ fn resolve_backend_respects_least_connections_strategy() {
         guard.pool.begin_request(0);
     }
 
-    let resolved = super::QUICListener::resolve_backend(
-        "GET",
-        "/api/items",
-        None,
-        None,
-        &upstream_pools,
-        &routing_index,
-        None,
-    )
-    .expect("resolve backend");
+    let request =
+        super::forwarding::SharedRouteResolutionRequest::new("GET", "/api/items", None, None, None);
+    let resolved =
+        super::QUICListener::resolve_backend_request(&request, &upstream_pools, &routing_index)
+            .expect("resolve backend");
 
     assert_eq!(
-        resolved.backend_addr, "127.0.0.1:7002",
+        resolved.backend.backend_addr, "127.0.0.1:7002",
         "least-connections should prefer lower in-flight backend in bootstrap selection"
     );
 }
@@ -859,30 +849,25 @@ fn resolve_backend_prefers_method_specific_route() {
         upstream_pools.insert(name.clone(), Arc::new(RwLock::new(pool)));
     }
 
-    let resolved = super::QUICListener::resolve_backend(
-        "GET",
-        "/api/items",
-        None,
-        None,
-        &upstream_pools,
-        &routing_index,
-        None,
-    )
-    .expect("GET resolve");
-    assert_eq!(resolved.upstream_name, "all_methods");
+    let request =
+        super::forwarding::SharedRouteResolutionRequest::new("GET", "/api/items", None, None, None);
+    let resolved =
+        super::QUICListener::resolve_backend_request(&request, &upstream_pools, &routing_index)
+            .expect("GET resolve");
+    assert_eq!(resolved.route.upstream_name, "all_methods");
 
-    let resolved = super::QUICListener::resolve_backend(
+    let request = super::forwarding::SharedRouteResolutionRequest::new(
         "POST",
         "/api/items",
         None,
         None,
-        &upstream_pools,
-        &routing_index,
         None,
-    )
-    .expect("POST resolve");
-    assert_eq!(resolved.upstream_name, "post_only");
-    assert_eq!(resolved.backend_addr, "127.0.0.1:7010");
+    );
+    let resolved =
+        super::QUICListener::resolve_backend_request(&request, &upstream_pools, &routing_index)
+            .expect("POST resolve");
+    assert_eq!(resolved.route.upstream_name, "post_only");
+    assert_eq!(resolved.backend.backend_addr, "127.0.0.1:7010");
 }
 
 #[test]
@@ -910,29 +895,35 @@ fn resolve_backend_uses_configured_header_lb_key() {
         }
     };
 
-    let first = super::QUICListener::resolve_backend(
+    let first_request = super::forwarding::SharedRouteResolutionRequest::new(
         "GET",
         "/api/items",
         None,
         None,
+        Some(&header_lookup),
+    );
+    let first = super::QUICListener::resolve_backend_request(
+        &first_request,
         &upstream_pools,
         &routing_index,
-        Some(&header_lookup),
     )
     .expect("first resolve");
-    let second = super::QUICListener::resolve_backend(
+    let second_request = super::forwarding::SharedRouteResolutionRequest::new(
         "GET",
         "/api/items",
         None,
         None,
+        Some(&header_lookup),
+    );
+    let second = super::QUICListener::resolve_backend_request(
+        &second_request,
         &upstream_pools,
         &routing_index,
-        Some(&header_lookup),
     )
     .expect("second resolve");
 
     assert_eq!(
-        first.backend_addr, second.backend_addr,
+        first.backend.backend_addr, second.backend.backend_addr,
         "consistent-hash should remain stable when configured header key is constant"
     );
 }

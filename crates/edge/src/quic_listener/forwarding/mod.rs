@@ -11,6 +11,7 @@ use std::{convert::Infallible, error::Error as StdError};
 use spooky_config::config::ScopedRateLimitScope;
 
 use self::prepare::{PreparedRequest, StartedAuthRequest};
+pub(in crate::quic_listener) use self::resolve::RouteResolutionRequest as SharedRouteResolutionRequest;
 use super::*;
 use crate::runtime::connection::{request::PendingForward, stream::StreamAdmissionState};
 

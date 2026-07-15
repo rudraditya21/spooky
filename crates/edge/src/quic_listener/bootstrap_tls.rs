@@ -389,17 +389,24 @@ impl QUICListener {
                                         .and_then(|value| value.to_str().ok())
                                         .map(str::to_string)
                                 };
-                                let resolved = Self::resolve_backend(
-                                    &method,
-                                    &path,
-                                    authority.as_deref(),
-                                    None,
-                                    &upstream_pools,
-                                    &routing_index,
-                                    Some(&lb_header_lookup),
-                                );
-                                let (backend_addr, upstream_name) = match resolved {
-                                    Ok(value) => (value.backend_addr, value.upstream_name),
+                                let (backend_addr, upstream_name) = match {
+                                    let resolution_request =
+                                        super::forwarding::SharedRouteResolutionRequest::new(
+                                            &method,
+                                            &path,
+                                            authority.as_deref(),
+                                            None,
+                                            Some(&lb_header_lookup),
+                                        );
+                                    Self::resolve_backend_request(
+                                        &resolution_request,
+                                        &upstream_pools,
+                                        &routing_index,
+                                    )
+                                } {
+                                    Ok(value) => {
+                                        (value.backend.backend_addr, value.route.upstream_name)
+                                    }
                                     Err(ProxyError::Transport(reason)) => {
                                         let (status, body) =
                                             bootstrap_resolution_error_response(&reason);

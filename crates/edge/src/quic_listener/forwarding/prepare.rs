@@ -5,7 +5,7 @@ use tracing::Span;
 
 use super::{
     auth::{AuthStart, auth_failure_mode, fail_open, start_external_auth_task},
-    resolve::ResolvedBackend,
+    resolve::{ResolvedBackend, ResolvedRoute, RouteResolutionRequest, SelectedBackend},
     *,
 };
 use crate::{
@@ -184,27 +184,33 @@ impl QUICListener {
         } else {
             method
         };
-        let resolved = Self::resolve_backend_without_inflight(
+        let resolution_request = RouteResolutionRequest::new(
             route_method,
             path,
             authority,
             Some(sticky_cid_key),
+            Some(&lb_header_lookup),
+        );
+        let resolved = Self::resolve_backend_without_inflight_request(
+            &resolution_request,
             upstream_pools,
             routing_index,
-            Some(&lb_header_lookup),
         );
 
         let prepared = match resolved {
-            Ok(ResolvedBackend {
-                upstream_name,
-                backend_addr,
-                backend_index,
-                upstream_pool,
-                backend_lb,
-                route_path_len,
-                route_host_specific,
-                route_reason,
-            }) => {
+            Ok(ResolvedBackend { route, backend }) => {
+                let ResolvedRoute {
+                    upstream_name,
+                    upstream_pool,
+                    route_path_len,
+                    route_host_specific,
+                    route_reason,
+                } = route;
+                let SelectedBackend {
+                    backend_addr,
+                    backend_index,
+                    backend_lb,
+                } = backend;
                 let upstream_policy = upstream_policies
                     .get(&upstream_name)
                     .cloned()
