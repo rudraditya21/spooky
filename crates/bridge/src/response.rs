@@ -90,7 +90,9 @@ pub(crate) fn status_forbids_response_body(status: StatusCode) -> bool {
 }
 
 fn is_hop_by_hop_response_header(name: &HeaderName, preserve_upgrade: bool) -> bool {
-    if preserve_upgrade && name == http::header::UPGRADE {
+    if preserve_upgrade
+        && (name == http::header::CONNECTION || name == http::header::UPGRADE)
+    {
         return false;
     }
 
@@ -126,7 +128,10 @@ pub fn should_strip_response_header(
     connection_tokens: &HashSet<String>,
     constraints: ResponseProtocolConstraints,
 ) -> bool {
-    (constraints.strip_connection_headers && connection_tokens.contains(name.as_str()))
+    (constraints.strip_connection_headers
+        && !(constraints.preserve_upgrade
+            && (name == http::header::CONNECTION || name == http::header::UPGRADE))
+        && connection_tokens.contains(name.as_str()))
         || is_hop_by_hop_response_header(name, constraints.preserve_upgrade)
         || matches!(constraints.protocol, ResponseNormalizationProtocol::Http3)
             && name == http::header::CONTENT_LENGTH
