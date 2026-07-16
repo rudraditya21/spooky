@@ -14,19 +14,6 @@ pub struct UpstreamPool {
 }
 
 impl UpstreamPool {
-    pub fn from_upstream(upstream: &spooky_config::config::Upstream) -> Result<Self, String> {
-        let backends = upstream.backends.iter().map(BackendState::new).collect();
-        let lb_policy = RuntimeLoadBalancingPolicy::normalize(&upstream.load_balancing)
-            .map_err(|err| err.to_string())?;
-        let load_balancer = LoadBalancing::from_runtime_strategy(lb_policy.strategy)?;
-
-        Ok(Self {
-            pool: BackendPool::new_from_states(backends),
-            load_balancer,
-            lb_policy,
-        })
-    }
-
     pub fn from_runtime_upstream(upstream: &RuntimeUpstream) -> Result<Self, String> {
         let backends = upstream
             .backends

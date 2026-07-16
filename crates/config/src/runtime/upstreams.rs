@@ -51,7 +51,8 @@ impl RuntimeUpstream {
         Ok(runtime_upstream)
     }
 
-    pub fn as_config_upstream(&self) -> Upstream {
+    #[cfg(test)]
+    pub(crate) fn as_config_upstream(&self) -> Upstream {
         Upstream {
             load_balancing: self.load_balancing.as_config(),
             auth: self.policy.upstream_auth.as_config(),

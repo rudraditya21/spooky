@@ -1,4 +1,9 @@
-use spooky_config::config::{Backend, HealthCheck, RouteMatch};
+use std::collections::HashMap;
+
+use spooky_config::{
+    config::{Backend, Config, HealthCheck, Listen, RouteMatch, Tls},
+    runtime::RuntimeConfig,
+};
 use spooky_lb::{load_balancing::LoadBalancing, upstream_pool::UpstreamPool};
 
 #[test]
@@ -46,7 +51,32 @@ fn upstream_pool_from_config() {
         ],
     };
 
-    let upstream_pool = UpstreamPool::from_upstream(&upstream).unwrap();
+    let mut upstreams = HashMap::new();
+    upstreams.insert("api".to_string(), upstream);
+    let runtime = RuntimeConfig::from_config(&Config {
+        version: 1,
+        listen: Listen {
+            protocol: "http1".to_string(),
+            tls: Tls {
+                cert: "/tmp/test-cert.pem".to_string(),
+                key: "/tmp/test-key.pem".to_string(),
+                ..Tls::default()
+            },
+            ..Listen::default()
+        },
+        listeners: Vec::new(),
+        upstream: upstreams,
+        load_balancing: None,
+        upstream_tls: Default::default(),
+        log: Default::default(),
+        performance: Default::default(),
+        observability: Default::default(),
+        resilience: Default::default(),
+        security: Default::default(),
+    })
+    .unwrap();
+
+    let upstream_pool = UpstreamPool::from_runtime_upstream(runtime.upstreams.get("api").unwrap()).unwrap();
     assert!(matches!(
         upstream_pool.load_balancer,
         LoadBalancing::RoundRobin(_)

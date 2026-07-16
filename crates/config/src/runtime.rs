@@ -79,7 +79,8 @@ impl RuntimeConfig {
         self.listener_runtime_configs().into_iter().next()
     }
 
-    pub fn upstreams_as_config(&self) -> HashMap<String, Upstream> {
+    #[cfg(test)]
+    pub(crate) fn upstreams_as_config(&self) -> HashMap<String, Upstream> {
         self.upstreams
             .iter()
             .map(|(name, upstream)| (name.clone(), upstream.as_config_upstream()))
@@ -90,7 +91,8 @@ impl RuntimeConfig {
         self.policies.clone()
     }
 
-    pub fn upstream_policy_sets(&self) -> HashMap<String, RuntimeUpstreamPolicySet> {
+    #[cfg(test)]
+    pub(crate) fn upstream_policy_sets(&self) -> HashMap<String, RuntimeUpstreamPolicySet> {
         self.upstreams
             .iter()
             .map(|(name, upstream)| (name.clone(), upstream.policy_set.clone()))
@@ -270,12 +272,6 @@ pub struct RuntimeUpstreamPolicy {
     pub host: RuntimeHostPolicy,
     pub forwarded_headers: RuntimeForwardedHeaderPolicy,
     pub protocol: RuntimeProtocolPolicy,
-}
-
-impl RuntimeUpstream {
-    pub fn policy_set(&self) -> RuntimeUpstreamPolicySet {
-        self.policy_set.clone()
-    }
 }
 
 #[cfg(test)]

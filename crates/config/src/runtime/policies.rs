@@ -186,7 +186,7 @@ pub struct RuntimeRouteMatchPolicy {
 }
 
 impl RuntimeRouteMatchPolicy {
-    pub fn normalize(
+    pub(crate) fn normalize(
         upstream_name: &str,
         route: &crate::config::RouteMatch,
     ) -> Result<Self, RuntimeConfigError> {
@@ -215,7 +215,8 @@ impl RuntimeRouteMatchPolicy {
         })
     }
 
-    pub fn as_config(&self) -> crate::config::RouteMatch {
+    #[cfg(test)]
+    pub(crate) fn as_config(&self) -> crate::config::RouteMatch {
         crate::config::RouteMatch {
             host: self.host.clone(),
             path_prefix: self.path_prefix.clone(),
@@ -240,7 +241,7 @@ pub enum RuntimeRequestKeySpec {
 }
 
 impl RuntimeRequestKeySpec {
-    pub fn normalize(raw: &str) -> Result<Self, RuntimeConfigError> {
+    pub(crate) fn normalize(raw: &str) -> Result<Self, RuntimeConfigError> {
         let normalized = raw.trim().to_ascii_lowercase();
         match normalized.as_str() {
             "path" => Ok(Self::Path),
@@ -277,21 +278,6 @@ impl RuntimeRequestKeySpec {
         }
     }
 
-    pub fn as_config(&self) -> String {
-        match self {
-            Self::Path => "path".to_string(),
-            Self::Authority => "authority".to_string(),
-            Self::Method => "method".to_string(),
-            Self::Cid => "cid".to_string(),
-            Self::StickyCid => "sticky-cid".to_string(),
-            Self::PeerIp => "peer_ip".to_string(),
-            Self::ClientIp => "client_ip".to_string(),
-            Self::BearerToken => "bearer_token".to_string(),
-            Self::Header(name) => format!("header:{name}"),
-            Self::Cookie(name) => format!("cookie:{name}"),
-            Self::Query(name) => format!("query:{name}"),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -307,7 +293,7 @@ pub struct RuntimeApiKeyAuth {
 }
 
 impl RuntimeApiKeyAuth {
-    pub fn normalize(
+    pub(crate) fn normalize(
         api_key: &crate::config::ApiKeyAuth,
         upstream_name: &str,
     ) -> Result<Self, RuntimeConfigError> {
@@ -327,7 +313,8 @@ impl RuntimeApiKeyAuth {
         })
     }
 
-    pub fn as_config(&self) -> crate::config::ApiKeyAuth {
+    #[cfg(test)]
+    pub(crate) fn as_config(&self) -> crate::config::ApiKeyAuth {
         crate::config::ApiKeyAuth {
             header_name: self.header_name.clone(),
             keys: self.keys.clone(),
@@ -344,7 +331,7 @@ pub struct RuntimeJwtAuth {
 }
 
 impl RuntimeJwtAuth {
-    pub fn normalize(
+    pub(crate) fn normalize(
         jwt: &crate::config::JwtAuth,
         upstream_name: &str,
     ) -> Result<Self, RuntimeConfigError> {
@@ -363,7 +350,8 @@ impl RuntimeJwtAuth {
         })
     }
 
-    pub fn as_config(&self) -> crate::config::JwtAuth {
+    #[cfg(test)]
+    pub(crate) fn as_config(&self) -> crate::config::JwtAuth {
         crate::config::JwtAuth {
             secret: self.secret.clone(),
             issuer: self.issuer.clone(),
@@ -381,14 +369,15 @@ pub enum RuntimeExternalAuthFailureMode {
 }
 
 impl RuntimeExternalAuthFailureMode {
-    pub fn from_config(mode: crate::config::ExternalAuthFailureMode) -> Self {
+    pub(crate) fn from_config(mode: crate::config::ExternalAuthFailureMode) -> Self {
         match mode {
             crate::config::ExternalAuthFailureMode::FailOpen => Self::FailOpen,
             crate::config::ExternalAuthFailureMode::FailClosed => Self::FailClosed,
         }
     }
 
-    pub fn as_config(self) -> crate::config::ExternalAuthFailureMode {
+    #[cfg(test)]
+    pub(crate) fn as_config(self) -> crate::config::ExternalAuthFailureMode {
         match self {
             Self::FailOpen => crate::config::ExternalAuthFailureMode::FailOpen,
             Self::FailClosed => crate::config::ExternalAuthFailureMode::FailClosed,
@@ -432,6 +421,7 @@ impl RuntimeExternalAuthRequestHeader {
             .collect()
     }
 
+    #[cfg(test)]
     fn as_config(&self) -> crate::config::ExternalAuthRequestHeader {
         crate::config::ExternalAuthRequestHeader {
             name: self.name.clone(),
@@ -547,6 +537,7 @@ impl RuntimeExternalAuth {
         }
     }
 
+    #[cfg(test)]
     fn as_config(&self) -> crate::config::ExternalAuth {
         match self {
             Self::Http {
@@ -588,6 +579,7 @@ impl RuntimeExternalAuth {
         }
     }
 
+    #[cfg(test)]
     fn header_as_config(
         header: &RuntimeExternalAuthRequestHeader,
     ) -> crate::config::ExternalAuthRequestHeader {
@@ -605,7 +597,7 @@ pub struct RuntimeAuthPolicy {
 }
 
 impl RuntimeAuthPolicy {
-    pub fn normalize(
+    pub(crate) fn normalize(
         auth: &crate::config::RouteAuth,
         upstream_name: &str,
     ) -> Result<Self, RuntimeConfigError> {
@@ -636,7 +628,8 @@ impl RuntimeAuthPolicy {
         })
     }
 
-    pub fn as_config(&self) -> crate::config::RouteAuth {
+    #[cfg(test)]
+    pub(crate) fn as_config(&self) -> crate::config::RouteAuth {
         crate::config::RouteAuth {
             api_key: self.api_key.as_ref().map(RuntimeApiKeyAuth::as_config),
             jwt: self.jwt.as_ref().map(RuntimeJwtAuth::as_config),
@@ -663,7 +656,7 @@ pub struct RuntimeTimeoutPolicy {
 }
 
 impl RuntimeTimeoutPolicy {
-    pub fn normalize(performance: &Performance) -> Result<Self, RuntimeConfigError> {
+    pub(crate) fn normalize(performance: &Performance) -> Result<Self, RuntimeConfigError> {
         require_nonzero_u64("performance.backend_timeout_ms", performance.backend_timeout_ms)?;
         require_nonzero_u64(
             "performance.backend_connect_timeout_ms",
@@ -801,7 +794,7 @@ pub struct RuntimeBackendDnsPolicy {
 }
 
 impl RuntimeTransportPolicy {
-    pub fn normalize(performance: &Performance) -> Result<Self, RuntimeConfigError> {
+    pub(crate) fn normalize(performance: &Performance) -> Result<Self, RuntimeConfigError> {
         require_nonzero_usize("performance.worker_threads", performance.worker_threads)?;
         if performance.worker_threads > 1024 {
             return Err(config_invalid(format!(
@@ -1021,7 +1014,7 @@ pub struct RuntimeBackendEndpoint {
 }
 
 impl RuntimeBackendEndpoint {
-    pub fn normalize(
+    pub(crate) fn normalize(
         upstream_name: &str,
         backend_id: &str,
         address: &str,
@@ -1069,7 +1062,7 @@ pub struct RuntimeBackendHealthCheck {
 }
 
 impl RuntimeBackendHealthCheck {
-    pub fn normalize(
+    pub(crate) fn normalize(
         upstream_name: &str,
         backend_id: &str,
         health_check: &crate::config::HealthCheck,
@@ -1109,7 +1102,8 @@ impl RuntimeBackendHealthCheck {
         })
     }
 
-    pub fn as_config(&self) -> crate::config::HealthCheck {
+    #[cfg(test)]
+    pub(crate) fn as_config(&self) -> crate::config::HealthCheck {
         crate::config::HealthCheck {
             path: self.path.clone(),
             interval: self.interval.as_millis().try_into().unwrap_or(u64::MAX),
@@ -1158,7 +1152,7 @@ pub struct RuntimeLoadBalancingPolicy {
 }
 
 impl RuntimeLoadBalancingPolicy {
-    pub fn normalize(load_balancing: &LoadBalancing) -> Result<Self, RuntimeConfigError> {
+    pub(crate) fn normalize(load_balancing: &LoadBalancing) -> Result<Self, RuntimeConfigError> {
         let strategy = RuntimeLoadBalancingStrategy::from_lb_type(&load_balancing.lb_type);
         if matches!(strategy, RuntimeLoadBalancingStrategy::Other) {
             return Err(config_invalid(format!(
@@ -1182,7 +1176,8 @@ impl RuntimeLoadBalancingPolicy {
         })
     }
 
-    pub fn as_config(&self) -> LoadBalancing {
+    #[cfg(test)]
+    pub(crate) fn as_config(&self) -> LoadBalancing {
         LoadBalancing {
             lb_type: self.strategy.canonical_name().to_string(),
             key: self.key.clone(),
@@ -1202,7 +1197,9 @@ pub struct RuntimeScopedRateLimitPolicy {
 }
 
 impl RuntimeScopedRateLimitPolicy {
-    pub fn normalize(rule: &crate::config::ScopedRateLimit) -> Result<Self, RuntimeConfigError> {
+    pub(crate) fn normalize(
+        rule: &crate::config::ScopedRateLimit,
+    ) -> Result<Self, RuntimeConfigError> {
         let rule_name = rule.name.trim();
         if rule_name.is_empty() {
             return Err(config_invalid(
@@ -1363,7 +1360,7 @@ pub struct RuntimeRateLimitPolicy {
 }
 
 impl RuntimeRateLimitPolicy {
-    pub fn normalize(resilience: &Resilience) -> Result<Self, RuntimeConfigError> {
+    pub(crate) fn normalize(resilience: &Resilience) -> Result<Self, RuntimeConfigError> {
         let mut seen_names = std::collections::HashSet::new();
         let mut scoped_limits = Vec::with_capacity(resilience.scoped_rate_limits.len());
         for rule in &resilience.scoped_rate_limits {
@@ -1394,7 +1391,7 @@ pub struct RuntimeAdmissionPolicy {
 }
 
 impl RuntimeAdmissionPolicy {
-    pub fn normalize(
+    pub(crate) fn normalize(
         resilience: &Resilience,
         global_inflight_limit: usize,
     ) -> Result<Self, RuntimeConfigError> {
@@ -1725,7 +1722,7 @@ pub struct RuntimePolicySet {
 }
 
 impl RuntimePolicySet {
-    pub fn from_config(config: &Config) -> Result<Self, RuntimeConfigError> {
+    pub(crate) fn from_config(config: &Config) -> Result<Self, RuntimeConfigError> {
         let timeouts = RuntimeTimeoutPolicy::normalize(&config.performance)?;
         let transport = RuntimeTransportPolicy::normalize(&config.performance)?;
         let rate_limits = RuntimeRateLimitPolicy::normalize(&config.resilience)?;
@@ -1769,26 +1766,4 @@ pub struct RuntimeUpstreamPolicySet {
     pub host: RuntimeHostPolicy,
     pub forwarded_headers: RuntimeForwardedHeaderPolicy,
     pub protocol: RuntimeProtocolPolicy,
-}
-
-impl RuntimeUpstreamPolicySet {
-    pub fn normalize(
-        upstream: &RuntimeUpstream,
-        base: &RuntimePolicySet,
-    ) -> Result<Self, RuntimeConfigError> {
-        Ok(Self {
-            timeouts: base.timeouts.clone(),
-            auth: upstream.policy.upstream_auth.clone(),
-            rate_limits: base.rate_limits.clone(),
-            load_balancing: upstream.load_balancing.clone(),
-            admission: base.admission.clone(),
-            transport: RuntimeUpstreamTransportPolicy::from_effective_tls(
-                &upstream.effective_tls,
-                &base.transport,
-            ),
-            host: upstream.policy.host.clone(),
-            forwarded_headers: upstream.policy.forwarded_headers.clone(),
-            protocol: upstream.policy.protocol.clone(),
-        })
-    }
 }

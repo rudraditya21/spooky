@@ -457,12 +457,14 @@ pub(crate) fn log_backend_health_transition(addr: &str, transition: HealthTransi
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::time::Duration;
 
     use spooky_config::config::{
-        Backend, ForwardedHeaderPolicy, HealthCheck, LoadBalancing, RouteAuth, RouteMatch,
-        Upstream, UpstreamHostPolicy,
+        Backend, Config, ForwardedHeaderPolicy, HealthCheck, Listen, LoadBalancing, RouteAuth,
+        RouteMatch, Tls, Upstream, UpstreamHostPolicy,
     };
+    use spooky_config::runtime::RuntimeConfig;
 
     use super::*;
 
@@ -471,8 +473,10 @@ mod tests {
     }
 
     fn test_upstream_pool() -> Arc<RwLock<UpstreamPool>> {
-        Arc::new(RwLock::new(
-            UpstreamPool::from_upstream(&Upstream {
+        let mut upstreams = HashMap::new();
+        upstreams.insert(
+            "api".to_string(),
+            Upstream {
                 load_balancing: LoadBalancing {
                     lb_type: "round-robin".to_string(),
                     key: None,
@@ -492,16 +496,51 @@ mod tests {
                     weight: 1,
                     health_check: Some(HealthCheck {
                         path: "/health".to_string(),
-                        interval: 0,
+                        interval: 1,
                         timeout_ms: 1000,
                         failure_threshold: 1,
                         success_threshold: 1,
                         cooldown_ms: 0,
                     }),
                 }],
-            })
-            .expect("pool"),
-        ))
+            },
+        );
+        let runtime = RuntimeConfig::from_config(&Config {
+            version: 1,
+            listen: Listen {
+                protocol: "http1".to_string(),
+                tls: Tls {
+                    cert: "/tmp/test-cert.pem".to_string(),
+                    key: "/tmp/test-key.pem".to_string(),
+                    ..Tls::default()
+                },
+                ..Listen::default()
+            },
+            listeners: Vec::new(),
+            upstream: upstreams,
+            load_balancing: None,
+            upstream_tls: Default::default(),
+            log: Default::default(),
+            performance: Default::default(),
+            observability: Default::default(),
+            resilience: Default::default(),
+            security: Default::default(),
+        })
+        .expect("runtime config");
+
+        let mut pool =
+            UpstreamPool::from_runtime_upstream(runtime.upstreams.get("api").expect("upstream"))
+                .expect("pool");
+        pool.pool.backends[0].health_check = Some(HealthCheck {
+            path: "/health".to_string(),
+            interval: 0,
+            timeout_ms: 1000,
+            failure_threshold: 1,
+            success_threshold: 1,
+            cooldown_ms: 0,
+        });
+
+        Arc::new(RwLock::new(pool))
     }
 
     fn upstream_request_count(

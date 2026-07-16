@@ -87,6 +87,31 @@ fn test_upstream_with(lb_type: &str, lb_key: Option<&str>, method: Option<&str>)
     }
 }
 
+fn runtime_config_with_upstreams(upstreams: HashMap<String, Upstream>) -> RuntimeConfig {
+    RuntimeConfig::from_config(&SpookyConfigConfig {
+        version: 1,
+        listen: Listen {
+            protocol: "http1".to_string(),
+            tls: Tls {
+                cert: "/tmp/test-cert.pem".to_string(),
+                key: "/tmp/test-key.pem".to_string(),
+                ..Tls::default()
+            },
+            ..Listen::default()
+        },
+        listeners: Vec::new(),
+        upstream: upstreams,
+        load_balancing: None,
+        upstream_tls: UpstreamTls::default(),
+        log: Log::default(),
+        performance: Performance::default(),
+        observability: Observability::default(),
+        resilience: Resilience::default(),
+        security: Security::default(),
+    })
+    .expect("runtime config")
+}
+
 fn write_test_cert_for_name(dir: &Path, cert_name: &str, dns_name: &str) -> (String, String) {
     let mut params = CertificateParams::new(vec![dns_name.to_string()]);
     params
@@ -761,16 +786,24 @@ type TestRoutingContext = (
 fn test_routing_context(lb_type: &str) -> TestRoutingContext {
     let mut upstreams = HashMap::new();
     upstreams.insert("api_pool".to_string(), test_upstream(lb_type));
-    let routing_index = super::RouteIndex::from_upstreams(&upstreams);
-    let pool = super::UpstreamPool::from_upstream(upstreams.get("api_pool").expect("upstream"))
-        .expect("pool");
+    let runtime = runtime_config_with_upstreams(upstreams);
+    let routing_index = super::RouteIndex::from_runtime_upstreams(&runtime.upstreams);
+    let pool = super::UpstreamPool::from_runtime_upstream(
+        runtime.upstreams.get("api_pool").expect("upstream"),
+    )
+    .expect("pool");
     let pool = Arc::new(RwLock::new(pool));
     let mut upstream_pools = HashMap::new();
     upstream_pools.insert("api_pool".to_string(), Arc::clone(&pool));
     let mut upstream_policies = HashMap::new();
     upstream_policies.insert(
         "api_pool".to_string(),
-        spooky_config::runtime::RuntimeUpstreamPolicy::default(),
+        runtime
+            .upstreams
+            .get("api_pool")
+            .expect("upstream")
+            .policy
+            .clone(),
     );
     (upstream_pools, upstream_policies, routing_index, pool)
 }
@@ -876,16 +909,14 @@ fn resolve_backend_prefers_method_specific_route() {
     }];
     upstreams.insert("post_only".to_string(), post_only);
 
-    let routing_index = super::RouteIndex::from_upstreams(&upstreams);
+    let runtime = runtime_config_with_upstreams(upstreams);
+    let routing_index = super::RouteIndex::from_runtime_upstreams(&runtime.upstreams);
     let mut upstream_pools = HashMap::new();
     let mut upstream_policies = HashMap::new();
-    for (name, upstream) in &upstreams {
-        let pool = super::UpstreamPool::from_upstream(upstream).expect("pool");
+    for (name, upstream) in &runtime.upstreams {
+        let pool = super::UpstreamPool::from_runtime_upstream(upstream).expect("pool");
         upstream_pools.insert(name.clone(), Arc::new(RwLock::new(pool)));
-        upstream_policies.insert(
-            name.clone(),
-            spooky_config::runtime::RuntimeUpstreamPolicy::default(),
-        );
+        upstream_policies.insert(name.clone(), upstream.policy.clone());
     }
 
     let request =
@@ -920,16 +951,24 @@ fn resolve_backend_uses_configured_header_lb_key() {
             "api_pool".to_string(),
             test_upstream_with("consistent-hash", Some("header:x-user-id"), None),
         );
-        let routing_index = super::RouteIndex::from_upstreams(&upstreams);
-        let pool = super::UpstreamPool::from_upstream(upstreams.get("api_pool").expect("upstream"))
-            .expect("pool");
+        let runtime = runtime_config_with_upstreams(upstreams);
+        let routing_index = super::RouteIndex::from_runtime_upstreams(&runtime.upstreams);
+        let pool = super::UpstreamPool::from_runtime_upstream(
+            runtime.upstreams.get("api_pool").expect("upstream"),
+        )
+        .expect("pool");
         let pool = Arc::new(RwLock::new(pool));
         let mut upstream_pools = HashMap::new();
         upstream_pools.insert("api_pool".to_string(), Arc::clone(&pool));
         let mut upstream_policies = HashMap::new();
         upstream_policies.insert(
             "api_pool".to_string(),
-            spooky_config::runtime::RuntimeUpstreamPolicy::default(),
+            runtime
+                .upstreams
+                .get("api_pool")
+                .expect("upstream")
+                .policy
+                .clone(),
         );
         (upstream_pools, upstream_policies, routing_index, pool)
     };
