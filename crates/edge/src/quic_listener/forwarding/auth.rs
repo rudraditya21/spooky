@@ -465,7 +465,7 @@ impl QUICListener {
                 if let Some(pending_forward) = req.pending_forward.as_mut() {
                     merge_auth_request_mutations(
                         &mut Arc::make_mut(pending_forward).auth_header_mutations,
-                        request_header_mutations.into_iter().map(Into::into),
+                        request_header_mutations,
                     );
                 }
                 Self::materialize_forward_after_auth(stream_id, req, h3, quic, exec_ctx, shared_ctx)
