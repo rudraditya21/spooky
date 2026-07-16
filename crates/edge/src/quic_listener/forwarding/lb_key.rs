@@ -1,4 +1,5 @@
 use super::*;
+use spooky_config::runtime::{RuntimeLoadBalancingStrategy, RuntimeRequestKeySpec};
 
 struct LbKeyRequestParts<'a> {
     method: &'a str,
@@ -91,6 +92,22 @@ fn extract_query_param(path: &str, param: &str) -> Option<String> {
 }
 
 impl QUICListener {
+    pub(in crate::quic_listener::forwarding) fn resolve_lb_key_for_runtime_request(
+        lb_strategy: RuntimeLoadBalancingStrategy,
+        lb_key_spec: Option<&RuntimeRequestKeySpec>,
+        request: &super::resolve::RouteResolutionRequest<'_>,
+    ) -> ResolvedLbKey {
+        let request = LbKeyRequestParts::new(
+            request.method,
+            request.path,
+            request.authority,
+            request.cid_key,
+            None,
+            request.header_lookup,
+        );
+        Self::resolve_lb_key_for_runtime_input(lb_strategy, lb_key_spec, &request)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(in crate::quic_listener::forwarding) fn resolve_lb_key(
         lb_type: &str,
@@ -107,21 +124,44 @@ impl QUICListener {
         Self::resolve_lb_key_for_input(&LbKeyResolutionInput::new(lb_type, lb_key_spec, request))
     }
 
-    pub(in crate::quic_listener::forwarding) fn resolve_lb_key_for_route_request(
-        lb_type: &str,
-        lb_key_spec: Option<&str>,
-        request: &super::resolve::RouteResolutionRequest<'_>,
-    ) -> ResolvedLbKey {
-        Self::resolve_lb_key(
-            lb_type,
-            lb_key_spec,
-            request.method,
-            request.path,
-            request.authority,
-            request.cid_key,
-            None,
-            request.header_lookup,
-        )
+    fn resolve_lb_key_from_runtime_parts(
+        lb_key_spec: &RuntimeRequestKeySpec,
+        request: &LbKeyRequestParts<'_>,
+    ) -> Option<String> {
+        match lb_key_spec {
+            RuntimeRequestKeySpec::Path => {
+                let path_only = request
+                    .path
+                    .split_once('?')
+                    .map(|(p, _)| p)
+                    .unwrap_or(request.path);
+                Some(path_only.to_string())
+            }
+            RuntimeRequestKeySpec::Authority => request.authority.map(str::to_string),
+            RuntimeRequestKeySpec::Method => Some(request.method.to_string()),
+            RuntimeRequestKeySpec::Cid | RuntimeRequestKeySpec::StickyCid => {
+                request.cid_key.map(str::to_string)
+            }
+            RuntimeRequestKeySpec::PeerIp | RuntimeRequestKeySpec::ClientIp => {
+                request.client_addr.map(|addr| addr.ip().to_string())
+            }
+            RuntimeRequestKeySpec::BearerToken => {
+                let raw = request
+                    .header_lookup
+                    .and_then(|lookup| lookup(http::header::AUTHORIZATION.as_str()))?;
+                Self::bearer_token_from_authorization_value(&raw)
+            }
+            RuntimeRequestKeySpec::Header(key_name) => {
+                request.header_lookup.and_then(|lookup| lookup(key_name))
+            }
+            RuntimeRequestKeySpec::Cookie(cookie_name) => {
+                let cookie_header = request
+                    .header_lookup
+                    .and_then(|lookup| lookup(http::header::COOKIE.as_str()))?;
+                extract_cookie_value(cookie_header.as_str(), cookie_name)
+            }
+            RuntimeRequestKeySpec::Query(param) => extract_query_param(request.path, param),
+        }
     }
 
     fn resolve_lb_key_from_parts(
@@ -210,6 +250,38 @@ impl QUICListener {
 
         if input.lb_type == "sticky-cid"
             && let Some(cid_key) = input.request.cid_key
+        {
+            return ResolvedLbKey {
+                value: cid_key.to_string(),
+                source: LbKeySource::StickyCidFallback,
+            };
+        }
+
+        ResolvedLbKey {
+            value: default_key,
+            source: LbKeySource::DefaultFallback,
+        }
+    }
+
+    fn resolve_lb_key_for_runtime_input(
+        lb_strategy: RuntimeLoadBalancingStrategy,
+        lb_key_spec: Option<&RuntimeRequestKeySpec>,
+        request: &LbKeyRequestParts<'_>,
+    ) -> ResolvedLbKey {
+        let default_key = Self::default_lb_request_key_for_parts(request);
+
+        if let Some(spec) = lb_key_spec
+            && let Some(value) = Self::resolve_lb_key_from_runtime_parts(spec, request)
+            && !value.is_empty()
+        {
+            return ResolvedLbKey {
+                value,
+                source: LbKeySource::ConfiguredSpec,
+            };
+        }
+
+        if matches!(lb_strategy, RuntimeLoadBalancingStrategy::StickyCid)
+            && let Some(cid_key) = request.cid_key
         {
             return ResolvedLbKey {
                 value: cid_key.to_string(),

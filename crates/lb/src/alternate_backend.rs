@@ -37,25 +37,31 @@ pub fn choose_alternate_backend(
     excluded_indices: &[usize],
     lb_key: Option<&str>,
 ) -> AlternateBackendDecision {
-    let readonly_candidate = pool
-        .pick_readonly(lb_key.unwrap_or_default())
-        .filter(|index| !is_excluded(*index, excluded_indices));
-    if let Some(index) = readonly_candidate {
-        return AlternateBackendDecision::Select(AlternateBackendChoice {
-            index,
-            mode: AlternateBackendSelectionMode::LoadBalancerReadonly,
-        });
+    let policy = pool.alternate_backend_policy();
+
+    if policy.readonly_lb_pick {
+        let readonly_candidate = pool
+            .pick_readonly(lb_key.unwrap_or_default())
+            .filter(|index| !is_excluded(*index, excluded_indices));
+        if let Some(index) = readonly_candidate {
+            return AlternateBackendDecision::Select(AlternateBackendChoice {
+                index,
+                mode: AlternateBackendSelectionMode::LoadBalancerReadonly,
+            });
+        }
     }
 
-    let fallback_candidate = pool
-        .pool
-        .healthy_indices_iter()
-        .find(|index| !is_excluded(*index, excluded_indices));
-    if let Some(index) = fallback_candidate {
-        return AlternateBackendDecision::Select(AlternateBackendChoice {
-            index,
-            mode: AlternateBackendSelectionMode::HealthyFallback,
-        });
+    if policy.healthy_fallback {
+        let fallback_candidate = pool
+            .pool
+            .healthy_indices_iter()
+            .find(|index| !is_excluded(*index, excluded_indices));
+        if let Some(index) = fallback_candidate {
+            return AlternateBackendDecision::Select(AlternateBackendChoice {
+                index,
+                mode: AlternateBackendSelectionMode::HealthyFallback,
+            });
+        }
     }
 
     if pool.pool.healthy_len() == 0 {
@@ -72,6 +78,7 @@ pub fn choose_alternate_backend(
 #[cfg(test)]
 mod tests {
     use spooky_config::config::{Backend, HealthCheck, LoadBalancing, RouteMatch, Upstream};
+    use spooky_config::runtime::RuntimeAlternateBackendPolicy;
 
     use super::*;
     use crate::health::HealthFailureReason;
@@ -191,6 +198,47 @@ mod tests {
             decision,
             AlternateBackendDecision::DoNotSelect {
                 denial: AlternateBackendFailureReason::NoHealthyBackends,
+            }
+        );
+    }
+
+    #[test]
+    fn suppresses_readonly_pick_when_policy_disables_it() {
+        let mut pool = UpstreamPool::from_upstream(&upstream(
+            "round-robin",
+            &["http://a", "http://b", "http://c"],
+        ))
+        .expect("pool");
+        pool.set_alternate_backend_policy(RuntimeAlternateBackendPolicy {
+            readonly_lb_pick: false,
+            healthy_fallback: true,
+        });
+
+        let decision = choose_alternate_backend(&pool, &[0], None);
+        assert_eq!(
+            decision,
+            AlternateBackendDecision::Select(AlternateBackendChoice {
+                index: 1,
+                mode: AlternateBackendSelectionMode::HealthyFallback,
+            })
+        );
+    }
+
+    #[test]
+    fn reports_excluded_backends_when_all_failover_modes_are_disabled() {
+        let mut pool =
+            UpstreamPool::from_upstream(&upstream("round-robin", &["http://a", "http://b"]))
+                .expect("pool");
+        pool.set_alternate_backend_policy(RuntimeAlternateBackendPolicy {
+            readonly_lb_pick: false,
+            healthy_fallback: false,
+        });
+
+        let decision = choose_alternate_backend(&pool, &[0], None);
+        assert_eq!(
+            decision,
+            AlternateBackendDecision::DoNotSelect {
+                denial: AlternateBackendFailureReason::OnlyExcludedBackendsHealthy,
             }
         );
     }

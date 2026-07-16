@@ -1683,9 +1683,11 @@ mod tests {
             None,
             Some(&lookup),
         );
-        let routed_header = QUICListener::resolve_lb_key_for_route_request(
-            "",
-            Some("header:x-user-id"),
+        let routed_header = QUICListener::resolve_lb_key_for_runtime_request(
+            spooky_config::runtime::RuntimeLoadBalancingStrategy::RoundRobin,
+            Some(&spooky_config::runtime::RuntimeRequestKeySpec::Header(
+                "x-user-id".to_string(),
+            )),
             &route_request,
         );
         assert_eq!(direct_header.value, routed_header.value);
@@ -1704,9 +1706,11 @@ mod tests {
             None,
             Some(&lookup),
         );
-        let routed_sticky = QUICListener::resolve_lb_key_for_route_request(
-            "sticky-cid",
-            Some("header:x-missing"),
+        let routed_sticky = QUICListener::resolve_lb_key_for_runtime_request(
+            spooky_config::runtime::RuntimeLoadBalancingStrategy::StickyCid,
+            Some(&spooky_config::runtime::RuntimeRequestKeySpec::Header(
+                "x-missing".to_string(),
+            )),
             &route_request,
         );
         assert_eq!(direct_sticky.value, routed_sticky.value);

@@ -335,12 +335,18 @@ impl QUICListener {
         request: &RouteResolutionRequest<'_>,
         pool: &UpstreamPool,
     ) -> BackendSelectionPlan {
-        let lb_type = pool.lb_name().to_string();
         let ResolvedLbKey {
             value: lb_key,
             source: _lb_key_source,
-        } = Self::resolve_lb_key_for_route_request(&lb_type, pool.lb_key(), request);
-        BackendSelectionPlan { lb_type, lb_key }
+        } = Self::resolve_lb_key_for_runtime_request(
+            pool.lb_strategy(),
+            pool.lb_key_spec(),
+            request,
+        );
+        BackendSelectionPlan {
+            lb_type: pool.lb_strategy().canonical_name().to_string(),
+            lb_key,
+        }
     }
 
     fn no_servers_in_upstream_error() -> ProxyError {
