@@ -16,7 +16,9 @@ pub(in crate::quic_listener) use self::resolve::BootstrapResolutionInput;
 #[cfg(test)]
 pub(in crate::quic_listener) use self::resolve::RouteResolutionRequest as TestRouteResolutionRequest;
 use super::*;
-use crate::runtime::connection::{request::PendingForward, stream::StreamAdmissionState};
+use crate::runtime::connection::{
+    outcome::classify_status_outcome, request::PendingForward, stream::StreamAdmissionState,
+};
 
 pub(super) fn abort_stream(req: &mut RequestEnvelope, metrics: &Metrics) -> StreamPhase {
     let phase = req.phase.clone();
@@ -157,11 +159,11 @@ impl QUICListener {
     }
 
     fn request_metrics_outcome_for_status(status: StatusCode) -> (bool, RouteOutcome) {
-        if status.is_server_error() {
-            (false, RouteOutcome::Failure)
-        } else {
-            (true, RouteOutcome::Success)
-        }
+        let decision = classify_status_outcome(status);
+        (
+            matches!(decision.route_outcome, crate::runtime::connection::outcome::CanonicalRouteOutcome::Success),
+            decision.route_outcome.as_metrics_outcome(),
+        )
     }
 
     fn log_access(req: &RequestEnvelope, status: u16) {
