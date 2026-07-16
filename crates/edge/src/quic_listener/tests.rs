@@ -1174,7 +1174,7 @@ fn response_size_cap_enforced_as_running_total() {
         unknown_length_prebuffer_bytes: 10,
         chunk_bytes: 4,
     };
-    assert!(matches!(
+    assert!(
         checked_response_body_guardrails(
             config,
             ResponseBodyGuardrailInput {
@@ -1189,10 +1189,10 @@ fn response_size_cap_enforced_as_running_total() {
                 body_forwarding_enabled: true,
                 exempt_from_body_size_cap: false,
             },
-        ),
-        Ok(_)
-    ));
-    assert!(matches!(
+        )
+        .is_ok()
+    );
+    assert!(
         checked_response_body_guardrails(
             config,
             ResponseBodyGuardrailInput {
@@ -1207,9 +1207,9 @@ fn response_size_cap_enforced_as_running_total() {
                 body_forwarding_enabled: true,
                 exempt_from_body_size_cap: false,
             },
-        ),
-        Ok(_)
-    ));
+        )
+        .is_ok()
+    );
     assert_eq!(
         checked_response_body_guardrails(
             config,
