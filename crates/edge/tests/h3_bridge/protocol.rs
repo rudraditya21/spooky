@@ -670,6 +670,7 @@ fn grpc_timeout_returns_recoverable_proxy_error() {
     let backend_addr = rt.block_on(start_h2_backend_with_grpc_routes());
     let mut config = make_config(0, backend_addr.to_string(), cert, key);
     config.performance.backend_timeout_ms = 150;
+    config.performance.backend_connect_timeout_ms = 150;
     let listener = QUICListener::new(config).expect("failed to create listener");
     let listen_addr = listener.socket.local_addr().unwrap();
     let _listener_task = ListenerTaskGuard::spawn(&rt, listener);

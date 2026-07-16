@@ -2934,6 +2934,7 @@ fn request_body_idle_timeout_returns_408() {
     let backend_addr = rt.block_on(start_h2_backend());
     let mut config = make_config(0, backend_addr.to_string(), cert, key);
     config.performance.client_body_idle_timeout_ms = 120;
+    config.performance.backend_body_total_timeout_ms = 10_000;
     config.performance.backend_total_request_timeout_ms = 10_000;
 
     let listener = QUICListener::new(config).expect("failed to create listener");
@@ -3209,8 +3210,10 @@ fn long_stream_survives_body_total_timeout_after_progress() {
     let rt = tokio::runtime::Runtime::new().expect("runtime");
     let backend_addr = rt.block_on(start_h2_backend_with_regression_routes());
     let mut config = make_config(0, backend_addr.to_string(), cert, key);
+    config.performance.backend_timeout_ms = 240;
+    config.performance.backend_connect_timeout_ms = 240;
     config.performance.backend_body_total_timeout_ms = 250;
-    config.performance.backend_body_idle_timeout_ms = 500;
+    config.performance.backend_body_idle_timeout_ms = 240;
     config.performance.backend_total_request_timeout_ms = 5_000;
     let listener = QUICListener::new(config).expect("failed to create listener");
     let listen_addr = listener.socket.local_addr().unwrap();
@@ -3765,6 +3768,7 @@ fn backend_timeout_respects_configured_performance_value() {
     let backend_addr = rt.block_on(start_h2_backend_with_regression_routes());
     let mut config = make_config(0, backend_addr.to_string(), cert, key);
     config.performance.backend_timeout_ms = 150;
+    config.performance.backend_connect_timeout_ms = 150;
 
     let listener = QUICListener::new(config).expect("failed to create listener");
     let listen_addr = listener.socket.local_addr().unwrap();
@@ -3841,6 +3845,7 @@ fn chaos_packet_loss_like_timeout_maps_to_recoverable_response() {
     let backend_addr = rt.block_on(start_h2_backend_with_chaos_routes());
     let mut config = make_config(0, backend_addr.to_string(), cert, key);
     config.performance.backend_timeout_ms = 120;
+    config.performance.backend_connect_timeout_ms = 120;
 
     let listener = QUICListener::new(config).expect("failed to create listener");
     let listen_addr = listener.socket.local_addr().unwrap();
@@ -3953,6 +3958,7 @@ fn chaos_partial_outage_preserves_some_availability() {
     ];
     let mut config = make_config_with_backends(0, backends, "round-robin", cert, key);
     config.performance.backend_timeout_ms = 250;
+    config.performance.backend_connect_timeout_ms = 250;
 
     let listener = QUICListener::new(config).expect("failed to create listener");
     let listen_addr = listener.socket.local_addr().unwrap();
@@ -4088,6 +4094,7 @@ fn response_body_cap_returns_503_on_declared_length_breach() {
     // Cap at 1 KiB — far below the 8 KiB the backend will send.
     let mut config = make_config(0, backend_addr.to_string(), cert, key);
     config.performance.max_response_body_bytes = 1024;
+    config.performance.unknown_length_response_prebuffer_bytes = 1024;
 
     let listener = QUICListener::new(config).expect("failed to create listener");
     let listen_addr = listener.socket.local_addr().unwrap();
@@ -4276,6 +4283,7 @@ fn response_body_cap_returns_503_on_unknown_length_breach() {
 
     let mut config = make_config(0, backend_addr.to_string(), cert, key);
     config.performance.max_response_body_bytes = 1024;
+    config.performance.unknown_length_response_prebuffer_bytes = 1024;
 
     let listener = QUICListener::new(config).expect("failed to create listener");
     let listen_addr = listener.socket.local_addr().unwrap();
@@ -4858,6 +4866,7 @@ fn teardown_upstream_timeout_cleans_up_stream() {
     let mut config = make_config(0, backend_addr.to_string(), cert, key);
     // Use a short timeout so the test doesn't wait long.
     config.performance.backend_timeout_ms = 200;
+    config.performance.backend_connect_timeout_ms = 200;
 
     let listener = QUICListener::new(config).expect("listener");
     let listen_addr = listener.socket.local_addr().unwrap();

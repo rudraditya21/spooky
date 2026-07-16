@@ -1,4 +1,9 @@
-use spooky_config::config::{Backend, HealthCheck, LoadBalancing, RouteMatch, Upstream};
+use std::collections::HashMap;
+
+use spooky_config::{
+    config::{Backend, Config, HealthCheck, Listen, LoadBalancing, RouteMatch, Tls, Upstream},
+    runtime::{RuntimeConfig, RuntimeUpstream},
+};
 use spooky_lb::upstream_pool::UpstreamPool;
 
 use crate::{
@@ -80,8 +85,40 @@ fn build_lb_upstream(scale: usize, lb_type: &str) -> Upstream {
     }
 }
 
+fn build_runtime_lb_upstream(scale: usize, lb_type: &str) -> Result<RuntimeUpstream, String> {
+    let mut upstreams = HashMap::new();
+    upstreams.insert("bench".to_string(), build_lb_upstream(scale, lb_type));
+
+    RuntimeConfig::from_config(&Config {
+        version: 1,
+        listen: Listen {
+            protocol: "http1".to_string(),
+            tls: Tls {
+                cert: "/tmp/test-cert.pem".to_string(),
+                key: "/tmp/test-key.pem".to_string(),
+                ..Tls::default()
+            },
+            ..Listen::default()
+        },
+        listeners: Vec::new(),
+        upstream: upstreams,
+        load_balancing: None,
+        upstream_tls: Default::default(),
+        log: Default::default(),
+        performance: Default::default(),
+        observability: Default::default(),
+        resilience: Default::default(),
+        security: Default::default(),
+    })
+    .map_err(|err| format!("failed to normalize benchmark upstream '{lb_type}': {err}"))?
+    .upstreams
+    .remove("bench")
+    .ok_or_else(|| "missing normalized benchmark upstream".to_string())
+}
+
 pub fn build_lb_pool(scale: usize, lb_type: &str) -> Result<UpstreamPool, String> {
-    UpstreamPool::from_upstream(&build_lb_upstream(scale, lb_type))
+    let runtime_upstream = build_runtime_lb_upstream(scale, lb_type)?;
+    UpstreamPool::from_runtime_upstream(&runtime_upstream)
         .map_err(|err| format!("failed to build LB pool '{lb_type}' for scale {scale}: {err}"))
 }
 
