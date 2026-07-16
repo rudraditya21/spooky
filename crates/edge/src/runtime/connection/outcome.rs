@@ -106,6 +106,16 @@ pub struct RequestOutcomeDecision {
     pub health_effect: HealthEffectHint,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct RequestMetricsObservation<'a> {
+    pub route_target: OutcomeRouteTarget<'a>,
+    pub backend_target: Option<OutcomeBackendTarget<'a>>,
+    pub elapsed: Duration,
+    pub status: Option<u16>,
+    pub metrics_outcome: RouteOutcome,
+    pub overload_reason: Option<OverloadShedReason>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AdmissionOutcomeClass {
     AuthDenied,
@@ -313,6 +323,41 @@ pub fn classify_request_outcome(input: RequestOutcomeInput<'_>) -> RequestOutcom
         overload_reason: decision.overload_reason,
         health_effect: decision.health_effect,
     }
+}
+
+pub fn record_request_metrics_observation(
+    metrics: &crate::Metrics,
+    observation: RequestMetricsObservation<'_>,
+) {
+    let RequestMetricsObservation {
+        route_target,
+        backend_target,
+        elapsed,
+        status,
+        metrics_outcome,
+        overload_reason,
+    } = observation;
+
+    if !matches!(metrics_outcome, RouteOutcome::Success) {
+        metrics.inc_failure();
+    }
+
+    if matches!(metrics_outcome, RouteOutcome::OverloadShed) {
+        if let Some(reason) = overload_reason {
+            metrics.inc_overload_shed_reason(reason);
+        } else {
+            metrics.inc_overload_shed();
+        }
+    }
+
+    metrics.record_route(route_target.route, elapsed, metrics_outcome);
+    metrics.record_request_result(
+        route_target.route,
+        backend_target.and_then(|target| target.backend_addr),
+        status,
+        metrics_outcome,
+        elapsed,
+    );
 }
 
 #[cfg(test)]

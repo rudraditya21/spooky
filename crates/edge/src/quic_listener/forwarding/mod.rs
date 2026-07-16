@@ -17,7 +17,13 @@ pub(in crate::quic_listener) use self::resolve::BootstrapResolutionInput;
 pub(in crate::quic_listener) use self::resolve::RouteResolutionRequest as TestRouteResolutionRequest;
 use super::*;
 use crate::runtime::connection::{
-    outcome::classify_status_outcome, request::PendingForward, stream::StreamAdmissionState,
+    outcome::{
+        OutcomeBackendTarget, OutcomeRouteTarget, RequestMetricsObservation,
+        classify_status_outcome,
+        record_request_metrics_observation,
+    },
+    request::PendingForward,
+    stream::StreamAdmissionState,
 };
 
 pub(super) fn abort_stream(req: &mut RequestEnvelope, metrics: &Metrics) -> StreamPhase {
@@ -255,13 +261,24 @@ impl QUICListener {
         req: &RequestEnvelope,
         status: Option<u16>,
         outcome: RouteOutcome,
+        overload_reason: Option<OverloadShedReason>,
     ) {
-        metrics.record_request_result(
-            req.upstream_name.as_deref().unwrap_or("unrouted"),
-            req.backend_addr.as_deref(),
-            status,
-            outcome,
-            req.start.elapsed(),
+        record_request_metrics_observation(
+            metrics,
+            RequestMetricsObservation {
+                route_target: OutcomeRouteTarget {
+                    route: req.upstream_name.as_deref().unwrap_or("unrouted"),
+                },
+                backend_target: Some(OutcomeBackendTarget {
+                    upstream: req.upstream_name.as_deref().unwrap_or("unrouted"),
+                    backend_addr: req.backend_addr.as_deref(),
+                    backend_index: req.backend_index,
+                }),
+                elapsed: req.start.elapsed(),
+                status,
+                metrics_outcome: outcome,
+                overload_reason,
+            },
         );
     }
 

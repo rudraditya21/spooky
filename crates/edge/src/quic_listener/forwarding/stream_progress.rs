@@ -784,16 +784,13 @@ impl QUICListener {
                                 Self::request_metrics_outcome_for_status(status);
                             if is_success {
                                 metrics.inc_success();
-                            } else {
-                                metrics.inc_failure();
                             }
-                            let route_label = req.upstream_name.as_deref().unwrap_or("unrouted");
-                            metrics.record_route(route_label, req.start.elapsed(), route_outcome);
                             Self::record_request_observation(
                                 metrics,
                                 req,
                                 Some(status.as_u16()),
                                 route_outcome,
+                                None,
                             );
                             resilience
                                 .adaptive_admission

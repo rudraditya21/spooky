@@ -21,14 +21,10 @@ impl QUICListener {
         let routing_index = shared_ctx.routing_index;
         let upstream_pools = shared_ctx.upstream_pools;
         let overload_retry_after_seconds = shared_ctx.resilience.shed_retry_after_seconds;
-        let start = req.start;
-        let route_label = req.upstream_name.as_deref().unwrap_or("unrouted");
 
         let (backend_addr, backend_index) = match (&req.backend_addr, req.backend_index) {
             (Some(a), Some(i)) => (a.as_str(), i),
             _ => {
-                metrics.inc_failure();
-                metrics.record_route(route_label, start.elapsed(), RouteOutcome::Failure);
                 Self::record_request_observation(
                     metrics,
                     req,
@@ -38,6 +34,7 @@ impl QUICListener {
                         http::StatusCode::SERVICE_UNAVAILABLE.as_u16()
                     }),
                     RouteOutcome::Failure,
+                    None,
                 );
                 return Self::send_simple_response(
                     h3,
@@ -63,14 +60,13 @@ impl QUICListener {
         match result {
             Ok(_) => {
                 error!("Unexpected successful forward result in error handler path");
-                metrics.inc_failure();
                 metrics.inc_backend_error();
-                metrics.record_route(route_label, start.elapsed(), RouteOutcome::BackendError);
                 Self::record_request_observation(
                     metrics,
                     req,
                     Some(http::StatusCode::BAD_GATEWAY.as_u16()),
                     RouteOutcome::BackendError,
+                    None,
                 );
                 Self::send_simple_response(
                     h3,
@@ -82,13 +78,12 @@ impl QUICListener {
             }
             Err(ProxyError::Bridge(err)) => {
                 error!("Bridge error: {:?}", err);
-                metrics.inc_failure();
-                metrics.record_route(route_label, start.elapsed(), RouteOutcome::Failure);
                 Self::record_request_observation(
                     metrics,
                     req,
                     Some(http::StatusCode::BAD_REQUEST.as_u16()),
                     RouteOutcome::Failure,
+                    None,
                 );
                 Self::log_access(req, 400);
                 Self::send_simple_response(
@@ -100,19 +95,19 @@ impl QUICListener {
                 )
             }
             Err(ProxyError::Pool(PoolError::BackendOverloaded(reason))) => {
-                metrics.inc_failure();
-                if is_unknown_length_response_prebuffer_reason(&reason) {
-                    metrics.inc_response_prebuffer_limit_reject();
-                    metrics.inc_overload_shed_reason(OverloadShedReason::ResponsePrebufferCap);
-                } else {
-                    metrics.inc_overload_shed_reason(OverloadShedReason::BackendInflight);
-                }
-                metrics.record_route(route_label, start.elapsed(), RouteOutcome::OverloadShed);
+                let overload_reason =
+                    if is_unknown_length_response_prebuffer_reason(&reason) {
+                        metrics.inc_response_prebuffer_limit_reject();
+                        OverloadShedReason::ResponsePrebufferCap
+                    } else {
+                        OverloadShedReason::BackendInflight
+                    };
                 Self::record_request_observation(
                     metrics,
                     req,
                     Some(http::StatusCode::SERVICE_UNAVAILABLE.as_u16()),
                     RouteOutcome::OverloadShed,
+                    Some(overload_reason),
                 );
                 Self::log_access(req, 503);
                 Self::send_overload_response(
@@ -124,15 +119,13 @@ impl QUICListener {
                 )
             }
             Err(ProxyError::Pool(PoolError::CircuitOpen(_))) => {
-                metrics.inc_failure();
                 metrics.inc_circuit_breaker_rejected();
-                metrics.inc_overload_shed_reason(OverloadShedReason::CircuitOpen);
-                metrics.record_route(route_label, start.elapsed(), RouteOutcome::OverloadShed);
                 Self::record_request_observation(
                     metrics,
                     req,
                     Some(http::StatusCode::SERVICE_UNAVAILABLE.as_u16()),
                     RouteOutcome::OverloadShed,
+                    Some(OverloadShedReason::CircuitOpen),
                 );
                 Self::log_access(req, 503);
                 Self::send_overload_response(
@@ -155,14 +148,13 @@ impl QUICListener {
                     }
                     _ => {}
                 }
-                metrics.inc_failure();
                 metrics.inc_backend_error();
-                metrics.record_route(route_label, start.elapsed(), RouteOutcome::BackendError);
                 Self::record_request_observation(
                     metrics,
                     req,
                     Some(http::StatusCode::BAD_GATEWAY.as_u16()),
                     RouteOutcome::BackendError,
+                    None,
                 );
                 Self::log_access(req, 502);
                 Self::send_simple_response(
@@ -182,14 +174,13 @@ impl QUICListener {
                         backend_addr,
                         err
                     );
-                    metrics.inc_failure();
                     metrics.inc_backend_error();
-                    metrics.record_route(route_label, start.elapsed(), RouteOutcome::BackendError);
                     Self::record_request_observation(
                         metrics,
                         req,
                         Some(http::StatusCode::BAD_GATEWAY.as_u16()),
                         RouteOutcome::BackendError,
+                        None,
                     );
                     Self::log_access(req, 502);
                     return Self::send_simple_response(
@@ -218,14 +209,13 @@ impl QUICListener {
 
                 match classified.kind {
                     UpstreamProxyErrorKind::Timeout => {
-                        metrics.inc_failure();
                         metrics.inc_timeout();
-                        metrics.record_route(route_label, start.elapsed(), RouteOutcome::Timeout);
                         Self::record_request_observation(
                             metrics,
                             req,
                             Some(http::StatusCode::SERVICE_UNAVAILABLE.as_u16()),
                             RouteOutcome::Timeout,
+                            None,
                         );
                         Self::log_access(req, 503);
                         Self::send_simple_response(
@@ -237,13 +227,12 @@ impl QUICListener {
                         )
                     }
                     UpstreamProxyErrorKind::Tls => {
-                        metrics.inc_failure();
-                        metrics.record_route(route_label, start.elapsed(), RouteOutcome::Failure);
                         Self::record_request_observation(
                             metrics,
                             req,
                             Some(http::StatusCode::INTERNAL_SERVER_ERROR.as_u16()),
                             RouteOutcome::Failure,
+                            None,
                         );
                         Self::log_access(req, 500);
                         Self::send_simple_response(
@@ -255,18 +244,13 @@ impl QUICListener {
                         )
                     }
                     UpstreamProxyErrorKind::Protocol => {
-                        metrics.inc_failure();
                         metrics.inc_backend_error();
-                        metrics.record_route(
-                            route_label,
-                            start.elapsed(),
-                            RouteOutcome::BackendError,
-                        );
                         Self::record_request_observation(
                             metrics,
                             req,
                             Some(http::StatusCode::BAD_GATEWAY.as_u16()),
                             RouteOutcome::BackendError,
+                            None,
                         );
                         Self::log_access(req, 502);
                         Self::send_simple_response(
@@ -278,18 +262,13 @@ impl QUICListener {
                         )
                     }
                     UpstreamProxyErrorKind::Send | UpstreamProxyErrorKind::Transport => {
-                        metrics.inc_failure();
                         metrics.inc_backend_error();
-                        metrics.record_route(
-                            route_label,
-                            start.elapsed(),
-                            RouteOutcome::BackendError,
-                        );
                         Self::record_request_observation(
                             metrics,
                             req,
                             Some(http::StatusCode::BAD_GATEWAY.as_u16()),
                             RouteOutcome::BackendError,
+                            None,
                         );
                         Self::log_access(req, 502);
                         Self::send_simple_response(
@@ -518,19 +497,13 @@ impl QUICListener {
                                 stream_id, err
                             );
                             req.phase = StreamPhase::Failed;
-                            metrics.inc_failure();
                             metrics.inc_backend_error();
-                            let route_label = req.upstream_name.as_deref().unwrap_or("unrouted");
-                            metrics.record_route(
-                                route_label,
-                                req.start.elapsed(),
-                                RouteOutcome::BackendError,
-                            );
                             Self::record_request_observation(
                                 metrics,
                                 req,
                                 Some(status.as_u16()),
                                 RouteOutcome::BackendError,
+                                None,
                             );
                             resilience
                                 .adaptive_admission
@@ -552,19 +525,13 @@ impl QUICListener {
                             stream_id, err
                         );
                         req.phase = StreamPhase::Failed;
-                        metrics.inc_failure();
                         metrics.inc_backend_error();
-                        let route_label = req.upstream_name.as_deref().unwrap_or("unrouted");
-                        metrics.record_route(
-                            route_label,
-                            req.start.elapsed(),
-                            RouteOutcome::BackendError,
-                        );
                         Self::record_request_observation(
                             metrics,
                             req,
                             req.response_status,
                             RouteOutcome::BackendError,
+                            None,
                         );
                         resilience
                             .adaptive_admission
@@ -590,19 +557,13 @@ impl QUICListener {
                                 stream_id, err
                             );
                             req.phase = StreamPhase::Failed;
-                            metrics.inc_failure();
                             metrics.inc_backend_error();
-                            let route_label = req.upstream_name.as_deref().unwrap_or("unrouted");
-                            metrics.record_route(
-                                route_label,
-                                req.start.elapsed(),
-                                RouteOutcome::BackendError,
-                            );
                             Self::record_request_observation(
                                 metrics,
                                 req,
                                 req.response_status,
                                 RouteOutcome::BackendError,
+                                None,
                             );
                             resilience
                                 .adaptive_admission
@@ -628,19 +589,13 @@ impl QUICListener {
                             stream_id, err
                         );
                         req.phase = StreamPhase::Failed;
-                        metrics.inc_failure();
                         metrics.inc_backend_error();
-                        let route_label = req.upstream_name.as_deref().unwrap_or("unrouted");
-                        metrics.record_route(
-                            route_label,
-                            req.start.elapsed(),
-                            RouteOutcome::BackendError,
-                        );
                         Self::record_request_observation(
                             metrics,
                             req,
                             req.response_status,
                             RouteOutcome::BackendError,
+                            None,
                         );
                         resilience
                             .adaptive_admission
@@ -696,20 +651,14 @@ impl QUICListener {
                     }
                     match err {
                         ProxyError::Timeout => {
-                            metrics.inc_failure();
                             metrics.inc_timeout();
-                            let route_label = req.upstream_name.as_deref().unwrap_or("unrouted");
-                            metrics.record_route(
-                                route_label,
-                                req.start.elapsed(),
-                                RouteOutcome::Timeout,
-                            );
                             Self::record_request_observation(
                                 metrics,
                                 req,
                                 req.response_status
                                     .or(Some(http::StatusCode::SERVICE_UNAVAILABLE.as_u16())),
                                 RouteOutcome::Timeout,
+                                None,
                             );
                             resilience
                                 .adaptive_admission
@@ -721,28 +670,20 @@ impl QUICListener {
                             );
                         }
                         ProxyError::Pool(PoolError::BackendOverloaded(reason)) => {
-                            metrics.inc_failure();
-                            if is_unknown_length_response_prebuffer_reason(&reason) {
-                                metrics.inc_response_prebuffer_limit_reject();
-                                metrics.inc_overload_shed_reason(
-                                    OverloadShedReason::ResponsePrebufferCap,
-                                );
-                            } else {
-                                metrics
-                                    .inc_overload_shed_reason(OverloadShedReason::BackendInflight);
-                            }
-                            let route_label = req.upstream_name.as_deref().unwrap_or("unrouted");
-                            metrics.record_route(
-                                route_label,
-                                req.start.elapsed(),
-                                RouteOutcome::OverloadShed,
-                            );
+                            let overload_reason =
+                                if is_unknown_length_response_prebuffer_reason(&reason) {
+                                    metrics.inc_response_prebuffer_limit_reject();
+                                    OverloadShedReason::ResponsePrebufferCap
+                                } else {
+                                    OverloadShedReason::BackendInflight
+                                };
                             Self::record_request_observation(
                                 metrics,
                                 req,
                                 req.response_status
                                     .or(Some(http::StatusCode::SERVICE_UNAVAILABLE.as_u16())),
                                 RouteOutcome::OverloadShed,
+                                Some(overload_reason),
                             );
                             resilience
                                 .adaptive_admission
@@ -754,20 +695,14 @@ impl QUICListener {
                             );
                         }
                         _ => {
-                            metrics.inc_failure();
                             metrics.inc_backend_error();
-                            let route_label = req.upstream_name.as_deref().unwrap_or("unrouted");
-                            metrics.record_route(
-                                route_label,
-                                req.start.elapsed(),
-                                RouteOutcome::BackendError,
-                            );
                             Self::record_request_observation(
                                 metrics,
                                 req,
                                 req.response_status
                                     .or(Some(http::StatusCode::BAD_GATEWAY.as_u16())),
                                 RouteOutcome::BackendError,
+                                None,
                             );
                             resilience
                                 .adaptive_admission
