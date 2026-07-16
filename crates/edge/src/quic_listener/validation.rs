@@ -11,6 +11,7 @@ pub(super) struct RequestValidationResult {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RequestBufferError {
+    BodySizeCap,
     StreamCap,
     GlobalCap,
 }

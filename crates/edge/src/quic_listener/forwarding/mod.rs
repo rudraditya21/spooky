@@ -923,10 +923,23 @@ impl QUICListener {
                                                     max_request_body_bytes,
                                                     request_buffer_global_cap_bytes,
                                                 ) {
-                                                    shed_due_to_buffer_pressure = true;
-                                                    metrics.inc_request_buffer_limit_reject();
-                                                    if err == RequestBufferError::GlobalCap {
-                                                        debug!("global request buffer cap reached");
+                                                    if err == RequestBufferError::BodySizeCap {
+                                                        payload_too_large = Some((
+                                                            req.upstream_name
+                                                                .clone()
+                                                                .unwrap_or_else(|| {
+                                                                    "unrouted".to_string()
+                                                                }),
+                                                            req.start.elapsed(),
+                                                        ));
+                                                    } else {
+                                                        shed_due_to_buffer_pressure = true;
+                                                        metrics.inc_request_buffer_limit_reject();
+                                                        if err == RequestBufferError::GlobalCap {
+                                                            debug!(
+                                                                "global request buffer cap reached"
+                                                            );
+                                                        }
                                                     }
                                                     break;
                                                 }

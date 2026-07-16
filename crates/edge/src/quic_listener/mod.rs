@@ -1862,7 +1862,17 @@ impl QUICListener {
         );
         let Ok(next_state) = next_state else {
             metrics.release_request_buffer(chunk_len);
-            return Err(RequestBufferError::StreamCap);
+            return Err(match next_state {
+                Err(RequestBodyGuardrailDecision::Reject {
+                    kind: BodyLimitKind::BodySizeCap,
+                }) => RequestBufferError::BodySizeCap,
+                Err(RequestBodyGuardrailDecision::Reject { .. }) => RequestBufferError::StreamCap,
+                Err(other) => unreachable!(
+                    "request ingress should not timeout in enqueue path: {:?}",
+                    other
+                ),
+                Ok(_) => unreachable!("handled Ok state before request buffer error mapping"),
+            });
         };
         req.body_buf_bytes = next_state.buffered_bytes;
         req.body_buf.push_back(chunk);
