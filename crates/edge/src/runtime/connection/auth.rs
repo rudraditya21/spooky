@@ -41,16 +41,16 @@ impl ExternalAuthExecutionPolicy {
     pub(crate) fn from_external_auth(value: &RuntimeExternalAuth) -> Self {
         match value {
             RuntimeExternalAuth::Http {
-                timeout_ms,
+                timeout,
                 failure_mode,
                 ..
             }
             | RuntimeExternalAuth::Oidc {
-                timeout_ms,
+                timeout,
                 failure_mode,
                 ..
             } => Self {
-                timeout: Duration::from_millis((*timeout_ms).max(1)),
+                timeout: *timeout,
                 failure_mode: *failure_mode,
             },
         }
@@ -1014,7 +1014,7 @@ mod tests {
             endpoint: "http://127.0.0.1:9000/auth".to_string(),
             request_headers: Vec::new(),
             response_header_allowlist: Vec::new(),
-            timeout_ms: 250,
+            timeout: Duration::from_millis(250),
             failure_mode: RuntimeExternalAuthFailureMode::FailOpen,
         };
 

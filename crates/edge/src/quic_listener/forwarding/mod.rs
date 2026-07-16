@@ -1422,7 +1422,7 @@ mod tests {
                     secret: "jwt-secret".to_string(),
                     issuer: Some("issuer-1".to_string()),
                     audience: Some("aud-1".to_string()),
-                    clock_skew_secs: 30,
+                    clock_skew: Duration::from_secs(30),
                 }),
                 external_auth: None,
                 required_scopes: Vec::new(),
@@ -1454,7 +1454,7 @@ mod tests {
             secret: "wrong".to_string(),
             issuer: Some("issuer-1".to_string()),
             audience: Some("aud-1".to_string()),
-            clock_skew_secs: 30,
+            clock_skew: Duration::from_secs(30),
         };
         assert!(
             super::super::admission::validated_hs256_jwt_claims(token.as_str(), &wrong_secret, now)
@@ -1473,7 +1473,7 @@ mod tests {
                     secret: "jwt-secret".to_string(),
                     issuer: None,
                     audience: None,
-                    clock_skew_secs: 0,
+                    clock_skew: Duration::ZERO,
                 },
                 now
             )

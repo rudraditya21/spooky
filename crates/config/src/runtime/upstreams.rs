@@ -2,183 +2,6 @@ use super::*;
 
 type RouteMatcherKey = (Option<String>, Option<String>, Option<String>);
 
-fn runtime_external_auth_request_headers(
-    headers: &[crate::config::ExternalAuthRequestHeader],
-) -> Vec<RuntimeExternalAuthRequestHeader> {
-    headers
-        .iter()
-        .map(|header| RuntimeExternalAuthRequestHeader {
-            name: header.name.clone(),
-            value: header.value.clone(),
-        })
-        .collect()
-}
-
-fn runtime_external_auth_failure_mode(
-    mode: crate::config::ExternalAuthFailureMode,
-) -> RuntimeExternalAuthFailureMode {
-    match mode {
-        crate::config::ExternalAuthFailureMode::FailOpen => {
-            RuntimeExternalAuthFailureMode::FailOpen
-        }
-        crate::config::ExternalAuthFailureMode::FailClosed => {
-            RuntimeExternalAuthFailureMode::FailClosed
-        }
-    }
-}
-
-fn config_external_auth_failure_mode(
-    mode: RuntimeExternalAuthFailureMode,
-) -> crate::config::ExternalAuthFailureMode {
-    match mode {
-        RuntimeExternalAuthFailureMode::FailOpen => {
-            crate::config::ExternalAuthFailureMode::FailOpen
-        }
-        RuntimeExternalAuthFailureMode::FailClosed => {
-            crate::config::ExternalAuthFailureMode::FailClosed
-        }
-    }
-}
-
-fn runtime_auth_policy(auth: &crate::config::RouteAuth) -> RuntimeAuthPolicy {
-    let api_key = auth.api_key.as_ref().map(|api_key| RuntimeApiKeyAuth {
-        header_name: api_key.header_name.clone(),
-        keys: api_key.keys.clone(),
-    });
-    let jwt = auth.jwt.as_ref().map(|jwt| RuntimeJwtAuth {
-        secret: jwt.secret.clone(),
-        issuer: jwt.issuer.clone(),
-        audience: jwt.audience.clone(),
-        clock_skew_secs: jwt.clock_skew_secs,
-    });
-    let external_auth = auth
-        .external_auth
-        .as_ref()
-        .map(|external_auth| match external_auth {
-            crate::config::ExternalAuth::Http {
-                endpoint,
-                request_headers,
-                response_header_allowlist,
-                timeout_ms,
-                failure_mode,
-            } => RuntimeExternalAuth::Http {
-                endpoint: endpoint.clone(),
-                request_headers: runtime_external_auth_request_headers(request_headers),
-                response_header_allowlist: response_header_allowlist.clone(),
-                timeout_ms: *timeout_ms,
-                failure_mode: runtime_external_auth_failure_mode(*failure_mode),
-            },
-            crate::config::ExternalAuth::Oidc {
-                discovery_url,
-                issuer_url,
-                client_id,
-                client_secret,
-                audience,
-                scopes,
-                request_headers,
-                response_header_allowlist,
-                timeout_ms,
-                failure_mode,
-            } => RuntimeExternalAuth::Oidc {
-                discovery_url: discovery_url.clone(),
-                issuer_url: issuer_url.clone(),
-                client_id: client_id.clone(),
-                client_secret: client_secret.clone(),
-                audience: audience.clone(),
-                scopes: scopes.clone(),
-                request_headers: runtime_external_auth_request_headers(request_headers),
-                response_header_allowlist: response_header_allowlist.clone(),
-                timeout_ms: *timeout_ms,
-                failure_mode: runtime_external_auth_failure_mode(*failure_mode),
-            },
-        });
-
-    RuntimeAuthPolicy {
-        api_key,
-        jwt,
-        external_auth,
-        required_scopes: auth.required_scopes.clone(),
-        required_roles: auth.required_roles.clone(),
-    }
-}
-
-fn config_external_auth_request_headers(
-    headers: &[RuntimeExternalAuthRequestHeader],
-) -> Vec<crate::config::ExternalAuthRequestHeader> {
-    headers
-        .iter()
-        .map(|header| crate::config::ExternalAuthRequestHeader {
-            name: header.name.clone(),
-            value: header.value.clone(),
-        })
-        .collect()
-}
-
-fn config_route_auth(auth: &RuntimeAuthPolicy) -> crate::config::RouteAuth {
-    let api_key = auth
-        .api_key
-        .as_ref()
-        .map(|api_key| crate::config::ApiKeyAuth {
-            header_name: api_key.header_name.clone(),
-            keys: api_key.keys.clone(),
-        });
-    let jwt = auth.jwt.as_ref().map(|jwt| crate::config::JwtAuth {
-        secret: jwt.secret.clone(),
-        issuer: jwt.issuer.clone(),
-        audience: jwt.audience.clone(),
-        clock_skew_secs: jwt.clock_skew_secs,
-    });
-    let external_auth = auth
-        .external_auth
-        .as_ref()
-        .map(|external_auth| match external_auth {
-            RuntimeExternalAuth::Http {
-                endpoint,
-                request_headers,
-                response_header_allowlist,
-                timeout_ms,
-                failure_mode,
-            } => crate::config::ExternalAuth::Http {
-                endpoint: endpoint.clone(),
-                request_headers: config_external_auth_request_headers(request_headers),
-                response_header_allowlist: response_header_allowlist.clone(),
-                timeout_ms: *timeout_ms,
-                failure_mode: config_external_auth_failure_mode(*failure_mode),
-            },
-            RuntimeExternalAuth::Oidc {
-                discovery_url,
-                issuer_url,
-                client_id,
-                client_secret,
-                audience,
-                scopes,
-                request_headers,
-                response_header_allowlist,
-                timeout_ms,
-                failure_mode,
-            } => crate::config::ExternalAuth::Oidc {
-                discovery_url: discovery_url.clone(),
-                issuer_url: issuer_url.clone(),
-                client_id: client_id.clone(),
-                client_secret: client_secret.clone(),
-                audience: audience.clone(),
-                scopes: scopes.clone(),
-                request_headers: config_external_auth_request_headers(request_headers),
-                response_header_allowlist: response_header_allowlist.clone(),
-                timeout_ms: *timeout_ms,
-                failure_mode: config_external_auth_failure_mode(*failure_mode),
-            },
-        });
-
-    crate::config::RouteAuth {
-        api_key,
-        jwt,
-        external_auth,
-        required_scopes: auth.required_scopes.clone(),
-        required_roles: auth.required_roles.clone(),
-    }
-}
-
 impl RuntimeUpstream {
     pub(super) fn from_config(
         config: &Config,
@@ -191,7 +14,7 @@ impl RuntimeUpstream {
             .clone()
             .unwrap_or_else(|| config.upstream_tls.clone());
         let policy = RuntimeUpstreamPolicy {
-            upstream_auth: runtime_auth_policy(&upstream.auth),
+            upstream_auth: RuntimeAuthPolicy::normalize(&upstream.auth, name)?,
             host: RuntimeHostPolicy(upstream.host_policy.clone()),
             forwarded_headers: RuntimeForwardedHeaderPolicy(upstream.forwarded_headers.clone()),
             protocol: base_policies.admission.protocol.clone(),
@@ -231,7 +54,7 @@ impl RuntimeUpstream {
     pub fn as_config_upstream(&self) -> Upstream {
         Upstream {
             load_balancing: self.load_balancing.clone(),
-            auth: config_route_auth(&self.policy.upstream_auth),
+            auth: self.policy.upstream_auth.as_config(),
             host_policy: self.policy.host.0.clone(),
             forwarded_headers: self.policy.forwarded_headers.0.clone(),
             tls: Some(self.effective_tls.clone()),

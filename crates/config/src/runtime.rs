@@ -17,10 +17,14 @@ mod policies;
 mod upstreams;
 
 pub use policies::{
-    RuntimeAdmissionPolicy, RuntimeListenerPolicySet, RuntimeLoadBalancingPolicy,
-    RuntimeLoadBalancingStrategy, RuntimePolicySet, RuntimeRateLimitPolicy,
-    RuntimeScopedRateLimitPolicy, RuntimeTimeoutPolicy, RuntimeTransportPolicy,
-    RuntimeUpstreamPolicySet, RuntimeUpstreamTransportPolicy,
+    RuntimeAdmissionPolicy, RuntimeApiKeyAuth, RuntimeAuthPolicy, RuntimeBrownoutPolicy,
+    RuntimeCircuitBreakerPolicy, RuntimeExternalAuth, RuntimeExternalAuthFailureMode,
+    RuntimeExternalAuthRequestHeader, RuntimeHedgingPolicy, RuntimeJwtAuth,
+    RuntimeListenerPolicySet, RuntimeLoadBalancingPolicy, RuntimeLoadBalancingStrategy,
+    RuntimePolicySet, RuntimeRateLimitPolicy, RuntimeRetryBudgetPolicy,
+    RuntimeRouteQueuePolicy, RuntimeScopedRateLimitPolicy, RuntimeTimeoutPolicy,
+    RuntimeTransportPolicy, RuntimeUpstreamPolicySet, RuntimeUpstreamTransportPolicy,
+    RuntimeWatchdogPolicy,
 };
 
 #[derive(Debug, Clone)]
@@ -255,65 +259,6 @@ pub struct RuntimeForwardedHeaderPolicy(pub ForwardedHeaderPolicy);
 pub struct RuntimeProtocolPolicy(pub ProtocolPolicy);
 
 #[derive(Debug, Clone, Default)]
-pub struct RuntimeApiKeyAuth {
-    pub header_name: String,
-    pub keys: Vec<String>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct RuntimeJwtAuth {
-    pub secret: String,
-    pub issuer: Option<String>,
-    pub audience: Option<String>,
-    pub clock_skew_secs: u64,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum RuntimeExternalAuthFailureMode {
-    FailOpen,
-    #[default]
-    FailClosed,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct RuntimeExternalAuthRequestHeader {
-    pub name: String,
-    pub value: String,
-}
-
-#[derive(Debug, Clone)]
-pub enum RuntimeExternalAuth {
-    Http {
-        endpoint: String,
-        request_headers: Vec<RuntimeExternalAuthRequestHeader>,
-        response_header_allowlist: Vec<String>,
-        timeout_ms: u64,
-        failure_mode: RuntimeExternalAuthFailureMode,
-    },
-    Oidc {
-        discovery_url: Option<String>,
-        issuer_url: Option<String>,
-        client_id: String,
-        client_secret: Option<String>,
-        audience: Option<String>,
-        scopes: Vec<String>,
-        request_headers: Vec<RuntimeExternalAuthRequestHeader>,
-        response_header_allowlist: Vec<String>,
-        timeout_ms: u64,
-        failure_mode: RuntimeExternalAuthFailureMode,
-    },
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct RuntimeAuthPolicy {
-    pub api_key: Option<RuntimeApiKeyAuth>,
-    pub jwt: Option<RuntimeJwtAuth>,
-    pub external_auth: Option<RuntimeExternalAuth>,
-    pub required_scopes: Vec<String>,
-    pub required_roles: Vec<String>,
-}
-
-#[derive(Debug, Clone, Default)]
 pub struct RuntimeUpstreamPolicy {
     /// Upstream-owned auth policy selected after route lookup resolves an upstream.
     pub upstream_auth: RuntimeAuthPolicy,
@@ -330,6 +275,8 @@ impl RuntimeUpstream {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{listeners::runtime_listeners, *};
     use crate::config::{
         Config, ForwardedHeaderPolicyMode, Listen, RouteMatch, Tls, TlsCertificate, Upstream,
@@ -364,7 +311,10 @@ mod tests {
         config.upstream.insert(
             "api".to_string(),
             Upstream {
-                load_balancing: LoadBalancing::default(),
+                load_balancing: LoadBalancing {
+                    lb_type: "round-robin".to_string(),
+                    key: None,
+                },
                 auth: Default::default(),
                 host_policy: UpstreamHostPolicy {
                     mode: UpstreamHostPolicyMode::Rewrite,
@@ -419,13 +369,13 @@ mod tests {
                 endpoint,
                 request_headers,
                 response_header_allowlist,
-                timeout_ms,
+                timeout,
                 ..
             }) => {
                 assert_eq!(endpoint, "https://auth.internal/check");
                 assert!(request_headers.is_empty());
                 assert!(response_header_allowlist.is_empty());
-                assert_eq!(*timeout_ms, 1_000);
+                assert_eq!(*timeout, Duration::from_millis(1_000));
             }
             other => panic!("unexpected external_auth contract: {:?}", other),
         }
@@ -473,7 +423,7 @@ mod tests {
                 scopes,
                 request_headers,
                 response_header_allowlist,
-                timeout_ms,
+                timeout,
                 ..
             }) => {
                 assert_eq!(
@@ -487,7 +437,7 @@ mod tests {
                 assert_eq!(scopes, &vec!["openid".to_string(), "profile".to_string()]);
                 assert!(request_headers.is_empty());
                 assert!(response_header_allowlist.is_empty());
-                assert_eq!(*timeout_ms, 1_500);
+                assert_eq!(*timeout, Duration::from_millis(1_500));
             }
             other => panic!("unexpected external_auth contract: {:?}", other),
         }

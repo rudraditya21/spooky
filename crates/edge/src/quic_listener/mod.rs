@@ -708,38 +708,40 @@ impl QUICListener {
             .resilience
             .validate()
             .map_err(|e| ProxyError::Transport(format!("invalid resilience config: {e}")))?;
-        let mut effective_resilience = config.resilience.clone();
+        let mut effective_admission = config.policies.admission.clone();
         let default_route_cap_limit = per_upstream_limit.saturating_mul(2).max(1);
-        if effective_resilience.route_queue.default_cap > default_route_cap_limit {
+        if effective_admission.route_queue.default_cap > default_route_cap_limit {
             warn!(
                 "resilience.route_queue.default_cap={} is above tuned limit {}; clamping for steadier timeout/admission behavior",
-                effective_resilience.route_queue.default_cap, default_route_cap_limit
+                effective_admission.route_queue.default_cap, default_route_cap_limit
             );
-            effective_resilience.route_queue.default_cap = default_route_cap_limit;
         }
         let global_route_cap_limit = global_inflight_limit.saturating_mul(2).max(1);
-        if effective_resilience.route_queue.global_cap > global_route_cap_limit {
+        if effective_admission.route_queue.global_cap > global_route_cap_limit {
             warn!(
                 "resilience.route_queue.global_cap={} is above tuned limit {}; clamping for steadier timeout/admission behavior",
-                effective_resilience.route_queue.global_cap, global_route_cap_limit
+                effective_admission.route_queue.global_cap, global_route_cap_limit
             );
-            effective_resilience.route_queue.global_cap = global_route_cap_limit;
-        }
-        for cap in effective_resilience.route_queue.caps.values_mut() {
-            *cap = (*cap).min(default_route_cap_limit).max(1);
         }
         let tuned_high_latency =
             (config.performance.backend_timeout_ms.saturating_mul(7) / 10).max(50);
-        if effective_resilience.adaptive_admission.high_latency_ms > tuned_high_latency {
+        if effective_admission.adaptive_admission.high_latency
+            > Duration::from_millis(tuned_high_latency)
+        {
             warn!(
                 "resilience.adaptive_admission.high_latency_ms={} is above tuned limit {}; clamping for faster overload reaction",
-                effective_resilience.adaptive_admission.high_latency_ms, tuned_high_latency
+                effective_admission.adaptive_admission.high_latency.as_millis(),
+                tuned_high_latency
             );
-            effective_resilience.adaptive_admission.high_latency_ms = tuned_high_latency;
         }
-        let resilience = Arc::new(RuntimeResilience::from_config(
-            &effective_resilience,
-            global_inflight_limit,
+        effective_admission = effective_admission.with_runtime_overrides(
+            default_route_cap_limit,
+            global_route_cap_limit,
+            Duration::from_millis(tuned_high_latency),
+        );
+        let resilience = Arc::new(RuntimeResilience::from_policies(
+            &effective_admission,
+            &config.policies.rate_limits,
         ));
         let watchdog = Arc::new(WatchdogCoordinator::new(&config.resilience.watchdog));
         for (listener_label, inventory) in listener_tls_store.snapshot() {

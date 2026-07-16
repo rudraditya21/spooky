@@ -1,6 +1,9 @@
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
-use spooky_config::config::Resilience as ResilienceConfig;
+use spooky_config::{
+    config::Resilience as ResilienceConfig,
+    runtime::{RuntimeAdmissionPolicy, RuntimeRateLimitPolicy},
+};
 
 use crate::resilience::{
     adaptive_admission::AdaptiveAdmission,
@@ -39,11 +42,10 @@ pub struct RuntimeResilience {
 impl RuntimeResilience {
     pub fn from_config(config: &ResilienceConfig, global_limit: usize) -> Self {
         let adaptive = &config.adaptive_admission;
-        let adaptive_max_limit = adaptive.max_limit.unwrap_or(global_limit);
         let admission = Arc::new(AdaptiveAdmission::new(
             adaptive.enabled,
             adaptive.min_limit,
-            adaptive_max_limit.max(adaptive.min_limit),
+            adaptive.max_limit.unwrap_or(global_limit).max(adaptive.min_limit),
             adaptive.increase_step,
             adaptive.decrease_step,
             adaptive.high_latency_ms,
@@ -72,7 +74,6 @@ impl RuntimeResilience {
             config.brownout.recover_inflight_percent,
             config.brownout.core_routes.clone(),
         ));
-
         let hedge_safe_methods = config
             .hedging
             .safe_methods
@@ -129,6 +130,125 @@ impl RuntimeResilience {
             early_data_safe_methods,
             allowed_methods,
             denied_path_prefixes: config.protocol.denied_path_prefixes.clone(),
+            connect_allowed_ports,
+            connect_allowed_authorities,
+            route_allowlist,
+        }
+    }
+
+    pub fn from_policies(
+        admission_policy: &RuntimeAdmissionPolicy,
+        rate_limit_policy: &RuntimeRateLimitPolicy,
+    ) -> Self {
+        let adaptive = &admission_policy.adaptive_admission;
+        let admission = Arc::new(AdaptiveAdmission::new(
+            adaptive.enabled,
+            adaptive.min_limit,
+            adaptive.max_limit.max(adaptive.min_limit),
+            adaptive.increase_step,
+            adaptive.decrease_step,
+            adaptive.high_latency.as_millis().try_into().unwrap_or(u64::MAX),
+        ));
+        let route_queue = Arc::new(RouteQueueLimiter::new(
+            admission_policy.route_queue.default_cap,
+            admission_policy.route_queue.global_cap,
+            admission_policy.route_queue.caps.clone(),
+        ));
+        let scoped_rate_limits = Arc::new(ScopedRateLimiters::new(
+            &rate_limit_policy
+                .scoped_limits
+                .iter()
+                .map(|rule| spooky_config::config::ScopedRateLimit {
+                    name: rule.name.clone(),
+                    scope: rule.scope,
+                    requests_per_sec: rule.requests_per_sec,
+                    burst: rule.burst,
+                    key: rule.key.clone(),
+                    route_allowlist: rule.route_allowlist.clone(),
+                    idle_ttl_secs: rule.idle_ttl.as_secs(),
+                })
+                .collect::<Vec<_>>(),
+        ));
+        let circuit_breakers = Arc::new(CircuitBreakers::new(
+            admission_policy.circuit_breaker.enabled,
+            admission_policy.circuit_breaker.failure_threshold,
+            admission_policy.circuit_breaker.open,
+            admission_policy.circuit_breaker.half_open_max_probes,
+        ));
+        let retry_budget = Arc::new(RetryBudget::new(
+            admission_policy.retry_budget.enabled,
+            admission_policy.retry_budget.ratio_percent,
+            admission_policy.retry_budget.per_route_ratio_percent.clone(),
+        ));
+        let brownout = Arc::new(BrownoutController::new(
+            admission_policy.brownout.enabled,
+            admission_policy.brownout.trigger_inflight_percent,
+            admission_policy.brownout.recover_inflight_percent,
+            admission_policy.brownout.core_routes.clone(),
+        ));
+        let hedge_safe_methods = admission_policy
+            .hedging
+            .safe_methods
+            .iter()
+            .map(|method| method.to_ascii_uppercase())
+            .collect::<HashSet<_>>();
+        let early_data_safe_methods = admission_policy
+            .protocol
+            .0
+            .early_data_safe_methods
+            .iter()
+            .map(|method| method.to_ascii_uppercase())
+            .collect::<HashSet<_>>();
+        let allowed_methods = admission_policy
+            .protocol
+            .0
+            .allowed_methods
+            .iter()
+            .map(|method| method.to_ascii_uppercase())
+            .collect::<HashSet<_>>();
+        let route_allowlist = admission_policy
+            .hedging
+            .route_allowlist
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let connect_allowed_ports = admission_policy
+            .protocol
+            .0
+            .connect_allowed_ports
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let connect_allowed_authorities = admission_policy
+            .protocol
+            .0
+            .connect_allowed_authorities
+            .iter()
+            .filter_map(|authority| normalize_connect_authority(authority))
+            .collect::<HashSet<_>>();
+
+        Self {
+            adaptive_admission: admission,
+            route_queue,
+            scoped_rate_limits,
+            circuit_breakers,
+            retry_budget,
+            brownout,
+            shed_retry_after_seconds: admission_policy.route_queue.shed_retry_after_seconds,
+            allow_0rtt: admission_policy.protocol.0.allow_0rtt,
+            max_headers_count: admission_policy.protocol.0.max_headers_count.max(1),
+            max_headers_bytes: admission_policy.protocol.0.max_headers_bytes.max(1),
+            enforce_authority_host_match: admission_policy
+                .protocol
+                .0
+                .enforce_authority_host_match,
+            allow_connect: admission_policy.protocol.0.allow_connect,
+            hedging_enabled: admission_policy.hedging.enabled,
+            hedging_delay: admission_policy.hedging.delay,
+            hedge_safe_methods,
+            early_data_safe_methods,
+            allowed_methods,
+            denied_path_prefixes: admission_policy.protocol.0.denied_path_prefixes.clone(),
             connect_allowed_ports,
             connect_allowed_authorities,
             route_allowlist,

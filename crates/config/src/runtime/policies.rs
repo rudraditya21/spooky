@@ -47,6 +47,19 @@ fn normalize_string_vec(values: &[String]) -> Vec<String> {
         .collect()
 }
 
+fn normalize_nonempty_string_vec(
+    field_name: &str,
+    values: &[String],
+) -> Result<Vec<String>, RuntimeConfigError> {
+    let normalized = normalize_string_vec(values);
+    if normalized.len() != values.len() {
+        return Err(config_invalid(format!(
+            "{field_name} must not contain empty values"
+        )));
+    }
+    Ok(normalized)
+}
+
 fn is_valid_http_token(value: &str) -> bool {
     !value.is_empty()
         && value
@@ -97,6 +110,353 @@ impl RuntimeLoadBalancingStrategy {
             "latency-aware" => Self::LatencyAware,
             "sticky-cid" => Self::StickyCid,
             _ => Self::Other,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RuntimeApiKeyAuth {
+    pub header_name: String,
+    pub keys: Vec<String>,
+}
+
+impl RuntimeApiKeyAuth {
+    pub fn normalize(
+        api_key: &crate::config::ApiKeyAuth,
+        upstream_name: &str,
+    ) -> Result<Self, RuntimeConfigError> {
+        let header_name = api_key.header_name.trim();
+        if header_name.is_empty() {
+            return Err(config_invalid(format!(
+                "upstream '{upstream_name}' auth.api_key.header_name must be non-empty"
+            )));
+        }
+        let keys = normalize_nonempty_string_vec(
+            &format!("upstream '{upstream_name}' auth.api_key.keys"),
+            &api_key.keys,
+        )?;
+        Ok(Self {
+            header_name: header_name.to_string(),
+            keys,
+        })
+    }
+
+    pub fn as_config(&self) -> crate::config::ApiKeyAuth {
+        crate::config::ApiKeyAuth {
+            header_name: self.header_name.clone(),
+            keys: self.keys.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RuntimeJwtAuth {
+    pub secret: String,
+    pub issuer: Option<String>,
+    pub audience: Option<String>,
+    pub clock_skew: Duration,
+}
+
+impl RuntimeJwtAuth {
+    pub fn normalize(
+        jwt: &crate::config::JwtAuth,
+        upstream_name: &str,
+    ) -> Result<Self, RuntimeConfigError> {
+        let secret = jwt.secret.trim();
+        if secret.is_empty() {
+            return Err(config_invalid(format!(
+                "upstream '{upstream_name}' auth.jwt.secret must be non-empty"
+            )));
+        }
+
+        Ok(Self {
+            secret: secret.to_string(),
+            issuer: normalize_optional_string(jwt.issuer.as_deref()),
+            audience: normalize_optional_string(jwt.audience.as_deref()),
+            clock_skew: Duration::from_secs(jwt.clock_skew_secs),
+        })
+    }
+
+    pub fn as_config(&self) -> crate::config::JwtAuth {
+        crate::config::JwtAuth {
+            secret: self.secret.clone(),
+            issuer: self.issuer.clone(),
+            audience: self.audience.clone(),
+            clock_skew_secs: self.clock_skew.as_secs(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RuntimeExternalAuthFailureMode {
+    FailOpen,
+    #[default]
+    FailClosed,
+}
+
+impl RuntimeExternalAuthFailureMode {
+    pub fn from_config(mode: crate::config::ExternalAuthFailureMode) -> Self {
+        match mode {
+            crate::config::ExternalAuthFailureMode::FailOpen => Self::FailOpen,
+            crate::config::ExternalAuthFailureMode::FailClosed => Self::FailClosed,
+        }
+    }
+
+    pub fn as_config(self) -> crate::config::ExternalAuthFailureMode {
+        match self {
+            Self::FailOpen => crate::config::ExternalAuthFailureMode::FailOpen,
+            Self::FailClosed => crate::config::ExternalAuthFailureMode::FailClosed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RuntimeExternalAuthRequestHeader {
+    pub name: String,
+    pub value: String,
+}
+
+impl RuntimeExternalAuthRequestHeader {
+    fn normalize(
+        header: &crate::config::ExternalAuthRequestHeader,
+        field_name: &str,
+    ) -> Result<Self, RuntimeConfigError> {
+        let name = header.name.trim();
+        if name.is_empty() {
+            return Err(config_invalid(format!("{field_name}.name must be non-empty")));
+        }
+        http::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+            config_invalid(format!("{field_name}.name must be a valid HTTP header name"))
+        })?;
+
+        Ok(Self {
+            name: name.to_string(),
+            value: header.value.clone(),
+        })
+    }
+
+    fn normalize_many(
+        headers: &[crate::config::ExternalAuthRequestHeader],
+        field_name: &str,
+    ) -> Result<Vec<Self>, RuntimeConfigError> {
+        headers
+            .iter()
+            .enumerate()
+            .map(|(index, header)| Self::normalize(header, &format!("{field_name}[{index}]")))
+            .collect()
+    }
+
+    fn as_config(&self) -> crate::config::ExternalAuthRequestHeader {
+        crate::config::ExternalAuthRequestHeader {
+            name: self.name.clone(),
+            value: self.value.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeExternalAuth {
+    Http {
+        endpoint: String,
+        request_headers: Vec<RuntimeExternalAuthRequestHeader>,
+        response_header_allowlist: Vec<String>,
+        timeout: Duration,
+        failure_mode: RuntimeExternalAuthFailureMode,
+    },
+    Oidc {
+        discovery_url: Option<String>,
+        issuer_url: Option<String>,
+        client_id: String,
+        client_secret: Option<String>,
+        audience: Option<String>,
+        scopes: Vec<String>,
+        request_headers: Vec<RuntimeExternalAuthRequestHeader>,
+        response_header_allowlist: Vec<String>,
+        timeout: Duration,
+        failure_mode: RuntimeExternalAuthFailureMode,
+    },
+}
+
+impl RuntimeExternalAuth {
+    fn normalize(
+        external_auth: &crate::config::ExternalAuth,
+        upstream_name: &str,
+    ) -> Result<Self, RuntimeConfigError> {
+        match external_auth {
+            crate::config::ExternalAuth::Http {
+                endpoint,
+                request_headers,
+                response_header_allowlist,
+                timeout_ms,
+                failure_mode,
+            } => {
+                if *timeout_ms == 0 {
+                    return Err(config_invalid(format!(
+                        "upstream '{upstream_name}' auth.external_auth.http.timeout_ms must be greater than 0"
+                    )));
+                }
+                Ok(Self::Http {
+                    endpoint: endpoint.clone(),
+                    request_headers: RuntimeExternalAuthRequestHeader::normalize_many(
+                        request_headers,
+                        &format!("upstream '{upstream_name}' auth.external_auth.http.request_headers"),
+                    )?,
+                    response_header_allowlist: normalize_nonempty_string_vec(
+                        &format!(
+                            "upstream '{upstream_name}' auth.external_auth.http.response_header_allowlist"
+                        ),
+                        response_header_allowlist,
+                    )?,
+                    timeout: Duration::from_millis(*timeout_ms),
+                    failure_mode: RuntimeExternalAuthFailureMode::from_config(*failure_mode),
+                })
+            }
+            crate::config::ExternalAuth::Oidc {
+                discovery_url,
+                issuer_url,
+                client_id,
+                client_secret,
+                audience,
+                scopes,
+                request_headers,
+                response_header_allowlist,
+                timeout_ms,
+                failure_mode,
+            } => {
+                if *timeout_ms == 0 {
+                    return Err(config_invalid(format!(
+                        "upstream '{upstream_name}' auth.external_auth.oidc.timeout_ms must be greater than 0"
+                    )));
+                }
+                let client_id = client_id.trim();
+                if client_id.is_empty() {
+                    return Err(config_invalid(format!(
+                        "upstream '{upstream_name}' auth.external_auth.oidc.client_id must be non-empty"
+                    )));
+                }
+                Ok(Self::Oidc {
+                    discovery_url: normalize_optional_string(discovery_url.as_deref()),
+                    issuer_url: normalize_optional_string(issuer_url.as_deref()),
+                    client_id: client_id.to_string(),
+                    client_secret: normalize_optional_string(client_secret.as_deref()),
+                    audience: normalize_optional_string(audience.as_deref()),
+                    scopes: normalize_nonempty_string_vec(
+                        &format!("upstream '{upstream_name}' auth.external_auth.oidc.scopes"),
+                        scopes,
+                    )?,
+                    request_headers: RuntimeExternalAuthRequestHeader::normalize_many(
+                        request_headers,
+                        &format!("upstream '{upstream_name}' auth.external_auth.oidc.request_headers"),
+                    )?,
+                    response_header_allowlist: normalize_nonempty_string_vec(
+                        &format!(
+                            "upstream '{upstream_name}' auth.external_auth.oidc.response_header_allowlist"
+                        ),
+                        response_header_allowlist,
+                    )?,
+                    timeout: Duration::from_millis(*timeout_ms),
+                    failure_mode: RuntimeExternalAuthFailureMode::from_config(*failure_mode),
+                })
+            }
+        }
+    }
+
+    fn as_config(&self) -> crate::config::ExternalAuth {
+        match self {
+            Self::Http {
+                endpoint,
+                request_headers,
+                response_header_allowlist,
+                timeout,
+                failure_mode,
+            } => crate::config::ExternalAuth::Http {
+                endpoint: endpoint.clone(),
+                request_headers: request_headers.iter().map(Self::header_as_config).collect(),
+                response_header_allowlist: response_header_allowlist.clone(),
+                timeout_ms: timeout.as_millis().try_into().unwrap_or(u64::MAX),
+                failure_mode: failure_mode.as_config(),
+            },
+            Self::Oidc {
+                discovery_url,
+                issuer_url,
+                client_id,
+                client_secret,
+                audience,
+                scopes,
+                request_headers,
+                response_header_allowlist,
+                timeout,
+                failure_mode,
+            } => crate::config::ExternalAuth::Oidc {
+                discovery_url: discovery_url.clone(),
+                issuer_url: issuer_url.clone(),
+                client_id: client_id.clone(),
+                client_secret: client_secret.clone(),
+                audience: audience.clone(),
+                scopes: scopes.clone(),
+                request_headers: request_headers.iter().map(Self::header_as_config).collect(),
+                response_header_allowlist: response_header_allowlist.clone(),
+                timeout_ms: timeout.as_millis().try_into().unwrap_or(u64::MAX),
+                failure_mode: failure_mode.as_config(),
+            },
+        }
+    }
+
+    fn header_as_config(
+        header: &RuntimeExternalAuthRequestHeader,
+    ) -> crate::config::ExternalAuthRequestHeader {
+        header.as_config()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RuntimeAuthPolicy {
+    pub api_key: Option<RuntimeApiKeyAuth>,
+    pub jwt: Option<RuntimeJwtAuth>,
+    pub external_auth: Option<RuntimeExternalAuth>,
+    pub required_scopes: Vec<String>,
+    pub required_roles: Vec<String>,
+}
+
+impl RuntimeAuthPolicy {
+    pub fn normalize(
+        auth: &crate::config::RouteAuth,
+        upstream_name: &str,
+    ) -> Result<Self, RuntimeConfigError> {
+        Ok(Self {
+            api_key: auth
+                .api_key
+                .as_ref()
+                .map(|api_key| RuntimeApiKeyAuth::normalize(api_key, upstream_name))
+                .transpose()?,
+            jwt: auth
+                .jwt
+                .as_ref()
+                .map(|jwt| RuntimeJwtAuth::normalize(jwt, upstream_name))
+                .transpose()?,
+            external_auth: auth
+                .external_auth
+                .as_ref()
+                .map(|external_auth| RuntimeExternalAuth::normalize(external_auth, upstream_name))
+                .transpose()?,
+            required_scopes: normalize_nonempty_string_vec(
+                &format!("upstream '{upstream_name}' auth.required_scopes"),
+                &auth.required_scopes,
+            )?,
+            required_roles: normalize_nonempty_string_vec(
+                &format!("upstream '{upstream_name}' auth.required_roles"),
+                &auth.required_roles,
+            )?,
+        })
+    }
+
+    pub fn as_config(&self) -> crate::config::RouteAuth {
+        crate::config::RouteAuth {
+            api_key: self.api_key.as_ref().map(RuntimeApiKeyAuth::as_config),
+            jwt: self.jwt.as_ref().map(RuntimeJwtAuth::as_config),
+            external_auth: self.external_auth.as_ref().map(RuntimeExternalAuth::as_config),
+            required_scopes: self.required_scopes.clone(),
+            required_roles: self.required_roles.clone(),
         }
     }
 }
@@ -515,6 +875,81 @@ impl RuntimeScopedRateLimitPolicy {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeAdaptiveAdmissionPolicy {
+    pub enabled: bool,
+    pub min_limit: usize,
+    pub max_limit: usize,
+    pub decrease_step: usize,
+    pub increase_step: usize,
+    pub high_latency: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeRouteQueuePolicy {
+    pub default_cap: usize,
+    pub global_cap: usize,
+    pub shed_retry_after_seconds: u32,
+    pub caps: HashMap<String, usize>,
+}
+
+impl RuntimeRouteQueuePolicy {
+    pub fn clamped(&self, default_cap_limit: usize, global_cap_limit: usize) -> Self {
+        let mut clamped = self.clone();
+        clamped.default_cap = clamped.default_cap.min(default_cap_limit).max(1);
+        clamped.global_cap = clamped.global_cap.min(global_cap_limit).max(1);
+        for cap in clamped.caps.values_mut() {
+            *cap = (*cap).min(default_cap_limit).max(1);
+        }
+        clamped
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeCircuitBreakerPolicy {
+    pub enabled: bool,
+    pub failure_threshold: u32,
+    pub open: Duration,
+    pub half_open_max_probes: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeHedgingPolicy {
+    pub enabled: bool,
+    pub delay: Duration,
+    pub safe_methods: Vec<String>,
+    pub route_allowlist: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeRetryBudgetPolicy {
+    pub enabled: bool,
+    pub ratio_percent: u8,
+    pub per_route_ratio_percent: HashMap<String, u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeBrownoutPolicy {
+    pub enabled: bool,
+    pub trigger_inflight_percent: u8,
+    pub recover_inflight_percent: u8,
+    pub core_routes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeWatchdogPolicy {
+    pub enabled: bool,
+    pub check_interval: Duration,
+    pub poll_stall_timeout: Duration,
+    pub timeout_error_rate_percent: u8,
+    pub min_requests_per_window: u64,
+    pub overload_inflight_percent: u8,
+    pub unhealthy_consecutive_windows: u32,
+    pub drain_grace: Duration,
+    pub restart_cooldown: Duration,
+    pub restart_command: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeRateLimitPolicy {
     pub scoped_limits: Vec<RuntimeScopedRateLimitPolicy>,
@@ -541,20 +976,20 @@ impl RuntimeRateLimitPolicy {
 
 #[derive(Debug, Clone)]
 pub struct RuntimeAdmissionPolicy {
-    pub adaptive_admission: crate::config::AdaptiveAdmission,
-    pub route_queue: crate::config::RouteQueue,
-    pub circuit_breaker: crate::config::CircuitBreaker,
-    pub hedging: crate::config::Hedging,
-    pub retry_budget: crate::config::RetryBudget,
-    pub brownout: crate::config::Brownout,
-    pub watchdog: crate::config::Watchdog,
+    pub adaptive_admission: RuntimeAdaptiveAdmissionPolicy,
+    pub route_queue: RuntimeRouteQueuePolicy,
+    pub circuit_breaker: RuntimeCircuitBreakerPolicy,
+    pub hedging: RuntimeHedgingPolicy,
+    pub retry_budget: RuntimeRetryBudgetPolicy,
+    pub brownout: RuntimeBrownoutPolicy,
+    pub watchdog: RuntimeWatchdogPolicy,
     pub protocol: RuntimeProtocolPolicy,
 }
 
 impl RuntimeAdmissionPolicy {
     pub fn normalize(
         resilience: &Resilience,
-        transport: &RuntimeTransportPolicy,
+        global_inflight_limit: usize,
     ) -> Result<Self, RuntimeConfigError> {
         if resilience.adaptive_admission.min_limit == 0 {
             return Err(config_invalid(
@@ -573,10 +1008,10 @@ impl RuntimeAdmissionPolicy {
                     max_limit, resilience.adaptive_admission.min_limit
                 )));
             }
-            if max_limit > transport.global_inflight_limit {
+            if max_limit > global_inflight_limit {
                 return Err(config_invalid(format!(
                     "resilience.adaptive_admission.max_limit ({}) must be <= performance.global_inflight_limit ({})",
-                    max_limit, transport.global_inflight_limit
+                    max_limit, global_inflight_limit
                 )));
             }
         }
@@ -608,29 +1043,24 @@ impl RuntimeAdmissionPolicy {
             ));
         }
 
-        let early_data_safe_methods = normalize_string_vec(&resilience.protocol.early_data_safe_methods);
-        if early_data_safe_methods.len() != resilience.protocol.early_data_safe_methods.len() {
-            return Err(config_invalid(
-                "resilience.protocol.early_data_safe_methods must not contain empty values",
-            ));
-        }
-        let allowed_methods = normalize_string_vec(&resilience.protocol.allowed_methods);
-        if allowed_methods.len() != resilience.protocol.allowed_methods.len() {
-            return Err(config_invalid(
-                "resilience.protocol.allowed_methods must not contain empty values",
-            ));
-        }
+        let early_data_safe_methods = normalize_nonempty_string_vec(
+            "resilience.protocol.early_data_safe_methods",
+            &resilience.protocol.early_data_safe_methods,
+        )?;
+        let allowed_methods = normalize_nonempty_string_vec(
+            "resilience.protocol.allowed_methods",
+            &resilience.protocol.allowed_methods,
+        )?;
         if allowed_methods.iter().any(|method| !is_valid_http_token(method)) {
             return Err(config_invalid(
                 "resilience.protocol.allowed_methods must contain valid HTTP method tokens",
             ));
         }
-        let denied_path_prefixes = normalize_string_vec(&resilience.protocol.denied_path_prefixes);
-        if denied_path_prefixes.len() != resilience.protocol.denied_path_prefixes.len()
-            || denied_path_prefixes
-                .iter()
-                .any(|prefix| !prefix.starts_with('/'))
-        {
+        let denied_path_prefixes = normalize_nonempty_string_vec(
+            "resilience.protocol.denied_path_prefixes",
+            &resilience.protocol.denied_path_prefixes,
+        )?;
+        if denied_path_prefixes.iter().any(|prefix| !prefix.starts_with('/')) {
             return Err(config_invalid(
                 "resilience.protocol.denied_path_prefixes must contain '/'-prefixed paths",
             ));
@@ -779,15 +1209,83 @@ impl RuntimeAdmissionPolicy {
         protocol.denied_path_prefixes = denied_path_prefixes;
 
         Ok(Self {
-            adaptive_admission: resilience.adaptive_admission.clone(),
-            route_queue: resilience.route_queue.clone(),
-            circuit_breaker: resilience.circuit_breaker.clone(),
-            hedging: resilience.hedging.clone(),
-            retry_budget: resilience.retry_budget.clone(),
-            brownout: resilience.brownout.clone(),
-            watchdog: resilience.watchdog.clone(),
+            adaptive_admission: RuntimeAdaptiveAdmissionPolicy {
+                enabled: resilience.adaptive_admission.enabled,
+                min_limit: resilience.adaptive_admission.min_limit,
+                max_limit: resilience
+                    .adaptive_admission
+                    .max_limit
+                    .unwrap_or(global_inflight_limit)
+                    .max(resilience.adaptive_admission.min_limit),
+                decrease_step: resilience.adaptive_admission.decrease_step,
+                increase_step: resilience.adaptive_admission.increase_step,
+                high_latency: Duration::from_millis(resilience.adaptive_admission.high_latency_ms),
+            },
+            route_queue: RuntimeRouteQueuePolicy {
+                default_cap: resilience.route_queue.default_cap,
+                global_cap: resilience.route_queue.global_cap,
+                shed_retry_after_seconds: resilience.route_queue.shed_retry_after_seconds.max(1),
+                caps: resilience.route_queue.caps.clone(),
+            },
+            circuit_breaker: RuntimeCircuitBreakerPolicy {
+                enabled: resilience.circuit_breaker.enabled,
+                failure_threshold: resilience.circuit_breaker.failure_threshold,
+                open: Duration::from_millis(resilience.circuit_breaker.open_ms.max(1)),
+                half_open_max_probes: resilience.circuit_breaker.half_open_max_probes,
+            },
+            hedging: RuntimeHedgingPolicy {
+                enabled: resilience.hedging.enabled,
+                delay: Duration::from_millis(resilience.hedging.delay_ms),
+                safe_methods: normalize_string_vec(&resilience.hedging.safe_methods),
+                route_allowlist: normalize_string_vec(&resilience.hedging.route_allowlist),
+            },
+            retry_budget: RuntimeRetryBudgetPolicy {
+                enabled: resilience.retry_budget.enabled,
+                ratio_percent: resilience.retry_budget.ratio_percent,
+                per_route_ratio_percent: resilience.retry_budget.per_route_ratio_percent.clone(),
+            },
+            brownout: RuntimeBrownoutPolicy {
+                enabled: resilience.brownout.enabled,
+                trigger_inflight_percent: resilience.brownout.trigger_inflight_percent,
+                recover_inflight_percent: resilience.brownout.recover_inflight_percent,
+                core_routes: normalize_string_vec(&resilience.brownout.core_routes),
+            },
+            watchdog: RuntimeWatchdogPolicy {
+                enabled: resilience.watchdog.enabled,
+                check_interval: Duration::from_millis(resilience.watchdog.check_interval_ms),
+                poll_stall_timeout: Duration::from_millis(
+                    resilience.watchdog.poll_stall_timeout_ms,
+                ),
+                timeout_error_rate_percent: resilience.watchdog.timeout_error_rate_percent,
+                min_requests_per_window: resilience.watchdog.min_requests_per_window,
+                overload_inflight_percent: resilience.watchdog.overload_inflight_percent,
+                unhealthy_consecutive_windows: resilience
+                    .watchdog
+                    .unhealthy_consecutive_windows,
+                drain_grace: Duration::from_millis(resilience.watchdog.drain_grace_ms),
+                restart_cooldown: Duration::from_millis(
+                    resilience.watchdog.restart_cooldown_ms,
+                ),
+                restart_command: resilience.watchdog.restart_command.clone(),
+            },
             protocol: RuntimeProtocolPolicy(protocol),
         })
+    }
+
+    pub fn with_runtime_overrides(
+        &self,
+        default_route_cap_limit: usize,
+        global_route_cap_limit: usize,
+        adaptive_high_latency_limit: Duration,
+    ) -> Self {
+        let mut updated = self.clone();
+        updated.route_queue = updated
+            .route_queue
+            .clamped(default_route_cap_limit, global_route_cap_limit);
+        if updated.adaptive_admission.high_latency > adaptive_high_latency_limit {
+            updated.adaptive_admission.high_latency = adaptive_high_latency_limit;
+        }
+        updated
     }
 }
 
@@ -817,7 +1315,8 @@ impl RuntimePolicySet {
         let timeouts = RuntimeTimeoutPolicy::normalize(&config.performance)?;
         let transport = RuntimeTransportPolicy::normalize(&config.performance)?;
         let rate_limits = RuntimeRateLimitPolicy::normalize(&config.resilience)?;
-        let admission = RuntimeAdmissionPolicy::normalize(&config.resilience, &transport)?;
+        let admission =
+            RuntimeAdmissionPolicy::normalize(&config.resilience, transport.global_inflight_limit)?;
 
         Ok(Self {
             timeouts,

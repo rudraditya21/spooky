@@ -487,21 +487,22 @@ pub(super) fn validated_hs256_jwt_claims(
     let Ok(now_secs) = now.duration_since(UNIX_EPOCH).map(|value| value.as_secs()) else {
         return None;
     };
+    let clock_skew_secs = jwt.clock_skew.as_secs();
     let exp = claims.get("exp").and_then(Value::as_u64)?;
-    if now_secs > exp.saturating_add(jwt.clock_skew_secs) {
+    if now_secs > exp.saturating_add(clock_skew_secs) {
         return None;
     }
     if claims
         .get("nbf")
         .and_then(Value::as_u64)
-        .is_some_and(|nbf| now_secs.saturating_add(jwt.clock_skew_secs) < nbf)
+        .is_some_and(|nbf| now_secs.saturating_add(clock_skew_secs) < nbf)
     {
         return None;
     }
     if claims
         .get("iat")
         .and_then(Value::as_u64)
-        .is_some_and(|iat| now_secs.saturating_add(jwt.clock_skew_secs) < iat)
+        .is_some_and(|iat| now_secs.saturating_add(clock_skew_secs) < iat)
     {
         return None;
     }
