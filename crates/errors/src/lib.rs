@@ -13,11 +13,11 @@ pub use proxy::{
 pub use retry::{
     AlternateBackendChoice, AlternateBackendDecision, AlternateBackendDenialReason,
     AlternateBackendPolicyFacts, HedgePolicyDecision, HedgePolicyDenialReason,
-    HedgePolicyFacts, HedgeTelemetryReason, RetryPolicyDecision, RetryPolicyDenial,
+    HedgePolicyFacts, HedgePrimaryState, HedgeTelemetryReason, RetryPolicyDecision, RetryPolicyDenial,
     RetryPolicyDenialReason, RetryPolicyFacts, RetryPolicyInput, RetryTelemetryReason,
     UpstreamRetryReason, UpstreamRetryability, UpstreamTerminalErrorKind,
     is_idempotent_method,
-    classify_retryability, evaluate_retry_policy, is_retryable,
+    classify_retryability, evaluate_hedge_policy, evaluate_retry_policy, is_retryable,
 };
 pub use upstream::{
     UpstreamErrorCategory, UpstreamErrorClassification, UpstreamHealthFailureMapping,

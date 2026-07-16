@@ -72,26 +72,39 @@ impl From<UpstreamRetryReason> for RetryTelemetryReason {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HedgePolicyFacts {
     pub hedging_configured: bool,
-    pub bodyless_mode: bool,
-    pub tunnel_allowed: bool,
     pub method_allowed: bool,
+    pub request_body_replayable: bool,
+    pub tunnel_request: bool,
     pub alternate_backend_available: bool,
+    pub alternate_backend_healthy: bool,
     pub budget_available: bool,
+    pub primary_state: HedgePrimaryState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HedgePrimaryState {
+    InFlightBeforeDelay,
+    InFlightAfterDelay,
+    Completed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HedgePolicyDenialReason {
     HedgingDisabled,
-    NotBodylessMode,
+    PrimaryRequestCompleted,
+    DelayNotElapsed,
+    RequestBodyNotReplayable,
     TunnelRequest,
     MethodNotAllowed,
     NoAlternateBackend,
+    AlternateBackendUnhealthy,
     BudgetDenied,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HedgePolicyDecision {
-    Hedge,
+    WaitForPrimary,
+    Hedge { reason: HedgeTelemetryReason },
     DoNotHedge { denial: HedgePolicyDenialReason },
 }
 
@@ -185,6 +198,62 @@ pub fn evaluate_retry_policy(input: RetryPolicyFacts) -> RetryPolicyDecision {
                 }
             } else {
                 RetryPolicyDecision::Retry { reason }
+            }
+        }
+    }
+}
+
+pub fn evaluate_hedge_policy(input: HedgePolicyFacts) -> HedgePolicyDecision {
+    if !input.hedging_configured {
+        return HedgePolicyDecision::DoNotHedge {
+            denial: HedgePolicyDenialReason::HedgingDisabled,
+        };
+    }
+
+    if !input.method_allowed {
+        return HedgePolicyDecision::DoNotHedge {
+            denial: HedgePolicyDenialReason::MethodNotAllowed,
+        };
+    }
+
+    if !input.request_body_replayable {
+        return HedgePolicyDecision::DoNotHedge {
+            denial: HedgePolicyDenialReason::RequestBodyNotReplayable,
+        };
+    }
+
+    if input.tunnel_request {
+        return HedgePolicyDecision::DoNotHedge {
+            denial: HedgePolicyDenialReason::TunnelRequest,
+        };
+    }
+
+    if !input.alternate_backend_available {
+        return HedgePolicyDecision::DoNotHedge {
+            denial: HedgePolicyDenialReason::NoAlternateBackend,
+        };
+    }
+
+    if !input.alternate_backend_healthy {
+        return HedgePolicyDecision::DoNotHedge {
+            denial: HedgePolicyDenialReason::AlternateBackendUnhealthy,
+        };
+    }
+
+    match input.primary_state {
+        HedgePrimaryState::Completed => HedgePolicyDecision::DoNotHedge {
+            denial: HedgePolicyDenialReason::PrimaryRequestCompleted,
+        },
+        HedgePrimaryState::InFlightBeforeDelay => HedgePolicyDecision::WaitForPrimary,
+        HedgePrimaryState::InFlightAfterDelay => {
+            if !input.budget_available {
+                HedgePolicyDecision::DoNotHedge {
+                    denial: HedgePolicyDenialReason::BudgetDenied,
+                }
+            } else {
+                HedgePolicyDecision::Hedge {
+                    reason: HedgeTelemetryReason::DelayElapsed,
+                }
             }
         }
     }
@@ -295,6 +364,76 @@ mod tests {
             evaluate_retry_policy(retry_facts()),
             RetryPolicyDecision::Retry {
                 reason: UpstreamRetryReason::Timeout,
+            }
+        );
+    }
+
+    fn hedge_facts() -> HedgePolicyFacts {
+        HedgePolicyFacts {
+            hedging_configured: true,
+            method_allowed: true,
+            request_body_replayable: true,
+            tunnel_request: false,
+            alternate_backend_available: true,
+            alternate_backend_healthy: true,
+            budget_available: true,
+            primary_state: HedgePrimaryState::InFlightAfterDelay,
+        }
+    }
+
+    #[test]
+    fn hedge_policy_waits_for_primary_before_delay() {
+        let mut facts = hedge_facts();
+        facts.primary_state = HedgePrimaryState::InFlightBeforeDelay;
+
+        assert_eq!(evaluate_hedge_policy(facts), HedgePolicyDecision::WaitForPrimary);
+    }
+
+    #[test]
+    fn hedge_policy_triggers_after_delay_when_eligible() {
+        assert_eq!(
+            evaluate_hedge_policy(hedge_facts()),
+            HedgePolicyDecision::Hedge {
+                reason: HedgeTelemetryReason::DelayElapsed,
+            }
+        );
+    }
+
+    #[test]
+    fn hedge_policy_rejects_non_replayable_requests() {
+        let mut facts = hedge_facts();
+        facts.request_body_replayable = false;
+
+        assert_eq!(
+            evaluate_hedge_policy(facts),
+            HedgePolicyDecision::DoNotHedge {
+                denial: HedgePolicyDenialReason::RequestBodyNotReplayable,
+            }
+        );
+    }
+
+    #[test]
+    fn hedge_policy_rejects_completed_primary() {
+        let mut facts = hedge_facts();
+        facts.primary_state = HedgePrimaryState::Completed;
+
+        assert_eq!(
+            evaluate_hedge_policy(facts),
+            HedgePolicyDecision::DoNotHedge {
+                denial: HedgePolicyDenialReason::PrimaryRequestCompleted,
+            }
+        );
+    }
+
+    #[test]
+    fn hedge_policy_rejects_when_budget_denied_after_delay() {
+        let mut facts = hedge_facts();
+        facts.budget_available = false;
+
+        assert_eq!(
+            evaluate_hedge_policy(facts),
+            HedgePolicyDecision::DoNotHedge {
+                denial: HedgePolicyDenialReason::BudgetDenied,
             }
         );
     }

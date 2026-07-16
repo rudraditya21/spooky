@@ -135,17 +135,22 @@ impl RuntimeResilience {
         }
     }
 
-    pub fn hedging_allowed_for(&self, method: &str, route: &str, bodyless: bool) -> bool {
-        if !self.hedging_enabled || self.brownout.is_active() || !bodyless {
-            return false;
-        }
-        let safe_method = self
-            .hedge_safe_methods
-            .contains(&method.to_ascii_uppercase());
-        if !safe_method {
+    pub fn hedging_route_enabled_for(&self, route: &str) -> bool {
+        if !self.hedging_enabled || self.brownout.is_active() {
             return false;
         }
         self.route_allowlist.is_empty() || self.route_allowlist.contains(route)
+    }
+
+    pub fn hedging_method_allowed(&self, method: &str) -> bool {
+        self.hedge_safe_methods
+            .contains(&method.to_ascii_uppercase())
+    }
+
+    pub fn hedging_allowed_for(&self, method: &str, route: &str, bodyless: bool) -> bool {
+        self.hedging_route_enabled_for(route)
+            && bodyless
+            && self.hedging_method_allowed(method)
     }
 
     pub fn early_data_allowed_for(&self, method: &str) -> bool {

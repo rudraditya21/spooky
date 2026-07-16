@@ -1,5 +1,6 @@
 use spooky_errors::{
-    RetryPolicyDecision, RetryPolicyFacts, RetryPolicyDenialReason, RetryTelemetryReason,
+    HedgePolicyDecision, HedgePolicyFacts, HedgePrimaryState, RetryPolicyDecision,
+    RetryPolicyFacts, RetryPolicyDenialReason, RetryTelemetryReason, evaluate_hedge_policy,
     evaluate_retry_policy, is_idempotent_method,
 };
 
@@ -150,9 +151,6 @@ impl QUICListener {
         let backend_endpoints = Arc::clone(&exec_ctx.backend_endpoints);
         let _backend_resolutions = Arc::clone(&exec_ctx.backend_resolution_store);
         let transport = Arc::clone(&exec_ctx.transport_pool);
-        let allow_hedge = req.tunnel_mode == TunnelMode::None
-            && req.bodyless_mode
-            && resilience.hedging_allowed_for(&req.method, &route_name, true);
         let hedge_delay = resilience.hedging_delay;
         let alternate_backend = req.upstream_pool.as_ref().and_then(|upstream_pool| {
             Self::pick_alternate_backend(upstream_pool, pending_forward.backend_index)
@@ -164,6 +162,9 @@ impl QUICListener {
         let bodyless_mode = req.bodyless_mode;
         let request_id = req.request_id;
         let method_idempotent = is_idempotent_method(&req.method);
+        let hedge_method_allowed = resilience.hedging_method_allowed(&req.method);
+        let hedge_configured = resilience.hedging_route_enabled_for(&route_name);
+        let hedge_tunnel_request = req.tunnel_mode != TunnelMode::None;
         let fut = async move {
             let mut hedge_telemetry =
                 crate::runtime::connection::response::HedgeTelemetry::default();
@@ -214,7 +215,19 @@ impl QUICListener {
                             "missing upstream request for non-websocket forward".into(),
                         )
                     })?;
-                    let response: Response<Incoming> = if allow_hedge {
+                    let response: Response<Incoming> = if matches!(
+                        evaluate_hedge_policy(HedgePolicyFacts {
+                            hedging_configured: hedge_configured,
+                            method_allowed: hedge_method_allowed,
+                            request_body_replayable: bodyless_mode,
+                            tunnel_request: hedge_tunnel_request,
+                            alternate_backend_available: alternate_backend.is_some(),
+                            alternate_backend_healthy: alternate_backend.is_some(),
+                            budget_available: false,
+                            primary_state: HedgePrimaryState::InFlightBeforeDelay,
+                        }),
+                        HedgePolicyDecision::WaitForPrimary
+                    ) {
                         let hedge_candidate = alternate_backend.clone().and_then(|(backend, _idx)| {
                             let endpoint = backend_endpoints.get(&backend)?;
                             pending_forward_for_upstream
@@ -241,31 +254,44 @@ impl QUICListener {
                                 _ = &mut hedge_sleep => None,
                             } {
                                 result?
-                            } else if retry_budget.allow_retry(&route_name).is_ok() {
-                                hedge_telemetry.launched = true;
-                                let hedge_fut = send_once(
-                                    hedge_backend,
-                                    hedge_request,
-                                    Arc::clone(&cb),
-                                    Arc::clone(&transport),
-                                );
-                                tokio::pin!(hedge_fut);
-                                tokio::select! {
-                                    result = &mut primary_fut => {
-                                        hedge_telemetry.primary_won_after_trigger = true;
-                                        hedge_telemetry.hedge_wasted = true;
-                                        result?
-                                    },
-                                    result = &mut hedge_fut => {
-                                        hedge_telemetry.hedge_won = true;
-                                        let elapsed_ms = primary_started.elapsed().as_millis() as u64;
-                                        let delay_ms = hedge_delay.as_millis() as u64;
-                                        hedge_telemetry.primary_late_ms = elapsed_ms.saturating_sub(delay_ms);
-                                        result?
-                                    },
-                                }
                             } else {
-                                primary_fut.await?
+                                match evaluate_hedge_policy(HedgePolicyFacts {
+                                    hedging_configured: hedge_configured,
+                                    method_allowed: hedge_method_allowed,
+                                    request_body_replayable: bodyless_mode,
+                                    tunnel_request: hedge_tunnel_request,
+                                    alternate_backend_available: true,
+                                    alternate_backend_healthy: true,
+                                    budget_available: retry_budget.allow_retry(&route_name).is_ok(),
+                                    primary_state: HedgePrimaryState::InFlightAfterDelay,
+                                }) {
+                                    HedgePolicyDecision::Hedge { .. } => {
+                                        hedge_telemetry.launched = true;
+                                        let hedge_fut = send_once(
+                                            hedge_backend,
+                                            hedge_request,
+                                            Arc::clone(&cb),
+                                            Arc::clone(&transport),
+                                        );
+                                        tokio::pin!(hedge_fut);
+                                        tokio::select! {
+                                            result = &mut primary_fut => {
+                                                hedge_telemetry.primary_won_after_trigger = true;
+                                                hedge_telemetry.hedge_wasted = true;
+                                                result?
+                                            },
+                                            result = &mut hedge_fut => {
+                                                hedge_telemetry.hedge_won = true;
+                                                let elapsed_ms = primary_started.elapsed().as_millis() as u64;
+                                                let delay_ms = hedge_delay.as_millis() as u64;
+                                                hedge_telemetry.primary_late_ms = elapsed_ms.saturating_sub(delay_ms);
+                                                result?
+                                            },
+                                        }
+                                    }
+                                    HedgePolicyDecision::WaitForPrimary
+                                    | HedgePolicyDecision::DoNotHedge { .. } => primary_fut.await?,
+                                }
                             }
                         } else {
                             send_once(
