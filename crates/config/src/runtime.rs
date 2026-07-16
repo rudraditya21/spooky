@@ -11,8 +11,17 @@ use crate::{
 
 #[path = "runtime/listeners.rs"]
 mod listeners;
+#[path = "runtime/policies.rs"]
+mod policies;
 #[path = "runtime/upstreams.rs"]
 mod upstreams;
+
+pub use policies::{
+    RuntimeAdmissionPolicy, RuntimeListenerPolicySet, RuntimeLoadBalancingPolicy,
+    RuntimeLoadBalancingStrategy, RuntimePolicySet, RuntimeRateLimitPolicy,
+    RuntimeScopedRateLimitPolicy, RuntimeTimeoutPolicy, RuntimeTransportPolicy,
+    RuntimeUpstreamPolicySet, RuntimeUpstreamTransportPolicy,
+};
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -58,6 +67,22 @@ impl RuntimeConfig {
         self.upstreams
             .iter()
             .map(|(name, upstream)| (name.clone(), upstream.as_config_upstream()))
+            .collect()
+    }
+
+    pub fn policies(&self) -> RuntimePolicySet {
+        RuntimePolicySet::from_runtime_config(self)
+    }
+
+    pub fn upstream_policy_sets(&self) -> HashMap<String, RuntimeUpstreamPolicySet> {
+        self.upstreams
+            .iter()
+            .map(|(name, upstream)| {
+                (
+                    name.clone(),
+                    upstream.policy_set(&self.performance, &self.resilience),
+                )
+            })
             .collect()
     }
 }
@@ -174,6 +199,12 @@ pub struct ListenerRuntimeConfig {
     pub observability: Observability,
 }
 
+impl ListenerRuntimeConfig {
+    pub fn policies(&self) -> RuntimeListenerPolicySet {
+        RuntimeListenerPolicySet::from_listener_runtime_config(self)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeListenerSource {
     LegacyListen,
@@ -284,6 +315,16 @@ pub struct RuntimeUpstreamPolicy {
     pub host: RuntimeHostPolicy,
     pub forwarded_headers: RuntimeForwardedHeaderPolicy,
     pub protocol: RuntimeProtocolPolicy,
+}
+
+impl RuntimeUpstream {
+    pub fn policy_set(
+        &self,
+        performance: &Performance,
+        resilience: &Resilience,
+    ) -> RuntimeUpstreamPolicySet {
+        RuntimeUpstreamPolicySet::from_runtime_parts(self, performance, resilience)
+    }
 }
 
 #[cfg(test)]
@@ -449,6 +490,82 @@ mod tests {
             }
             other => panic!("unexpected external_auth contract: {:?}", other),
         }
+    }
+
+    #[test]
+    fn runtime_policy_set_normalizes_timeout_and_transport_knobs() {
+        let mut config = sample_config();
+        config.performance.backend_timeout_ms = 2_500;
+        config.performance.backend_connect_timeout_ms = 400;
+        config.performance.h2_pool_idle_timeout_ms = 91_000;
+        config.performance.max_active_connections = 1234;
+        config.performance.request_buffer_global_cap_bytes = 9_999;
+        config.resilience.route_queue.shed_retry_after_seconds = 17;
+
+        let runtime = RuntimeConfig::from_config(&config).expect("runtime config");
+        let policies = runtime.policies();
+
+        assert_eq!(policies.timeouts.backend_request, Duration::from_millis(2_500));
+        assert_eq!(policies.timeouts.backend_connect, Duration::from_millis(400));
+        assert_eq!(policies.timeouts.h2_pool_idle, Duration::from_millis(91_000));
+        assert_eq!(policies.transport.max_active_connections, 1234);
+        assert_eq!(policies.transport.request_buffer_global_cap_bytes, 9_999);
+        assert_eq!(policies.admission.route_queue.shed_retry_after_seconds, 17);
+    }
+
+    #[test]
+    fn runtime_upstream_policy_set_carries_canonical_lb_auth_and_tls_shapes() {
+        let mut config = sample_config();
+        let upstream = config.upstream.get_mut("api").expect("api upstream");
+        upstream.load_balancing = LoadBalancing {
+            lb_type: "sticky-cid".to_string(),
+            key: Some("header:x-user-id".to_string()),
+        };
+        upstream.auth.api_key = Some(crate::config::ApiKeyAuth {
+            header_name: "x-api-key".to_string(),
+            keys: vec!["secret-1".to_string()],
+        });
+        upstream.tls = Some(UpstreamTls {
+            verify_certificates: false,
+            strict_sni: false,
+            ca_file: Some("/tmp/upstream-ca.pem".to_string()),
+            ca_dir: None,
+        });
+        config.resilience.scoped_rate_limits = vec![crate::config::ScopedRateLimit {
+            name: "client-default".to_string(),
+            scope: crate::config::ScopedRateLimitScope::Client,
+            requests_per_sec: 10,
+            burst: 20,
+            key: Some("peer_ip".to_string()),
+            route_allowlist: vec!["api".to_string()],
+            idle_ttl_secs: 30,
+        }];
+
+        let runtime = RuntimeConfig::from_config(&config).expect("runtime config");
+        let upstream_policies = runtime.upstream_policy_sets();
+        let api = upstream_policies.get("api").expect("api runtime policy set");
+
+        assert_eq!(
+            api.load_balancing.strategy,
+            RuntimeLoadBalancingStrategy::StickyCid
+        );
+        assert_eq!(
+            api.load_balancing.key.as_deref(),
+            Some("header:x-user-id")
+        );
+        assert_eq!(
+            api.auth.api_key.as_ref().map(|auth| auth.header_name.as_str()),
+            Some("x-api-key")
+        );
+        assert_eq!(
+            api.transport.effective_tls.ca_file.as_deref(),
+            Some("/tmp/upstream-ca.pem")
+        );
+        assert_eq!(api.rate_limits.scoped_limits.len(), 1);
+        assert_eq!(
+            api.rate_limits.scoped_limits[0].idle_ttl,
+            Duration::from_secs(30)
+        );
     }
 
     #[test]
