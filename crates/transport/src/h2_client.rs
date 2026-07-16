@@ -32,6 +32,7 @@ use rustls::{
     pki_types::{CertificateDer, ServerName, UnixTime},
 };
 use rustls_pki_types::pem::PemObject;
+use spooky_config::runtime::RuntimeBackendTlsPolicy;
 use tower_service::Service;
 
 #[derive(Debug, Clone)]
@@ -49,6 +50,17 @@ impl Default for TlsClientConfig {
             strict_sni: true,
             ca_file: None,
             ca_dir: None,
+        }
+    }
+}
+
+impl From<&RuntimeBackendTlsPolicy> for TlsClientConfig {
+    fn from(value: &RuntimeBackendTlsPolicy) -> Self {
+        Self {
+            verify_certificates: value.verify_certificates,
+            strict_sni: value.strict_sni,
+            ca_file: value.ca_file.clone(),
+            ca_dir: value.ca_dir.clone(),
         }
     }
 }

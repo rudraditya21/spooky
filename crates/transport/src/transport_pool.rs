@@ -6,6 +6,9 @@ use hyper::{
     body::{Bytes, Incoming},
 };
 pub use spooky_errors::PoolError;
+use spooky_config::runtime::{
+    RuntimeBackendConnectionPolicy, RuntimeBackendTransportKind, RuntimeUpstream,
+};
 
 use crate::{
     h1_pool::H1Pool,
@@ -101,6 +104,47 @@ impl UpstreamTransportPool {
             h1_pool,
             h2_pool,
         })
+    }
+
+    pub fn from_runtime_upstreams<'a, I>(
+        upstreams: I,
+        connection_policy: &RuntimeBackendConnectionPolicy,
+        dns_resolver: SharedDnsResolver,
+        connect_observer: Option<ConnectObserver>,
+    ) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = &'a RuntimeUpstream>,
+    {
+        let mut backends = Vec::new();
+        let mut backend_tls = HashMap::new();
+
+        for upstream in upstreams {
+            for backend in &upstream.backends {
+                let backend_addr = backend.backend.address.clone();
+                let kind = match backend.endpoint.transport_kind {
+                    RuntimeBackendTransportKind::Http1 => BackendTransportKind::Http1,
+                    RuntimeBackendTransportKind::H2 => BackendTransportKind::H2,
+                };
+                backends.push((backend_addr.clone(), kind));
+                if matches!(kind, BackendTransportKind::H2) {
+                    backend_tls.insert(
+                        backend_addr,
+                        TlsClientConfig::from(&upstream.policy_set.transport.tls),
+                    );
+                }
+            }
+        }
+
+        Self::new_with_observer(
+            backends,
+            backend_tls,
+            connection_policy.max_inflight,
+            connection_policy.max_idle_per_backend,
+            connection_policy.pool_idle_timeout,
+            connection_policy.connect_timeout,
+            dns_resolver,
+            connect_observer,
+        )
     }
 
     pub async fn send(

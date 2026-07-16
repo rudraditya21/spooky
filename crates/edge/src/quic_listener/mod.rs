@@ -51,15 +51,14 @@ use spooky_config::{
     config::ClientAuth,
     runtime::{
         ListenerRuntimeConfig, RuntimeConfig, RuntimeListenerTls, RuntimeTlsIdentity,
-        RuntimeBackendAddressKind, RuntimeBackendTlsPolicy, RuntimeBackendTransportKind,
-        RuntimeUpstreamPolicy,
+        RuntimeBackendAddressKind, RuntimeUpstreamPolicy,
     },
 };
 use spooky_errors::{PoolError, ProxyError};
 use spooky_lb::{health::HealthFailureReason, upstream_pool::UpstreamPool};
 use spooky_transport::{
-    h2_client::{SharedDnsResolver, TlsClientConfig},
-    transport_pool::{BackendTransportKind, UpstreamTransportPool},
+    h2_client::SharedDnsResolver,
+    transport_pool::UpstreamTransportPool,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -541,15 +540,6 @@ impl QUICListener {
         Self::new_with_socket_and_shared_state(listener_config, socket, shared_state)
     }
 
-    fn upstream_tls_client_config(tls: &RuntimeBackendTlsPolicy) -> TlsClientConfig {
-        TlsClientConfig {
-            verify_certificates: tls.verify_certificates,
-            strict_sni: tls.strict_sni,
-            ca_file: tls.ca_file.clone(),
-            ca_dir: tls.ca_dir.clone(),
-        }
-    }
-
     fn record_backend_connect(
         metrics: &Metrics,
         backend: &str,
@@ -572,8 +562,6 @@ impl QUICListener {
         let worker_slots = active_worker_threads.saturating_mul(shard_count).max(1);
         let per_upstream_limit = transport_policy.connection_limits.per_upstream_inflight.max(1);
         let global_inflight_limit = transport_policy.connection_limits.global_inflight.max(1);
-        let max_inflight_per_backend = transport_policy.backend_connections.max_inflight.max(1);
-
         info!(
             "Runtime performance concurrency worker_threads={} control_plane_threads={} packet_shards_per_worker={} reuseport={} pin_workers={}",
             worker_threads,
@@ -620,16 +608,11 @@ impl QUICListener {
             .collect::<HashMap<_, _>>();
         let listener_tls_store = Arc::new(Self::build_listener_tls_reload_store(config)?);
 
-        let mut backend_transports = Vec::new();
         let mut backend_resolutions = Vec::new();
         let mut seen_backend_origins: HashMap<String, (String, String)> = HashMap::new();
-        let mut backend_tls_configs: HashMap<String, TlsClientConfig> = HashMap::new();
         let mut backend_endpoints: HashMap<String, BackendEndpoint> = HashMap::new();
         let mut backend_health_checks = HashMap::new();
         for (upstream_name, upstream) in &config.upstreams {
-            let upstream_tls_client =
-                Self::upstream_tls_client_config(&upstream.policy_set.transport.tls);
-
             for backend in &upstream.backends {
                 let endpoint = backend.endpoint.canonical.clone();
                 let origin = backend.endpoint.origin.clone();
@@ -646,13 +629,6 @@ impl QUICListener {
                         existing_backend
                     )));
                 }
-                backend_transports.push((
-                    backend.backend.address.clone(),
-                    match backend.endpoint.transport_kind {
-                        RuntimeBackendTransportKind::Http1 => BackendTransportKind::Http1,
-                        RuntimeBackendTransportKind::H2 => BackendTransportKind::H2,
-                    },
-                ));
                 let authority_host = backend.endpoint.authority_host.clone();
                 let authority_port = backend.endpoint.authority_port;
                 let resolution = if matches!(backend.endpoint.address_kind, RuntimeBackendAddressKind::IpLiteral) {
@@ -684,19 +660,15 @@ impl QUICListener {
                     "Configured upstream TLS policy backend={} upstream={} verify_certificates={} strict_sni={} ca_file={:?} ca_dir={:?} authority_kind={}",
                     backend.backend.address,
                     upstream_name,
-                    upstream_tls_client.verify_certificates,
-                    upstream_tls_client.strict_sni,
-                    upstream_tls_client.ca_file,
-                    upstream_tls_client.ca_dir,
+                    upstream.policy_set.transport.tls.verify_certificates,
+                    upstream.policy_set.transport.tls.strict_sni,
+                    upstream.policy_set.transport.tls.ca_file,
+                    upstream.policy_set.transport.tls.ca_dir,
                     authority_kind
                 );
                 backend_endpoints.insert(backend.backend.address.clone(), endpoint);
                 if let Some(health_check) = backend.health_check.clone() {
                     backend_health_checks.insert(backend.backend.address.clone(), health_check);
-                }
-                if matches!(backend.endpoint.transport_kind, RuntimeBackendTransportKind::H2) {
-                    backend_tls_configs
-                        .insert(backend.backend.address.clone(), upstream_tls_client.clone());
                 }
             }
         }
@@ -720,13 +692,9 @@ impl QUICListener {
             },
         );
         let transport_pool = Arc::new(
-            UpstreamTransportPool::new_with_observer(
-                backend_transports,
-                backend_tls_configs,
-                max_inflight_per_backend,
-                transport_policy.backend_connections.max_idle_per_backend,
-                transport_policy.backend_connections.pool_idle_timeout,
-                transport_policy.backend_connections.connect_timeout,
+            UpstreamTransportPool::from_runtime_upstreams(
+                config.upstreams.values(),
+                &transport_policy.backend_connections,
                 backend_dns_resolver.clone(),
                 Some(connect_observer),
             )
