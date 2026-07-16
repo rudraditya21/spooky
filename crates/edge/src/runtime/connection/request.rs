@@ -71,7 +71,7 @@ pub struct RequestEnvelope {
     /// Deferred request-building snapshot for async auth/admission handoff.
     pub pending_forward: Option<Arc<PendingForward>>,
     /// Receives the external auth decision once async auth completes.
-    pub auth_result_rx: Option<oneshot::Receiver<ExternalAuthResult>>,
+    pub(crate) auth_result_rx: Option<oneshot::Receiver<ExternalAuthResult>>,
     /// Aborts the detached external auth task when the stream is cancelled.
     pub auth_abort: Option<AbortHandle>,
     /// Whether auth transport errors and timeouts should allow the request.
@@ -121,5 +121,5 @@ pub struct PendingForward {
     pub traceparent: Option<Arc<str>>,
     pub host_policy: UpstreamHostPolicy,
     pub forwarded_header_policy: ForwardedHeaderPolicy,
-    pub auth_header_mutations: Vec<PendingHeaderMutation>,
+    pub(crate) auth_header_mutations: Vec<PendingHeaderMutation>,
 }

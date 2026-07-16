@@ -3,14 +3,18 @@ use std::convert::Infallible;
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
 use serde_json::Value;
-use spooky_config::runtime::{RuntimeExternalAuth, RuntimeExternalAuthFailureMode};
+use spooky_config::runtime::RuntimeExternalAuth;
 use tokio::task::AbortHandle;
 
 use super::*;
 use crate::runtime::connection::{
     auth::{
-        ExternalAuthChallengeResponse, ExternalAuthDecision, ExternalAuthDenyResponse,
-        ExternalAuthRedirectResponse, ExternalAuthResult, PendingHeaderMutation,
+        ExternalAuthCompletion, ExternalAuthDecision, ExternalAuthDenyResponse,
+        ExternalAuthExecutionPolicy, ExternalAuthFailureDisposition, ExternalAuthResponseMetadata,
+        ExternalAuthResult, ExternalAuthTaskConfig, OidcAuthorizationCheck,
+        evaluate_external_auth_completion, merge_auth_request_mutations, oidc_audience_matches,
+        oidc_authorization_check, oidc_discovery_target, oidc_scope_satisfied,
+        validate_oidc_provider_metadata,
     },
     request::PendingForward,
     stream::StreamAdmissionState,
@@ -59,26 +63,6 @@ impl AuthHttpClient {
     }
 }
 
-pub(super) fn auth_failure_mode(
-    external_auth: &RuntimeExternalAuth,
-) -> RuntimeExternalAuthFailureMode {
-    match external_auth {
-        RuntimeExternalAuth::Http { failure_mode, .. }
-        | RuntimeExternalAuth::Oidc { failure_mode, .. } => *failure_mode,
-    }
-}
-
-pub(super) fn auth_timeout_ms(external_auth: &RuntimeExternalAuth) -> u64 {
-    match external_auth {
-        RuntimeExternalAuth::Http { timeout_ms, .. }
-        | RuntimeExternalAuth::Oidc { timeout_ms, .. } => *timeout_ms,
-    }
-}
-
-pub(super) fn fail_open(mode: RuntimeExternalAuthFailureMode) -> bool {
-    matches!(mode, RuntimeExternalAuthFailureMode::FailOpen)
-}
-
 fn is_unsafe_forwarded_auth_request_header(name: &[u8]) -> bool {
     name.eq_ignore_ascii_case(http::header::HOST.as_str().as_bytes())
         || name.eq_ignore_ascii_case(http::header::CONNECTION.as_str().as_bytes())
@@ -90,62 +74,6 @@ fn is_unsafe_forwarded_auth_request_header(name: &[u8]) -> bool {
         || name.eq_ignore_ascii_case(http::header::EXPECT.as_str().as_bytes())
         || name.eq_ignore_ascii_case(b"keep-alive")
         || name.eq_ignore_ascii_case(b"proxy-connection")
-}
-
-fn is_safe_auth_request_mutation_header(name: &str) -> bool {
-    !name.eq_ignore_ascii_case(http::header::HOST.as_str())
-        && !name.eq_ignore_ascii_case(http::header::CONNECTION.as_str())
-        && !name.eq_ignore_ascii_case(http::header::CONTENT_LENGTH.as_str())
-        && !name.eq_ignore_ascii_case(http::header::TRANSFER_ENCODING.as_str())
-        && !name.eq_ignore_ascii_case(http::header::UPGRADE.as_str())
-        && !name.eq_ignore_ascii_case(http::header::TE.as_str())
-        && !name.eq_ignore_ascii_case(http::header::TRAILER.as_str())
-        && !name.eq_ignore_ascii_case(http::header::EXPECT.as_str())
-        && !name.eq_ignore_ascii_case(http::header::AUTHORIZATION.as_str())
-        && !name.eq_ignore_ascii_case(http::header::LOCATION.as_str())
-        && !name.eq_ignore_ascii_case(http::header::WWW_AUTHENTICATE.as_str())
-        && !name.eq_ignore_ascii_case(http::header::FORWARDED.as_str())
-        && !name.eq_ignore_ascii_case("x-forwarded-for")
-        && !name.eq_ignore_ascii_case("x-forwarded-host")
-        && !name.eq_ignore_ascii_case("x-forwarded-port")
-        && !name.eq_ignore_ascii_case("x-forwarded-proto")
-        && !name.eq_ignore_ascii_case("keep-alive")
-        && !name.eq_ignore_ascii_case("proxy-connection")
-}
-
-pub(super) fn allowed_auth_headers(
-    headers: &http::HeaderMap,
-    allowlist: &[String],
-) -> Vec<(String, String)> {
-    headers
-        .iter()
-        .filter_map(|(name, value)| {
-            allowlist
-                .iter()
-                .any(|allowed| allowed.eq_ignore_ascii_case(name.as_str()))
-                .then(|| {
-                    value
-                        .to_str()
-                        .ok()
-                        .map(|value| (name.as_str().to_string(), value.to_string()))
-                })
-                .flatten()
-        })
-        .collect()
-}
-
-pub(super) fn auth_allow_mutations(
-    headers: &http::HeaderMap,
-    allowlist: &[String],
-) -> Vec<PendingHeaderMutation> {
-    allowed_auth_headers(headers, allowlist)
-        .into_iter()
-        .filter(|(name, _)| is_safe_auth_request_mutation_header(name))
-        .map(|(name, value)| PendingHeaderMutation::Upsert {
-            name: name.into_bytes(),
-            value: value.into_bytes(),
-        })
-        .collect()
 }
 
 pub(super) fn append_auth_request_headers(
@@ -274,74 +202,6 @@ async fn run_external_auth_with_timeout(
         .map_err(|_| ProxyError::Timeout)?
 }
 
-pub(super) fn map_http_external_auth_response(
-    status: http::StatusCode,
-    headers: &http::HeaderMap,
-    body: Vec<u8>,
-    response_header_allowlist: &[String],
-) -> ExternalAuthResult {
-    let location = headers
-        .get(http::header::LOCATION)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let challenge = headers
-        .get(http::header::WWW_AUTHENTICATE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let allowed_headers = allowed_auth_headers(headers, response_header_allowlist);
-    if status.is_success() {
-        return Ok(ExternalAuthDecision::Allow {
-            request_header_mutations: auth_allow_mutations(headers, response_header_allowlist),
-        });
-    }
-    if status.is_redirection() {
-        if let Some(location) = location {
-            return Ok(ExternalAuthDecision::Redirect(
-                ExternalAuthRedirectResponse {
-                    status,
-                    headers: allowed_headers
-                        .into_iter()
-                        .filter(|(name, _)| {
-                            !name.eq_ignore_ascii_case(http::header::LOCATION.as_str())
-                        })
-                        .collect(),
-                    location,
-                },
-            ));
-        }
-        return Err(ProxyError::Transport(
-            "external auth redirect missing location header".into(),
-        ));
-    }
-    if status == http::StatusCode::UNAUTHORIZED
-        && let Some(www_authenticate) = challenge
-    {
-        return Ok(ExternalAuthDecision::Challenge(
-            ExternalAuthChallengeResponse {
-                status,
-                headers: allowed_headers
-                    .into_iter()
-                    .filter(|(name, _)| {
-                        !name.eq_ignore_ascii_case(http::header::WWW_AUTHENTICATE.as_str())
-                    })
-                    .collect(),
-                www_authenticate,
-                body,
-            },
-        ));
-    }
-    if status.is_client_error() {
-        return Ok(ExternalAuthDecision::Deny(ExternalAuthDenyResponse {
-            status,
-            headers: allowed_headers,
-            body,
-        }));
-    }
-    Err(ProxyError::Transport(format!(
-        "external auth endpoint returned {status}"
-    )))
-}
-
 async fn run_http_external_auth(
     pending_forward: Arc<PendingForward>,
     endpoint: String,
@@ -362,7 +222,14 @@ async fn run_http_external_auth(
     } else {
         collect_auth_body(response.into_body()).await?
     };
-    map_http_external_auth_response(status, &headers, body, &response_header_allowlist)
+    crate::runtime::connection::auth::map_http_external_auth_response(
+        ExternalAuthResponseMetadata {
+            status,
+            headers: &headers,
+            body: &body,
+        },
+        &response_header_allowlist,
+    )
 }
 
 async fn fetch_json_document(uri: String, timeout: Duration) -> Result<Value, ProxyError> {
@@ -382,56 +249,6 @@ async fn fetch_json_document(uri: String, timeout: Duration) -> Result<Value, Pr
     serde_json::from_slice(&body).map_err(|err| ProxyError::Transport(err.to_string()))
 }
 
-/// Auth endpoints must use https; http is permitted only to loopback hosts,
-/// which are not reachable by on-path attackers (local development/testing).
-fn auth_uri_scheme_permitted(uri: &http::Uri) -> bool {
-    match uri.scheme_str() {
-        Some("https") => uri.authority().is_some(),
-        Some("http") => uri.host().is_some_and(uri_host_is_loopback),
-        _ => false,
-    }
-}
-
-fn uri_host_is_loopback(host: &str) -> bool {
-    let host = host
-        .strip_prefix('[')
-        .and_then(|inner| inner.strip_suffix(']'))
-        .unwrap_or(host);
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
-}
-
-fn oidc_discovery_url(discovery_url: Option<String>, issuer_url: Option<String>) -> Option<String> {
-    discovery_url.or_else(|| {
-        issuer_url.map(|issuer| {
-            format!(
-                "{}/.well-known/openid-configuration",
-                issuer.trim_end_matches('/')
-            )
-        })
-    })
-}
-
-pub(super) fn oidc_scope_satisfied(required_scopes: &[String], granted_scopes: &str) -> bool {
-    let granted: std::collections::HashSet<&str> = granted_scopes.split_whitespace().collect();
-    required_scopes
-        .iter()
-        .all(|scope| granted.contains(scope.as_str()))
-}
-
-pub(super) fn oidc_audience_matches(expected: Option<&str>, value: Option<&Value>) -> bool {
-    let Some(expected) = expected else {
-        return true;
-    };
-    match value {
-        Some(Value::String(single)) => single == expected,
-        Some(Value::Array(values)) => values.iter().any(|value| value.as_str() == Some(expected)),
-        _ => false,
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn run_oidc_external_auth(
     pending_forward: Arc<PendingForward>,
@@ -444,51 +261,17 @@ async fn run_oidc_external_auth(
     request_headers: Vec<spooky_config::runtime::RuntimeExternalAuthRequestHeader>,
     timeout: Duration,
 ) -> ExternalAuthResult {
-    let Some(authorization) = authorization_header_from_pending_forward(&pending_forward) else {
-        return Ok(ExternalAuthDecision::Challenge(
-            ExternalAuthChallengeResponse {
-                status: http::StatusCode::UNAUTHORIZED,
-                headers: Vec::new(),
-                www_authenticate: "Bearer".to_string(),
-                body: b"missing bearer token\n".to_vec(),
-            },
-        ));
+    let token = match oidc_authorization_check(
+        authorization_header_from_pending_forward(&pending_forward).as_deref(),
+    ) {
+        OidcAuthorizationCheck::Token(token) => token,
+        OidcAuthorizationCheck::Challenge(response) => {
+            return Ok(ExternalAuthDecision::Challenge(response));
+        }
     };
-    let Some(token) = QUICListener::bearer_token_from_authorization_value(&authorization) else {
-        return Ok(ExternalAuthDecision::Challenge(
-            ExternalAuthChallengeResponse {
-                status: http::StatusCode::UNAUTHORIZED,
-                headers: Vec::new(),
-                www_authenticate: "Bearer".to_string(),
-                body: b"invalid bearer token\n".to_vec(),
-            },
-        ));
-    };
-    let discovery = oidc_discovery_url(discovery_url, issuer_url.clone())
-        .ok_or_else(|| ProxyError::Transport("oidc auth missing discovery metadata".into()))?;
-    let discovery_uri = discovery
-        .parse::<http::Uri>()
-        .map_err(|err| ProxyError::Transport(err.to_string()))?;
-    if !auth_uri_scheme_permitted(&discovery_uri) {
-        return Err(ProxyError::Transport(
-            "oidc discovery endpoint must use https (http allowed only for loopback)".into(),
-        ));
-    }
-    let document = fetch_json_document(discovery, timeout).await?;
-    let introspection_endpoint = document
-        .get("introspection_endpoint")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            ProxyError::Transport("oidc discovery missing introspection_endpoint".into())
-        })?;
-    let introspection_uri = introspection_endpoint
-        .parse::<http::Uri>()
-        .map_err(|err| ProxyError::Transport(err.to_string()))?;
-    if !auth_uri_scheme_permitted(&introspection_uri) {
-        return Err(ProxyError::Transport(
-            "oidc introspection endpoint must use https (http allowed only for loopback)".into(),
-        ));
-    }
+    let discovery = oidc_discovery_target(discovery_url.as_deref(), issuer_url.as_deref())?;
+    let document = fetch_json_document(discovery.url, timeout).await?;
+    let metadata = validate_oidc_provider_metadata(&document)?;
 
     let mut body = format!(
         "token={}&client_id={}",
@@ -506,7 +289,7 @@ async fn run_oidc_external_auth(
 
     let mut builder = Request::builder()
         .method(http::Method::POST)
-        .uri(introspection_endpoint)
+        .uri(metadata.introspection_endpoint)
         .header(
             http::header::CONTENT_TYPE,
             http::header::HeaderValue::from_static("application/x-www-form-urlencoded"),
@@ -585,7 +368,7 @@ async fn run_external_auth(
     pending_forward: Arc<PendingForward>,
     external_auth: RuntimeExternalAuth,
 ) -> ExternalAuthResult {
-    let timeout = Duration::from_millis(auth_timeout_ms(&external_auth).max(1));
+    let timeout = ExternalAuthExecutionPolicy::from_external_auth(&external_auth).timeout;
     match external_auth {
         RuntimeExternalAuth::Http {
             endpoint,
@@ -632,12 +415,12 @@ pub(super) fn start_external_auth_task(
     pending_forward: Arc<PendingForward>,
     external_auth: RuntimeExternalAuth,
 ) -> Result<AuthStart, ProxyError> {
-    let timeout_ms = auth_timeout_ms(&external_auth).max(1);
-    let mode = auth_failure_mode(&external_auth);
-    let timeout = Duration::from_millis(timeout_ms);
+    let task_config = ExternalAuthTaskConfig::from_external_auth(&external_auth);
     let (tx, rx) = oneshot::channel();
     let fut = async move {
-        let result = run_external_auth_with_timeout(pending_forward, external_auth, timeout).await;
+        let result =
+            run_external_auth_with_timeout(pending_forward, external_auth, task_config.timeout)
+                .await;
         let _ = tx.send(result);
     };
     let Some(handle) = runtime_handle() else {
@@ -649,8 +432,8 @@ pub(super) fn start_external_auth_task(
     Ok(AuthStart {
         rx,
         abort: join.abort_handle(),
-        deadline: Instant::now() + timeout,
-        fail_open: fail_open(mode),
+        deadline: Instant::now() + task_config.timeout,
+        fail_open: task_config.disposition.fail_open(),
     })
 }
 
@@ -670,26 +453,26 @@ impl QUICListener {
             abort.abort();
         }
         req.auth_deadline = None;
-        match result {
-            Ok(ExternalAuthDecision::Allow {
+        let completion = evaluate_external_auth_completion(
+            result,
+            ExternalAuthFailureDisposition::from_fail_open(req.auth_fail_open),
+        );
+        match completion {
+            ExternalAuthCompletion::Allow {
                 request_header_mutations,
-            }) => {
+            } => {
                 metrics.inc_external_auth_allowed();
                 if let Some(pending_forward) = req.pending_forward.as_mut() {
-                    Arc::make_mut(pending_forward)
-                        .auth_header_mutations
-                        .extend(request_header_mutations);
+                    merge_auth_request_mutations(
+                        &mut Arc::make_mut(pending_forward).auth_header_mutations,
+                        request_header_mutations,
+                    );
                 }
                 Self::materialize_forward_after_auth(stream_id, req, h3, quic, exec_ctx, shared_ctx)
             }
-            Ok(decision) => {
+            ExternalAuthCompletion::Respond(decision) => {
                 req.admission_state = StreamAdmissionState::Denied;
-                req.response_status = match &decision {
-                    ExternalAuthDecision::Deny(response) => Some(response.status.as_u16()),
-                    ExternalAuthDecision::Redirect(response) => Some(response.status.as_u16()),
-                    ExternalAuthDecision::Challenge(response) => Some(response.status.as_u16()),
-                    ExternalAuthDecision::Allow { .. } => None,
-                };
+                req.response_status = Some(decision.status().as_u16());
                 metrics.inc_failure();
                 metrics.inc_policy_denied();
                 metrics.inc_external_auth_denied();
@@ -707,43 +490,56 @@ impl QUICListener {
                 Self::send_external_auth_decision_response(h3, quic, stream_id, &decision)?;
                 Ok(false)
             }
-            Err(err) if req.auth_fail_open => {
-                match &err {
-                    ProxyError::Timeout => metrics.inc_external_auth_timeout(),
-                    _ => metrics.inc_external_auth_error(),
+            ExternalAuthCompletion::FailOpen { timed_out, error } => {
+                if timed_out {
+                    metrics.inc_external_auth_timeout();
+                    warn!(
+                        "request_id={} route={} external auth failed open: timeout",
+                        req.request_id,
+                        req.upstream_name.as_deref().unwrap_or("unrouted"),
+                    );
+                } else {
+                    metrics.inc_external_auth_error();
+                    if let Some(error) = error {
+                        warn!(
+                            "request_id={} route={} external auth failed open: {:?}",
+                            req.request_id,
+                            req.upstream_name.as_deref().unwrap_or("unrouted"),
+                            error
+                        );
+                    }
                 }
-                warn!(
-                    "request_id={} route={} external auth failed open: {:?}",
-                    req.request_id,
-                    req.upstream_name.as_deref().unwrap_or("unrouted"),
-                    err
-                );
                 Self::materialize_forward_after_auth(stream_id, req, h3, quic, exec_ctx, shared_ctx)
             }
-            Err(err) => {
+            ExternalAuthCompletion::Reject {
+                status,
+                body,
+                timed_out,
+                error,
+            } => {
+                if timed_out {
+                    metrics.inc_external_auth_timeout();
+                } else {
+                    metrics.inc_external_auth_error();
+                    if let Some(error) = &error {
+                        debug!(
+                            "request_id={} route={} external auth rejected after error: {:?}",
+                            req.request_id,
+                            req.upstream_name.as_deref().unwrap_or("unrouted"),
+                            error
+                        );
+                    }
+                }
                 metrics.inc_failure();
                 let route_label = req.upstream_name.as_deref().unwrap_or("unrouted");
-                let (status, body, outcome) = match err {
-                    ProxyError::Timeout => {
-                        metrics.inc_external_auth_timeout();
-                        (
-                            http::StatusCode::GATEWAY_TIMEOUT,
-                            b"external auth timeout\n".as_slice(),
-                            RouteOutcome::Timeout,
-                        )
-                    }
-                    _ => {
-                        metrics.inc_external_auth_error();
-                        (
-                            http::StatusCode::SERVICE_UNAVAILABLE,
-                            b"external auth unavailable\n".as_slice(),
-                            RouteOutcome::Failure,
-                        )
-                    }
+                let route_outcome = if timed_out {
+                    RouteOutcome::Timeout
+                } else {
+                    RouteOutcome::Failure
                 };
                 req.admission_state = StreamAdmissionState::Denied;
                 req.response_status = Some(status.as_u16());
-                metrics.record_route(route_label, req.start.elapsed(), outcome);
+                metrics.record_route(route_label, req.start.elapsed(), route_outcome);
                 Self::send_simple_response(h3, quic, stream_id, status, body)?;
                 Ok(false)
             }

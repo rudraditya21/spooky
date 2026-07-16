@@ -1126,21 +1126,11 @@ mod tests {
     use sha2::Sha256;
     use spooky_config::{
         config::{ScopedRateLimit, ScopedRateLimitScope},
-        runtime::{
-            RuntimeApiKeyAuth, RuntimeAuthPolicy, RuntimeExternalAuth,
-            RuntimeExternalAuthFailureMode, RuntimeJwtAuth, RuntimeUpstreamPolicy,
-        },
+        runtime::{RuntimeApiKeyAuth, RuntimeAuthPolicy, RuntimeJwtAuth, RuntimeUpstreamPolicy},
     };
 
-    use super::{
-        auth::{
-            allowed_auth_headers, append_auth_request_headers, auth_allow_mutations,
-            auth_failure_mode, auth_timeout_ms, fail_open, map_http_external_auth_response,
-            oidc_audience_matches, oidc_scope_satisfied,
-        },
-        *,
-    };
-    use crate::runtime::connection::auth::{ExternalAuthDecision, PendingHeaderMutation};
+    use super::{auth::append_auth_request_headers, *};
+    use crate::runtime::connection::auth::PendingHeaderMutation;
 
     fn sample_pending_forward(headers: Vec<quiche::h3::Header>) -> PendingForward {
         PendingForward {
@@ -1754,64 +1744,6 @@ mod tests {
     }
 
     #[test]
-    fn auth_header_allowlist_is_case_insensitive() {
-        let mut headers = http::HeaderMap::new();
-        headers.insert("x-auth-user", http::HeaderValue::from_static("alice"));
-        headers.insert("x-ignore", http::HeaderValue::from_static("nope"));
-        headers.insert(
-            http::header::CONTENT_LENGTH,
-            http::HeaderValue::from_static("12"),
-        );
-
-        assert_eq!(
-            allowed_auth_headers(&headers, &["X-Auth-User".to_string()]),
-            vec![("x-auth-user".to_string(), "alice".to_string())]
-        );
-
-        assert_eq!(
-            auth_allow_mutations(&headers, &["x-auth-user".to_string()]),
-            vec![PendingHeaderMutation::Upsert {
-                name: b"x-auth-user".to_vec(),
-                value: b"alice".to_vec(),
-            }]
-        );
-    }
-
-    #[test]
-    fn auth_allow_mutations_drops_unsafe_request_headers() {
-        let mut headers = http::HeaderMap::new();
-        headers.insert("x-auth-user", http::HeaderValue::from_static("alice"));
-        headers.insert(
-            http::header::AUTHORIZATION,
-            http::HeaderValue::from_static("Bearer test"),
-        );
-        headers.insert(
-            http::header::LOCATION,
-            http::HeaderValue::from_static("https://login"),
-        );
-        headers.insert(
-            http::header::CONTENT_LENGTH,
-            http::HeaderValue::from_static("12"),
-        );
-
-        assert_eq!(
-            auth_allow_mutations(
-                &headers,
-                &[
-                    "x-auth-user".to_string(),
-                    "authorization".to_string(),
-                    "location".to_string(),
-                    "content-length".to_string(),
-                ],
-            ),
-            vec![PendingHeaderMutation::Upsert {
-                name: b"x-auth-user".to_vec(),
-                value: b"alice".to_vec(),
-            }]
-        );
-    }
-
-    #[test]
     fn append_auth_request_headers_strips_hop_by_hop_and_framing_headers() {
         let pending_forward = sample_pending_forward(vec![
             quiche::h3::Header::new(b":method", b"GET"),
@@ -1843,157 +1775,5 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("Bearer token")
         );
-    }
-
-    #[test]
-    fn http_external_auth_response_mapping_preserves_allowlisted_denial_headers() {
-        let mut headers = http::HeaderMap::new();
-        headers.insert("x-auth-reason", http::HeaderValue::from_static("policy"));
-        headers.insert("x-drop", http::HeaderValue::from_static("secret"));
-
-        let decision = map_http_external_auth_response(
-            http::StatusCode::FORBIDDEN,
-            &headers,
-            b"denied
-"
-            .to_vec(),
-            &["x-auth-reason".to_string()],
-        )
-        .expect("deny decision");
-
-        match decision {
-            ExternalAuthDecision::Deny(response) => {
-                assert_eq!(response.status, http::StatusCode::FORBIDDEN);
-                assert_eq!(response.body, b"denied\n".to_vec());
-                assert_eq!(
-                    response.headers,
-                    vec![("x-auth-reason".to_string(), "policy".to_string())]
-                );
-            }
-            other => panic!("unexpected decision: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn http_external_auth_response_mapping_builds_challenge_from_401() {
-        let mut headers = http::HeaderMap::new();
-        headers.insert(
-            http::header::WWW_AUTHENTICATE,
-            http::HeaderValue::from_static("Bearer realm=\"spooky\""),
-        );
-        headers.insert("x-auth-reason", http::HeaderValue::from_static("expired"));
-
-        let decision = map_http_external_auth_response(
-            http::StatusCode::UNAUTHORIZED,
-            &headers,
-            b"challenge\n".to_vec(),
-            &["x-auth-reason".to_string()],
-        )
-        .expect("challenge decision");
-
-        match decision {
-            ExternalAuthDecision::Challenge(response) => {
-                assert_eq!(response.status, http::StatusCode::UNAUTHORIZED);
-                assert_eq!(response.www_authenticate, "Bearer realm=\"spooky\"");
-                assert_eq!(response.body, b"challenge\n".to_vec());
-                assert_eq!(
-                    response.headers,
-                    vec![("x-auth-reason".to_string(), "expired".to_string())]
-                );
-            }
-            other => panic!("unexpected decision: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn http_external_auth_response_mapping_dedupes_standard_redirect_and_challenge_headers() {
-        let mut redirect_headers = http::HeaderMap::new();
-        redirect_headers.insert(
-            http::header::LOCATION,
-            http::HeaderValue::from_static("https://login.example.com/"),
-        );
-        let redirect = map_http_external_auth_response(
-            http::StatusCode::FOUND,
-            &redirect_headers,
-            Vec::new(),
-            &["location".to_string()],
-        )
-        .expect("redirect decision");
-        match redirect {
-            ExternalAuthDecision::Redirect(response) => {
-                assert!(response.headers.is_empty());
-                assert_eq!(response.location, "https://login.example.com/");
-            }
-            other => panic!("unexpected decision: {other:?}"),
-        }
-
-        let mut challenge_headers = http::HeaderMap::new();
-        challenge_headers.insert(
-            http::header::WWW_AUTHENTICATE,
-            http::HeaderValue::from_static("Bearer realm=\"spooky\""),
-        );
-        let challenge = map_http_external_auth_response(
-            http::StatusCode::UNAUTHORIZED,
-            &challenge_headers,
-            b"challenge\n".to_vec(),
-            &["www-authenticate".to_string()],
-        )
-        .expect("challenge decision");
-        match challenge {
-            ExternalAuthDecision::Challenge(response) => {
-                assert!(response.headers.is_empty());
-                assert_eq!(response.www_authenticate, "Bearer realm=\"spooky\"");
-            }
-            other => panic!("unexpected decision: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn http_external_auth_response_mapping_requires_redirect_location() {
-        let headers = http::HeaderMap::new();
-        let err =
-            map_http_external_auth_response(http::StatusCode::FOUND, &headers, Vec::new(), &[])
-                .expect_err("redirect without location must fail");
-        assert!(matches!(err, ProxyError::Transport(_)));
-    }
-
-    #[test]
-    fn oidc_helper_predicates_match_expected_scope_and_audience_shapes() {
-        assert!(oidc_scope_satisfied(
-            &["read".to_string(), "write".to_string()],
-            "read write admin"
-        ));
-        assert!(!oidc_scope_satisfied(
-            &["read".to_string(), "write".to_string()],
-            "read"
-        ));
-
-        assert!(oidc_audience_matches(
-            Some("api://edge"),
-            Some(&serde_json::Value::String("api://edge".to_string()))
-        ));
-        assert!(oidc_audience_matches(
-            Some("api://edge"),
-            Some(&serde_json::json!(["other", "api://edge"]))
-        ));
-        assert!(!oidc_audience_matches(
-            Some("api://edge"),
-            Some(&serde_json::Value::String("api://other".to_string()))
-        ));
-        assert!(oidc_audience_matches(None, None));
-    }
-
-    #[test]
-    fn external_auth_failure_mode_helpers_track_fail_open() {
-        let auth = RuntimeExternalAuth::Http {
-            endpoint: "http://127.0.0.1:9000/auth".to_string(),
-            request_headers: Vec::new(),
-            response_header_allowlist: Vec::new(),
-            timeout_ms: 250,
-            failure_mode: RuntimeExternalAuthFailureMode::FailOpen,
-        };
-
-        assert_eq!(auth_timeout_ms(&auth), 250);
-        assert!(fail_open(auth_failure_mode(&auth)));
     }
 }

@@ -90,9 +90,7 @@ pub(crate) fn status_forbids_response_body(status: StatusCode) -> bool {
 }
 
 fn is_hop_by_hop_response_header(name: &HeaderName, preserve_upgrade: bool) -> bool {
-    if preserve_upgrade
-        && (name == http::header::CONNECTION || name == http::header::UPGRADE)
-    {
+    if preserve_upgrade && (name == http::header::CONNECTION || name == http::header::UPGRADE) {
         return false;
     }
 
@@ -234,13 +232,12 @@ pub fn apply_response_header_defaults(
 
     if matches!(emission.content_length, ContentLengthPolicy::Strip) {
         headers.retain(|header| header.name != http::header::CONTENT_LENGTH);
-    } else if !has_content_length
-        && let Ok(value) = HeaderValue::from_str(&body_len.to_string()) {
-            headers.push(NormalizedHeader {
-                name: http::header::CONTENT_LENGTH,
-                value,
-            });
-        }
+    } else if !has_content_length && let Ok(value) = HeaderValue::from_str(&body_len.to_string()) {
+        headers.push(NormalizedHeader {
+            name: http::header::CONTENT_LENGTH,
+            value,
+        });
+    }
 
     if matches!(
         emission.content_type,
