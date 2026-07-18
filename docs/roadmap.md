@@ -21,16 +21,14 @@ Spooky is not yet strongest today as:
 
 These are the highest-value areas for the next phase of maturity.
 
-### 1. Full Configuration Hot Reload
+### 1. Complete Configuration Hot Reload
 
-Add safe live update support for:
+Full config hot reload is **shipped** (`POST /admin/runtime/reload`): routes, upstreams, backends,
+timeouts and limits, resilience policies, and observability endpoint changes apply live via an
+atomic runtime swap. The remaining work is to close the restart-only gaps:
 
-- listeners
-- routes
-- upstreams
-- timeouts and limits
-- resilience policies
-- observability settings
+- listener removal and bind-address changes (listener *addition* is already live)
+- startup-owned settings: log level/file/format, tracing config, control-plane thread counts
 
 ### 2. Dynamic Config Safety
 
