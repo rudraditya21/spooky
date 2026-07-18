@@ -492,11 +492,12 @@ For environments requiring mandatory access control, create appropriate policies
 Spooky exposes a Prometheus-compatible metrics endpoint. Configure it in `config.yaml`:
 
 ```yaml
-metrics:
-  enabled: true
-  address: "127.0.0.1"
-  port: 9090
-  path: "/metrics"
+observability:
+  metrics:
+    enabled: true
+    address: "127.0.0.1"
+    port: 9901
+    path: "/metrics"
 ```
 
 Scrape it with Prometheus:
@@ -509,7 +510,7 @@ scrape_configs:
     scrape_timeout: 10s
     metrics_path: '/metrics'
     static_configs:
-      - targets: ['spooky-01.internal:9090', 'spooky-02.internal:9090']
+      - targets: ['spooky-01.internal:9901', 'spooky-02.internal:9901']
         labels:
           environment: 'production'
           service: 'proxy'

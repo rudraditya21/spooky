@@ -49,7 +49,7 @@ After starting Spooky against the new config (in a staging environment, or as a 
 The `/admin/runtime` endpoint returns the current runtime state of every upstream pool, including per-backend health status. Query it within the first 30 seconds of startup:
 
 ```bash
-curl -s http://127.0.0.1:9000/admin/runtime | jq .
+curl -sk https://127.0.0.1:9902/admin/runtime | jq .
 ```
 
 A healthy response looks like this:
@@ -97,10 +97,11 @@ A pool where `healthy_count` is less than `total_count` indicates partial degrad
 
 ### 2. Watch health check logs at debug level
 
-During the first 30 seconds after startup, run Spooky at debug log level (or tail its logs if already running with structured output) and watch for health probe results:
+During the first 30 seconds after startup, run Spooky at debug log level (or tail its logs if already running with structured output) and watch for health probe results. The log level is set in the config file via `log.level: debug` (there is no `SPOOKY_LOG`/`RUST_LOG` environment variable):
 
 ```bash
-SPOOKY_LOG=debug spooky --config /etc/spooky/config-new.yaml 2>&1 | grep -i "health\|probe\|backend"
+# set `log.level: debug` in config-new.yaml, then:
+spooky --config /etc/spooky/config-new.yaml 2>&1 | grep -i "health\|probe\|backend"
 ```
 
 You are looking for probe success messages for every backend. Any repeated probe failure for a backend that should be reachable is a signal to stop and investigate before the instance takes traffic.
@@ -216,8 +217,9 @@ Run the new-config instance on a different port from the production instance. Bo
 # Production instance (already running)
 # Config: /etc/spooky/config.yaml, port 443
 
-# Canary instance
-spooky --config /etc/spooky/config-new.yaml --listen 0.0.0.0:8443
+# Canary instance — the CLI only accepts --config/-c; set the bind address in the config file.
+# Use config-new.yaml with `listen.address`/`listen.port` set to the canary port (e.g. 8443).
+spooky --config /etc/spooky/config-new.yaml
 ```
 
 Alternatively, use a separate unit file if running under systemd:
@@ -254,19 +256,25 @@ Run the same query for the canary instance and compare. A lower success rate on 
 
 ```promql
 histogram_quantile(0.99,
-  rate(spooky_request_duration_seconds_bucket{instance="host:9090"}[5m])
+  rate(spooky_upstream_request_latency_ms_bucket{instance="host:9901"}[5m])
 )
 ```
 
-A p99 latency increase on the canary instance (but not the production instance) points to backend latency regression or a timeout misconfiguration in the new config.
+This histogram is in **milliseconds** (buckets are `_ms`), and carries `upstream`/`outcome`/`le`
+labels. A p99 latency increase on the canary instance (but not the production instance) points to
+backend latency regression or a timeout misconfiguration in the new config.
 
-**Backend health gauge (should be 1 for all backends on both instances):**
+**Backend health (compare health-check success/failure between instances):**
+
+Spooky does not export a per-backend boolean health gauge. Use the health-check counters instead:
 
 ```promql
-spooky_backend_healthy{instance="host:9090"}
+rate(spooky_health_checks_failure{instance="host:9901"}[5m])
 ```
 
-Any backend showing `0` on the canary but `1` on the production instance confirms a backend reachability or config problem specific to the new config.
+A rising health-check failure rate on the canary but not the production instance confirms a backend
+reachability or config problem specific to the new config. (Live per-backend health is also visible
+in the `/admin/runtime` snapshot.)
 
 ### 4. Promote or roll back
 
@@ -309,7 +317,7 @@ A timeout spike after restart is a strong signal that backend addresses changed 
 Poll this endpoint repeatedly in the first few minutes after restart:
 
 ```bash
-watch -n 5 'curl -s http://127.0.0.1:9000/admin/runtime | jq ".upstreams | to_entries[] | {pool: .key, healthy: .value.healthy_count, total: .value.total_count}"'
+watch -n 5 'curl -sk https://127.0.0.1:9902/admin/runtime | jq ".upstreams | to_entries[] | {pool: .key, healthy: .value.healthy_count, total: .value.total_count}"'
 ```
 
 Any pool where `healthy` is less than `total` after 60 seconds of uptime should be investigated. If a backend was healthy before the restart and is now unhealthy, the new config is likely pointing to a wrong address or using a different TLS mode that the backend does not expect.
@@ -400,7 +408,7 @@ Expected: `Active: active (running)`. If the service enters a failed state, chec
 
 ```bash
 for i in $(seq 1 10); do
-  STATUS=$(curl -o /dev/null -s -w "%{http_code}" http://127.0.0.1:9000/health)
+  STATUS=$(curl -o /dev/null -sk -w "%{http_code}" https://127.0.0.1:9902/health)
   echo "$(date +%T) /health: $STATUS"
   [ "$STATUS" = "200" ] && break
   sleep 0.5
