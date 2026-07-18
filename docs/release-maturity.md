@@ -26,7 +26,7 @@ Operators should **not** assume:
 
 - every interface is frozen
 - every deployment shape has been equally hardened
-- a restart-free config workflow exists
+- a fully restart-free config workflow exists — most config applies live via `POST /admin/runtime/reload`, but startup-owned settings (log, tracing, thread counts) and listener removal/bind-address changes still require a restart
 
 ## Current Strong Areas
 

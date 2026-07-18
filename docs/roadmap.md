@@ -81,16 +81,18 @@ These areas make Spooky far more competitive as a general production reverse pro
 
 ### 7. Operator Features
 
-- first-class rate limiting
+- distributed / cross-instance rate limiting (scoped per-instance rate limiting already ships)
 - stronger capacity guidance
 - more complete runbooks and alerts
 - better runtime visibility for why requests were shed, retried, or rerouted
 
 ### 8. Auth And Policy Features
 
-- JWT validation
-- external auth integration
-- stronger route-level policy controls
+- JWKS / asymmetric JWT validation (RS256/ES256) — local JWT validation ships today but is HS256-only
+- stronger route-level policy controls and layered/chained auth providers
+
+_Already shipped (previously listed here as future): scoped rate limiting (route/client/tenant/token),
+local HS256 JWT validation with scope/role RBAC, and external auth via HTTP subrequest or OIDC._
 
 ## Longer-Term Competitive Priorities
 
