@@ -107,3 +107,71 @@ impl RouteTrie {
         best
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::routing::{decision::RouteDecisionReason, route::IndexedRoute, trie::RouteTrie};
+
+    fn route(upstream_idx: usize, path_len: usize) -> IndexedRoute {
+        IndexedRoute {
+            upstream_idx,
+            path_len,
+            host_specific: false,
+            method_specific: false,
+            order: upstream_idx,
+        }
+    }
+
+    #[test]
+    fn longest_prefix_returns_none_when_trie_is_empty() {
+        let trie = RouteTrie::default();
+        let upstream_methods = Vec::new();
+
+        assert_eq!(trie.longest_prefix("/api", None, &upstream_methods), None);
+        assert_eq!(
+            trie.longest_prefix_with_reason("/api", None, &upstream_methods),
+            None
+        );
+    }
+
+    #[test]
+    fn longest_prefix_prefers_longest_overlapping_prefix() {
+        let mut trie = RouteTrie::default();
+        let upstream_methods = vec![None, None];
+        trie.insert(Some("/api"), route(0, "/api".len()));
+        trie.insert(Some("/api/v1"), route(1, "/api/v1".len()));
+
+        assert_eq!(
+            trie.longest_prefix("/api/v1/users", None, &upstream_methods),
+            Some(route(1, "/api/v1".len()))
+        );
+    }
+
+    #[test]
+    fn longest_prefix_uses_root_fallback_when_no_child_matches() {
+        let mut trie = RouteTrie::default();
+        let upstream_methods = vec![None];
+        trie.insert(None, route(0, 0));
+
+        assert_eq!(
+            trie.longest_prefix("/unmatched", None, &upstream_methods),
+            Some(route(0, 0))
+        );
+    }
+
+    #[test]
+    fn longest_prefix_with_reason_reports_longer_prefix_preference() {
+        let mut trie = RouteTrie::default();
+        let upstream_methods = vec![None, None];
+        trie.insert(None, route(0, 0));
+        trie.insert(Some("/api"), route(1, "/api".len()));
+
+        assert_eq!(
+            trie.longest_prefix_with_reason("/api/users", None, &upstream_methods),
+            Some((
+                route(1, "/api".len()),
+                Some(RouteDecisionReason::HostPathLongerOrEqual)
+            ))
+        );
+    }
+}
