@@ -10,3 +10,9 @@ http = { workspace = true }
 hyper-util = { workspace = true }
 quiche = { workspace = true }
 spooky-lb = { path = "../lb" }
+
+[dev-dependencies]
+bytes.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+tokio.workspace = true
