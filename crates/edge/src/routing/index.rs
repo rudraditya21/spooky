@@ -179,11 +179,14 @@ impl RouteIndex {
 
         let default_best = self
             .default_trie
-            .longest_prefix(path, method, &self.upstream_methods)
-            .map(|route| RouteCandidate {
-                route,
-                host_match_kind: HostMatchKind::Default,
-                wildcard_suffix_len: 0,
+            .longest_prefix_with_reason(path, method, &self.upstream_methods)
+            .map(|(route, decision_reason)| HostLookupResult {
+                candidate: RouteCandidate {
+                    route,
+                    host_match_kind: HostMatchKind::Default,
+                    wildcard_suffix_len: 0,
+                },
+                decision_reason,
             });
         if let Some(best) = host_best
             && best.candidate.route.path_len >= self.default_max_path_len
@@ -191,7 +194,7 @@ impl RouteIndex {
             let fallback_reason = match default_best {
                 None => RouteDecisionReason::HostTrieNoDefault,
                 Some(default_route) => {
-                    match compare_route_candidate(default_route, best.candidate) {
+                    match compare_route_candidate(default_route.candidate, best.candidate) {
                         RoutePreference::TakeCandidateHostSpecific => {
                             RouteDecisionReason::HostSpecificTieBreak
                         }
@@ -221,10 +224,12 @@ impl RouteIndex {
 
         match (default_best, host_best) {
             (Some(default_route), None) => Some(RouteDecision {
-                upstream: self.upstream_names[default_route.route.upstream_idx].as_str(),
-                matched_path_len: default_route.route.path_len,
-                host_specific: default_route.route.host_specific,
-                reason: RouteDecisionReason::DefaultPathLonger,
+                upstream: self.upstream_names[default_route.candidate.route.upstream_idx].as_str(),
+                matched_path_len: default_route.candidate.route.path_len,
+                host_specific: default_route.candidate.route.host_specific,
+                reason: default_route
+                    .decision_reason
+                    .unwrap_or(RouteDecisionReason::DefaultPathLonger),
             }),
             (None, Some(host_route)) => Some(RouteDecision {
                 upstream: self.upstream_names[host_route.candidate.route.upstream_idx].as_str(),
@@ -235,7 +240,7 @@ impl RouteIndex {
                     .unwrap_or(RouteDecisionReason::HostTrieNoDefault),
             }),
             (Some(current), Some(candidate)) => {
-                let preference = compare_route_candidate(current, candidate.candidate);
+                let preference = compare_route_candidate(current.candidate, candidate.candidate);
                 let fallback_reason = match preference {
                     RoutePreference::TakeCandidatePathLen => {
                         RouteDecisionReason::HostPathLongerOrEqual
@@ -258,7 +263,7 @@ impl RouteIndex {
                     RoutePreference::KeepCurrent => RouteDecisionReason::DefaultPathLonger,
                 };
                 let selected = match preference {
-                    RoutePreference::KeepCurrent => current,
+                    RoutePreference::KeepCurrent => current.candidate,
                     _ => candidate.candidate,
                 };
                 Some(RouteDecision {
@@ -268,7 +273,7 @@ impl RouteIndex {
                     reason: if selected == candidate.candidate {
                         candidate.decision_reason.unwrap_or(fallback_reason)
                     } else {
-                        fallback_reason
+                        current.decision_reason.unwrap_or(fallback_reason)
                     },
                 })
             }
@@ -342,5 +347,162 @@ impl From<ConfiguredHostPattern> for RuntimeRouteHostPattern {
             ConfiguredHostPattern::Exact(host) => Self::Exact(host),
             ConfiguredHostPattern::WildcardSuffix(suffix) => Self::WildcardSuffix(suffix),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use spooky_config::config::{Backend, LoadBalancing, RouteMatch, Upstream};
+
+    use crate::routing::{decision::RouteDecisionReason, index::RouteIndex};
+
+    fn upstream(path_prefix: &str, host: Option<&str>, method: Option<&str>) -> Upstream {
+        Upstream {
+            load_balancing: LoadBalancing {
+                lb_type: "round-robin".to_string(),
+                key: None,
+            },
+            auth: Default::default(),
+            host_policy: Default::default(),
+            forwarded_headers: Default::default(),
+            tls: None,
+            route: RouteMatch {
+                path_prefix: Some(path_prefix.to_string()),
+                host: host.map(str::to_string),
+                method: method.map(str::to_string),
+            },
+            backends: vec![Backend {
+                id: "b1".to_string(),
+                address: "http://127.0.0.1:7001".to_string(),
+                weight: 1,
+                health_check: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn lookup_prefers_host_specific_route_over_default() {
+        let upstreams = HashMap::from([
+            ("default".to_string(), upstream("/api", None, None)),
+            (
+                "payments".to_string(),
+                upstream("/api", Some("pay.example.com"), None),
+            ),
+        ]);
+        let index = RouteIndex::from_upstreams(&upstreams);
+
+        assert_eq!(
+            index.lookup("/api", Some("pay.example.com")),
+            Some("payments")
+        );
+
+        let decision = index
+            .lookup_with_decision("/api", Some("pay.example.com"))
+            .expect("route decision");
+        assert_eq!(decision.upstream, "payments");
+        assert_eq!(decision.reason, RouteDecisionReason::HostSpecificTieBreak);
+    }
+
+    #[test]
+    fn lookup_prefers_exact_host_over_wildcard() {
+        let upstreams = HashMap::from([
+            (
+                "wildcard".to_string(),
+                upstream("/api", Some("*.example.com"), None),
+            ),
+            (
+                "exact".to_string(),
+                upstream("/api", Some("api.example.com"), None),
+            ),
+        ]);
+        let index = RouteIndex::from_upstreams(&upstreams);
+
+        assert_eq!(index.lookup("/api", Some("api.example.com")), Some("exact"));
+
+        let decision = index
+            .lookup_with_decision("/api", Some("api.example.com"))
+            .expect("route decision");
+        assert_eq!(decision.upstream, "exact");
+        assert_eq!(decision.reason, RouteDecisionReason::ExactHostTieBreak);
+    }
+
+    #[test]
+    fn lookup_prefers_more_specific_wildcard_suffix() {
+        let upstreams = HashMap::from([
+            (
+                "broad".to_string(),
+                upstream("/api", Some("*.example.com"), None),
+            ),
+            (
+                "narrow".to_string(),
+                upstream("/api", Some("*.svc.example.com"), None),
+            ),
+        ]);
+        let index = RouteIndex::from_upstreams(&upstreams);
+
+        assert_eq!(
+            index.lookup("/api", Some("edge.svc.example.com")),
+            Some("narrow")
+        );
+
+        let decision = index
+            .lookup_with_decision("/api", Some("edge.svc.example.com"))
+            .expect("route decision");
+        assert_eq!(decision.upstream, "narrow");
+        assert_eq!(
+            decision.reason,
+            RouteDecisionReason::WildcardSpecificityTieBreak
+        );
+    }
+
+    #[test]
+    fn lookup_for_method_prefers_method_specific_route() {
+        let upstreams = HashMap::from([
+            ("generic".to_string(), upstream("/transfer", None, None)),
+            (
+                "post_only".to_string(),
+                upstream("/transfer", None, Some("POST")),
+            ),
+        ]);
+        let index = RouteIndex::from_upstreams(&upstreams);
+
+        assert_eq!(
+            index.lookup_for_method("/transfer", None, Some("POST")),
+            Some("post_only")
+        );
+
+        let decision = index
+            .lookup_with_decision_for_method("/transfer", None, Some("POST"))
+            .expect("route decision");
+        assert_eq!(decision.upstream, "post_only");
+        assert_eq!(decision.reason, RouteDecisionReason::MethodSpecificTieBreak);
+    }
+
+    #[test]
+    fn lookup_with_decision_prefers_longer_default_path_when_host_route_is_shorter() {
+        let upstreams = HashMap::from([
+            (
+                "host_short".to_string(),
+                upstream("/api", Some("pay.example.com"), None),
+            ),
+            (
+                "default_long".to_string(),
+                upstream("/api/v1/payments", None, None),
+            ),
+        ]);
+        let index = RouteIndex::from_upstreams(&upstreams);
+
+        assert_eq!(
+            index.lookup("/api/v1/payments", Some("pay.example.com")),
+            Some("default_long")
+        );
+
+        let decision = index
+            .lookup_with_decision("/api/v1/payments", Some("pay.example.com"))
+            .expect("route decision");
+        assert_eq!(decision.upstream, "default_long");
+        assert_eq!(decision.reason, RouteDecisionReason::DefaultPathLonger);
     }
 }
