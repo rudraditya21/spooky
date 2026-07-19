@@ -1739,9 +1739,45 @@ impl QUICListener {
                 .close(true, 0x1, b"http3 protocol handling error");
         }
 
-        Self::maybe_rotate_scid(&mut connection, &self.metrics);
-
         let mut send_buf = [0u8; MAX_DATAGRAM_SIZE_BYTES];
+
+        let shared_ctx = ForwardingSharedCtx {
+            metrics: Arc::clone(&self.metrics),
+            resilience: &self.resilience,
+            routing_index: &self.routing_index,
+            upstream_pools: &self.upstream_pools,
+        };
+        let exec_ctx = ForwardingExecutionCtx {
+            transport_pool: Arc::clone(&self.transport_pool),
+            backend_endpoints: Arc::clone(&self.backend_endpoints),
+            backend_resolution_store: Arc::clone(&self.backend_resolution_store),
+            upstream_inflight: &self.upstream_inflight,
+            global_inflight: Arc::clone(&self.global_inflight),
+            backend_timeout: self.backend_timeout,
+            inflight_acquire_wait: self.inflight_acquire_wait,
+        };
+        let progress_config = StreamProgressConfig {
+            backend_body_idle_timeout: self.backend_body_idle_timeout,
+            backend_body_total_timeout: self.backend_body_total_timeout,
+            max_response_body_bytes: self.max_response_body_bytes,
+            unknown_length_response_prebuffer_bytes: self.unknown_length_response_prebuffer_bytes,
+            client_body_idle_timeout: self.client_body_idle_timeout,
+            listen_port: self.config.listen.listen.port,
+        };
+
+        if !connection.quic.is_closed() {
+            Self::advance_connection_streams(
+                &self.socket,
+                &mut connection,
+                &mut send_buf,
+                &shared_ctx,
+                &exec_ctx,
+                &progress_config,
+                "packet path",
+            );
+        }
+
+        Self::maybe_rotate_scid(&mut connection, &self.metrics);
 
         Self::flush_send(&self.socket, &mut send_buf, &mut connection);
         Self::handle_timeout(&self.socket, &mut send_buf, &mut connection);
@@ -1772,6 +1808,29 @@ impl QUICListener {
 
         let mut send_buf = [0u8; MAX_DATAGRAM_SIZE_BYTES];
         let mut to_remove = Vec::new();
+        let shared_ctx = ForwardingSharedCtx {
+            metrics: Arc::clone(&self.metrics),
+            resilience: &self.resilience,
+            routing_index: &self.routing_index,
+            upstream_pools: &self.upstream_pools,
+        };
+        let exec_ctx = ForwardingExecutionCtx {
+            transport_pool: Arc::clone(&self.transport_pool),
+            backend_endpoints: Arc::clone(&self.backend_endpoints),
+            backend_resolution_store: Arc::clone(&self.backend_resolution_store),
+            upstream_inflight: &self.upstream_inflight,
+            global_inflight: Arc::clone(&self.global_inflight),
+            backend_timeout: self.backend_timeout,
+            inflight_acquire_wait: self.inflight_acquire_wait,
+        };
+        let progress_config = StreamProgressConfig {
+            backend_body_idle_timeout: self.backend_body_idle_timeout,
+            backend_body_total_timeout: self.backend_body_total_timeout,
+            max_response_body_bytes: self.max_response_body_bytes,
+            unknown_length_response_prebuffer_bytes: self.unknown_length_response_prebuffer_bytes,
+            client_body_idle_timeout: self.client_body_idle_timeout,
+            listen_port: self.config.listen.listen.port,
+        };
 
         for (scid, connection) in self.connections.iter_mut() {
             let timeout = match connection.quic.timeout() {
@@ -1801,44 +1860,15 @@ impl QUICListener {
             }
 
             // Advance in-flight streams independent of inbound packets.
-            if let Some(mut h3) = connection.h3.take() {
-                let shared_ctx = ForwardingSharedCtx {
-                    metrics: Arc::clone(&self.metrics),
-                    resilience: &self.resilience,
-                    routing_index: &self.routing_index,
-                    upstream_pools: &self.upstream_pools,
-                };
-                let exec_ctx = ForwardingExecutionCtx {
-                    transport_pool: Arc::clone(&self.transport_pool),
-                    backend_endpoints: Arc::clone(&self.backend_endpoints),
-                    backend_resolution_store: Arc::clone(&self.backend_resolution_store),
-                    upstream_inflight: &self.upstream_inflight,
-                    global_inflight: Arc::clone(&self.global_inflight),
-                    backend_timeout: self.backend_timeout,
-                    inflight_acquire_wait: self.inflight_acquire_wait,
-                };
-                let progress_config = StreamProgressConfig {
-                    backend_body_idle_timeout: self.backend_body_idle_timeout,
-                    backend_body_total_timeout: self.backend_body_total_timeout,
-                    max_response_body_bytes: self.max_response_body_bytes,
-                    unknown_length_response_prebuffer_bytes: self
-                        .unknown_length_response_prebuffer_bytes,
-                    client_body_idle_timeout: self.client_body_idle_timeout,
-                    listen_port: self.config.listen.listen.port,
-                };
-                if let Err(e) = Self::advance_streams_non_blocking(
-                    &mut connection.streams,
-                    &mut connection.quic,
-                    &mut h3,
-                    &exec_ctx,
-                    &shared_ctx,
-                    &progress_config,
-                ) {
-                    error!("advance_streams_non_blocking in timeout path: {:?}", e);
-                }
-                connection.h3 = Some(h3);
-                Self::flush_send(&self.socket, &mut send_buf, connection);
-            }
+            Self::advance_connection_streams(
+                &self.socket,
+                connection,
+                &mut send_buf,
+                &shared_ctx,
+                &exec_ctx,
+                &progress_config,
+                "timeout path",
+            );
         }
 
         sweep_closed_connections(
@@ -1863,6 +1893,33 @@ impl QUICListener {
             connection.last_activity = Instant::now();
             Self::flush_send(socket, send_buf, connection);
         }
+    }
+
+    fn advance_connection_streams(
+        socket: &UdpSocket,
+        connection: &mut QuicConnection,
+        send_buf: &mut [u8],
+        shared_ctx: &ForwardingSharedCtx<'_>,
+        exec_ctx: &ForwardingExecutionCtx<'_>,
+        progress_config: &StreamProgressConfig,
+        context: &str,
+    ) {
+        let Some(mut h3) = connection.h3.take() else {
+            return;
+        };
+
+        if let Err(e) = Self::advance_streams_non_blocking(
+            &mut connection.streams,
+            &mut connection.quic,
+            &mut h3,
+            exec_ctx,
+            shared_ctx,
+            progress_config,
+        ) {
+            error!("advance_streams_non_blocking in {}: {:?}", context, e);
+        }
+        connection.h3 = Some(h3);
+        Self::flush_send(socket, send_buf, connection);
     }
 
     fn refresh_active_connection_metric(&self) {
