@@ -1,9 +1,10 @@
 use std::{collections::HashMap, path::Path, sync::Arc};
 
 use http_body_util::BodyExt;
+use log::LevelFilter;
 use spooky_config::{
     config::{
-        Backend, ClientAuth, Config as SpookyConfigConfig, Listen, LoadBalancing, Log,
+        Backend, ClientAuth, Config as SpookyConfigConfig, Listen, LoadBalancing, Log, LogFormat,
         Observability, Performance, Resilience, RouteMatch, Security, Tls, Upstream, UpstreamTls,
     },
     runtime::RuntimeConfig,
@@ -318,7 +319,7 @@ fn validate_metrics_reload_compatibility_allows_bind_change_when_socket_is_free(
 }
 
 #[test]
-fn validate_startup_owned_reload_compatibility_rejects_log_change() {
+fn validate_startup_owned_reload_compatibility_allows_log_level_change() {
     let dir = tempdir().expect("tempdir");
     let (cert, key) = write_test_cert_for_name(dir.path(), "server", "api.example.com");
     let current = test_config(cert.clone(), key.clone());
@@ -332,9 +333,29 @@ fn validate_startup_owned_reload_compatibility_rejects_log_change() {
         QUICListener::validate_startup_owned_reload_compatibility(&current_bundle, &next_bundle);
 
     assert!(
+        issues.iter().all(|issue| !issue.contains("log.level")),
+        "expected log.level to be live-reloadable, got: {issues:?}"
+    );
+}
+
+#[test]
+fn validate_startup_owned_reload_compatibility_rejects_log_format_change() {
+    let dir = tempdir().expect("tempdir");
+    let (cert, key) = write_test_cert_for_name(dir.path(), "server", "api.example.com");
+    let current = test_config(cert.clone(), key.clone());
+
+    let mut next = current.clone();
+    next.log.format = LogFormat::Json;
+
+    let current_bundle = runtime_bundle_from_config("current.yaml", &current);
+    let next_bundle = runtime_bundle_from_config("next.yaml", &next);
+    let issues =
+        QUICListener::validate_startup_owned_reload_compatibility(&current_bundle, &next_bundle);
+
+    assert!(
         issues
             .iter()
-            .any(|issue| issue.contains("log.level") && issue.contains("restart required"))
+            .any(|issue| issue.contains("log.format") && issue.contains("restart required"))
     );
 }
 
@@ -448,6 +469,21 @@ fn validate_startup_owned_reload_compatibility_rejects_control_plane_thread_chan
             .iter()
             .any(|issue| issue.contains("performance.control_plane_threads"))
     );
+}
+
+#[test]
+fn apply_live_log_level_reload_updates_global_filter() {
+    spooky_utils::logger::set_log_level("info").expect("set initial level");
+
+    let changed = QUICListener::apply_live_log_level_reload("info", "haunt")
+        .expect("apply live log level reload");
+    assert!(changed);
+    assert_eq!(log::max_level(), LevelFilter::Debug);
+
+    let changed = QUICListener::apply_live_log_level_reload("haunt", "haunt")
+        .expect("same-level reload should succeed");
+    assert!(!changed);
+    assert_eq!(log::max_level(), LevelFilter::Debug);
 }
 
 #[tokio::test]

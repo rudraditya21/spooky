@@ -141,12 +141,6 @@ impl QUICListener {
 
         Self::note_restart_required_change(
             &mut issues,
-            "log.level",
-            &current.log_config.level,
-            &next.log_config.level,
-        );
-        Self::note_restart_required_change(
-            &mut issues,
             "log.file.enabled",
             &current.log_config.file.enabled,
             &next.log_config.file.enabled,

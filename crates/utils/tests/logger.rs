@@ -1,18 +1,70 @@
-use std::{io, path::Path};
+use std::{
+    io,
+    path::Path,
+    sync::{Mutex, OnceLock},
+};
 
+use log::LevelFilter;
 use serde_json::json;
 use spooky_utils::logger::{
     errors::{build_create_log_dir_error, build_open_log_file_error},
     formatter::build_json_payload,
     init::{LoggerInitStatus, try_init_logger},
+    set_log_level,
 };
+
+fn logger_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+    TEST_MUTEX
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 #[test]
 fn logger_init_is_idempotent() {
+    let _guard = logger_test_guard();
     let _first = try_init_logger("info", false, "", false);
 
     let second = try_init_logger("debug", true, "/tmp/ignored.log", true);
     assert_eq!(second, LoggerInitStatus::AlreadyInitialized);
+}
+
+#[test]
+fn set_log_level_accepts_all_supported_aliases() {
+    let _guard = logger_test_guard();
+
+    let cases = [
+        ("whisper", LevelFilter::Trace),
+        ("trace", LevelFilter::Trace),
+        ("haunt", LevelFilter::Debug),
+        ("debug", LevelFilter::Debug),
+        ("spooky", LevelFilter::Info),
+        ("info", LevelFilter::Info),
+        ("scream", LevelFilter::Warn),
+        ("warn", LevelFilter::Warn),
+        ("poltergeist", LevelFilter::Error),
+        ("error", LevelFilter::Error),
+        ("silence", LevelFilter::Off),
+        ("off", LevelFilter::Off),
+    ];
+
+    for (alias, expected) in cases {
+        set_log_level(alias).expect("supported log level should be accepted");
+        assert_eq!(
+            log::max_level(),
+            expected,
+            "alias {alias} mapped incorrectly"
+        );
+    }
+}
+
+#[test]
+fn set_log_level_rejects_invalid_values() {
+    let _guard = logger_test_guard();
+
+    let err = set_log_level("debug-verbose").expect_err("invalid level must be rejected");
+    assert_eq!(err.to_string(), "invalid log level 'debug-verbose'");
 }
 
 #[test]

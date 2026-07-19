@@ -14,6 +14,7 @@ spooky-lb = { path = "../lb" }
 spooky-bridge = { path = "../bridge" }
 spooky-transport = { path = "../transport" }
 spooky-errors = { path = "../errors" }
+spooky-utils = { path = "../utils" }
 bytes.workspace = true
 http.workspace = true
 http-body-util.workspace = true
