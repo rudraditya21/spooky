@@ -6,6 +6,18 @@ use super::{
 };
 
 impl QUICListener {
+    pub(super) fn apply_live_log_level_reload(
+        current_level: &str,
+        next_level: &str,
+    ) -> Result<bool, spooky_utils::logger::LogLevelError> {
+        if current_level == next_level {
+            return Ok(false);
+        }
+
+        spooky_utils::logger::set_log_level(next_level)?;
+        Ok(true)
+    }
+
     pub(super) fn bearer_token_from_authorization_header(raw: &str) -> Option<&str> {
         let raw = raw.trim();
         let split = raw.find(char::is_whitespace)?;
@@ -768,6 +780,9 @@ impl QUICListener {
                     }),
                 );
             }
+            let current_log_level = runtime.log_config.level.clone();
+            let next_log_level = next_runtime.log_config.level.clone();
+
             QUICListener::spawn_generation_background_tasks(
                 &next_runtime.runtime_config,
                 next_runtime.shared_state.as_ref(),
@@ -784,6 +799,13 @@ impl QUICListener {
                     );
                 }
             };
+            if let Err(err) = Self::apply_live_log_level_reload(&current_log_level, &next_log_level)
+            {
+                error!(
+                    "Runtime reload applied generation={} but failed to update live log.level from '{}' to '{}': {}",
+                    generation, current_log_level, next_log_level, err
+                );
+            }
             tokio::spawn(async move {
                 retired_tasks
                     .retire_with_timeout(Duration::from_secs(5))
