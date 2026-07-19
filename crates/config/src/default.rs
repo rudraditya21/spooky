@@ -219,40 +219,6 @@ pub fn perf_default_quic_initial_max_streams_bidi() -> u64 {
     100
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::LogFormat;
-
-    #[test]
-    fn documented_scalar_defaults_match_contract() {
-        assert_eq!(get_default_version(), 1);
-        assert_eq!(get_default_protocol(), "http3");
-        assert_eq!(get_default_port(), 9889);
-        assert_eq!(get_default_address(), "0.0.0.0");
-        assert_eq!(get_default_weight(), 100);
-        assert_eq!(get_default_path(), "/health");
-        assert_eq!(get_default_interval(), 5_000);
-        assert_eq!(get_default_health_timeout(), 1_000);
-        assert_eq!(get_default_failure_threshold(), 3);
-        assert_eq!(get_default_success_threshold(), 2);
-        assert_eq!(get_default_log_level(), "info");
-    }
-
-    #[test]
-    fn documented_composite_defaults_match_contract() {
-        let load_balancing = get_default_load_balancing();
-        assert_eq!(load_balancing.lb_type, "round-robin");
-        assert_eq!(load_balancing.key, None);
-
-        let log = get_default_log();
-        assert_eq!(log.level, "info");
-        assert!(!log.file.enabled);
-        assert_eq!(log.file.path, "/var/log/spooky/spooky.log");
-        assert_eq!(log.format, LogFormat::Plain);
-    }
-}
-
 pub fn perf_default_quic_initial_max_streams_uni() -> u64 {
     100
 }
@@ -504,3 +470,40 @@ pub fn upstream_tls_default_verify_certificates() -> bool {
 pub fn upstream_tls_default_strict_sni() -> bool {
     true
 }
+
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::LogFormat;
+
+    #[test]
+    fn documented_scalar_defaults_match_contract() {
+        assert_eq!(get_default_version(), 1);
+        assert_eq!(get_default_protocol(), "http3");
+        assert_eq!(get_default_port(), 9889);
+        assert_eq!(get_default_address(), "0.0.0.0");
+        assert_eq!(get_default_weight(), 100);
+        assert_eq!(get_default_path(), "/health");
+        assert_eq!(get_default_interval(), 5_000);
+        assert_eq!(get_default_health_timeout(), 1_000);
+        assert_eq!(get_default_failure_threshold(), 3);
+        assert_eq!(get_default_success_threshold(), 2);
+        assert_eq!(get_default_log_level(), "info");
+    }
+
+    #[test]
+    fn documented_composite_defaults_match_contract() {
+        let load_balancing = get_default_load_balancing();
+        assert_eq!(load_balancing.lb_type, "round-robin");
+        assert_eq!(load_balancing.key, None);
+
+        let log = get_default_log();
+        assert_eq!(log.level, "info");
+        assert!(!log.file.enabled);
+        assert_eq!(log.file.path, "/var/log/spooky/spooky.log");
+        assert_eq!(log.format, LogFormat::Plain);
+    }
+}
+
