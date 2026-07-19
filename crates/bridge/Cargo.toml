@@ -12,3 +12,7 @@ http-body-util.workspace = true
 hyper.workspace = true
 spooky-errors = { path = "../errors" }
 spooky-config = { path = "../config" }
+
+[[test]]
+name = "regression"
+path = "tests/regression/main.rs"
