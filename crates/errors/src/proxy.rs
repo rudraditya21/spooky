@@ -112,3 +112,190 @@ pub fn classify_upstream_proxy_error(err: &ProxyError) -> Option<ClassifiedUpstr
         | ProxyError::Pool(PoolError::InflightLimiterClosed) => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use http_body_util::Empty;
+    use hyper::Uri;
+    use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+
+    use super::{ProxyError, UpstreamProxyErrorKind, classify_upstream_proxy_error};
+    use crate::{
+        BridgeError, PoolError, UpstreamErrorCategory, UpstreamErrorClassification,
+        UpstreamHealthFailureMapping, UpstreamRetryReason, UpstreamRetryability,
+        UpstreamTerminalErrorKind, UpstreamTlsReason,
+    };
+    use spooky_lb::health::HealthFailureReason;
+
+    async fn connect_send_error() -> hyper_util::client::legacy::Error {
+        let client: Client<hyper_util::client::legacy::connect::HttpConnector, Empty<Bytes>> =
+            Client::builder(TokioExecutor::new()).build_http();
+        let uri: Uri = "http://127.0.0.1:1/".parse().expect("valid local uri");
+
+        client
+            .get(uri)
+            .await
+            .expect_err("connect to unused port should fail")
+    }
+
+    #[test]
+    fn display_covers_proxy_error_variants() {
+        assert_eq!(
+            ProxyError::Bridge(BridgeError::InvalidMethod).to_string(),
+            "bridge error: invalid HTTP method"
+        );
+        assert_eq!(
+            ProxyError::Pool(PoolError::UnknownBackend("api-a".to_string())).to_string(),
+            "pool error: unknown backend: api-a"
+        );
+        assert_eq!(
+            ProxyError::Transport("connection reset by peer".to_string()).to_string(),
+            "transport error: connection reset by peer"
+        );
+        assert_eq!(ProxyError::Timeout.to_string(), "backend timeout");
+        assert_eq!(
+            ProxyError::Protocol("bad response frame".to_string()).to_string(),
+            "protocol error: bad response frame"
+        );
+        assert_eq!(
+            ProxyError::Tls("unknown issuer".to_string()).to_string(),
+            "TLS error: unknown issuer"
+        );
+    }
+
+    #[test]
+    fn bridge_and_non_send_pool_errors_have_no_upstream_category() {
+        assert_eq!(
+            classify_upstream_proxy_error(&ProxyError::Bridge(BridgeError::InvalidHeader)),
+            None
+        );
+        assert_eq!(
+            classify_upstream_proxy_error(&ProxyError::Pool(PoolError::UnknownBackend(
+                "api-a".to_string(),
+            ))),
+            None
+        );
+        assert_eq!(
+            classify_upstream_proxy_error(&ProxyError::Pool(PoolError::BackendOverloaded(
+                "api-b".to_string(),
+            ))),
+            None
+        );
+        assert_eq!(
+            classify_upstream_proxy_error(&ProxyError::Pool(PoolError::CircuitOpen(
+                "api-c".to_string(),
+            ))),
+            None
+        );
+        assert_eq!(
+            classify_upstream_proxy_error(&ProxyError::Pool(PoolError::InflightLimiterClosed)),
+            None
+        );
+    }
+
+    #[test]
+    fn transport_timeout_protocol_and_tls_map_to_expected_categories() {
+        let transport = classify_upstream_proxy_error(&ProxyError::Transport(
+            "connection reset by peer".to_string(),
+        ))
+        .expect("transport should classify");
+        assert_eq!(transport.kind, UpstreamProxyErrorKind::Transport);
+        assert_eq!(transport.detail, "connection reset by peer");
+        assert_eq!(
+            transport.classification,
+            UpstreamErrorClassification::transport()
+        );
+        assert_eq!(
+            transport.health_failure,
+            Some(UpstreamHealthFailureMapping {
+                failure_reason: HealthFailureReason::Transport,
+                metrics_reason: "transport",
+            })
+        );
+        assert_eq!(
+            transport.retryability,
+            UpstreamRetryability::Retryable(UpstreamRetryReason::Transport)
+        );
+
+        let timeout =
+            classify_upstream_proxy_error(&ProxyError::Timeout).expect("timeout should classify");
+        assert_eq!(timeout.kind, UpstreamProxyErrorKind::Timeout);
+        assert_eq!(timeout.detail, "backend timeout");
+        assert_eq!(
+            timeout.classification,
+            UpstreamErrorClassification::timeout()
+        );
+        assert_eq!(
+            timeout.health_failure,
+            Some(UpstreamHealthFailureMapping {
+                failure_reason: HealthFailureReason::Timeout,
+                metrics_reason: "timeout",
+            })
+        );
+        assert_eq!(
+            timeout.retryability,
+            UpstreamRetryability::Retryable(UpstreamRetryReason::Timeout)
+        );
+
+        let protocol =
+            classify_upstream_proxy_error(&ProxyError::Protocol("bad response frame".to_string()))
+                .expect("protocol should classify");
+        assert_eq!(protocol.kind, UpstreamProxyErrorKind::Protocol);
+        assert_eq!(protocol.detail, "bad response frame");
+        assert_eq!(
+            protocol.classification.category,
+            UpstreamErrorCategory::Protocol
+        );
+        assert_eq!(protocol.health_failure, None);
+        assert_eq!(
+            protocol.retryability,
+            UpstreamRetryability::Terminal(UpstreamTerminalErrorKind::Protocol)
+        );
+
+        let tls = classify_upstream_proxy_error(&ProxyError::Tls("unknown issuer".to_string()))
+            .expect("tls should classify");
+        assert_eq!(tls.kind, UpstreamProxyErrorKind::Tls);
+        assert_eq!(tls.detail, "unknown issuer");
+        assert_eq!(
+            tls.classification,
+            UpstreamErrorClassification::tls(UpstreamTlsReason::UnknownIssuer)
+        );
+        assert_eq!(tls.health_failure, None);
+        assert_eq!(
+            tls.retryability,
+            UpstreamRetryability::Terminal(UpstreamTerminalErrorKind::Tls)
+        );
+
+        let generic_tls = classify_upstream_proxy_error(&ProxyError::Tls("boom".to_string()))
+            .expect("generic tls should classify");
+        assert_eq!(
+            generic_tls.classification,
+            UpstreamErrorClassification::tls(UpstreamTlsReason::Handshake)
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_send_classifies_as_terminal_send_error() {
+        let err = ProxyError::Pool(PoolError::Send(connect_send_error().await));
+        let classified = classify_upstream_proxy_error(&err).expect("send should classify");
+
+        assert_eq!(classified.kind, UpstreamProxyErrorKind::Send);
+        assert_eq!(
+            classified.classification.category,
+            UpstreamErrorCategory::Transport
+        );
+        assert_eq!(
+            classified.health_failure,
+            Some(UpstreamHealthFailureMapping {
+                failure_reason: HealthFailureReason::Transport,
+                metrics_reason: "transport",
+            })
+        );
+        assert_eq!(
+            classified.retryability,
+            UpstreamRetryability::Terminal(UpstreamTerminalErrorKind::PoolSend)
+        );
+        assert!(!classified.detail.is_empty());
+    }
+}
