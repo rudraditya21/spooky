@@ -29,7 +29,7 @@ impl RuntimeTaskRegistry {
         }
     }
 
-    fn retire_now(&self) -> Vec<oneshot::Receiver<()>> {
+    fn begin_generation_retirement(&self) -> Vec<oneshot::Receiver<()>> {
         let mut state = match self.state.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -48,12 +48,14 @@ impl RuntimeTaskRegistry {
             .collect()
     }
 
-    pub(crate) fn abort_all(&self) {
-        let _ = self.retire_now();
+    pub(crate) fn abort_generation(&self) {
+        let _ = self.begin_generation_retirement();
     }
 
-    pub(crate) async fn retire_with_timeout(&self, timeout: Duration) {
-        let completions = self.retire_now();
+    async fn wait_for_generation_retirement(
+        completions: Vec<oneshot::Receiver<()>>,
+        timeout: Duration,
+    ) {
         if completions.is_empty() {
             return;
         }
@@ -74,11 +76,31 @@ impl RuntimeTaskRegistry {
             );
         }
     }
+
+    pub(crate) fn retire_generation(&self, timeout: Duration) {
+        let completions = self.begin_generation_retirement();
+        if completions.is_empty() {
+            return;
+        }
+
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    Self::wait_for_generation_retirement(completions, timeout).await;
+                });
+            }
+            Err(_) => {
+                warn!(
+                    "generation background tasks retired without an active Tokio runtime; completion wait skipped"
+                );
+            }
+        }
+    }
 }
 
 impl Drop for RuntimeTaskRegistry {
     fn drop(&mut self) {
-        self.abort_all();
+        self.abort_generation();
     }
 }
 

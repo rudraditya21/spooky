@@ -798,8 +798,8 @@ impl QUICListener {
                 &next_runtime.runtime_config,
                 next_runtime.shared_state.as_ref(),
             );
-            let (generation, retired_tasks) = match runtime_bundle_handle.replace(next_runtime) {
-                Ok(result) => result,
+            let generation = match runtime_bundle_handle.replace(next_runtime) {
+                Ok(generation) => generation,
                 Err(err) => {
                     return Self::json_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -817,11 +817,6 @@ impl QUICListener {
                     generation, current_log_level, next_log_level, err
                 );
             }
-            tokio::spawn(async move {
-                retired_tasks
-                    .retire_with_timeout(Duration::from_secs(5))
-                    .await;
-            });
             return Self::json_response(
                 StatusCode::ACCEPTED,
                 json!({

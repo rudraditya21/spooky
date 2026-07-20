@@ -1,4 +1,7 @@
-use std::sync::{Arc, RwLock};
+use std::{
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
 use spooky_config::runtime::{ListenerRuntimeConfig, RuntimeConfig};
 use spooky_errors::ProxyError;
@@ -9,7 +12,6 @@ use crate::runtime::{
         StartupOwnedRuntimeState,
     },
     shared_state::SharedRuntimeState,
-    tasks::RuntimeTaskRegistry,
 };
 
 #[derive(Clone)]
@@ -120,17 +122,14 @@ impl RuntimeBundleHandle {
         self.with_current_generation(|current| f(current.view()))
     }
 
-    pub fn replace(
-        &self,
-        bundle: RuntimeBundle,
-    ) -> Result<(u64, Arc<RuntimeTaskRegistry>), ProxyError> {
+    pub fn replace(&self, bundle: RuntimeBundle) -> Result<u64, ProxyError> {
         let generation = bundle.generation;
         let next_tasks = Arc::clone(&bundle.shared_state.generation_state().generation_tasks);
         let previous = {
             let mut guard = match self.inner.write() {
                 Ok(guard) => guard,
                 Err(_) => {
-                    next_tasks.abort_all();
+                    next_tasks.abort_generation();
                     return Err(ProxyError::Transport(
                         "runtime bundle lock poisoned".to_string(),
                     ));
@@ -138,7 +137,11 @@ impl RuntimeBundleHandle {
             };
             std::mem::replace(&mut *guard, Arc::new(bundle))
         };
-        let retired_tasks = Arc::clone(&previous.shared_state.generation_state().generation_tasks);
-        Ok((generation, retired_tasks))
+        previous
+            .shared_state
+            .generation_state()
+            .generation_tasks
+            .retire_generation(Duration::from_secs(5));
+        Ok(generation)
     }
 }
