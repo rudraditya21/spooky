@@ -3,6 +3,7 @@ use std::time::Instant;
 use http::StatusCode;
 use spooky_errors::{ProxyError, classify_upstream_proxy_error};
 
+use super::request::BootstrapPreparedRoute;
 use crate::{
     Metrics, OverloadShedReason,
     runtime::connection::outcome::{
@@ -10,8 +11,6 @@ use crate::{
         observe_backend_response_status, observe_proxy_error_outcome, observe_status_outcome,
     },
 };
-
-use super::request::BootstrapPreparedRoute;
 
 pub(in crate::quic_listener) fn bootstrap_route_target<'a>(
     route: &'a str,

@@ -6,10 +6,10 @@ use http_body_util::combinators::BoxBody;
 use hyper::body::Incoming;
 use spooky_errors::ProxyError;
 
-use super::outcome::observe_bootstrap_dispatch_failure;
 use super::{
     context::BootstrapDispatchCtx, intake::bootstrap_error_response,
-    request::BootstrapPreparedRoute, websocket::dispatch_bootstrap_websocket,
+    outcome::observe_bootstrap_dispatch_failure, request::BootstrapPreparedRoute,
+    websocket::dispatch_bootstrap_websocket,
 };
 
 pub(in crate::quic_listener) struct BootstrapDispatchInput<'a> {

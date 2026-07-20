@@ -26,8 +26,6 @@ use spooky_config::{
 use spooky_errors::ProxyError;
 use spooky_lb::upstream_pool::UpstreamPool;
 
-use crate::runtime::connection::outcome::AdmissionOutcomeClass;
-
 use super::{
     super::{
         QUICListener,
@@ -38,11 +36,11 @@ use super::{
         forwarding::BootstrapResolutionInput,
     },
     context::BootstrapRequestCtx,
-    intake::BootstrapRequestIntake,
-    intake::bootstrap_error_response,
+    intake::{BootstrapRequestIntake, bootstrap_error_response},
     outcome::{observe_bootstrap_admission_outcome, observe_bootstrap_request_proxy_error},
     response::{BootstrapStreamingBody, boxed_full},
 };
+use crate::runtime::connection::outcome::AdmissionOutcomeClass;
 
 pub(in crate::quic_listener) struct BootstrapPreparedRoute {
     pub(in crate::quic_listener) endpoint: BackendEndpoint,

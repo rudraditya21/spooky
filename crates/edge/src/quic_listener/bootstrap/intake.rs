@@ -4,18 +4,17 @@ use bytes::Bytes;
 use http::{Request, Response, StatusCode};
 use http_body_util::combinators::BoxBody;
 use hyper::{body::Incoming, upgrade::OnUpgrade};
-
-use crate::{
-    Metrics,
-    resilience::runtime::RuntimeResilience,
-    runtime::connection::outcome::{OutcomeRouteTarget, observe_proxy_error_outcome},
-};
 use spooky_errors::{BridgeError, ProxyError};
 
 use super::{
     super::{protocol::is_head_method, validation::validate_http_request},
     response::boxed_full,
     websocket::capture_bootstrap_websocket_flow,
+};
+use crate::{
+    Metrics,
+    resilience::runtime::RuntimeResilience,
+    runtime::connection::outcome::{OutcomeRouteTarget, observe_proxy_error_outcome},
 };
 
 pub(in crate::quic_listener) struct BootstrapRequestIntake {

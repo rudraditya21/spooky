@@ -9,9 +9,8 @@ use spooky_config::{backend_endpoint::BackendEndpoint, runtime::RuntimeUpstreamP
 use spooky_lb::upstream_pool::UpstreamPool;
 use spooky_transport::transport_pool::UpstreamTransportPool;
 
-use crate::{Metrics, resilience::runtime::RuntimeResilience, routing::index::RouteIndex};
-
 use super::state::BootstrapConnectionState;
+use crate::{Metrics, resilience::runtime::RuntimeResilience, routing::index::RouteIndex};
 
 pub(in crate::quic_listener) struct BootstrapBodyLimits {
     pub(in crate::quic_listener) max_request_body_bytes: usize,

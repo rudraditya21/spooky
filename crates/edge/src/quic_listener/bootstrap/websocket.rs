@@ -9,11 +9,10 @@ use log::{debug, warn};
 use spooky_config::backend_endpoint::BackendScheme;
 use spooky_errors::ProxyError;
 
-use super::outcome::{
-    finish_bootstrap_backend_request_accounting, observe_bootstrap_dispatch_failure,
-};
 use super::{
-    dispatch::BootstrapDispatchInput, intake::bootstrap_error_response,
+    dispatch::BootstrapDispatchInput,
+    intake::bootstrap_error_response,
+    outcome::{finish_bootstrap_backend_request_accounting, observe_bootstrap_dispatch_failure},
     request::BootstrapPreparedRoute,
 };
 use crate::quic_listener::protocol::is_websocket_upgrade_request;
