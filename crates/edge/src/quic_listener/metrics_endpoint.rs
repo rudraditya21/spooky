@@ -13,7 +13,10 @@ use spooky_config::config::MetricsEndpoint;
 use spooky_errors::ProxyError;
 
 use super::{
-    QUICListener, runtime_endpoint::RuntimeConnectionSlotGuard, runtime_handle,
+    QUICListener,
+    runtime_endpoint::RuntimeConnectionSlotGuard,
+    runtime_handle,
+    runtime_state::{CanonicalRuntimeView, ControlPlaneBootstrap},
     spawn_supervised_async_task,
 };
 use crate::{Metrics, runtime::bundle::RuntimeBundleHandle};
@@ -24,29 +27,22 @@ struct MetricsEndpointBinding {
     active_connections: Arc<AtomicUsize>,
 }
 
+#[derive(Clone)]
 pub(super) struct MetricsEndpointState {
-    pub(super) metrics_path: String,
-    pub(super) max_connections: usize,
-    pub(super) connection_timeout: Duration,
+    pub(super) endpoint: MetricsEndpoint,
     pub(super) metrics: Arc<Metrics>,
 }
 
 impl QUICListener {
     pub(super) fn spawn_metrics_endpoint(
-        config: &spooky_config::runtime::RuntimeConfig,
-        metrics: Arc<Metrics>,
-        runtime_bundle: Option<Arc<RuntimeBundleHandle>>,
+        bootstrap: &ControlPlaneBootstrap<'_>,
     ) -> Result<(), ProxyError> {
-        let endpoint = &config.observability.metrics;
-        if runtime_bundle.is_none() && !endpoint.enabled {
+        let startup_state = bootstrap.with_runtime_view(Self::metrics_endpoint_state_from_runtime);
+        if bootstrap.runtime_bundle.is_none() && !startup_state.endpoint.enabled {
             return Ok(());
         }
-        let required = endpoint.required;
-        let startup_endpoint = endpoint.clone();
-        let startup_metrics_path = startup_endpoint.path.clone();
-        let startup_max_connections = startup_endpoint.max_connections.max(1);
-        let startup_connection_timeout =
-            Duration::from_millis(startup_endpoint.connection_timeout_ms.max(1));
+        let runtime_bundle = bootstrap.runtime_bundle.clone();
+        let required = startup_state.endpoint.required;
 
         let handle = match runtime_handle() {
             Some(handle) => handle,
@@ -60,8 +56,11 @@ impl QUICListener {
             }
         };
 
-        let initial_binding = if startup_endpoint.enabled {
-            let bind = format!("{}:{}", startup_endpoint.address, startup_endpoint.port);
+        let initial_binding = if startup_state.endpoint.enabled {
+            let bind = format!(
+                "{}:{}",
+                startup_state.endpoint.address, startup_state.endpoint.port
+            );
             match Self::bind_tcp_listener(&bind, Some(&handle), "metrics endpoint") {
                 Ok(listener) => Some(MetricsEndpointBinding {
                     bind,
@@ -83,15 +82,16 @@ impl QUICListener {
         spawn_supervised_async_task(
             &handle,
             "metrics-endpoint",
-            Some(Arc::clone(&metrics)),
+            Some(Arc::clone(&startup_state.metrics)),
             async move {
                 let mut listener_binding = initial_binding;
 
                 loop {
-                    let endpoint = Self::current_metrics_endpoint_config(
+                    let runtime_state = Self::current_metrics_endpoint_state(
                         runtime_bundle.as_ref(),
-                        &startup_endpoint,
+                        &startup_state,
                     );
+                    let endpoint = &runtime_state.endpoint;
                     let desired_bind = format!("{}:{}", endpoint.address, endpoint.port);
 
                     if !endpoint.enabled {
@@ -155,25 +155,23 @@ impl QUICListener {
                             continue;
                         }
                     };
-                    let runtime_state = Self::metrics_endpoint_state(
+                    let runtime_state = Self::current_metrics_endpoint_state(
                         runtime_bundle.as_ref(),
-                        startup_metrics_path.clone(),
-                        startup_max_connections,
-                        startup_connection_timeout,
-                        Arc::clone(&metrics),
+                        &startup_state,
                     );
                     let active_connections = Arc::clone(&binding.active_connections);
                     if !Self::try_claim_runtime_connection_slot(
                         &active_connections,
-                        runtime_state.max_connections,
+                        runtime_state.endpoint.max_connections.max(1),
                     ) {
                         continue;
                     }
 
                     let io = TokioIo::new(stream);
                     let metrics = Arc::clone(&runtime_state.metrics);
-                    let metrics_path = runtime_state.metrics_path.clone();
-                    let timeout = runtime_state.connection_timeout;
+                    let metrics_path = runtime_state.endpoint.path.clone();
+                    let timeout =
+                        Duration::from_millis(runtime_state.endpoint.connection_timeout_ms.max(1));
 
                     tokio::spawn(async move {
                         let _connection_guard = RuntimeConnectionSlotGuard::new(active_connections);
@@ -206,46 +204,26 @@ impl QUICListener {
         Ok(())
     }
 
-    pub(super) fn current_metrics_endpoint_config(
-        runtime_bundle: Option<&Arc<RuntimeBundleHandle>>,
-        startup_endpoint: &MetricsEndpoint,
-    ) -> MetricsEndpoint {
-        runtime_bundle
-            .map(|handle| {
-                handle
-                    .current_view()
-                    .runtime_config()
-                    .observability
-                    .metrics
-                    .clone()
-            })
-            .unwrap_or_else(|| startup_endpoint.clone())
+    fn metrics_endpoint_state_from_runtime(
+        runtime: CanonicalRuntimeView<'_>,
+    ) -> MetricsEndpointState {
+        MetricsEndpointState {
+            endpoint: runtime.runtime_config().observability.metrics.clone(),
+            metrics: runtime.shared_services().metrics.clone(),
+        }
     }
 
-    pub(super) fn metrics_endpoint_state(
+    pub(super) fn current_metrics_endpoint_state(
         runtime_bundle: Option<&Arc<RuntimeBundleHandle>>,
-        startup_metrics_path: String,
-        startup_max_connections: usize,
-        startup_connection_timeout: Duration,
-        startup_metrics: Arc<Metrics>,
+        startup_state: &MetricsEndpointState,
     ) -> MetricsEndpointState {
-        if let Some(handle) = runtime_bundle {
-            let runtime = handle.current_view();
-            let endpoint = &runtime.runtime_config().observability.metrics;
-            return MetricsEndpointState {
-                metrics_path: endpoint.path.clone(),
-                max_connections: endpoint.max_connections.max(1),
-                connection_timeout: Duration::from_millis(endpoint.connection_timeout_ms.max(1)),
-                metrics: runtime.shared_services().metrics.clone(),
-            };
-        }
-
-        MetricsEndpointState {
-            metrics_path: startup_metrics_path,
-            max_connections: startup_max_connections,
-            connection_timeout: startup_connection_timeout,
-            metrics: startup_metrics,
-        }
+        runtime_bundle
+            .map(|handle| {
+                handle.with_current_view(|view| {
+                    Self::metrics_endpoint_state_from_runtime(CanonicalRuntimeView::Active(view))
+                })
+            })
+            .unwrap_or_else(|| startup_state.clone())
     }
 
     fn handle_metrics_request(

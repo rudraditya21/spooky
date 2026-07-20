@@ -37,14 +37,12 @@ impl QUICListener {
     fn spawn_control_plane_bootstrap(
         bootstrap: ControlPlaneBootstrap<'_>,
     ) -> Result<(), ProxyError> {
-        Self::configure_expected_workers(bootstrap.shared_state, bootstrap.worker_count);
+        Self::configure_expected_workers(
+            bootstrap.shared_state.shared_services().watchdog.as_ref(),
+            bootstrap.worker_count,
+        );
         Self::spawn_generation_background_tasks(&bootstrap);
-        let shared = bootstrap.shared_state.shared_services();
-        Self::spawn_metrics_endpoint(
-            bootstrap.runtime_config,
-            Arc::clone(&shared.metrics),
-            bootstrap.runtime_bundle.clone(),
-        )?;
+        Self::spawn_metrics_endpoint(&bootstrap)?;
         Self::spawn_control_api_endpoint(
             bootstrap.runtime_config,
             bootstrap.shared_state,
@@ -55,38 +53,39 @@ impl QUICListener {
     }
 
     pub(super) fn spawn_generation_background_tasks(bootstrap: &ControlPlaneBootstrap<'_>) {
-        Self::configure_expected_workers_from_runtime(
-            bootstrap.runtime_config,
-            bootstrap.shared_state,
-        );
-        let shared_state = bootstrap.shared_state;
-        let shared = shared_state.shared_services();
-        let generation = shared_state.generation_state();
-        let task_registry = Arc::clone(&generation.generation_tasks);
-        Self::spawn_backend_dns_refresh(
-            bootstrap.runtime_config,
-            Arc::clone(&shared.transport_pool),
-            Arc::clone(&shared.backend_resolution_store),
-            shared.backend_dns_resolver.clone(),
-            Arc::clone(&shared.metrics),
-            Arc::clone(&task_registry),
-        );
-        Self::spawn_health_checks(
-            generation.upstream_pools.clone(),
-            Arc::clone(&shared.transport_pool),
-            Arc::clone(&generation.backend_endpoints),
-            Arc::clone(&generation.backend_health_checks),
-            Arc::clone(&shared.backend_resolution_store),
-            Arc::clone(&shared.metrics),
-            Arc::clone(&task_registry),
-        );
-        Self::spawn_watchdog(
-            bootstrap.runtime_config,
-            Arc::clone(&shared.metrics),
-            Arc::clone(&generation.resilience),
-            Arc::clone(&shared.watchdog),
-            task_registry,
-        );
+        bootstrap.with_runtime_view(|runtime| {
+            Self::configure_expected_workers_from_runtime(
+                runtime.runtime_config(),
+                runtime.shared_services().watchdog.as_ref(),
+            );
+            let shared = runtime.shared_services();
+            let generation = runtime.generation_state();
+            let task_registry = Arc::clone(&generation.generation_tasks);
+            Self::spawn_backend_dns_refresh(
+                runtime.runtime_config(),
+                Arc::clone(&shared.transport_pool),
+                Arc::clone(&shared.backend_resolution_store),
+                shared.backend_dns_resolver.clone(),
+                Arc::clone(&shared.metrics),
+                Arc::clone(&task_registry),
+            );
+            Self::spawn_health_checks(
+                generation.upstream_pools.clone(),
+                Arc::clone(&shared.transport_pool),
+                Arc::clone(&generation.backend_endpoints),
+                Arc::clone(&generation.backend_health_checks),
+                Arc::clone(&shared.backend_resolution_store),
+                Arc::clone(&shared.metrics),
+                Arc::clone(&task_registry),
+            );
+            Self::spawn_watchdog(
+                runtime.runtime_config(),
+                Arc::clone(&shared.metrics),
+                Arc::clone(&generation.resilience),
+                Arc::clone(&shared.watchdog),
+                task_registry,
+            );
+        });
     }
 
     pub(super) fn spawn_generation_background_tasks_for_runtime(
@@ -107,19 +106,19 @@ impl QUICListener {
         });
     }
 
-    fn configure_expected_workers(shared_state: &SharedRuntimeState, worker_count: usize) {
-        shared_state
-            .shared_services()
-            .watchdog
-            .set_expected_workers(worker_count.max(1));
+    fn configure_expected_workers(
+        watchdog: &crate::watchdog::coordinator::WatchdogCoordinator,
+        worker_count: usize,
+    ) {
+        watchdog.set_expected_workers(worker_count.max(1));
     }
 
     fn configure_expected_workers_from_runtime(
         config: &RuntimeConfig,
-        shared_state: &SharedRuntimeState,
+        watchdog: &crate::watchdog::coordinator::WatchdogCoordinator,
     ) {
         Self::configure_expected_workers(
-            shared_state,
+            watchdog,
             config
                 .policies
                 .transport

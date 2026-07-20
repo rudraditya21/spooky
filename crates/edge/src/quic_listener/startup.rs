@@ -494,6 +494,30 @@ impl QUICListener {
         })
     }
 
+    pub fn new_with_socket_and_runtime_bundle(
+        listener_label: &str,
+        socket: UdpSocket,
+        runtime_bundle: Arc<RuntimeBundleHandle>,
+    ) -> Result<Self, ProxyError> {
+        let runtime = runtime_bundle.current_view();
+        let listener_config = runtime
+            .listener_runtime_config(listener_label)
+            .ok_or_else(|| {
+                ProxyError::Transport(format!(
+                    "runtime reload dropped listener '{}'",
+                    listener_label
+                ))
+            })?;
+        let mut listener = Self::new_with_socket_and_shared_state(
+            listener_config,
+            socket,
+            Arc::clone(&runtime.bundle().shared_state),
+        )?;
+        listener.runtime_generation = runtime.generation();
+        listener.runtime_bundle = Some(runtime_bundle);
+        Ok(listener)
+    }
+
     pub fn with_runtime_bundle(mut self, runtime_bundle: Arc<RuntimeBundleHandle>) -> Self {
         self.runtime_generation = runtime_bundle.generation();
         self.runtime_bundle = Some(runtime_bundle);

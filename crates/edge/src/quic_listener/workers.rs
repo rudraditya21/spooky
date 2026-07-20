@@ -14,7 +14,7 @@ use spooky_config::runtime::ListenerRuntimeConfig;
 
 use crate::{
     constants::MAX_DATAGRAM_SIZE_BYTES,
-    quic_listener::ListenerWorkerRuntimeState,
+    quic_listener::{ListenerWorkerRuntimeState, runtime_state::initialize_listener_from_runtime},
     runtime::{
         bundle::RuntimeBundleHandle, listener::QUICListener, shared_state::SharedRuntimeState,
     },
@@ -169,18 +169,18 @@ fn run_sharded_listener_worker(
             .spawn(move || -> Result<(), String> {
                 maybe_pin_worker(shard_thread_idx, pin_workers);
                 shard_shared.bind_metrics_worker_slot(shard_thread_idx);
-                let mut listener = QUICListener::new_with_socket_and_shared_state(
-                    shard_config,
+                let mut listener = initialize_listener_from_runtime(
                     shard_socket,
+                    &shard_config,
                     shard_shared,
+                    Some(Arc::clone(&shard_runtime_bundle)),
                 )
                 .map_err(|err| {
                     format!(
                         "worker {} shard {} listener init failed: {}",
                         worker_idx, shard_idx, err
                     )
-                })?
-                .with_runtime_bundle(Arc::clone(&shard_runtime_bundle));
+                })?;
 
                 let idle_timeout = Duration::from_millis(10);
                 while !shard_shutdown.load(Ordering::Relaxed) {
@@ -329,18 +329,18 @@ fn run_single_listener_worker(worker_runtime: WorkerThreadRuntime) -> Result<(),
     worker_runtime
         .shared_state
         .bind_metrics_worker_slot(worker_runtime.worker_idx);
-    let mut listener = QUICListener::new_with_socket_and_shared_state(
-        worker_runtime.listener_config,
+    let mut listener = initialize_listener_from_runtime(
         worker_runtime.socket,
+        &worker_runtime.listener_config,
         worker_runtime.shared_state,
+        Some(Arc::clone(&worker_runtime.runtime_bundle)),
     )
     .map_err(|err| {
         format!(
             "worker {} listener init failed: {}",
             worker_runtime.worker_idx, err
         )
-    })?
-    .with_runtime_bundle(Arc::clone(&worker_runtime.runtime_bundle));
+    })?;
 
     while !worker_runtime.shutdown.load(Ordering::Relaxed) {
         listener.poll();
