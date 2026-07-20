@@ -12,10 +12,12 @@ use crate::{
 };
 use spooky_errors::{BridgeError, ProxyError};
 
-use super::super::{
-    bootstrap_tls::boxed_full,
-    protocol::{is_head_method, is_websocket_upgrade_request},
-    validation::validate_http_request,
+use super::{
+    boxed_full,
+    super::{
+        protocol::{is_head_method, is_websocket_upgrade_request},
+        validation::validate_http_request,
+    },
 };
 
 pub(in crate::quic_listener) struct BootstrapRequestIntake {

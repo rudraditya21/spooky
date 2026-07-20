@@ -1,6 +1,7 @@
 mod dispatch;
 mod intake;
 mod request;
+mod response;
 mod startup;
 mod state;
 
@@ -13,6 +14,9 @@ pub(in crate::quic_listener) use self::intake::{
 pub(in crate::quic_listener) use self::request::{
     BootstrapBuildRequestInput, BootstrapPolicyEvaluationInput, BootstrapPreparedRoute,
     build_bootstrap_upstream_request, evaluate_bootstrap_request_policy,
+};
+pub(in crate::quic_listener) use self::response::{
+    BootstrapStreamingBody, BootstrapWritebackInput, boxed_full, write_bootstrap_response,
 };
 pub(in crate::quic_listener) use self::startup::{
     PreparedBootstrapListenerStartup, prepare_bootstrap_listener_startup,
