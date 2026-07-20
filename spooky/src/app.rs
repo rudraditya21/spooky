@@ -17,8 +17,8 @@ use spooky_edge::{
 
 use crate::{
     listener_group::{
-        ListenerGroupRuntime, allocate_worker_index_base, collect_finished_listener_groups,
-        log_listener_startup, reconcile_listener_groups, spawn_managed_listener_group,
+        allocate_worker_index_base, collect_finished_listener_groups, log_listener_startup,
+        reconcile_listener_groups, shutdown_listener_groups, spawn_managed_listener_group,
     },
     privilege_drop, runtime_guard,
 };
@@ -229,27 +229,6 @@ async fn run(
     spooky_utils::telemetry::init::shutdown_tracing();
     info!("Spooky shutdown complete");
 }
-
-async fn shutdown_listener_groups(
-    listener_groups: &mut Vec<ListenerGroupRuntime>,
-    worker_failed: &mut bool,
-) {
-    for group in listener_groups.iter() {
-        group.request_shutdown();
-    }
-    loop {
-        collect_finished_listener_groups(listener_groups, worker_failed);
-        if listener_groups.is_empty() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    for group in listener_groups.drain(..) {
-        group.join_all(worker_failed);
-    }
-}
-
 #[cfg(unix)]
 async fn wait_for_shutdown_signal() {
     use tokio::signal::unix::{SignalKind, signal};

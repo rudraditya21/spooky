@@ -67,6 +67,27 @@ impl ListenerGroupRuntime {
     }
 }
 
+pub(crate) async fn shutdown_listener_groups(
+    listener_groups: &mut Vec<ListenerGroupRuntime>,
+    worker_failed: &mut bool,
+) {
+    for group in listener_groups.iter() {
+        group.request_shutdown();
+    }
+
+    loop {
+        collect_finished_listener_groups(listener_groups, worker_failed);
+        if listener_groups.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    for group in listener_groups.drain(..) {
+        group.join_all(worker_failed);
+    }
+}
+
 pub(crate) fn listener_label(config: &ListenerRuntimeConfig) -> String {
     format!(
         "{}:{}",

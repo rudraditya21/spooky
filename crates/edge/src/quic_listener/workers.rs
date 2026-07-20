@@ -198,10 +198,7 @@ fn run_sharded_listener_worker(
                     }
                 }
 
-                listener.start_draining();
-                while !listener.drain_complete() {
-                    listener.poll_idle();
-                }
+                listener.drain_with_idle_polls();
                 Ok(())
             })
             .map_err(|err| {
@@ -329,10 +326,7 @@ fn run_single_listener_worker(
         listener.poll();
     }
 
-    listener.start_draining();
-    while !listener.drain_complete() {
-        listener.poll();
-    }
+    listener.drain_with_active_polls();
     Ok(())
 }
 

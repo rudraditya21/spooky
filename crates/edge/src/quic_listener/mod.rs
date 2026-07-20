@@ -115,6 +115,7 @@ mod forwarding;
 mod health_check;
 mod metrics_endpoint;
 mod runtime_endpoint;
+mod shutdown;
 mod startup;
 mod tls_runtime;
 mod token_bucket;
@@ -498,54 +499,6 @@ fn boxed_full(body: Bytes) -> http_body_util::combinators::BoxBody<Bytes, Infall
 }
 
 impl QUICListener {
-    pub fn start_draining(&mut self) {
-        if self.draining {
-            return;
-        }
-        self.draining = true;
-        self.drain_start = Some(Instant::now());
-        info!("Draining connections");
-    }
-
-    pub fn drain_complete(&mut self) -> bool {
-        if !self.draining {
-            return self.connections.is_empty();
-        }
-
-        if self.connections.is_empty() {
-            return true;
-        }
-
-        // Once all in-flight streams are terminal, drain can complete without
-        // waiting for clients to idle-close their QUIC connections.
-        let has_active_streams = self
-            .connections
-            .values()
-            .any(|conn| !conn.streams.is_empty());
-        if !has_active_streams {
-            self.close_all();
-            return true;
-        }
-
-        if let Some(start) = self.drain_start
-            && start.elapsed() >= self.drain_timeout
-        {
-            self.close_all();
-            return true;
-        }
-
-        false
-    }
-
-    fn close_all(&mut self) {
-        let mut send_buf = [0u8; MAX_DATAGRAM_SIZE_BYTES];
-        for connection in self.connections.values_mut() {
-            let _ = connection.quic.close(true, 0x0, b"draining");
-            Self::flush_send(&self.socket, &mut send_buf, connection);
-        }
-        self.clear_connection_registry();
-    }
-
     fn random_reset_token() -> u128 {
         let mut token = [0u8; RESET_TOKEN_LEN_BYTES];
         rand::thread_rng().fill_bytes(&mut token);
@@ -596,31 +549,6 @@ impl QUICListener {
                 debug!("SCID rotation skipped: {:?}", e);
             }
         }
-    }
-
-    fn poll_preamble(&mut self) -> bool {
-        if let Err(err) = self.sync_runtime_bundle_if_needed() {
-            error!(
-                "Failed to refresh runtime configuration for listener {}: {}",
-                self.listener_label, err
-            );
-        }
-        self.watchdog.mark_poll_progress();
-        if !self.watchdog.restart_requested() {
-            self.watchdog_worker_drained = false;
-        }
-        if self.watchdog.restart_requested() && !self.draining {
-            warn!("Watchdog requested restart; entering draining mode");
-            self.start_draining();
-        }
-        if self.draining && self.drain_complete() {
-            if self.watchdog.restart_requested() && !self.watchdog_worker_drained {
-                self.watchdog.mark_worker_drained();
-                self.watchdog_worker_drained = true;
-            }
-            return false;
-        }
-        true
     }
 
     pub fn poll(&mut self) {
