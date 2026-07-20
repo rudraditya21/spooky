@@ -458,7 +458,6 @@ fn bootstrap_connection_state_prefers_reloaded_runtime_settings() {
         listener_tls_store: Arc::clone(&startup_shared.listener_tls_store),
         transport_pool: Arc::clone(&startup_shared.transport_pool),
         backend_endpoints: Arc::clone(&startup_shared.backend_endpoints),
-        backend_resolution_store: Arc::clone(&startup_shared.backend_resolution_store),
         upstream_policies: Arc::clone(&startup_shared.upstream_policies),
         metrics: Arc::clone(&startup_shared.metrics),
         resilience: Arc::clone(&startup_shared.resilience),
@@ -486,7 +485,7 @@ fn bootstrap_connection_state_prefers_reloaded_runtime_settings() {
     .expect("reloaded bundle");
     let runtime_handle = Arc::new(super::RuntimeBundleHandle::new(reloaded_bundle));
 
-    let state = super::QUICListener::bootstrap_connection_state(
+    let state = super::bootstrap::bootstrap_connection_state(
         &listener_label,
         Some(&runtime_handle),
         &startup_state,
