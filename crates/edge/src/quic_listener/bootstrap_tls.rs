@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     convert::Infallible,
     net::SocketAddr,
     pin::Pin,
@@ -41,24 +40,25 @@ use spooky_config::{
 };
 use spooky_errors::{BridgeError, ProxyError, classify_upstream_proxy_error};
 use spooky_lb::upstream_pool::UpstreamPool;
-use spooky_transport::transport_pool::UpstreamTransportPool;
 
+pub(super) use super::bootstrap::{BootstrapConnectionState, BootstrapStartupState};
 use super::{
     QUICListener,
     admission::{
         AdmissionPolicyDecision, admission_rejection_response,
         evaluate_forwarding_pre_admission_policy,
     },
+    bootstrap::{
+        PreparedBootstrapListenerStartup, prepare_bootstrap_listener_startup,
+        spawn_bootstrap_listener_task,
+    },
     is_head_method, is_websocket_upgrade_request,
     runtime_endpoint::RuntimeConnectionSlotGuard,
-    runtime_handle, spawn_supervised_async_task, validate_http_request,
+    validate_http_request,
 };
 use crate::{
-    Metrics, REQUEST_ID_COUNTER,
-    resilience::runtime::RuntimeResilience,
-    routing::index::RouteIndex,
+    REQUEST_ID_COUNTER,
     runtime::{
-        backend::store::RuntimeBackendResolutionStore,
         bundle::RuntimeBundleHandle,
         connection::{
             guardrails::{
@@ -75,7 +75,6 @@ use crate::{
             },
         },
         shared_state::SharedRuntimeState,
-        tls::store::ListenerTlsReloadStore,
     },
 };
 
@@ -238,37 +237,6 @@ pub(super) fn boxed_full(body: Bytes) -> http_body_util::combinators::BoxBody<By
     Full::new(body).map_err(|never| match never {}).boxed()
 }
 
-pub(super) struct BootstrapConnectionState {
-    pub(super) alt_svc_value: String,
-    pub(super) backend_timeout: Duration,
-    pub(super) max_request_body_bytes: usize,
-    pub(super) max_response_body_bytes: usize,
-    pub(super) max_connections: usize,
-    pub(super) connection_timeout: Duration,
-    pub(super) listener_tls_store: Arc<ListenerTlsReloadStore>,
-    pub(super) transport_pool: Arc<UpstreamTransportPool>,
-    pub(super) backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
-    pub(super) backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
-    pub(super) upstream_policies: Arc<HashMap<String, RuntimeUpstreamPolicy>>,
-    pub(super) metrics: Arc<Metrics>,
-    pub(super) resilience: Arc<RuntimeResilience>,
-    pub(super) upstream_pools: HashMap<String, Arc<RwLock<UpstreamPool>>>,
-    pub(super) routing_index: Arc<RouteIndex>,
-}
-
-pub(super) struct BootstrapStartupState {
-    pub(super) listener_config: ListenerRuntimeConfig,
-    pub(super) listener_tls_store: Arc<ListenerTlsReloadStore>,
-    pub(super) transport_pool: Arc<UpstreamTransportPool>,
-    pub(super) backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
-    pub(super) backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
-    pub(super) upstream_policies: Arc<HashMap<String, RuntimeUpstreamPolicy>>,
-    pub(super) metrics: Arc<Metrics>,
-    pub(super) resilience: Arc<RuntimeResilience>,
-    pub(super) upstream_pools: HashMap<String, Arc<RwLock<UpstreamPool>>>,
-    pub(super) routing_index: Arc<RouteIndex>,
-}
-
 fn bootstrap_bridge_headers(headers: &http::HeaderMap) -> Vec<quiche::h3::Header> {
     headers
         .iter()
@@ -342,84 +310,25 @@ impl QUICListener {
         runtime_bundle: Option<Arc<RuntimeBundleHandle>>,
         shutdown_signal: Option<Arc<AtomicBool>>,
     ) -> Result<(), ProxyError> {
-        let transport_policy = &config.policies.transport;
-        let timeout_policy = &config.policies.timeouts;
-        let bind = format!(
-            "{}:{}",
-            config.listen.listen.address, config.listen.listen.port
-        );
-        let alt_svc_value = format!("h3=\":{}\"; ma=86400", config.listen.listen.port);
-        let max_connections = transport_policy
-            .connection_limits
-            .max_active_connections
-            .max(1);
-        let connection_timeout = timeout_policy.client_body_idle;
-        let listener_label = Self::listener_label(config);
-        shared_state
-            .listener_tls_store
-            .bootstrap_server_config(&listener_label)
-            .ok_or_else(|| {
-                ProxyError::Tls(format!(
-                    "failed to initialize bootstrap TLS listener config for '{}': missing reload state",
-                    listener_label
-                ))
-            })?;
+        let PreparedBootstrapListenerStartup {
+            bind,
+            alt_svc_value,
+            max_connections,
+            connection_timeout,
+            listener_label,
+            listener,
+            runtime_handle,
+            runtime_bundle,
+            shutdown_signal,
+            startup_state,
+        } = prepare_bootstrap_listener_startup(
+            config,
+            shared_state,
+            runtime_bundle,
+            shutdown_signal,
+        )?;
 
-        let transport_pool = Arc::clone(&shared_state.transport_pool);
-        let backend_endpoints = Arc::clone(&shared_state.backend_endpoints);
-        let backend_resolution_store = Arc::clone(&shared_state.backend_resolution_store);
-        let upstream_policies = Arc::clone(&shared_state.upstream_policies);
-        let metrics = Arc::clone(&shared_state.metrics);
-        let resilience = Arc::clone(&shared_state.resilience);
-        let upstream_pools = shared_state.upstream_pools.clone();
-        let listener_tls_store = Arc::clone(&shared_state.listener_tls_store);
-        let runtime_bundle = runtime_bundle.clone();
-        let handle = match runtime_handle() {
-            Some(h) => h,
-            None => {
-                return Err(ProxyError::Transport(
-                    "failed to start bootstrap TLS listener: no Tokio runtime available"
-                        .to_string(),
-                ));
-            }
-        };
-
-        let std_listener = std::net::TcpListener::bind(&bind).map_err(|err| {
-            ProxyError::Transport(format!(
-                "failed to bind bootstrap TLS listener on {}: {}",
-                bind, err
-            ))
-        })?;
-        if let Err(err) = std_listener.set_nonblocking(true) {
-            return Err(ProxyError::Transport(format!(
-                "failed to set bootstrap TLS listener nonblocking ({}): {}",
-                bind, err
-            )));
-        }
-        let listener = {
-            let _guard = handle.enter();
-            tokio::net::TcpListener::from_std(std_listener).map_err(|err| {
-                ProxyError::Transport(format!(
-                    "failed to register bootstrap TLS listener {}: {}",
-                    bind, err
-                ))
-            })?
-        };
-
-        let startup_state = BootstrapStartupState {
-            listener_config: config.clone(),
-            listener_tls_store: Arc::clone(&listener_tls_store),
-            transport_pool: Arc::clone(&transport_pool),
-            backend_endpoints: Arc::clone(&backend_endpoints),
-            backend_resolution_store: Arc::clone(&backend_resolution_store),
-            upstream_policies: Arc::clone(&upstream_policies),
-            metrics: Arc::clone(&metrics),
-            resilience: Arc::clone(&resilience),
-            upstream_pools: upstream_pools.clone(),
-            routing_index: Arc::clone(&shared_state.routing_index),
-        };
-
-        spawn_supervised_async_task(&handle, "bootstrap-tls-listener", None, async move {
+        spawn_bootstrap_listener_task(&runtime_handle, async move {
             info!(
                 "Bootstrap TLS listener ready bind=https://{} protocol=tcp+tls",
                 bind,
@@ -1692,67 +1601,6 @@ impl QUICListener {
         runtime_bundle: Option<&Arc<RuntimeBundleHandle>>,
         startup: &BootstrapStartupState,
     ) -> Option<BootstrapConnectionState> {
-        let (
-            listener_config,
-            listener_tls_store,
-            transport_pool,
-            backend_endpoints,
-            backend_resolution_store,
-            upstream_policies,
-            metrics,
-            resilience,
-            upstream_pools,
-            routing_index,
-        ) = if let Some(handle) = runtime_bundle {
-            let runtime = handle.current();
-            (
-                runtime.listener_runtime_config(listener_label)?,
-                runtime.shared_state.listener_tls_store.clone(),
-                runtime.shared_state.transport_pool.clone(),
-                runtime.shared_state.backend_endpoints.clone(),
-                runtime.shared_state.backend_resolution_store.clone(),
-                runtime.shared_state.upstream_policies.clone(),
-                runtime.shared_state.metrics.clone(),
-                runtime.shared_state.resilience.clone(),
-                runtime.shared_state.upstream_pools.clone(),
-                runtime.shared_state.routing_index.clone(),
-            )
-        } else {
-            (
-                startup.listener_config.clone(),
-                Arc::clone(&startup.listener_tls_store),
-                Arc::clone(&startup.transport_pool),
-                Arc::clone(&startup.backend_endpoints),
-                Arc::clone(&startup.backend_resolution_store),
-                Arc::clone(&startup.upstream_policies),
-                Arc::clone(&startup.metrics),
-                Arc::clone(&startup.resilience),
-                startup.upstream_pools.clone(),
-                Arc::clone(&startup.routing_index),
-            )
-        };
-
-        Some(BootstrapConnectionState {
-            alt_svc_value: format!("h3=\":{}\"; ma=86400", listener_config.listen.listen.port),
-            backend_timeout: listener_config.policies.timeouts.backend_request,
-            max_request_body_bytes: listener_config.policies.transport.max_request_body_bytes,
-            max_response_body_bytes: listener_config.policies.transport.max_response_body_bytes,
-            max_connections: listener_config
-                .policies
-                .transport
-                .connection_limits
-                .max_active_connections
-                .max(1),
-            connection_timeout: listener_config.policies.timeouts.client_body_idle,
-            listener_tls_store,
-            transport_pool,
-            backend_endpoints,
-            backend_resolution_store,
-            upstream_policies,
-            metrics,
-            resilience,
-            upstream_pools,
-            routing_index,
-        })
+        super::bootstrap::bootstrap_connection_state(listener_label, runtime_bundle, startup)
     }
 }
