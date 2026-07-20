@@ -9,10 +9,7 @@ use spooky_config::{backend_endpoint::BackendEndpoint, runtime::RuntimeUpstreamP
 use spooky_lb::upstream_pool::UpstreamPool;
 use spooky_transport::transport_pool::UpstreamTransportPool;
 
-use crate::{
-    Metrics, resilience::runtime::RuntimeResilience, routing::index::RouteIndex,
-    runtime::backend::store::RuntimeBackendResolutionStore,
-};
+use crate::{Metrics, resilience::runtime::RuntimeResilience, routing::index::RouteIndex};
 
 use super::state::BootstrapConnectionState;
 
@@ -27,7 +24,6 @@ pub(in crate::quic_listener) struct BootstrapRuntimeCtx {
     pub(in crate::quic_listener) body_limits: BootstrapBodyLimits,
     pub(in crate::quic_listener) transport_pool: Arc<UpstreamTransportPool>,
     pub(in crate::quic_listener) backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
-    pub(in crate::quic_listener) _backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
     pub(in crate::quic_listener) upstream_policies: Arc<HashMap<String, RuntimeUpstreamPolicy>>,
     pub(in crate::quic_listener) metrics: Arc<Metrics>,
     pub(in crate::quic_listener) resilience: Arc<RuntimeResilience>,
@@ -48,7 +44,6 @@ impl BootstrapRuntimeCtx {
             },
             transport_pool: Arc::clone(&state.transport_pool),
             backend_endpoints: Arc::clone(&state.backend_endpoints),
-            _backend_resolution_store: Arc::clone(&state.backend_resolution_store),
             upstream_policies: Arc::clone(&state.upstream_policies),
             metrics: Arc::clone(&state.metrics),
             resilience: Arc::clone(&state.resilience),
