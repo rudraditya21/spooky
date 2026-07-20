@@ -48,19 +48,11 @@ impl SharedRuntimeState {
     }
 
     pub fn snapshot_backend_health(&self) -> (usize, usize) {
-        let mut healthy = 0usize;
-        let mut total = 0usize;
-
-        for pool in self.generation_state.upstream_pools.values() {
-            let guard = match pool.read() {
-                Ok(guard) => guard,
-                Err(_) => continue,
-            };
-            let pool_total = guard.pool.len();
-            total = total.saturating_add(pool_total);
-            healthy = healthy.saturating_add(guard.pool.healthy_len().min(pool_total));
-        }
-
-        (healthy, total)
+        let summary = self
+            .shared_services
+            .backend_lifecycle
+            .snapshot_inventory(&self.generation_state.upstream_pools)
+            .summary();
+        (summary.healthy_backends, summary.total_backends)
     }
 }

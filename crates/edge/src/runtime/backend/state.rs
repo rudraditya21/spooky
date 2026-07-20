@@ -76,6 +76,59 @@ pub struct BackendLifecycleSnapshot {
     pub membership: BackendMembershipState,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct BackendPoolPlacementSnapshot {
+    pub upstream_name: String,
+    pub backend_index: usize,
+    pub healthy: bool,
+    pub active_requests: usize,
+    pub ewma_latency_ms: Option<f64>,
+    pub membership_epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CanonicalBackendLifecycleSnapshot {
+    pub identity: BackendIdentity,
+    pub resolution: BackendResolutionState,
+    pub health: BackendHealthState,
+    pub membership: BackendMembershipState,
+    pub placements: Vec<BackendPoolPlacementSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackendLifecycleInventorySummary {
+    pub healthy_backends: usize,
+    pub total_backends: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BackendLifecycleInventorySnapshot {
+    pub backends: Vec<CanonicalBackendLifecycleSnapshot>,
+}
+
+impl BackendLifecycleInventorySnapshot {
+    pub fn summary(&self) -> BackendLifecycleInventorySummary {
+        let total_backends = self
+            .backends
+            .iter()
+            .filter(|backend| !backend.placements.is_empty())
+            .count();
+        let healthy_backends = self
+            .backends
+            .iter()
+            .filter(|backend| {
+                !backend.placements.is_empty()
+                    && matches!(backend.health, BackendHealthState::Healthy)
+            })
+            .count();
+
+        BackendLifecycleInventorySummary {
+            healthy_backends,
+            total_backends,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;

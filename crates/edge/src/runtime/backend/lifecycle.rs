@@ -18,8 +18,9 @@ use super::{
     resolution::RuntimeBackendResolution,
     store::RuntimeBackendResolutionStore,
     state::{
-        BackendHealthState, BackendIdentity, BackendLifecycleSnapshot, BackendMembershipState,
-        BackendResolutionState,
+        BackendHealthState, BackendIdentity, BackendLifecycleInventorySnapshot,
+        BackendLifecycleSnapshot, BackendMembershipState, BackendPoolPlacementSnapshot,
+        CanonicalBackendLifecycleSnapshot, BackendResolutionState,
     },
 };
 use crate::Metrics;
@@ -144,6 +145,90 @@ impl BackendLifecycleCoordinator {
 
     pub fn snapshot_all(&self) -> HashMap<String, BackendLifecycleSnapshot> {
         self.resolution_store.snapshot()
+    }
+
+    pub fn snapshot_inventory(
+        &self,
+        upstream_pools: &HashMap<String, Arc<RwLock<UpstreamPool>>>,
+    ) -> BackendLifecycleInventorySnapshot {
+        let mut snapshots = self
+            .snapshot_all()
+            .into_values()
+            .map(|snapshot| {
+                (
+                    snapshot.identity.backend_addr.clone(),
+                    CanonicalBackendLifecycleSnapshot {
+                        identity: snapshot.identity,
+                        resolution: snapshot.resolution,
+                        health: snapshot.health,
+                        membership: snapshot.membership,
+                        placements: Vec::new(),
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        for (upstream_name, pool) in upstream_pools {
+            let Ok(guard) = pool.read() else {
+                continue;
+            };
+            let membership_summary = guard.membership_summary();
+            for backend_index in guard.backend_indices() {
+                let Some(backend_addr) = guard.backend_address(backend_index) else {
+                    continue;
+                };
+                let Some(backend) = guard.pool.backend(backend_index) else {
+                    continue;
+                };
+                let entry = snapshots.entry(backend_addr.to_string()).or_insert_with(|| {
+                    CanonicalBackendLifecycleSnapshot {
+                        identity: BackendIdentity::new(backend_addr.to_string()),
+                        resolution: BackendResolutionState {
+                            authority_host: backend_addr.to_string(),
+                            authority_port: 0,
+                            address_kind: super::resolution::RuntimeBackendAddressKind::IpLiteral,
+                            resolved_addrs: Vec::new(),
+                            last_refresh_success_at: None,
+                            refresh_generation: 0,
+                        },
+                        health: BackendHealthState::Unknown,
+                        membership: BackendMembershipState::Removed,
+                        placements: Vec::new(),
+                    }
+                });
+                entry.placements.push(BackendPoolPlacementSnapshot {
+                    upstream_name: upstream_name.clone(),
+                    backend_index,
+                    healthy: guard.pool.is_healthy_index(backend_index),
+                    active_requests: backend.active_requests(),
+                    ewma_latency_ms: backend.ewma_latency_ms(),
+                    membership_epoch: membership_summary.membership_epoch,
+                });
+            }
+        }
+
+        let mut backends = snapshots.into_values().collect::<Vec<_>>();
+        for backend in &mut backends {
+            if backend.placements.is_empty() {
+                backend.membership = BackendMembershipState::Removed;
+                continue;
+            }
+
+            backend.membership = BackendMembershipState::Active;
+            backend.health = if backend.placements.iter().all(|placement| placement.healthy) {
+                BackendHealthState::Healthy
+            } else {
+                BackendHealthState::Unhealthy { reason: None }
+            };
+            backend.placements.sort_by(|left, right| {
+                left.upstream_name
+                    .cmp(&right.upstream_name)
+                    .then(left.backend_index.cmp(&right.backend_index))
+            });
+        }
+        backends.sort_by(|left, right| left.identity.backend_addr.cmp(&right.identity.backend_addr));
+
+        BackendLifecycleInventorySnapshot { backends }
     }
 
     pub fn apply_refresh(
@@ -590,6 +675,33 @@ mod tests {
         let all = coordinator.snapshot_all();
         assert_eq!(all.len(), 1);
         assert!(all.contains_key("https://backend.internal:8443"));
+    }
+
+    #[test]
+    fn lifecycle_coordinator_merges_resolution_and_pool_health_into_inventory() {
+        let store = Arc::new(RuntimeBackendResolutionStore::new([
+            RuntimeBackendResolution::hostname(
+                "127.0.0.1:8080".to_string(),
+                "backend.internal".to_string(),
+                8080,
+            ),
+        ]));
+        let coordinator = BackendLifecycleCoordinator::new(store);
+        let mut pools = HashMap::new();
+        pools.insert("api".to_string(), test_upstream_pool());
+
+        let inventory = coordinator.snapshot_inventory(&pools);
+        let backend = inventory
+            .backends
+            .iter()
+            .find(|backend| backend.identity.backend_addr == "127.0.0.1:8080")
+            .expect("backend inventory");
+
+        assert_eq!(inventory.summary().healthy_backends, 1);
+        assert_eq!(inventory.summary().total_backends, 1);
+        assert_eq!(backend.placements.len(), 1);
+        assert!(matches!(backend.health, BackendHealthState::Healthy));
+        assert_eq!(backend.placements[0].upstream_name, "api");
     }
 
     #[test]

@@ -75,6 +75,7 @@ impl QUICListener {
             metrics: Arc::clone(&shared.metrics),
             resilience: Arc::clone(&generation.resilience),
             watchdog: Arc::clone(&shared.watchdog),
+            backend_lifecycle: Arc::clone(&shared.backend_lifecycle),
             upstream_pools: generation.upstream_pools.clone(),
             listener_runtime_configs: Arc::clone(&generation.listener_runtime_configs),
             listener_tls_store: Arc::clone(&shared.listener_tls_store),
@@ -384,7 +385,9 @@ impl QUICListener {
         }
 
         if req.method() == Method::GET && path == paths.ready_path.as_str() {
-            let (healthy_backends, total_backends) = state.snapshot_backend_health();
+            let backend_summary = state.snapshot_backend_health();
+            let healthy_backends = backend_summary.healthy_backends;
+            let total_backends = backend_summary.total_backends;
             let restart_requested = watchdog.restart_requested();
             let ready = !restart_requested && (total_backends == 0 || healthy_backends > 0);
             let response = json!({
@@ -412,7 +415,10 @@ impl QUICListener {
                     }),
                 );
             }
-            let (healthy_backends, total_backends) = state.snapshot_backend_health();
+            let backend_inventory = state.snapshot_backend_inventory();
+            let backend_summary = backend_inventory.summary();
+            let healthy_backends = backend_summary.healthy_backends;
+            let total_backends = backend_summary.total_backends;
             let live_tls_store = state.current_listener_tls_store();
             let tls_listeners = live_tls_store
                 .snapshot()
@@ -468,6 +474,36 @@ impl QUICListener {
                     json!({
                         "healthy": healthy_backends,
                         "total": total_backends,
+                        "lifecycle": backend_inventory.backends.iter().map(|backend| {
+                            json!({
+                                "backend": backend.identity.backend_addr,
+                                "health": match &backend.health {
+                                    crate::runtime::backend::state::BackendHealthState::Unknown => "unknown",
+                                    crate::runtime::backend::state::BackendHealthState::Healthy => "healthy",
+                                    crate::runtime::backend::state::BackendHealthState::Unhealthy { .. } => "unhealthy",
+                                },
+                                "membership": match &backend.membership {
+                                    crate::runtime::backend::state::BackendMembershipState::Active => "active",
+                                    crate::runtime::backend::state::BackendMembershipState::Suppressed => "suppressed",
+                                    crate::runtime::backend::state::BackendMembershipState::Removed => "removed",
+                                },
+                                "authority_host": backend.resolution.authority_host,
+                                "authority_port": backend.resolution.authority_port,
+                                "resolved_addrs": backend.resolution.resolved_addrs.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                                "resolution_generation": backend.resolution.refresh_generation,
+                                "last_refresh_success_at_unix_seconds": backend.resolution.last_refresh_success_at.and_then(|time| time.duration_since(std::time::SystemTime::UNIX_EPOCH).ok()).map(|duration| duration.as_secs()),
+                                "placements": backend.placements.iter().map(|placement| {
+                                    json!({
+                                        "upstream": placement.upstream_name,
+                                        "backend_index": placement.backend_index,
+                                        "healthy": placement.healthy,
+                                        "active_requests": placement.active_requests,
+                                        "ewma_latency_ms": placement.ewma_latency_ms,
+                                        "membership_epoch": placement.membership_epoch,
+                                    })
+                                }).collect::<Vec<_>>(),
+                            })
+                        }).collect::<Vec<_>>(),
                     }),
                 ),
                 (

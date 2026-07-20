@@ -1,7 +1,14 @@
 use std::sync::atomic::AtomicUsize;
 
 use super::*;
-use crate::runtime::{bundle::ActiveRuntimeGeneration, generation::RuntimeGenerationView};
+use crate::runtime::{
+    backend::{
+        lifecycle::BackendLifecycleCoordinator,
+        state::{BackendLifecycleInventorySnapshot, BackendLifecycleInventorySummary},
+    },
+    bundle::ActiveRuntimeGeneration,
+    generation::RuntimeGenerationView,
+};
 
 #[derive(Clone)]
 pub(super) struct ControlApiPaths {
@@ -32,6 +39,7 @@ pub(super) struct ControlApiState {
     pub(super) metrics: Arc<Metrics>,
     pub(super) resilience: Arc<RuntimeResilience>,
     pub(super) watchdog: Arc<WatchdogCoordinator>,
+    pub(super) backend_lifecycle: Arc<BackendLifecycleCoordinator>,
     pub(super) upstream_pools: HashMap<String, Arc<RwLock<UpstreamPool>>>,
     pub(super) listener_runtime_configs: Arc<HashMap<String, ListenerRuntimeConfig>>,
     pub(super) listener_tls_store: Arc<ListenerTlsReloadStore>,
@@ -133,33 +141,18 @@ impl ControlApiState {
         .or_else(|| Some(self.primary_listener_label.clone()))
     }
 
-    pub(super) fn snapshot_backend_health(&self) -> (usize, usize) {
+    pub(super) fn snapshot_backend_inventory(&self) -> BackendLifecycleInventorySnapshot {
         if let Some(runtime) = self.current_generation() {
-            let mut healthy = 0usize;
-            let mut total = 0usize;
-            for pool in runtime.state().upstream_pools.values() {
-                let guard = match pool.read() {
-                    Ok(guard) => guard,
-                    Err(_) => continue,
-                };
-                let pool_total = guard.pool.len();
-                total = total.saturating_add(pool_total);
-                healthy = healthy.saturating_add(guard.pool.healthy_len().min(pool_total));
-            }
-            return (healthy, total);
+            return runtime
+                .shared_services()
+                .backend_lifecycle
+                .snapshot_inventory(&runtime.state().upstream_pools);
         }
 
-        let mut healthy = 0usize;
-        let mut total = 0usize;
-        for pool in self.upstream_pools.values() {
-            let guard = match pool.read() {
-                Ok(guard) => guard,
-                Err(_) => continue,
-            };
-            let pool_total = guard.pool.len();
-            total = total.saturating_add(pool_total);
-            healthy = healthy.saturating_add(guard.pool.healthy_len().min(pool_total));
-        }
-        (healthy, total)
+        self.backend_lifecycle.snapshot_inventory(&self.upstream_pools)
+    }
+
+    pub(super) fn snapshot_backend_health(&self) -> BackendLifecycleInventorySummary {
+        self.snapshot_backend_inventory().summary()
     }
 }
