@@ -15,7 +15,7 @@ use tokio::sync::Semaphore;
 
 use crate::{
     constants::UDP_READ_TIMEOUT_MS,
-    quic_listener::{ListenerRuntimeSettings, TokenBucket},
+    quic_listener::{ListenerRuntimeSettings, TokenBucket, runtime_state::PreparedListenerStartup},
     resilience::runtime::RuntimeResilience,
     routing::index::RouteIndex,
     runtime::{
@@ -27,12 +27,6 @@ use crate::{
     },
     watchdog::{config::WatchdogRuntimeConfig, coordinator::WatchdogCoordinator},
 };
-
-struct PreparedListenerStartup {
-    listener_config: ListenerRuntimeConfig,
-    shared_state: Arc<SharedRuntimeState>,
-    socket: UdpSocket,
-}
 
 impl QUICListener {
     pub(super) fn listener_runtime_settings(

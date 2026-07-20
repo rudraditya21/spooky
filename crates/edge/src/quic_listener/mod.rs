@@ -116,6 +116,7 @@ mod forwarding;
 mod health_check;
 mod metrics_endpoint;
 mod runtime_endpoint;
+mod runtime_state;
 mod shutdown;
 mod startup;
 mod tls_runtime;
@@ -133,6 +134,7 @@ pub(crate) use connection::{ConnectionRoutes, sweep_closed_connections};
 use forwarding::{ForwardingExecutionCtx, ForwardingSharedCtx, StreamProgressConfig, abort_stream};
 #[cfg(test)]
 use health_check::classify_active_health_check_response;
+pub use runtime_state::ListenerWorkerRuntimeState;
 pub(crate) use token_bucket::TokenBucket;
 use validation::{
     RequestBufferError, extract_header_value, generated_span_id, generated_trace_id,

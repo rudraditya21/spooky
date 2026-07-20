@@ -783,7 +783,7 @@ impl QUICListener {
             let current_log_level = runtime.log_config.level.clone();
             let next_log_level = next_runtime.log_config.level.clone();
 
-            QUICListener::spawn_generation_background_tasks(
+            QUICListener::spawn_generation_background_tasks_for_runtime(
                 &next_runtime.runtime_config,
                 next_runtime.shared_state.as_ref(),
             );

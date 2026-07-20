@@ -10,7 +10,10 @@ use std::{
 use log::{error, info};
 use spooky_config::runtime::{ListenerRuntimeConfig, RuntimeConfig};
 use spooky_edge::{
-    quic_listener::workers::{ListenerWorkerGroupConfig, spawn_listener_worker_group},
+    quic_listener::{
+        ListenerWorkerRuntimeState,
+        workers::{ListenerWorkerGroupConfig, spawn_listener_worker_group},
+    },
     runtime::{
         bundle::RuntimeBundleHandle, listener::QUICListener, shared_state::SharedRuntimeState,
     },
@@ -135,7 +138,6 @@ pub(crate) fn spawn_managed_listener_group(
     })?;
 
     let worker_handles = spawn_listener_worker_group(
-        listener_config,
         &ListenerWorkerGroupConfig {
             worker_count: signature.worker_count,
             shard_count: signature.shard_count,
@@ -144,9 +146,12 @@ pub(crate) fn spawn_managed_listener_group(
             pin_workers: signature.pin_workers,
             worker_index_base,
         },
-        worker_shared,
-        runtime_bundle,
-        Arc::clone(&shutdown),
+        ListenerWorkerRuntimeState {
+            listener_config,
+            shared_state: worker_shared,
+            runtime_bundle,
+            shutdown: Arc::clone(&shutdown),
+        },
     )?;
 
     Ok(ListenerGroupRuntime {

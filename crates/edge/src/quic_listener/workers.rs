@@ -14,6 +14,7 @@ use spooky_config::runtime::ListenerRuntimeConfig;
 
 use crate::{
     constants::MAX_DATAGRAM_SIZE_BYTES,
+    quic_listener::ListenerWorkerRuntimeState,
     runtime::{
         bundle::RuntimeBundleHandle, listener::QUICListener, shared_state::SharedRuntimeState,
     },
@@ -37,19 +38,16 @@ pub struct ListenerWorkerGroupConfig {
 }
 
 pub fn spawn_listener_worker_group(
-    listener_config: ListenerRuntimeConfig,
     config: &ListenerWorkerGroupConfig,
-    worker_shared: Arc<SharedRuntimeState>,
-    runtime_bundle: Arc<RuntimeBundleHandle>,
-    worker_shutdown: Arc<AtomicBool>,
+    runtime: ListenerWorkerRuntimeState,
 ) -> Result<Vec<thread::JoinHandle<Result<(), String>>>, String> {
     let sockets = if config.worker_count > 1 {
-        match QUICListener::bind_reuseport_sockets(&listener_config, config.worker_count) {
+        match QUICListener::bind_reuseport_sockets(&runtime.listener_config, config.worker_count) {
             Ok(sockets) => sockets,
             Err(e) => return Err(format!("Failed to bind SO_REUSEPORT sockets: {}", e)),
         }
     } else {
-        match QUICListener::bind_socket(&listener_config, false) {
+        match QUICListener::bind_socket(&runtime.listener_config, false) {
             Ok(socket) => vec![socket],
             Err(e) => return Err(format!("Failed to bind UDP socket: {}", e)),
         }
@@ -58,10 +56,10 @@ pub fn spawn_listener_worker_group(
     let mut worker_handles = Vec::with_capacity(sockets.len());
     for (socket_idx, socket) in sockets.into_iter().enumerate() {
         let worker_idx = config.worker_index_base.saturating_add(socket_idx);
-        let worker_config = listener_config.clone();
-        let worker_shutdown = Arc::clone(&worker_shutdown);
-        let worker_shared = Arc::clone(&worker_shared);
-        let worker_runtime_bundle = Arc::clone(&runtime_bundle);
+        let worker_config = runtime.listener_config.clone();
+        let worker_shutdown = Arc::clone(&runtime.shutdown);
+        let worker_shared = Arc::clone(&runtime.shared_state);
+        let worker_runtime_bundle = Arc::clone(&runtime.runtime_bundle);
         let thread_name = format!("spooky-data-plane-{}", worker_idx);
         let shard_count = config.shard_count;
         let shard_queue_capacity = config.shard_queue_capacity;
