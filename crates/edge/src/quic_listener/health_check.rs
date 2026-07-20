@@ -1,11 +1,13 @@
 use http_body_util::Full;
-use spooky_errors::{classify_upstream_proxy_error, classify_upstream_send_error};
+use spooky_errors::classify_upstream_proxy_error;
 
 use super::*;
 use crate::runtime::{
     backend::{
         event::BackendHealthObservationOutcome,
-        lifecycle::{apply_backend_health_observation, evaluate_active_health_check},
+        lifecycle::{
+            ActiveHealthCheckEvaluation, BackendLifecycleCoordinator, evaluate_active_health_check,
+        },
         state::BackendIdentity,
     },
     connection::outcome::record_classified_backend_failure_metrics,
@@ -19,7 +21,7 @@ impl QUICListener {
         backend_health_checks: Arc<
             HashMap<String, spooky_config::runtime::RuntimeBackendHealthCheck>,
         >,
-        _backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
+        backend_lifecycle: Arc<BackendLifecycleCoordinator>,
         metrics: Arc<Metrics>,
         task_registry: Arc<RuntimeTaskRegistry>,
     ) {
@@ -100,7 +102,7 @@ impl QUICListener {
 
         for (base_interval_ms, mut jobs) in grouped_jobs {
             let transport_pool = Arc::clone(&transport_pool);
-            let _backend_resolution_store = Arc::clone(&_backend_resolution_store);
+            let backend_lifecycle = Arc::clone(&backend_lifecycle);
             let task_metrics = Arc::clone(&metrics);
             let handle = handle.clone();
             let supervise_metrics = Arc::clone(&task_metrics);
@@ -161,104 +163,36 @@ impl QUICListener {
                                     )
                                 }
                                 Ok(Err(PoolError::Send(send_err))) => {
-                                    let classified = classify_upstream_send_error(&send_err);
-                                    Self::log_classified_upstream_failure(
-                                        "health_check",
-                                        None,
-                                        None,
-                                        &job.backend_identity,
-                                        &classified,
-                                    );
-                                    let reason = record_classified_backend_failure_metrics(
-                                        "health_check",
+                                    Self::evaluate_failed_health_check(
                                         &job.backend_identity,
                                         task_metrics.as_ref(),
-                                        &classified,
-                                    );
-                                    evaluate_active_health_check(
-                                        BackendIdentity::new(job.backend_identity.clone()),
-                                        BackendHealthObservationOutcome::Failure,
-                                        reason,
                                         job.base_interval_ms,
                                         job.consecutive_failures,
+                                        ProxyError::Pool(PoolError::Send(send_err)),
+                                        HealthFailureReason::Transport,
                                     )
                                 }
                                 Ok(Err(pool_err)) => {
-                                    let proxy_err = ProxyError::Pool(pool_err);
-                                    if let Some(classified) =
-                                        classify_upstream_proxy_error(&proxy_err)
-                                    {
-                                        Self::log_classified_upstream_failure(
-                                            "health_check",
-                                            None,
-                                            None,
-                                            &job.backend_identity,
-                                            &classified,
-                                        );
-                                        let reason = record_classified_backend_failure_metrics(
-                                            "health_check",
-                                            &job.backend_identity,
-                                            task_metrics.as_ref(),
-                                            &classified,
-                                        );
-                                        evaluate_active_health_check(
-                                            BackendIdentity::new(job.backend_identity.clone()),
-                                            BackendHealthObservationOutcome::Failure,
-                                            reason,
-                                            job.base_interval_ms,
-                                            job.consecutive_failures,
-                                        )
-                                    } else {
-                                        task_metrics
-                                            .inc_health_failure(HealthFailureReason::Transport);
-                                        evaluate_active_health_check(
-                                            BackendIdentity::new(job.backend_identity.clone()),
-                                            BackendHealthObservationOutcome::Failure,
-                                            Some(HealthFailureReason::Transport),
-                                            job.base_interval_ms,
-                                            job.consecutive_failures,
-                                        )
-                                    }
+                                    Self::evaluate_failed_health_check(
+                                        &job.backend_identity,
+                                        task_metrics.as_ref(),
+                                        job.base_interval_ms,
+                                        job.consecutive_failures,
+                                        ProxyError::Pool(pool_err),
+                                        HealthFailureReason::Transport,
+                                    )
                                 }
-                                Err(_) => {
-                                    if let Some(classified) =
-                                        classify_upstream_proxy_error(&ProxyError::Timeout)
-                                    {
-                                        Self::log_classified_upstream_failure(
-                                            "health_check",
-                                            None,
-                                            None,
-                                            &job.backend_identity,
-                                            &classified,
-                                        );
-                                        let reason = record_classified_backend_failure_metrics(
-                                            "health_check",
-                                            &job.backend_identity,
-                                            task_metrics.as_ref(),
-                                            &classified,
-                                        );
-                                        evaluate_active_health_check(
-                                            BackendIdentity::new(job.backend_identity.clone()),
-                                            BackendHealthObservationOutcome::Failure,
-                                            reason,
-                                            job.base_interval_ms,
-                                            job.consecutive_failures,
-                                        )
-                                    } else {
-                                        task_metrics
-                                            .inc_health_failure(HealthFailureReason::Timeout);
-                                        evaluate_active_health_check(
-                                            BackendIdentity::new(job.backend_identity.clone()),
-                                            BackendHealthObservationOutcome::Failure,
-                                            Some(HealthFailureReason::Timeout),
-                                            job.base_interval_ms,
-                                            job.consecutive_failures,
-                                        )
-                                    }
-                                }
+                                Err(_) => Self::evaluate_failed_health_check(
+                                    &job.backend_identity,
+                                    task_metrics.as_ref(),
+                                    job.base_interval_ms,
+                                    job.consecutive_failures,
+                                    ProxyError::Timeout,
+                                    HealthFailureReason::Timeout,
+                                ),
                             };
 
-                            let transition = apply_backend_health_observation(
+                            let transition = backend_lifecycle.apply_health_observation(
                                 Some(&job.upstream_pool),
                                 Some(job.index),
                                 &evaluation.observation,
@@ -294,4 +228,42 @@ impl QUICListener {
 
 pub(super) fn classify_active_health_check_response(status: StatusCode) -> HealthClassification {
     outcome_from_status(status)
+}
+
+impl QUICListener {
+    fn evaluate_failed_health_check(
+        backend_identity: &str,
+        metrics: &Metrics,
+        base_interval_ms: u64,
+        consecutive_failures: u32,
+        proxy_error: ProxyError,
+        fallback_reason: HealthFailureReason,
+    ) -> ActiveHealthCheckEvaluation {
+        let reason = if let Some(classified) = classify_upstream_proxy_error(&proxy_error) {
+            Self::log_classified_upstream_failure(
+                "health_check",
+                None,
+                None,
+                backend_identity,
+                &classified,
+            );
+            record_classified_backend_failure_metrics(
+                "health_check",
+                backend_identity,
+                metrics,
+                &classified,
+            )
+        } else {
+            metrics.inc_health_failure(fallback_reason);
+            Some(fallback_reason)
+        };
+
+        evaluate_active_health_check(
+            BackendIdentity::new(backend_identity.to_string()),
+            BackendHealthObservationOutcome::Failure,
+            reason,
+            base_interval_ms,
+            consecutive_failures,
+        )
+    }
 }

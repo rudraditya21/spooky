@@ -74,7 +74,7 @@ impl QUICListener {
                 Arc::clone(&shared.transport_pool),
                 Arc::clone(&generation.backend_endpoints),
                 Arc::clone(&generation.backend_health_checks),
-                Arc::clone(&shared.backend_resolution_store),
+                Arc::clone(&shared.backend_lifecycle),
                 Arc::clone(&shared.metrics),
                 Arc::clone(&task_registry),
             );
