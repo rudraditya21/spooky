@@ -8,6 +8,7 @@ mod stream_progress;
 
 use std::convert::Infallible;
 
+use http_body_util::Full;
 use spooky_config::config::ScopedRateLimitScope;
 use spooky_errors::ClassifiedUpstreamProxyError;
 

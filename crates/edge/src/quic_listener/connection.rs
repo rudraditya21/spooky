@@ -1,5 +1,67 @@
 use super::*;
 
+fn is_benign_quic_close(err: &quiche::ConnectionError) -> bool {
+    !err.is_app && err.error_code == 0 && err.reason.is_empty()
+}
+
+fn log_quic_connection_error(
+    source: &str,
+    peer: SocketAddr,
+    trace_id: &str,
+    err: &quiche::ConnectionError,
+) {
+    if is_benign_quic_close(err) {
+        debug!(
+            "QUIC {} close without error: peer={} trace_id={} is_app={} error_code={} reason_len={}",
+            source,
+            peer,
+            trace_id,
+            err.is_app,
+            err.error_code,
+            err.reason.len()
+        );
+        return;
+    }
+
+    if err.reason.is_empty() {
+        error!(
+            "QUIC {} error: peer={} trace_id={} is_app={} error_code={}",
+            source, peer, trace_id, err.is_app, err.error_code
+        );
+    } else {
+        error!(
+            "QUIC {} error: peer={} trace_id={} is_app={} error_code={} reason={}",
+            source,
+            peer,
+            trace_id,
+            err.is_app,
+            err.error_code,
+            String::from_utf8_lossy(&err.reason)
+        );
+    }
+}
+
+pub(super) fn maybe_log_quic_connection_error(
+    source: &str,
+    peer: SocketAddr,
+    trace_id: &str,
+    err: &quiche::ConnectionError,
+    last_logged: &mut Option<QuicConnectionErrorSnapshot>,
+) {
+    let snapshot = QuicConnectionErrorSnapshot {
+        is_app: err.is_app,
+        error_code: err.error_code,
+        reason: err.reason.clone(),
+    };
+
+    if last_logged.as_ref() == Some(&snapshot) {
+        return;
+    }
+
+    *last_logged = Some(snapshot);
+    log_quic_connection_error(source, peer, trace_id, err);
+}
+
 impl QUICListener {
     pub(super) fn clear_connection_registry(&mut self) {
         self.connections.clear();

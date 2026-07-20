@@ -1,3 +1,4 @@
+use http_body_util::Full;
 use spooky_errors::{classify_upstream_proxy_error, classify_upstream_send_error};
 
 use super::*;

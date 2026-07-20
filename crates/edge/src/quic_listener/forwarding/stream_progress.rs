@@ -5,8 +5,8 @@ use crate::runtime::connection::{
         BodyLimitKind, BodyTimeoutKind, ProgressiveEmissionPolicy, RESPONSE_BODY_TOO_LARGE_BODY,
         RequestBodyGuardrailConfig, RequestBodyGuardrailDecision, RequestBodyGuardrailInput,
         ResponseBodyGuardrailConfig, ResponseBodyGuardrailDecision, ResponseBodyGuardrailInput,
-        checked_response_body_guardrails, evaluate_request_body_timeouts,
-        response_body_limit_reason, response_chunk_ranges,
+        checked_request_body_ingress, checked_response_body_guardrails,
+        evaluate_request_body_timeouts, response_body_limit_reason, response_chunk_ranges,
     },
     response::ForwardingPolicyTelemetry,
 };
@@ -52,6 +52,127 @@ fn response_body_guardrail_error(decision: ResponseBodyGuardrailDecision) -> Opt
 }
 
 impl QUICListener {
+    pub(in crate::quic_listener) fn push_request_chunk(
+        req: &mut RequestEnvelope,
+        chunk: Bytes,
+        metrics: &Metrics,
+        max_request_body_bytes: usize,
+        request_buffer_global_cap_bytes: usize,
+    ) -> Result<(), RequestBufferError> {
+        let chunk_len = chunk.len();
+        if !metrics.try_reserve_request_buffer(chunk_len, request_buffer_global_cap_bytes) {
+            return Err(RequestBufferError::Global);
+        }
+
+        let next_state = checked_request_body_ingress(
+            RequestBodyGuardrailConfig {
+                idle_timeout: Duration::ZERO,
+                total_timeout: Duration::ZERO,
+                max_body_bytes: max_request_body_bytes,
+                max_buffered_bytes: max_request_body_bytes,
+            },
+            RequestBodyGuardrailInput {
+                elapsed: Duration::ZERO,
+                idle_for: Duration::ZERO,
+                bytes_received: req.body_bytes_received,
+                buffered_bytes: req.body_buf_bytes,
+                next_chunk_bytes: chunk_len,
+                declared_content_length: None,
+                exempt_from_body_size_cap: false,
+            },
+        );
+        let Ok(next_state) = next_state else {
+            metrics.release_request_buffer(chunk_len);
+            return Err(match next_state {
+                Err(RequestBodyGuardrailDecision::Reject {
+                    kind: BodyLimitKind::BodySize,
+                }) => RequestBufferError::BodySize,
+                Err(RequestBodyGuardrailDecision::Reject { .. }) => RequestBufferError::Stream,
+                Err(other) => unreachable!(
+                    "request ingress should not timeout in enqueue path: {:?}",
+                    other
+                ),
+                Ok(_) => unreachable!("handled Ok state before request buffer error mapping"),
+            });
+        };
+        req.body_buf_bytes = next_state.buffered_bytes;
+        req.body_buf.push_back(chunk);
+        Ok(())
+    }
+
+    pub(in crate::quic_listener) fn enqueue_request_chunk(
+        req: &mut RequestEnvelope,
+        chunk: Bytes,
+        metrics: &Metrics,
+        max_request_body_bytes: usize,
+        request_buffer_global_cap_bytes: usize,
+    ) -> Result<(), RequestBufferError> {
+        if let Some(tx) = &req.body_tx {
+            match tx.try_send(chunk) {
+                Ok(()) => Ok(()),
+                Err(TrySendError::Full(chunk)) => Self::push_request_chunk(
+                    req,
+                    chunk,
+                    metrics,
+                    max_request_body_bytes,
+                    request_buffer_global_cap_bytes,
+                ),
+                Err(TrySendError::Closed(_chunk)) => {
+                    if req.body_buf_bytes > 0 {
+                        metrics.release_request_buffer(req.body_buf_bytes);
+                    }
+                    req.body_tx = None;
+                    req.body_buf.clear();
+                    req.body_buf_bytes = 0;
+                    Ok(())
+                }
+            }
+        } else {
+            Self::push_request_chunk(
+                req,
+                chunk,
+                metrics,
+                max_request_body_bytes,
+                request_buffer_global_cap_bytes,
+            )
+        }
+    }
+
+    pub(in crate::quic_listener) fn flush_request_buffer(
+        req: &mut RequestEnvelope,
+        metrics: &Metrics,
+    ) {
+        let Some(tx) = req.body_tx.as_ref() else {
+            return;
+        };
+
+        loop {
+            let Some(chunk) = req.body_buf.pop_front() else {
+                break;
+            };
+            let len = chunk.len();
+            match tx.try_send(chunk) {
+                Ok(()) => {
+                    req.body_buf_bytes = req.body_buf_bytes.saturating_sub(len);
+                    metrics.release_request_buffer(len);
+                }
+                Err(TrySendError::Full(chunk)) => {
+                    req.body_buf.push_front(chunk);
+                    break;
+                }
+                Err(TrySendError::Closed(_chunk)) => {
+                    if req.body_buf_bytes > 0 {
+                        metrics.release_request_buffer(req.body_buf_bytes);
+                    }
+                    req.body_buf.clear();
+                    req.body_buf_bytes = 0;
+                    req.body_tx = None;
+                    break;
+                }
+            }
+        }
+    }
+
     /// Advance all in-flight streams without blocking.
     ///
     /// Called after every packet-driven `handle_h3` pass and from

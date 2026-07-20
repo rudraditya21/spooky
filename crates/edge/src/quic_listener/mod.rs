@@ -1,15 +1,8 @@
 use core::net::SocketAddr;
 use std::{
     collections::{HashMap, HashSet},
-    convert::Infallible,
-    future::Future,
     net::UdpSocket,
-    pin::Pin,
-    sync::{
-        Arc, OnceLock, RwLock,
-        atomic::{AtomicUsize, Ordering},
-    },
-    task::{Context, Poll},
+    sync::{Arc, RwLock, atomic::Ordering},
     time::{Duration, Instant},
 };
 
@@ -20,12 +13,8 @@ use boring::{
 };
 use bytes::Bytes;
 use http::{Request, Response, StatusCode};
-use http_body_util::{BodyExt, Full, combinators::BoxBody};
-use hyper::{
-    body::{Body, Frame, Incoming},
-    client::conn::http1 as client_http1,
-    upgrade,
-};
+use http_body_util::{BodyExt, combinators::BoxBody};
+use hyper::{body::Incoming, client::conn::http1 as client_http1, upgrade};
 use hyper_util::rt::TokioIo;
 use log::{debug, error, info, warn};
 use quiche::{Config, h3::NameValue};
@@ -58,7 +47,6 @@ use spooky_lb::{health::HealthFailureReason, upstream_pool::UpstreamPool};
 use spooky_transport::{h2_client::SharedDnsResolver, transport_pool::UpstreamTransportPool};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    runtime::Handle,
     sync::{Semaphore, mpsc, mpsc::error::TrySendError, oneshot},
 };
 #[cfg(test)]
@@ -83,8 +71,7 @@ use crate::{
             guardrails::{
                 BodyLimitKind, REQUEST_BODY_TOO_LARGE_BODY, RequestBodyGuardrailConfig,
                 RequestBodyGuardrailDecision, RequestBodyGuardrailInput,
-                ResponseBodyGuardrailConfig, ResponseBodyGuardrailInput,
-                checked_request_body_ingress, checked_response_body_guardrails,
+                checked_request_body_ingress,
             },
             quic::{QuicConnection, QuicConnectionErrorSnapshot},
             request::RequestEnvelope,
@@ -94,7 +81,7 @@ use crate::{
         health::{HealthClassification, outcome_from_status},
         listener::QUICListener,
         shared_state::SharedRuntimeState,
-        tasks::{RuntimeTaskRegistration, RuntimeTaskRegistry},
+        tasks::RuntimeTaskRegistry,
         tls::{
             inventory::{
                 ListenerTlsInventory, RuntimeLoadedClientAuthCa, RuntimeLoadedTlsIdentity,
@@ -107,6 +94,7 @@ use crate::{
 };
 
 mod admission;
+mod async_runtime;
 mod backend_resolution;
 mod bootstrap_tls;
 mod connection;
@@ -115,6 +103,7 @@ mod control_plane;
 mod forwarding;
 mod health_check;
 mod metrics_endpoint;
+mod protocol;
 mod runtime_endpoint;
 mod runtime_state;
 mod shutdown;
@@ -124,8 +113,11 @@ mod token_bucket;
 mod validation;
 pub mod workers;
 
+pub use async_runtime::configure_async_runtime;
+pub(crate) use async_runtime::{runtime_handle, spawn_async_task, spawn_supervised_async_task};
 #[cfg(test)]
 use bootstrap_tls::BootstrapStartupState;
+use connection::maybe_log_quic_connection_error;
 #[cfg(test)]
 pub(crate) use connection::purge_connection_routes;
 #[cfg(test)]
@@ -134,6 +126,15 @@ pub(crate) use connection::{ConnectionRoutes, sweep_closed_connections};
 use forwarding::{ForwardingExecutionCtx, ForwardingSharedCtx, StreamProgressConfig, abort_stream};
 #[cfg(test)]
 use health_check::classify_active_health_check_response;
+pub(crate) use protocol::{
+    can_poll_upstream_result, collect_h3_trailers, is_bodyless_request_mode, is_connect_method,
+    is_head_method, is_tunnel_mode, is_tunnel_response, is_websocket_upgrade_request,
+};
+#[cfg(test)]
+pub(crate) use protocol::{
+    connection_header_tokens, is_connect_tunnel_response, should_strip_bootstrap_request_header,
+    should_strip_bootstrap_response_header, should_strip_h3_response_header,
+};
 pub use runtime_state::ListenerWorkerRuntimeState;
 pub(crate) use token_bucket::TokenBucket;
 use validation::{
@@ -160,346 +161,7 @@ struct ListenerRuntimeSettings {
     new_connections_burst: u32,
 }
 
-#[cfg(test)]
-fn connection_header_tokens(headers: &http::HeaderMap) -> HashSet<String> {
-    let mut tokens = HashSet::new();
-    for value in headers.get_all(http::header::CONNECTION) {
-        let Ok(raw) = value.to_str() else {
-            continue;
-        };
-        for part in raw.split(',') {
-            let token = part.trim().to_ascii_lowercase();
-            if token.is_empty() {
-                continue;
-            }
-            tokens.insert(token);
-        }
-    }
-    tokens
-}
-
-#[cfg(test)]
-fn should_strip_bootstrap_request_header(
-    name: &http::header::HeaderName,
-    connection_tokens: &HashSet<String>,
-) -> bool {
-    if connection_tokens.contains(name.as_str()) {
-        return true;
-    }
-
-    if name == http::header::CONTENT_LENGTH {
-        return true;
-    }
-
-    if name == http::header::CONNECTION
-        || name == http::header::PROXY_AUTHENTICATE
-        || name == http::header::PROXY_AUTHORIZATION
-        || name == http::header::TE
-        || name == http::header::TRAILER
-        || name == http::header::TRANSFER_ENCODING
-        || name == http::header::UPGRADE
-        || name.as_str().eq_ignore_ascii_case("keep-alive")
-        || name.as_str().eq_ignore_ascii_case("proxy-connection")
-        || name.as_str().eq_ignore_ascii_case("forwarded")
-        || name.as_str().eq_ignore_ascii_case("x-forwarded-for")
-        || name.as_str().eq_ignore_ascii_case("x-forwarded-proto")
-        || name.as_str().eq_ignore_ascii_case("x-forwarded-host")
-    {
-        return true;
-    }
-
-    false
-}
-
-#[cfg(test)]
-fn should_strip_h3_response_header(
-    name: &http::header::HeaderName,
-    connection_tokens: &HashSet<String>,
-) -> bool {
-    should_strip_response_header(
-        name,
-        connection_tokens,
-        ResponseProtocolConstraints {
-            protocol: ResponseNormalizationProtocol::Http3,
-            strip_connection_headers: true,
-            allow_trailers: true,
-            preserve_upgrade: false,
-        },
-    )
-}
-
-fn collect_h3_trailers(trailers: &http::HeaderMap) -> Vec<(Vec<u8>, Vec<u8>)> {
-    normalize_response_trailers(
-        trailers,
-        ResponseProtocolConstraints {
-            protocol: ResponseNormalizationProtocol::Http3,
-            strip_connection_headers: true,
-            allow_trailers: true,
-            preserve_upgrade: false,
-        },
-    )
-    .into_iter()
-    .map(|header| {
-        (
-            header.name.as_str().as_bytes().to_vec(),
-            header.value.as_bytes().to_vec(),
-        )
-    })
-    .collect()
-}
-
-#[cfg(test)]
-fn should_strip_bootstrap_response_header(
-    name: &http::header::HeaderName,
-    connection_tokens: &HashSet<String>,
-) -> bool {
-    should_strip_response_header(
-        name,
-        connection_tokens,
-        ResponseProtocolConstraints {
-            protocol: ResponseNormalizationProtocol::Http1,
-            strip_connection_headers: true,
-            allow_trailers: false,
-            preserve_upgrade: false,
-        },
-    )
-}
-
-fn is_connect_method(method: &str) -> bool {
-    method.eq_ignore_ascii_case("CONNECT")
-}
-
-fn is_head_method(method: &str) -> bool {
-    method.eq_ignore_ascii_case("HEAD")
-}
-
-fn is_bodyless_request_mode(method: &str, content_length: Option<usize>) -> bool {
-    content_length.unwrap_or(0) == 0
-        && (method.eq_ignore_ascii_case("GET") || is_head_method(method))
-}
-
-fn is_tunnel_mode(tunnel_mode: TunnelMode) -> bool {
-    tunnel_mode != TunnelMode::None
-}
-
-fn is_tunnel_response(tunnel_mode: TunnelMode, status: StatusCode) -> bool {
-    is_tunnel_mode(tunnel_mode) && status.is_success()
-}
-
-#[cfg(test)]
-fn is_connect_tunnel_response(method: &str, status: StatusCode) -> bool {
-    is_connect_method(method) && status.is_success()
-}
-
-fn can_poll_upstream_result(req: &RequestEnvelope) -> bool {
-    if req.admission_state != StreamAdmissionState::ReadyToForward {
-        return false;
-    }
-
-    if is_tunnel_mode(req.tunnel_mode)
-        && (req.phase == StreamPhase::ReceivingRequest
-            || req.phase == StreamPhase::AwaitingUpstream)
-    {
-        return true;
-    }
-
-    req.phase == StreamPhase::AwaitingUpstream
-        && req.request_fin_received
-        && req.body_tx.is_none()
-        && req.body_buf.is_empty()
-}
-
-fn header_has_token(value: &http::HeaderValue, token: &str) -> bool {
-    value
-        .to_str()
-        .ok()
-        .map(|raw| {
-            raw.split(',')
-                .any(|part| part.trim().eq_ignore_ascii_case(token))
-        })
-        .unwrap_or(false)
-}
-
-fn is_websocket_upgrade_request(req: &Request<Incoming>, use_h2: bool) -> bool {
-    if use_h2 || req.method() != http::Method::GET {
-        return false;
-    }
-    let Some(upgrade_header) = req.headers().get(http::header::UPGRADE) else {
-        return false;
-    };
-    if !upgrade_header
-        .to_str()
-        .map(|v| v.eq_ignore_ascii_case("websocket"))
-        .unwrap_or(false)
-    {
-        return false;
-    }
-    req.headers()
-        .get(http::header::CONNECTION)
-        .map(|v| header_has_token(v, "upgrade"))
-        .unwrap_or(false)
-}
-
-type BootstrapServiceFuture = std::pin::Pin<
-    Box<
-        dyn std::future::Future<
-                Output = Result<
-                    hyper::Response<
-                        http_body_util::combinators::BoxBody<hyper::body::Bytes, Infallible>,
-                    >,
-                    hyper::Error,
-                >,
-            > + Send,
-    >,
->;
-
 type LbHeaderLookup<'a> = dyn Fn(&str) -> Option<String> + 'a;
-
-struct BootstrapStreamingBody {
-    inner: Incoming,
-    guardrails: Option<ResponseBodyGuardrailConfig>,
-    declared_content_length: Option<usize>,
-    bytes_seen: usize,
-    prebuffered_bytes: usize,
-    capped: bool,
-    backend_accounting: Option<BootstrapBackendAccounting>,
-}
-
-struct BootstrapBackendAccounting {
-    upstream_pool: Arc<RwLock<UpstreamPool>>,
-    backend_index: usize,
-    start: Instant,
-    status: Option<u16>,
-    finished: bool,
-}
-
-impl BootstrapStreamingBody {
-    fn new(inner: Incoming) -> Self {
-        Self {
-            inner,
-            guardrails: None,
-            declared_content_length: None,
-            bytes_seen: 0,
-            prebuffered_bytes: 0,
-            capped: false,
-            backend_accounting: None,
-        }
-    }
-
-    fn with_response_guardrails(
-        inner: Incoming,
-        max_body_bytes: usize,
-        declared_content_length: Option<usize>,
-        upstream_pool: Arc<RwLock<UpstreamPool>>,
-        backend_index: usize,
-        start: Instant,
-        status: Option<u16>,
-    ) -> Self {
-        Self {
-            inner,
-            guardrails: Some(ResponseBodyGuardrailConfig {
-                idle_timeout: Duration::MAX,
-                total_timeout: Duration::MAX,
-                max_body_bytes,
-                unknown_length_prebuffer_bytes: max_body_bytes,
-                chunk_bytes: usize::MAX,
-            }),
-            declared_content_length,
-            bytes_seen: 0,
-            prebuffered_bytes: 0,
-            capped: false,
-            backend_accounting: Some(BootstrapBackendAccounting {
-                upstream_pool,
-                backend_index,
-                start,
-                status,
-                finished: false,
-            }),
-        }
-    }
-
-    fn finish_backend_accounting(&mut self) {
-        if let Some(accounting) = self.backend_accounting.as_mut() {
-            if accounting.finished {
-                return;
-            }
-            crate::runtime::connection::outcome::finish_backend_request_accounting(
-                crate::runtime::connection::outcome::BackendRequestFinishInput {
-                    upstream_pool: Some(&accounting.upstream_pool),
-                    backend_index: Some(accounting.backend_index),
-                    elapsed: accounting.start.elapsed(),
-                    status: accounting.status,
-                },
-            );
-            accounting.finished = true;
-        }
-    }
-}
-
-impl Body for BootstrapStreamingBody {
-    type Data = Bytes;
-    type Error = Infallible;
-
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        if self.capped {
-            return Poll::Ready(None);
-        }
-
-        match Pin::new(&mut self.inner).poll_frame(cx) {
-            Poll::Ready(Some(Ok(frame))) => {
-                if let Some(guardrails) = self.guardrails
-                    && let Some(data) = frame.data_ref()
-                {
-                    if let Ok(next_state) = checked_response_body_guardrails(
-                        guardrails,
-                        ResponseBodyGuardrailInput {
-                            elapsed: Duration::ZERO,
-                            idle_for: Duration::ZERO,
-                            bytes_received: self.bytes_seen,
-                            prebuffered_bytes: self.prebuffered_bytes,
-                            next_chunk_bytes: data.len(),
-                            declared_content_length: self.declared_content_length,
-                            headers_emitted: true,
-                            progressive_emission_allowed: true,
-                            body_forwarding_enabled: true,
-                            exempt_from_body_size_cap: false,
-                        },
-                    ) {
-                        self.bytes_seen = next_state.next_state.bytes_received;
-                        self.prebuffered_bytes = next_state.next_state.prebuffered_bytes;
-                    } else {
-                        self.capped = true;
-                        self.finish_backend_accounting();
-                        return Poll::Ready(None);
-                    }
-                }
-                Poll::Ready(Some(Ok(frame)))
-            }
-            Poll::Ready(Some(Err(_))) => {
-                self.finish_backend_accounting();
-                Poll::Ready(None)
-            }
-            Poll::Ready(None) => {
-                self.finish_backend_accounting();
-                Poll::Ready(None)
-            }
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl Drop for BootstrapStreamingBody {
-    fn drop(&mut self) {
-        self.finish_backend_accounting();
-    }
-}
-
-fn boxed_full(body: Bytes) -> http_body_util::combinators::BoxBody<Bytes, Infallible> {
-    Full::new(body).map_err(|never| match never {}).boxed()
-}
 
 impl QUICListener {
     fn random_reset_token() -> u128 {
@@ -935,295 +597,7 @@ impl QUICListener {
         }
         connection.streams.clear();
     }
-
-    fn push_request_chunk(
-        req: &mut RequestEnvelope,
-        chunk: Bytes,
-        metrics: &Metrics,
-        max_request_body_bytes: usize,
-        request_buffer_global_cap_bytes: usize,
-    ) -> Result<(), RequestBufferError> {
-        let chunk_len = chunk.len();
-        if !metrics.try_reserve_request_buffer(chunk_len, request_buffer_global_cap_bytes) {
-            return Err(RequestBufferError::Global);
-        }
-
-        let next_state = checked_request_body_ingress(
-            RequestBodyGuardrailConfig {
-                idle_timeout: Duration::ZERO,
-                total_timeout: Duration::ZERO,
-                max_body_bytes: max_request_body_bytes,
-                max_buffered_bytes: max_request_body_bytes,
-            },
-            RequestBodyGuardrailInput {
-                elapsed: Duration::ZERO,
-                idle_for: Duration::ZERO,
-                bytes_received: req.body_bytes_received,
-                buffered_bytes: req.body_buf_bytes,
-                next_chunk_bytes: chunk_len,
-                declared_content_length: None,
-                exempt_from_body_size_cap: false,
-            },
-        );
-        let Ok(next_state) = next_state else {
-            metrics.release_request_buffer(chunk_len);
-            return Err(match next_state {
-                Err(RequestBodyGuardrailDecision::Reject {
-                    kind: BodyLimitKind::BodySize,
-                }) => RequestBufferError::BodySize,
-                Err(RequestBodyGuardrailDecision::Reject { .. }) => RequestBufferError::Stream,
-                Err(other) => unreachable!(
-                    "request ingress should not timeout in enqueue path: {:?}",
-                    other
-                ),
-                Ok(_) => unreachable!("handled Ok state before request buffer error mapping"),
-            });
-        };
-        req.body_buf_bytes = next_state.buffered_bytes;
-        req.body_buf.push_back(chunk);
-        Ok(())
-    }
-
-    fn enqueue_request_chunk(
-        req: &mut RequestEnvelope,
-        chunk: Bytes,
-        metrics: &Metrics,
-        max_request_body_bytes: usize,
-        request_buffer_global_cap_bytes: usize,
-    ) -> Result<(), RequestBufferError> {
-        if let Some(tx) = &req.body_tx {
-            match tx.try_send(chunk) {
-                Ok(()) => Ok(()),
-                Err(TrySendError::Full(chunk)) => Self::push_request_chunk(
-                    req,
-                    chunk,
-                    metrics,
-                    max_request_body_bytes,
-                    request_buffer_global_cap_bytes,
-                ),
-                Err(TrySendError::Closed(_chunk)) => {
-                    if req.body_buf_bytes > 0 {
-                        metrics.release_request_buffer(req.body_buf_bytes);
-                    }
-                    req.body_tx = None;
-                    req.body_buf.clear();
-                    req.body_buf_bytes = 0;
-                    Ok(())
-                }
-            }
-        } else {
-            Self::push_request_chunk(
-                req,
-                chunk,
-                metrics,
-                max_request_body_bytes,
-                request_buffer_global_cap_bytes,
-            )
-        }
-    }
-
-    fn flush_request_buffer(req: &mut RequestEnvelope, metrics: &Metrics) {
-        let Some(tx) = req.body_tx.as_ref() else {
-            return;
-        };
-
-        loop {
-            let Some(chunk) = req.body_buf.pop_front() else {
-                break;
-            };
-            let len = chunk.len();
-            match tx.try_send(chunk) {
-                Ok(()) => {
-                    req.body_buf_bytes = req.body_buf_bytes.saturating_sub(len);
-                    metrics.release_request_buffer(len);
-                }
-                Err(TrySendError::Full(chunk)) => {
-                    req.body_buf.push_front(chunk);
-                    break;
-                }
-                Err(TrySendError::Closed(_chunk)) => {
-                    if req.body_buf_bytes > 0 {
-                        metrics.release_request_buffer(req.body_buf_bytes);
-                    }
-                    req.body_buf.clear();
-                    req.body_buf_bytes = 0;
-                    req.body_tx = None;
-                    break;
-                }
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn handle_metrics_request(
-        req: Request<Incoming>,
-        metrics_path: &str,
-        metrics: Arc<Metrics>,
-    ) -> Response<Full<Bytes>> {
-        if req.uri().path() != metrics_path {
-            return match Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(Full::new(Bytes::from_static(b"not found\n")))
-            {
-                Ok(resp) => resp,
-                Err(_) => Response::new(Full::new(Bytes::from_static(b"not found\n"))),
-            };
-        }
-
-        let body = metrics.render_prometheus();
-        match Response::builder()
-            .status(StatusCode::OK)
-            .header("content-type", "text/plain; version=0.0.4")
-            .body(Full::new(Bytes::from(body)))
-        {
-            Ok(resp) => resp,
-            Err(_) => Response::new(Full::new(Bytes::from_static(b"failed to render metrics\n"))),
-        }
-    }
 }
-
-fn is_benign_quic_close(err: &quiche::ConnectionError) -> bool {
-    !err.is_app && err.error_code == 0 && err.reason.is_empty()
-}
-
-fn log_quic_connection_error(
-    source: &str,
-    peer: SocketAddr,
-    trace_id: &str,
-    err: &quiche::ConnectionError,
-) {
-    if is_benign_quic_close(err) {
-        debug!(
-            "QUIC {} close without error: peer={} trace_id={} is_app={} error_code={} reason_len={}",
-            source,
-            peer,
-            trace_id,
-            err.is_app,
-            err.error_code,
-            err.reason.len()
-        );
-        return;
-    }
-
-    if err.reason.is_empty() {
-        error!(
-            "QUIC {} error: peer={} trace_id={} is_app={} error_code={}",
-            source, peer, trace_id, err.is_app, err.error_code
-        );
-    } else {
-        error!(
-            "QUIC {} error: peer={} trace_id={} is_app={} error_code={} reason={}",
-            source,
-            peer,
-            trace_id,
-            err.is_app,
-            err.error_code,
-            String::from_utf8_lossy(&err.reason)
-        );
-    }
-}
-
-fn maybe_log_quic_connection_error(
-    source: &str,
-    peer: SocketAddr,
-    trace_id: &str,
-    err: &quiche::ConnectionError,
-    last_logged: &mut Option<QuicConnectionErrorSnapshot>,
-) {
-    let snapshot = QuicConnectionErrorSnapshot {
-        is_app: err.is_app,
-        error_code: err.error_code,
-        reason: err.reason.clone(),
-    };
-
-    if last_logged.as_ref() == Some(&snapshot) {
-        return;
-    }
-
-    *last_logged = Some(snapshot);
-    log_quic_connection_error(source, peer, trace_id, err);
-}
-
-pub fn configure_async_runtime(worker_threads: usize) {
-    let threads = worker_threads.max(1);
-    if FALLBACK_RT.get().is_some() {
-        warn!(
-            "async runtime already initialized; ignoring new worker_threads={}",
-            threads
-        );
-        return;
-    }
-    FALLBACK_RT_THREADS.store(threads, Ordering::Relaxed);
-}
-
-fn runtime_handle() -> Option<Handle> {
-    if let Ok(handle) = Handle::try_current() {
-        return Some(handle);
-    }
-    fallback_runtime().map(|rt| rt.handle().clone())
-}
-
-fn spawn_async_task<F>(fut: F, _task_name: &str) -> bool
-where
-    F: Future + Send + 'static,
-    F::Output: Send + 'static,
-{
-    if let Some(handle) = runtime_handle() {
-        handle.spawn(fut);
-        true
-    } else {
-        false
-    }
-}
-
-fn spawn_supervised_async_task<F>(
-    handle: &Handle,
-    task_name: &'static str,
-    metrics: Option<Arc<Metrics>>,
-    fut: F,
-) -> RuntimeTaskRegistration
-where
-    F: Future<Output = ()> + Send + 'static,
-{
-    let task_name = task_name.to_string();
-    let (completion_tx, completion_rx) = oneshot::channel();
-    let join = handle.spawn(fut);
-    let abort = join.abort_handle();
-    let monitor_handle = handle.clone();
-    monitor_handle.spawn(async move {
-        match join.await {
-            Ok(()) => {}
-            Err(err) => {
-                if let Some(metrics) = metrics {
-                    metrics.inc_runtime_panic();
-                }
-                if err.is_panic() {
-                    error!("Background task '{}' panicked", task_name);
-                } else {
-                    warn!("Background task '{}' cancelled", task_name);
-                }
-            }
-        }
-        let _ = completion_tx.send(());
-    });
-    RuntimeTaskRegistration::new(abort, completion_rx)
-}
-
-fn fallback_runtime() -> Option<&'static tokio::runtime::Runtime> {
-    FALLBACK_RT
-        .get_or_init(|| {
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .worker_threads(FALLBACK_RT_THREADS.load(Ordering::Relaxed))
-                .thread_name("spooky-edge-fallback-rt")
-                .build()
-                .ok()
-        })
-        .as_ref()
-}
-
-static FALLBACK_RT: OnceLock<Option<tokio::runtime::Runtime>> = OnceLock::new();
-static FALLBACK_RT_THREADS: AtomicUsize = AtomicUsize::new(2);
 
 #[cfg(test)]
 mod tests;

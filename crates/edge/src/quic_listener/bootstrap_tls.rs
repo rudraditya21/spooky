@@ -2,18 +2,20 @@ use std::{
     collections::HashMap,
     convert::Infallible,
     net::SocketAddr,
+    pin::Pin,
     sync::{
         Arc, RwLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
 use bytes::Bytes;
 use http::{Request, Response, StatusCode};
-use http_body_util::{BodyExt, combinators::BoxBody};
+use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::{
-    body::Incoming,
+    body::{Body, Frame, Incoming},
     client::conn::http1 as client_http1,
     server::conn::{http1, http2},
     service::service_fn,
@@ -42,12 +44,12 @@ use spooky_lb::upstream_pool::UpstreamPool;
 use spooky_transport::transport_pool::UpstreamTransportPool;
 
 use super::{
-    BootstrapServiceFuture, BootstrapStreamingBody, QUICListener,
+    QUICListener,
     admission::{
         AdmissionPolicyDecision, admission_rejection_response,
         evaluate_forwarding_pre_admission_policy,
     },
-    boxed_full, is_head_method, is_websocket_upgrade_request,
+    is_head_method, is_websocket_upgrade_request,
     runtime_endpoint::RuntimeConnectionSlotGuard,
     runtime_handle, spawn_supervised_async_task, validate_http_request,
 };
@@ -76,6 +78,165 @@ use crate::{
         tls::store::ListenerTlsReloadStore,
     },
 };
+
+type BootstrapServiceFuture = Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<
+                    hyper::Response<
+                        http_body_util::combinators::BoxBody<hyper::body::Bytes, Infallible>,
+                    >,
+                    hyper::Error,
+                >,
+            > + Send,
+    >,
+>;
+
+struct BootstrapStreamingBody {
+    inner: Incoming,
+    guardrails: Option<ResponseBodyGuardrailConfig>,
+    declared_content_length: Option<usize>,
+    bytes_seen: usize,
+    prebuffered_bytes: usize,
+    capped: bool,
+    backend_accounting: Option<BootstrapBackendAccounting>,
+}
+
+struct BootstrapBackendAccounting {
+    upstream_pool: Arc<RwLock<UpstreamPool>>,
+    backend_index: usize,
+    start: Instant,
+    status: Option<u16>,
+    finished: bool,
+}
+
+impl BootstrapStreamingBody {
+    fn new(inner: Incoming) -> Self {
+        Self {
+            inner,
+            guardrails: None,
+            declared_content_length: None,
+            bytes_seen: 0,
+            prebuffered_bytes: 0,
+            capped: false,
+            backend_accounting: None,
+        }
+    }
+
+    fn with_response_guardrails(
+        inner: Incoming,
+        max_body_bytes: usize,
+        declared_content_length: Option<usize>,
+        upstream_pool: Arc<RwLock<UpstreamPool>>,
+        backend_index: usize,
+        start: Instant,
+        status: Option<u16>,
+    ) -> Self {
+        Self {
+            inner,
+            guardrails: Some(ResponseBodyGuardrailConfig {
+                idle_timeout: Duration::MAX,
+                total_timeout: Duration::MAX,
+                max_body_bytes,
+                unknown_length_prebuffer_bytes: max_body_bytes,
+                chunk_bytes: usize::MAX,
+            }),
+            declared_content_length,
+            bytes_seen: 0,
+            prebuffered_bytes: 0,
+            capped: false,
+            backend_accounting: Some(BootstrapBackendAccounting {
+                upstream_pool,
+                backend_index,
+                start,
+                status,
+                finished: false,
+            }),
+        }
+    }
+
+    fn finish_backend_accounting(&mut self) {
+        if let Some(accounting) = self.backend_accounting.as_mut() {
+            if accounting.finished {
+                return;
+            }
+            crate::runtime::connection::outcome::finish_backend_request_accounting(
+                crate::runtime::connection::outcome::BackendRequestFinishInput {
+                    upstream_pool: Some(&accounting.upstream_pool),
+                    backend_index: Some(accounting.backend_index),
+                    elapsed: accounting.start.elapsed(),
+                    status: accounting.status,
+                },
+            );
+            accounting.finished = true;
+        }
+    }
+}
+
+impl Body for BootstrapStreamingBody {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        if self.capped {
+            return Poll::Ready(None);
+        }
+
+        match Pin::new(&mut self.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(guardrails) = self.guardrails
+                    && let Some(data) = frame.data_ref()
+                {
+                    if let Ok(next_state) = checked_response_body_guardrails(
+                        guardrails,
+                        ResponseBodyGuardrailInput {
+                            elapsed: Duration::ZERO,
+                            idle_for: Duration::ZERO,
+                            bytes_received: self.bytes_seen,
+                            prebuffered_bytes: self.prebuffered_bytes,
+                            next_chunk_bytes: data.len(),
+                            declared_content_length: self.declared_content_length,
+                            headers_emitted: true,
+                            progressive_emission_allowed: true,
+                            body_forwarding_enabled: true,
+                            exempt_from_body_size_cap: false,
+                        },
+                    ) {
+                        self.bytes_seen = next_state.next_state.bytes_received;
+                        self.prebuffered_bytes = next_state.next_state.prebuffered_bytes;
+                    } else {
+                        self.capped = true;
+                        self.finish_backend_accounting();
+                        return Poll::Ready(None);
+                    }
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(_))) => {
+                self.finish_backend_accounting();
+                Poll::Ready(None)
+            }
+            Poll::Ready(None) => {
+                self.finish_backend_accounting();
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for BootstrapStreamingBody {
+    fn drop(&mut self) {
+        self.finish_backend_accounting();
+    }
+}
+
+pub(super) fn boxed_full(body: Bytes) -> http_body_util::combinators::BoxBody<Bytes, Infallible> {
+    Full::new(body).map_err(|never| match never {}).boxed()
+}
 
 pub(super) struct BootstrapConnectionState {
     pub(super) alt_svc_value: String,

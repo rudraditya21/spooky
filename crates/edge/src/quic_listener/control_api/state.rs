@@ -1,3 +1,5 @@
+use std::sync::atomic::AtomicUsize;
+
 use super::*;
 
 #[derive(Clone)]

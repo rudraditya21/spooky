@@ -3,6 +3,9 @@ use std::{
     time::Duration,
 };
 
+use bytes::Bytes;
+use http::{Response, StatusCode};
+use http_body_util::Full;
 use hyper::{Request, body::Incoming, server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
 use log::{debug, error, info};
@@ -242,6 +245,32 @@ impl QUICListener {
             max_connections: startup_max_connections,
             connection_timeout: startup_connection_timeout,
             metrics: startup_metrics,
+        }
+    }
+
+    fn handle_metrics_request(
+        req: Request<Incoming>,
+        metrics_path: &str,
+        metrics: Arc<Metrics>,
+    ) -> Response<Full<Bytes>> {
+        if req.uri().path() != metrics_path {
+            return match Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Full::new(Bytes::from_static(b"not found\n")))
+            {
+                Ok(resp) => resp,
+                Err(_) => Response::new(Full::new(Bytes::from_static(b"not found\n"))),
+            };
+        }
+
+        let body = metrics.render_prometheus();
+        match Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/plain; version=0.0.4")
+            .body(Full::new(Bytes::from(body)))
+        {
+            Ok(resp) => resp,
+            Err(_) => Response::new(Full::new(Bytes::from_static(b"failed to render metrics\n"))),
         }
     }
 }

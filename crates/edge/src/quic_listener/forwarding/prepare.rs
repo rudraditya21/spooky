@@ -1,5 +1,6 @@
 use std::convert::Infallible;
 
+use http_body_util::Full;
 use spooky_config::runtime::RuntimeExternalAuth;
 use tracing::Span;
 
