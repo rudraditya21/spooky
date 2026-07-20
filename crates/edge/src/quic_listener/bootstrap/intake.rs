@@ -3,7 +3,7 @@ use std::{convert::Infallible, time::Instant};
 use bytes::Bytes;
 use http::{Request, Response, StatusCode};
 use http_body_util::combinators::BoxBody;
-use hyper::{body::Incoming, upgrade};
+use hyper::{body::Incoming, upgrade::OnUpgrade};
 
 use crate::{
     Metrics,
@@ -13,11 +13,8 @@ use crate::{
 use spooky_errors::{BridgeError, ProxyError};
 
 use super::{
-    boxed_full,
-    super::{
-        protocol::{is_head_method, is_websocket_upgrade_request},
-        validation::validate_http_request,
-    },
+    super::{protocol::is_head_method, validation::validate_http_request},
+    boxed_full, capture_bootstrap_websocket_flow,
 };
 
 pub(in crate::quic_listener) struct BootstrapRequestIntake {
@@ -27,7 +24,7 @@ pub(in crate::quic_listener) struct BootstrapRequestIntake {
     pub(in crate::quic_listener) content_length: Option<usize>,
     pub(in crate::quic_listener) suppress_downstream_body: bool,
     pub(in crate::quic_listener) is_websocket_upgrade: bool,
-    pub(in crate::quic_listener) client_upgrade: Option<upgrade::OnUpgrade>,
+    pub(in crate::quic_listener) client_upgrade: Option<OnUpgrade>,
 }
 
 pub(in crate::quic_listener) fn bootstrap_error_response(
@@ -50,12 +47,7 @@ pub(in crate::quic_listener) fn prepare_bootstrap_request_intake(
     alt_svc: &str,
     request_start: Instant,
 ) -> Result<BootstrapRequestIntake, Response<BoxBody<Bytes, Infallible>>> {
-    let is_websocket_upgrade = is_websocket_upgrade_request(req, use_h2);
-    let client_upgrade = if is_websocket_upgrade {
-        Some(upgrade::on(&mut *req))
-    } else {
-        None
-    };
+    let websocket_flow = capture_bootstrap_websocket_flow(req, use_h2);
 
     let request = match validate_http_request(req, resilience) {
         Ok(request) => request,
@@ -83,7 +75,7 @@ pub(in crate::quic_listener) fn prepare_bootstrap_request_intake(
         path: request.path,
         authority: request.authority,
         content_length: request.content_length,
-        is_websocket_upgrade,
-        client_upgrade,
+        is_websocket_upgrade: websocket_flow.is_websocket_upgrade,
+        client_upgrade: websocket_flow.client_upgrade,
     })
 }

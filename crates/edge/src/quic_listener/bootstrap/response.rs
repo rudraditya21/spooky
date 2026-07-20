@@ -9,12 +9,7 @@ use std::{
 use bytes::Bytes;
 use http::{Response, StatusCode};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
-use hyper::{
-    body::{Body, Frame, Incoming},
-    upgrade::{self, OnUpgrade},
-};
-use hyper_util::rt::TokioIo;
-use log::debug;
+use hyper::body::{Body, Frame, Incoming};
 use spooky_bridge::response::{
     ResponseBodyMode, ResponseBodyPolicy, ResponseNormalizationInput,
     ResponseNormalizationProtocol, ResponseProtocolConstraints, normalize_upstream_response,
@@ -24,9 +19,10 @@ use spooky_lb::upstream_pool::UpstreamPool;
 
 use crate::{
     Metrics, OverloadShedReason,
-    quic_listener::bootstrap::request::{
-        BootstrapPreparedRoute, bootstrap_backend_target_for_prepared,
-        bootstrap_route_target_for_prepared,
+    quic_listener::bootstrap::{
+        BootstrapPreparedRoute,
+        request::{bootstrap_backend_target_for_prepared, bootstrap_route_target_for_prepared},
+        write_bootstrap_websocket_upgrade,
     },
     runtime::connection::{
         guardrails::{
@@ -194,7 +190,7 @@ pub(in crate::quic_listener) struct BootstrapWritebackInput<'a> {
     pub(in crate::quic_listener) alt_svc: &'a str,
     pub(in crate::quic_listener) suppress_downstream_body: bool,
     pub(in crate::quic_listener) is_websocket_upgrade: bool,
-    pub(in crate::quic_listener) client_upgrade: Option<OnUpgrade>,
+    pub(in crate::quic_listener) client_upgrade: Option<hyper::upgrade::OnUpgrade>,
     pub(in crate::quic_listener) max_response_body_bytes: usize,
 }
 
@@ -304,42 +300,15 @@ pub(in crate::quic_listener) fn write_bootstrap_response(
 
     if input.is_websocket_upgrade && input.upstream_resp.status() == StatusCode::SWITCHING_PROTOCOLS
     {
-        let client_upgrade = match input.client_upgrade {
-            Some(upgrade) => upgrade,
-            None => {
-                return Ok(Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .header("alt-svc", input.alt_svc)
-                    .body(boxed_full(Bytes::from_static(b"upgrade setup error\n")))
-                    .unwrap_or_else(|_| {
-                        Response::new(boxed_full(Bytes::from_static(b"error\n")))
-                    }));
-            }
-        };
-        let upstream_upgrade = upgrade::on(&mut input.upstream_resp);
-        tokio::spawn(async move {
-            let (client, upstream) = match tokio::try_join!(client_upgrade, upstream_upgrade) {
-                Ok(v) => v,
-                Err(err) => {
-                    debug!("Bootstrap WebSocket upgrade join failed: {}", err);
-                    return;
-                }
-            };
-            let mut client = TokioIo::new(client);
-            let mut upstream = TokioIo::new(upstream);
-            let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
-        });
-        crate::runtime::connection::outcome::finish_backend_request_accounting(
-            crate::runtime::connection::outcome::BackendRequestFinishInput {
-                upstream_pool: Some(&input.prepared_route.upstream_pool),
-                backend_index: Some(input.prepared_route.backend_index),
-                elapsed: input.request_start.elapsed(),
-                status: Some(status.as_u16()),
-            },
+        return write_bootstrap_websocket_upgrade(
+            resp_builder,
+            &mut input.upstream_resp,
+            input.prepared_route,
+            input.request_start,
+            input.alt_svc,
+            input.client_upgrade,
+            status,
         );
-        return Ok(resp_builder
-            .body(boxed_full(Bytes::new()))
-            .unwrap_or_else(|_| Response::new(boxed_full(Bytes::new()))));
     }
 
     let resp_body = if matches!(

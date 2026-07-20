@@ -4,6 +4,7 @@ mod request;
 mod response;
 mod startup;
 mod state;
+mod websocket;
 
 pub(in crate::quic_listener) use self::dispatch::{
     BootstrapDispatchInput, dispatch_bootstrap_upstream,
@@ -24,4 +25,8 @@ pub(in crate::quic_listener) use self::startup::{
 };
 pub(in crate::quic_listener) use self::state::{
     BootstrapConnectionState, BootstrapStartupState, bootstrap_connection_state,
+};
+pub(in crate::quic_listener) use self::websocket::{
+    capture_bootstrap_websocket_flow, dispatch_bootstrap_websocket,
+    write_bootstrap_websocket_upgrade,
 };
