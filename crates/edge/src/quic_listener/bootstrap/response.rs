@@ -16,21 +16,19 @@ use spooky_bridge::response::{
 };
 use spooky_lb::upstream_pool::UpstreamPool;
 
-use crate::{
-    quic_listener::bootstrap::{BootstrapPreparedRoute, write_bootstrap_websocket_upgrade},
-    runtime::connection::guardrails::{
-        BodyLimitKind, RESPONSE_BODY_TOO_LARGE_BODY, ResponseBodyGuardrailConfig,
-        ResponseBodyGuardrailDecision, ResponseBodyGuardrailInput,
-        checked_response_body_guardrails,
-    },
+use crate::runtime::connection::guardrails::{
+    BodyLimitKind, RESPONSE_BODY_TOO_LARGE_BODY, ResponseBodyGuardrailConfig,
+    ResponseBodyGuardrailDecision, ResponseBodyGuardrailInput, checked_response_body_guardrails,
 };
 
 use super::outcome::{
     finish_bootstrap_backend_request_accounting, observe_bootstrap_response_prebuffer_overflow,
     observe_bootstrap_response_status,
 };
-use crate::quic_listener::bootstrap::BootstrapDispatchCtx;
-
+use super::{
+    context::BootstrapDispatchCtx, request::BootstrapPreparedRoute,
+    websocket::write_bootstrap_websocket_upgrade,
+};
 pub(in crate::quic_listener) struct BootstrapStreamingBody {
     inner: Incoming,
     guardrails: Option<ResponseBodyGuardrailConfig>,

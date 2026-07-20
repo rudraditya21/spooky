@@ -37,9 +37,11 @@ use super::{
         },
         forwarding::BootstrapResolutionInput,
     },
-    BootstrapRequestCtx, BootstrapStreamingBody, bootstrap_error_response, boxed_full,
+    context::BootstrapRequestCtx,
     intake::BootstrapRequestIntake,
+    intake::bootstrap_error_response,
     outcome::{observe_bootstrap_admission_outcome, observe_bootstrap_request_proxy_error},
+    response::{BootstrapStreamingBody, boxed_full},
 };
 
 pub(in crate::quic_listener) struct BootstrapPreparedRoute {

@@ -14,7 +14,8 @@ use spooky_errors::{BridgeError, ProxyError};
 
 use super::{
     super::{protocol::is_head_method, validation::validate_http_request},
-    boxed_full, capture_bootstrap_websocket_flow,
+    response::boxed_full,
+    websocket::capture_bootstrap_websocket_flow,
 };
 
 pub(in crate::quic_listener) struct BootstrapRequestIntake {

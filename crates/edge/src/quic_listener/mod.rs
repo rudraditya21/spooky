@@ -119,7 +119,7 @@ pub(in crate::quic_listener) use async_runtime::{
     runtime_handle, spawn_async_task, spawn_supervised_async_task,
 };
 #[cfg(test)]
-use bootstrap_tls::BootstrapStartupState;
+use bootstrap::BootstrapStartupState;
 use connection::maybe_log_quic_connection_error;
 #[cfg(test)]
 pub(crate) use connection::purge_connection_routes;

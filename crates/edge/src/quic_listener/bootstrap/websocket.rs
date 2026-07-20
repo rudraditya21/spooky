@@ -9,14 +9,14 @@ use log::{debug, warn};
 use spooky_config::backend_endpoint::BackendScheme;
 use spooky_errors::ProxyError;
 
-use crate::quic_listener::{
-    bootstrap::{BootstrapDispatchInput, BootstrapPreparedRoute, bootstrap_error_response},
-    protocol::is_websocket_upgrade_request,
-};
-
 use super::outcome::{
     finish_bootstrap_backend_request_accounting, observe_bootstrap_dispatch_failure,
 };
+use super::{
+    dispatch::BootstrapDispatchInput, intake::bootstrap_error_response,
+    request::BootstrapPreparedRoute,
+};
+use crate::quic_listener::protocol::is_websocket_upgrade_request;
 
 pub(in crate::quic_listener) struct BootstrapWebsocketFlow {
     pub(in crate::quic_listener) is_websocket_upgrade: bool,
