@@ -122,8 +122,11 @@ mod validation;
 
 #[cfg(test)]
 use bootstrap_tls::BootstrapStartupState;
+#[cfg(test)]
+pub(crate) use connection::purge_connection_routes;
+#[cfg(test)]
 use connection::resolve_primary_from_radix_prefix;
-pub(crate) use connection::{ConnectionRoutes, purge_connection_routes, sweep_closed_connections};
+pub(crate) use connection::{ConnectionRoutes, sweep_closed_connections};
 use forwarding::{ForwardingExecutionCtx, ForwardingSharedCtx, StreamProgressConfig, abort_stream};
 #[cfg(test)]
 use health_check::classify_active_health_check_response;
@@ -539,152 +542,7 @@ impl QUICListener {
             let _ = connection.quic.close(true, 0x0, b"draining");
             Self::flush_send(&self.socket, &mut send_buf, connection);
         }
-
-        self.connections.clear();
-        self.cid_routes.clear();
-        self.peer_routes.clear();
-        self.cid_radix.clear();
-        self.refresh_active_connection_metric();
-    }
-
-    fn take_or_create_connection(
-        &mut self,
-        peer: SocketAddr,
-        local_addr: SocketAddr,
-        packet_type: quiche::Type,
-        dcid: &[u8],
-        has_token: bool,
-    ) -> Option<(QuicConnection, Arc<[u8]>)> {
-        debug!(
-            "Packet DCID (len={}): {:02x?}, type: {:?}, active connections: {}",
-            dcid.len(),
-            dcid,
-            packet_type,
-            self.connections.len()
-        );
-
-        // Try exact match first
-        if let Some(mut connection) = self.connections.remove(dcid) {
-            debug!("Found existing connection for DCID: {:02x?}", dcid);
-            let primary = Arc::clone(&connection.primary_scid);
-            self.peer_routes.remove(&connection.peer_address);
-            connection.peer_address = peer;
-            return Some((connection, primary));
-        }
-
-        // For Short packets, try prefix match (client may append bytes to our SCID)
-        // This handles cases where client uses longer DCIDs based on server's SCID
-        if packet_type == quiche::Type::Short
-            && dcid.len() > MIN_SCID_LEN_BYTES
-            && let Some(primary_cid) = resolve_primary_from_radix_prefix(
-                dcid,
-                &self.connections,
-                &mut self.cid_routes,
-                &mut self.cid_radix,
-            )
-        {
-            debug!(
-                "Found connection via prefix match. Resolved CID: {:02x?}, Packet DCID: {:02x?}",
-                primary_cid, dcid
-            );
-            if let Some(mut connection) = self.connections.remove(primary_cid.as_ref()) {
-                self.peer_routes.remove(&connection.peer_address);
-                connection.peer_address = peer;
-                return Some((connection, primary_cid));
-            }
-        }
-
-        if self.draining {
-            self.metrics.inc_ingress_draining_drop();
-            return None;
-        }
-
-        // Only create new connections for Initial packets
-        if packet_type != quiche::Type::Initial {
-            debug!("Non-Initial packet for unknown connection, ignoring");
-            self.metrics.inc_ingress_unroutable();
-            return None;
-        }
-
-        // If this is a 0-RTT packet without a valid token, we need to reject it
-        if has_token {
-            debug!("Received 0-RTT attempt, will negotiate fresh connection");
-            // return None;
-        }
-
-        // Rate-limit new connection creation to prevent unbounded memory growth
-        // under connection floods. Existing connections are never affected.
-        if !self.conn_rate_limiter.try_consume() {
-            debug!(
-                "New connection rate limit exceeded, dropping Initial packet from {}",
-                peer
-            );
-            self.metrics.inc_ingress_rate_limited();
-            return None;
-        }
-
-        if self.connections.len() >= self.max_active_connections {
-            self.metrics.inc_connection_cap_reject();
-            self.metrics
-                .inc_overload_shed_reason(OverloadShedReason::ConnectionCap);
-            debug!(
-                "Active connection cap reached (cap={}, active={}), dropping Initial packet from {}",
-                self.max_active_connections,
-                self.connections.len(),
-                peer
-            );
-            return None;
-        }
-
-        if let Err(err) = self.sync_runtime_bundle_if_needed() {
-            error!(
-                "Failed to reload QUIC TLS configuration for listener {}: {}",
-                self.listener_label, err
-            );
-            self.metrics.inc_ingress_connection_create_failed();
-            return None;
-        }
-
-        let mut scid_bytes = [0u8; DEFAULT_SCID_LEN_BYTES];
-        rand::thread_rng().fill_bytes(&mut scid_bytes);
-
-        let scid = quiche::ConnectionId::from_ref(&scid_bytes);
-
-        let quic_connection =
-            match quiche::accept(&scid, None, local_addr, peer, &mut self.quic_config) {
-                Ok(conn) => conn,
-                Err(e) => {
-                    error!("quiche::accept failed: {:?}", e);
-                    self.metrics.inc_ingress_connection_create_failed();
-                    return None;
-                }
-            };
-
-        let connection = QuicConnection {
-            quic: quic_connection,
-            h3: None,
-            h3_config: self.h3_config.clone(),
-            streams: HashMap::new(),
-            peer_address: peer,
-            last_activity: Instant::now(),
-            primary_scid: Arc::from(&scid_bytes[..]),
-            routing_scids: HashSet::from([Arc::from(&scid_bytes[..])]),
-            packets_since_rotation: 0,
-            last_scid_rotation: Instant::now(),
-            tls_observed: false,
-            tls_handshake_failure_recorded: false,
-            tls_client_auth_failure_recorded: false,
-            last_peer_error_snapshot: None,
-            last_local_error_snapshot: None,
-        };
-
-        // Store connection using server's SCID (not client's DCID)
-        // After handshake, client will use server's SCID as DCID in subsequent packets
-        debug!(
-            "Creating new connection with server SCID: {:02x?}",
-            scid_bytes
-        );
-        Some((connection, Arc::from(&scid_bytes[..])))
+        self.clear_connection_registry();
     }
 
     fn random_reset_token() -> u128 {
@@ -737,76 +595,6 @@ impl QUICListener {
                 debug!("SCID rotation skipped: {:?}", e);
             }
         }
-    }
-
-    fn remove_connection_routes(&mut self, connection: &QuicConnection) {
-        purge_connection_routes(
-            &mut self.cid_routes,
-            &mut self.cid_radix,
-            &mut self.peer_routes,
-            &connection.primary_scid,
-            &connection.routing_scids,
-            &connection.peer_address,
-        );
-    }
-
-    fn sync_connection_routes(&mut self, connection: &mut QuicConnection) -> Arc<[u8]> {
-        let mut active_scids: HashSet<Arc<[u8]>> = connection
-            .quic
-            .source_ids()
-            .map(|cid| Arc::from(cid.as_ref()))
-            .collect();
-
-        if active_scids.is_empty() {
-            active_scids.insert(Arc::clone(&connection.primary_scid));
-        }
-
-        let active_source_id: Arc<[u8]> = Arc::from(connection.quic.source_id().as_ref());
-        let primary = if active_scids.contains(&active_source_id) {
-            active_source_id
-        } else if active_scids.contains(&connection.primary_scid) {
-            Arc::clone(&connection.primary_scid)
-        } else {
-            active_scids
-                .iter()
-                .min_by(|left, right| left.as_ref().cmp(right.as_ref()))
-                .cloned()
-                .unwrap_or_else(|| Arc::clone(&connection.primary_scid))
-        };
-
-        let retired_scids: Vec<Arc<[u8]>> = connection
-            .routing_scids
-            .difference(&active_scids)
-            .cloned()
-            .collect();
-
-        // Phase 1: make active SCIDs prefix-matchable before retirements.
-        for cid in &active_scids {
-            self.cid_radix.insert(Arc::clone(cid));
-        }
-
-        // Phase 2: clear previous aliases for this connection.
-        for cid in &connection.routing_scids {
-            self.cid_routes.remove(cid.as_ref());
-        }
-
-        // Phase 3: install aliases for active non-primary SCIDs.
-        for cid in &active_scids {
-            if *cid == primary {
-                continue;
-            }
-            self.cid_routes
-                .insert(Arc::clone(cid), Arc::clone(&primary));
-        }
-
-        // Phase 4: retire stale SCIDs after active set is fully installed.
-        for retired in retired_scids {
-            self.cid_radix.remove(retired.as_ref());
-        }
-
-        connection.routing_scids = active_scids;
-        connection.primary_scid = Arc::clone(&primary);
-        primary
     }
 
     fn poll_preamble(&mut self) -> bool {
@@ -923,105 +711,15 @@ impl QUICListener {
         let transport_pool = self.transport_pool.clone();
 
         // First, try to find existing connection by DCID
-        debug!("Looking up connection with DCID: {:?}", hex::encode(dcid));
-        let (mut connection, current_primary) =
-            if let Some(mut conn) = self.connections.remove(dcid) {
-                let primary = Arc::clone(&conn.primary_scid);
-                self.peer_routes.remove(&conn.peer_address);
-                conn.peer_address = peer;
-                debug!("Found existing connection for {}", peer);
-                (conn, primary)
-            } else if let Some(primary) = self.cid_routes.get(dcid).cloned() {
-                if let Some(mut conn) = self.connections.remove(&primary) {
-                    self.peer_routes.remove(&conn.peer_address);
-                    conn.peer_address = peer;
-                    debug!(
-                        "Found existing connection via SCID alias {} -> {}",
-                        hex::encode(dcid),
-                        hex::encode(&primary)
-                    );
-                    (conn, primary)
-                } else {
-                    // Stale alias entry.
-                    self.cid_routes.remove(dcid);
-                    match self.take_or_create_connection(
-                        peer,
-                        local_addr,
-                        packet_type,
-                        dcid,
-                        header_has_token,
-                    ) {
-                        Some(conn) => {
-                            debug!("Created new connection for {}", peer);
-                            conn
-                        }
-                        None => {
-                            debug!(
-                                "Dropping packet for unknown connection from {} (DCID: {:?})",
-                                peer,
-                                hex::encode(dcid)
-                            );
-                            return;
-                        }
-                    }
-                }
-            } else if let Some(primary) = self.peer_routes.get(&peer).cloned() {
-                if let Some(mut conn) = self.connections.remove(&primary) {
-                    self.peer_routes.remove(&conn.peer_address);
-                    conn.peer_address = peer;
-                    debug!(
-                        "Found existing connection via peer map {} -> {}",
-                        peer,
-                        hex::encode(&primary)
-                    );
-                    (conn, primary)
-                } else {
-                    // Stale peer map entry.
-                    self.peer_routes.remove(&peer);
-                    match self.take_or_create_connection(
-                        peer,
-                        local_addr,
-                        packet_type,
-                        dcid,
-                        header_has_token,
-                    ) {
-                        Some(conn_pair) => {
-                            debug!("Created new connection for {}", peer);
-                            conn_pair
-                        }
-                        None => {
-                            debug!(
-                                "Dropping packet for unknown connection from {} (DCID: {:?})",
-                                peer,
-                                hex::encode(dcid)
-                            );
-                            return;
-                        }
-                    }
-                }
-            } else {
-                // No existing connection found, try to create new one.
-                match self.take_or_create_connection(
-                    peer,
-                    local_addr,
-                    packet_type,
-                    dcid,
-                    header_has_token,
-                ) {
-                    Some(conn_pair) => {
-                        debug!("Created new connection for {}", peer);
-                        conn_pair
-                    }
-                    None => {
-                        debug!(
-                            "Dropping packet for unknown connection from {} (DCID: {:?})",
-                            peer,
-                            hex::encode(dcid)
-                        );
-                        return;
-                    }
-                }
-            };
+        let Some((mut connection, current_primary)) = self.acquire_connection_for_packet(
+            peer,
+            local_addr,
+            packet_type,
+            dcid,
+            header_has_token,
+        ) else {
+            return;
+        };
 
         let recv_info = quiche::RecvInfo {
             from: peer,
@@ -1031,8 +729,7 @@ impl QUICListener {
         if let Err(e) = connection.quic.recv(packet, recv_info) {
             error!("QUIC recv failed: {:?}", e);
             Self::release_connection_streams(&mut connection, &self.metrics);
-            self.remove_connection_routes(&connection);
-            self.refresh_active_connection_metric();
+            self.discard_connection(&connection);
             return;
         }
 
@@ -1171,22 +868,12 @@ impl QUICListener {
         Self::handle_timeout(&self.socket, &mut send_buf, &mut connection);
 
         if !connection.quic.is_closed() {
-            let new_primary = self.sync_connection_routes(&mut connection);
-            debug!(
-                "Storing connection with key: {:02x?} (previous: {:02x?})",
-                new_primary, current_primary
-            );
-            self.peer_routes
-                .insert(connection.peer_address, Arc::clone(&new_primary));
-            self.connections
-                .insert(Arc::clone(&new_primary), connection);
+            self.store_connection(&current_primary, connection);
         } else {
             Self::release_connection_streams(&mut connection, &self.metrics);
-            self.remove_connection_routes(&connection);
+            self.discard_connection(&connection);
             debug!("Connection closed, not storing");
         }
-
-        self.refresh_active_connection_metric();
     }
 
     fn handle_timeouts(&mut self) {
@@ -1308,10 +995,6 @@ impl QUICListener {
         }
         connection.h3 = Some(h3);
         Self::flush_send(socket, send_buf, connection);
-    }
-
-    fn refresh_active_connection_metric(&self) {
-        self.metrics.set_active_connections(self.connections.len());
     }
 
     fn release_connection_streams(connection: &mut QuicConnection, metrics: &Metrics) {
