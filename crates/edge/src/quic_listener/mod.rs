@@ -111,6 +111,7 @@ mod backend_resolution;
 mod bootstrap_tls;
 mod connection;
 mod control_api;
+mod control_plane;
 mod forwarding;
 mod health_check;
 mod metrics_endpoint;
