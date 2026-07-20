@@ -142,20 +142,20 @@ impl QUICListener {
         Self::note_restart_required_change(
             &mut issues,
             "log.file.enabled",
-            &current.log_config.file.enabled,
-            &next.log_config.file.enabled,
+            &current.startup.log_config.file.enabled,
+            &next.startup.log_config.file.enabled,
         );
         Self::note_restart_required_change(
             &mut issues,
             "log.file.path",
-            &current.log_config.file.path,
-            &next.log_config.file.path,
+            &current.startup.log_config.file.path,
+            &next.startup.log_config.file.path,
         );
         Self::note_restart_required_change(
             &mut issues,
             "log.format",
-            &current.log_config.format,
-            &next.log_config.format,
+            &current.startup.log_config.format,
+            &next.startup.log_config.format,
         );
 
         let current_tracing = &current.runtime_config.observability.tracing;

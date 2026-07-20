@@ -1,28 +1,39 @@
 use std::sync::{Arc, RwLock};
 
-use spooky_config::{
-    config::Log,
-    runtime::{ListenerRuntimeConfig, RuntimeConfig},
-};
+use spooky_config::runtime::{ListenerRuntimeConfig, RuntimeConfig};
 use spooky_errors::ProxyError;
 
-use crate::runtime::{shared_state::SharedRuntimeState, tasks::RuntimeTaskRegistry};
+use crate::runtime::{
+    generation::{RuntimeGenerationView, StartupOwnedRuntimeState},
+    shared_state::SharedRuntimeState,
+    tasks::RuntimeTaskRegistry,
+};
 
 #[derive(Clone)]
 pub struct RuntimeBundle {
     pub generation: u64,
-    pub config_path: String,
-    pub log_config: Log,
+    pub startup: StartupOwnedRuntimeState,
     pub runtime_config: RuntimeConfig,
     pub shared_state: Arc<SharedRuntimeState>,
 }
 
 impl RuntimeBundle {
+    pub fn startup(&self) -> &StartupOwnedRuntimeState {
+        &self.startup
+    }
+
+    pub fn generation_view(&self) -> RuntimeGenerationView<'_> {
+        RuntimeGenerationView {
+            generation: self.generation,
+            startup: &self.startup,
+            runtime_config: &self.runtime_config,
+            shared: self.shared_state.shared_services(),
+            state: self.shared_state.generation_state(),
+        }
+    }
+
     pub fn listener_runtime_config(&self, label: &str) -> Option<ListenerRuntimeConfig> {
-        self.shared_state
-            .listener_runtime_configs
-            .get(label)
-            .cloned()
+        self.generation_view().listener_runtime_config(label)
     }
 }
 
@@ -49,12 +60,17 @@ impl RuntimeBundleHandle {
         self.current().generation
     }
 
+    pub fn with_current_view<R>(&self, f: impl FnOnce(RuntimeGenerationView<'_>) -> R) -> R {
+        let current = self.current();
+        f(current.generation_view())
+    }
+
     pub fn replace(
         &self,
         bundle: RuntimeBundle,
     ) -> Result<(u64, Arc<RuntimeTaskRegistry>), ProxyError> {
         let generation = bundle.generation;
-        let next_tasks = Arc::clone(&bundle.shared_state.generation_tasks);
+        let next_tasks = Arc::clone(&bundle.shared_state.generation_state().generation_tasks);
         let previous = {
             let mut guard = match self.inner.write() {
                 Ok(guard) => guard,
@@ -67,7 +83,7 @@ impl RuntimeBundleHandle {
             };
             std::mem::replace(&mut *guard, Arc::new(bundle))
         };
-        let retired_tasks = Arc::clone(&previous.shared_state.generation_tasks);
+        let retired_tasks = Arc::clone(&previous.shared_state.generation_state().generation_tasks);
         Ok((generation, retired_tasks))
     }
 }

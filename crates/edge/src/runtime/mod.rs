@@ -1,6 +1,7 @@
 pub mod backend;
 pub mod bundle;
 pub mod connection;
+pub mod generation;
 pub mod health;
 pub mod listener;
 pub mod shared_state;

@@ -650,7 +650,7 @@ impl QUICListener {
                 },
                 "runtime": {
                     "generation": runtime.generation,
-                    "config_path": runtime.config_path,
+                    "config_path": runtime.startup.config_path,
                 },
                 "extension_model": {
                     "status": "non_goal",
@@ -689,7 +689,7 @@ impl QUICListener {
                 );
             }
 
-            let config_path = runtime.config_path.clone();
+            let config_path = runtime.startup.config_path.clone();
             let config = match read_config(&config_path) {
                 Ok(config) => config,
                 Err(err) => {
@@ -737,8 +737,10 @@ impl QUICListener {
             };
             let next_runtime = RuntimeBundle {
                 generation: runtime.generation.saturating_add(1),
-                config_path,
-                log_config: config.log.clone(),
+                startup: crate::runtime::generation::StartupOwnedRuntimeState {
+                    config_path,
+                    log_config: config.log.clone(),
+                },
                 runtime_config,
                 shared_state: Arc::clone(&next_shared_state),
             };
@@ -784,8 +786,8 @@ impl QUICListener {
                     }),
                 );
             }
-            let current_log_level = runtime.log_config.level.clone();
-            let next_log_level = next_runtime.log_config.level.clone();
+            let current_log_level = runtime.startup.log_config.level.clone();
+            let next_log_level = next_runtime.startup.log_config.level.clone();
 
             QUICListener::spawn_generation_background_tasks_for_runtime(
                 &next_runtime.runtime_config,

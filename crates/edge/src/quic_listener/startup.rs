@@ -21,6 +21,7 @@ use crate::{
     runtime::{
         backend::{resolution::RuntimeBackendResolution, store::RuntimeBackendResolutionStore},
         bundle::{RuntimeBundle, RuntimeBundleHandle},
+        generation::{RuntimeGenerationState, RuntimeSharedServices, StartupOwnedRuntimeState},
         listener::QUICListener,
         shared_state::SharedRuntimeState,
         tasks::RuntimeTaskRegistry,
@@ -322,30 +323,34 @@ impl QUICListener {
             Self::update_listener_tls_expiry_metrics(&metrics, &listener_label, &inventory);
         }
 
-        Ok(SharedRuntimeState {
-            listener_runtime_configs: Arc::new(listener_runtime_configs),
-            listener_tls_store,
-            transport_pool,
-            backend_endpoints: Arc::new(backend_endpoints),
-            backend_health_checks: Arc::new(backend_health_checks),
-            backend_resolution_store,
-            backend_dns_resolver,
-            upstream_policies: Arc::new(
-                config
-                    .upstreams
-                    .iter()
-                    .map(|(name, upstream)| (name.clone(), upstream.policy.clone()))
-                    .collect(),
-            ),
-            upstream_pools,
-            upstream_inflight,
-            global_inflight: Arc::new(Semaphore::new(global_inflight_limit)),
-            routing_index,
-            metrics,
-            resilience,
-            watchdog,
-            generation_tasks: Arc::new(RuntimeTaskRegistry::new()),
-        })
+        Ok(SharedRuntimeState::from_parts(
+            RuntimeSharedServices {
+                listener_tls_store,
+                transport_pool,
+                backend_resolution_store,
+                backend_dns_resolver,
+                metrics,
+                watchdog,
+            },
+            RuntimeGenerationState {
+                listener_runtime_configs: Arc::new(listener_runtime_configs),
+                backend_endpoints: Arc::new(backend_endpoints),
+                backend_health_checks: Arc::new(backend_health_checks),
+                upstream_policies: Arc::new(
+                    config
+                        .upstreams
+                        .iter()
+                        .map(|(name, upstream)| (name.clone(), upstream.policy.clone()))
+                        .collect(),
+                ),
+                upstream_pools,
+                upstream_inflight,
+                global_inflight: Arc::new(Semaphore::new(global_inflight_limit)),
+                routing_index,
+                resilience,
+                generation_tasks: Arc::new(RuntimeTaskRegistry::new()),
+            },
+        ))
     }
 
     pub fn build_runtime_bundle(
@@ -356,8 +361,10 @@ impl QUICListener {
         let shared_state = Arc::new(Self::build_shared_state(runtime_config)?);
         Ok(RuntimeBundle {
             generation: 0,
-            config_path,
-            log_config,
+            startup: StartupOwnedRuntimeState {
+                config_path,
+                log_config,
+            },
             runtime_config: runtime_config.clone(),
             shared_state,
         })
