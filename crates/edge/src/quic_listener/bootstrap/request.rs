@@ -130,11 +130,13 @@ fn bootstrap_request_build_input<'a>(
     }
 }
 
-fn bootstrap_route_target<'a>(route: &'a str) -> OutcomeRouteTarget<'a> {
+pub(in crate::quic_listener) fn bootstrap_route_target<'a>(
+    route: &'a str,
+) -> OutcomeRouteTarget<'a> {
     OutcomeRouteTarget { route }
 }
 
-fn bootstrap_backend_target<'a>(
+pub(in crate::quic_listener) fn bootstrap_backend_target<'a>(
     upstream_name: &'a str,
     backend_addr: &'a str,
     backend_index: usize,
@@ -144,6 +146,22 @@ fn bootstrap_backend_target<'a>(
         backend_addr: Some(backend_addr),
         backend_index: Some(backend_index),
     }
+}
+
+pub(in crate::quic_listener) fn bootstrap_route_target_for_prepared(
+    prepared_route: &BootstrapPreparedRoute,
+) -> OutcomeRouteTarget<'_> {
+    bootstrap_route_target(&prepared_route.upstream_name)
+}
+
+pub(in crate::quic_listener) fn bootstrap_backend_target_for_prepared(
+    prepared_route: &BootstrapPreparedRoute,
+) -> OutcomeBackendTarget<'_> {
+    bootstrap_backend_target(
+        &prepared_route.upstream_name,
+        &prepared_route.backend_addr,
+        prepared_route.backend_index,
+    )
 }
 
 fn internal_proxy_error_response(alt_svc: &str) -> Response<BoxBody<Bytes, Infallible>> {

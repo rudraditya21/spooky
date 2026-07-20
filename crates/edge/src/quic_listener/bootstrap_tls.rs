@@ -14,7 +14,6 @@ use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper::{
     body::{Body, Frame, Incoming},
-    client::conn::http1 as client_http1,
     server::conn::{http1, http2},
     service::service_fn,
     upgrade,
@@ -25,17 +24,18 @@ use spooky_bridge::response::{
     ResponseBodyMode, ResponseBodyPolicy, ResponseNormalizationInput,
     ResponseNormalizationProtocol, ResponseProtocolConstraints, normalize_upstream_response,
 };
-use spooky_config::{backend_endpoint::BackendScheme, runtime::ListenerRuntimeConfig};
-use spooky_errors::{ProxyError, classify_upstream_proxy_error};
+use spooky_config::runtime::ListenerRuntimeConfig;
+use spooky_errors::ProxyError;
 use spooky_lb::upstream_pool::UpstreamPool;
 
 pub(super) use super::bootstrap::{BootstrapConnectionState, BootstrapStartupState};
 use super::{
     QUICListener,
     bootstrap::{
-        BootstrapBuildRequestInput, BootstrapPolicyEvaluationInput, BootstrapPreparedRoute,
-        BootstrapRequestIntake, build_bootstrap_upstream_request,
-        evaluate_bootstrap_request_policy, prepare_bootstrap_request_intake,
+        BootstrapBuildRequestInput, BootstrapDispatchInput, BootstrapPolicyEvaluationInput,
+        BootstrapPreparedRoute, BootstrapRequestIntake, build_bootstrap_upstream_request,
+        dispatch_bootstrap_upstream, evaluate_bootstrap_request_policy,
+        prepare_bootstrap_request_intake,
     },
     bootstrap::{
         PreparedBootstrapListenerStartup, prepare_bootstrap_listener_startup,
@@ -612,347 +612,31 @@ impl QUICListener {
                                             }));
                                     }
                                 };
-                                let mut upstream_resp = if is_websocket_upgrade {
-                                    if endpoint.scheme() != BackendScheme::Http {
-                                        return Ok(Response::builder()
-                                            .status(StatusCode::BAD_GATEWAY)
-                                            .header("alt-svc", &alt)
-                                            .body(boxed_full(Bytes::from_static(
-                                                b"websocket bootstrap requires http upstream\n",
-                                            )))
-                                            .unwrap_or_else(|_| {
-                                                Response::new(boxed_full(Bytes::from_static(
-                                                    b"error\n",
-                                                )))
-                                            }));
-                                    }
-                                    let backend_target = endpoint.authority().to_string();
-                                    let upstream_path_uri = match http::Uri::try_from(request_path)
-                                    {
-                                        Ok(uri) => uri,
-                                        Err(_) => {
-                                            return Ok(Response::builder()
-                                                .status(StatusCode::BAD_GATEWAY)
-                                                .header("alt-svc", &alt)
-                                                .body(boxed_full(Bytes::from_static(b"bad uri\n")))
-                                                .unwrap_or_else(|_| {
-                                                    Response::new(boxed_full(Bytes::from_static(
-                                                        b"error\n",
-                                                    )))
-                                                }));
-                                        }
-                                    };
-                                    let (mut parts, body) = upstream_req.into_parts();
-                                    parts.uri = upstream_path_uri;
-                                    let upstream_req = Request::from_parts(parts, body);
-
-                                    let stream = match tokio::time::timeout(
+                                let mut upstream_resp =
+                                    match dispatch_bootstrap_upstream(BootstrapDispatchInput {
+                                        upstream_req,
+                                        prepared_route: &BootstrapPreparedRoute {
+                                            endpoint: endpoint.clone(),
+                                            backend_addr: backend_addr.clone(),
+                                            backend_index,
+                                            upstream_name: upstream_name.clone(),
+                                            upstream_policy: upstream_policy.clone(),
+                                            upstream_pool: Arc::clone(&upstream_pool),
+                                        },
+                                        transport_pool: transport_pool.as_ref(),
+                                        metrics: metrics.as_ref(),
+                                        request_start,
+                                        request_id,
                                         backend_timeout,
-                                        tokio::net::TcpStream::connect(&backend_target),
-                                    )
+                                        request_path,
+                                        is_websocket_upgrade,
+                                        alt_svc: &alt,
+                                    })
                                     .await
                                     {
-                                        Ok(Ok(s)) => {
-                                            if let Ok(resolved_addr) = s.peer_addr() {
-                                                metrics.record_backend_connect(
-                                                    &backend_target,
-                                                    endpoint.authority_host(),
-                                                    resolved_addr,
-                                                );
-                                            }
-                                            s
-                                        }
-                                        Ok(Err(err)) => {
-                                            warn!("Bootstrap WebSocket connect error: {}", err);
-                                            return Ok(Response::builder()
-                                                .status(StatusCode::BAD_GATEWAY)
-                                                .header("alt-svc", &alt)
-                                                .body(boxed_full(Bytes::from_static(
-                                                    b"upstream error\n",
-                                                )))
-                                                .unwrap_or_else(|_| {
-                                                    Response::new(boxed_full(Bytes::from_static(
-                                                        b"error\n",
-                                                    )))
-                                                }));
-                                        }
-                                        Err(_) => {
-                                            return Ok(Response::builder()
-                                                .status(StatusCode::GATEWAY_TIMEOUT)
-                                                .header("alt-svc", &alt)
-                                                .body(boxed_full(Bytes::from_static(
-                                                    b"upstream timeout\n",
-                                                )))
-                                                .unwrap_or_else(|_| {
-                                                    Response::new(boxed_full(Bytes::from_static(
-                                                        b"error\n",
-                                                    )))
-                                                }));
-                                        }
+                                        Ok(resp) => resp,
+                                        Err(response) => return Ok(response),
                                     };
-                                    let io = TokioIo::new(stream);
-                                    let (mut sender, conn) = match client_http1::handshake(io).await
-                                    {
-                                        Ok(v) => v,
-                                        Err(err) => {
-                                            warn!(
-                                                "Bootstrap WebSocket handshake setup failed: {}",
-                                                err
-                                            );
-                                            return Ok(Response::builder()
-                                                .status(StatusCode::BAD_GATEWAY)
-                                                .header("alt-svc", &alt)
-                                                .body(boxed_full(Bytes::from_static(
-                                                    b"upstream error\n",
-                                                )))
-                                                .unwrap_or_else(|_| {
-                                                    Response::new(boxed_full(Bytes::from_static(
-                                                        b"error\n",
-                                                    )))
-                                                }));
-                                        }
-                                    };
-                                    tokio::spawn(async move {
-                                        let _ = conn.with_upgrades().await;
-                                    });
-                                    match tokio::time::timeout(
-                                        backend_timeout,
-                                        sender.send_request(upstream_req),
-                                    )
-                                    .await
-                                    {
-                                        Ok(Ok(resp)) => resp,
-                                        Ok(Err(err)) => {
-                                            let proxy_err = ProxyError::Transport(err.to_string());
-                                            let _ = observe_proxy_error_outcome(
-                                                metrics.as_ref(),
-                                                bootstrap_route_target(&upstream_name),
-                                                Some(bootstrap_backend_target(
-                                                    &upstream_name,
-                                                    &backend_addr,
-                                                    backend_index,
-                                                )),
-                                                request_start.elapsed(),
-                                                Some(StatusCode::BAD_GATEWAY),
-                                                &proxy_err,
-                                                None,
-                                            );
-                                            if let Some(classified) =
-                                                classify_upstream_proxy_error(&proxy_err)
-                                            {
-                                                Self::log_classified_upstream_failure(
-                                                    "bootstrap",
-                                                    Some(request_id),
-                                                    Some(&upstream_name),
-                                                    &backend_addr,
-                                                    &classified,
-                                                );
-                                                if let Some(transition) = crate::runtime::connection::outcome::observe_classified_backend_failure(
-                                                    crate::runtime::connection::outcome::ClassifiedBackendFailureInput {
-                                                        metrics_phase: "bootstrap",
-                                                        backend_addr: &backend_addr,
-                                                        backend_index,
-                                                        upstream_pool: Some(&upstream_pool),
-                                                        metrics: metrics.as_ref(),
-                                                        classified: &classified,
-                                                    },
-                                                ) {
-                                                    crate::runtime::connection::outcome::log_backend_health_transition(
-                                                        &backend_addr,
-                                                        transition,
-                                                    );
-                                                }
-                                            } else {
-                                                warn!(
-                                                    "Bootstrap WebSocket upstream error route={} backend={}: {}",
-                                                    upstream_name, backend_addr, err
-                                                );
-                                            }
-                                            return Ok(Response::builder()
-                                                .status(StatusCode::BAD_GATEWAY)
-                                                .header("alt-svc", &alt)
-                                                .body(boxed_full(Bytes::from_static(
-                                                    b"upstream error\n",
-                                                )))
-                                                .unwrap_or_else(|_| {
-                                                    Response::new(boxed_full(Bytes::from_static(
-                                                        b"error\n",
-                                                    )))
-                                                }));
-                                        }
-                                        Err(_) => {
-                                            let _ = observe_proxy_error_outcome(
-                                                metrics.as_ref(),
-                                                bootstrap_route_target(&upstream_name),
-                                                Some(bootstrap_backend_target(
-                                                    &upstream_name,
-                                                    &backend_addr,
-                                                    backend_index,
-                                                )),
-                                                request_start.elapsed(),
-                                                Some(StatusCode::GATEWAY_TIMEOUT),
-                                                &ProxyError::Timeout,
-                                                None,
-                                            );
-                                            if let Some(classified) =
-                                                classify_upstream_proxy_error(&ProxyError::Timeout)
-                                            {
-                                                Self::log_classified_upstream_failure(
-                                                    "bootstrap",
-                                                    Some(request_id),
-                                                    Some(&upstream_name),
-                                                    &backend_addr,
-                                                    &classified,
-                                                );
-                                                if let Some(transition) = crate::runtime::connection::outcome::observe_classified_backend_failure(
-                                                    crate::runtime::connection::outcome::ClassifiedBackendFailureInput {
-                                                        metrics_phase: "bootstrap",
-                                                        backend_addr: &backend_addr,
-                                                        backend_index,
-                                                        upstream_pool: Some(&upstream_pool),
-                                                        metrics: metrics.as_ref(),
-                                                        classified: &classified,
-                                                    },
-                                                ) {
-                                                    crate::runtime::connection::outcome::log_backend_health_transition(
-                                                        &backend_addr,
-                                                        transition,
-                                                    );
-                                                }
-                                            }
-                                            return Ok(Response::builder()
-                                                .status(StatusCode::GATEWAY_TIMEOUT)
-                                                .header("alt-svc", &alt)
-                                                .body(boxed_full(Bytes::from_static(
-                                                    b"upstream timeout\n",
-                                                )))
-                                                .unwrap_or_else(|_| {
-                                                    Response::new(boxed_full(Bytes::from_static(
-                                                        b"error\n",
-                                                    )))
-                                                }));
-                                        }
-                                    }
-                                } else {
-                                    match tokio::time::timeout(
-                                        backend_timeout,
-                                        transport_pool.send(&backend_addr, upstream_req),
-                                    )
-                                    .await
-                                    {
-                                        Ok(Ok(resp)) => resp,
-                                        Ok(Err(err)) => {
-                                            let proxy_err = ProxyError::Pool(err);
-                                            let _ = observe_proxy_error_outcome(
-                                                metrics.as_ref(),
-                                                bootstrap_route_target(&upstream_name),
-                                                Some(bootstrap_backend_target(
-                                                    &upstream_name,
-                                                    &backend_addr,
-                                                    backend_index,
-                                                )),
-                                                request_start.elapsed(),
-                                                Some(StatusCode::BAD_GATEWAY),
-                                                &proxy_err,
-                                                None,
-                                            );
-                                            if let Some(classified) =
-                                                classify_upstream_proxy_error(&proxy_err)
-                                            {
-                                                Self::log_classified_upstream_failure(
-                                                    "bootstrap",
-                                                    Some(request_id),
-                                                    Some(&upstream_name),
-                                                    &backend_addr,
-                                                    &classified,
-                                                );
-                                                if let Some(transition) = crate::runtime::connection::outcome::observe_classified_backend_failure(
-                                                    crate::runtime::connection::outcome::ClassifiedBackendFailureInput {
-                                                        metrics_phase: "bootstrap",
-                                                        backend_addr: &backend_addr,
-                                                        backend_index,
-                                                        upstream_pool: Some(&upstream_pool),
-                                                        metrics: metrics.as_ref(),
-                                                        classified: &classified,
-                                                    },
-                                                ) {
-                                                    crate::runtime::connection::outcome::log_backend_health_transition(
-                                                        &backend_addr,
-                                                        transition,
-                                                    );
-                                                }
-                                            } else {
-                                                warn!(
-                                                    "Bootstrap proxy upstream error route={} backend={}: {}",
-                                                    upstream_name, backend_addr, proxy_err
-                                                );
-                                            }
-                                            return Ok(Response::builder()
-                                                .status(StatusCode::BAD_GATEWAY)
-                                                .header("alt-svc", &alt)
-                                                .body(boxed_full(Bytes::from_static(
-                                                    b"upstream error\n",
-                                                )))
-                                                .unwrap_or_else(|_| {
-                                                    Response::new(boxed_full(Bytes::from_static(
-                                                        b"error\n",
-                                                    )))
-                                                }));
-                                        }
-                                        Err(_) => {
-                                            let _ = observe_proxy_error_outcome(
-                                                metrics.as_ref(),
-                                                bootstrap_route_target(&upstream_name),
-                                                Some(bootstrap_backend_target(
-                                                    &upstream_name,
-                                                    &backend_addr,
-                                                    backend_index,
-                                                )),
-                                                request_start.elapsed(),
-                                                Some(StatusCode::GATEWAY_TIMEOUT),
-                                                &ProxyError::Timeout,
-                                                None,
-                                            );
-                                            if let Some(classified) =
-                                                classify_upstream_proxy_error(&ProxyError::Timeout)
-                                            {
-                                                Self::log_classified_upstream_failure(
-                                                    "bootstrap",
-                                                    Some(request_id),
-                                                    Some(&upstream_name),
-                                                    &backend_addr,
-                                                    &classified,
-                                                );
-                                                if let Some(transition) = crate::runtime::connection::outcome::observe_classified_backend_failure(
-                                                    crate::runtime::connection::outcome::ClassifiedBackendFailureInput {
-                                                        metrics_phase: "bootstrap",
-                                                        backend_addr: &backend_addr,
-                                                        backend_index,
-                                                        upstream_pool: Some(&upstream_pool),
-                                                        metrics: metrics.as_ref(),
-                                                        classified: &classified,
-                                                    },
-                                                ) {
-                                                    crate::runtime::connection::outcome::log_backend_health_transition(
-                                                        &backend_addr,
-                                                        transition,
-                                                    );
-                                                }
-                                            }
-                                            return Ok(Response::builder()
-                                                .status(StatusCode::GATEWAY_TIMEOUT)
-                                                .header("alt-svc", &alt)
-                                                .body(boxed_full(Bytes::from_static(
-                                                    b"upstream timeout\n",
-                                                )))
-                                                .unwrap_or_else(|_| {
-                                                    Response::new(boxed_full(Bytes::from_static(
-                                                        b"error\n",
-                                                    )))
-                                                }));
-                                        }
-                                    }
-                                };
 
                                 let status = upstream_resp.status();
                                 let normalized_response =

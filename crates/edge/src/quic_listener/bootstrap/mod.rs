@@ -1,8 +1,12 @@
+mod dispatch;
 mod intake;
 mod request;
 mod startup;
 mod state;
 
+pub(in crate::quic_listener) use self::dispatch::{
+    BootstrapDispatchInput, dispatch_bootstrap_upstream,
+};
 pub(in crate::quic_listener) use self::intake::{
     BootstrapRequestIntake, bootstrap_error_response, prepare_bootstrap_request_intake,
 };
