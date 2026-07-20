@@ -519,7 +519,7 @@ impl QUICListener {
     }
 
     pub fn with_runtime_bundle(mut self, runtime_bundle: Arc<RuntimeBundleHandle>) -> Self {
-        self.runtime_generation = runtime_bundle.generation();
+        self.runtime_generation = runtime_bundle.current_generation();
         self.runtime_bundle = Some(runtime_bundle);
         self
     }

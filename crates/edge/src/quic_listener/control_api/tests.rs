@@ -506,8 +506,9 @@ async fn runtime_bundle_cert_reload_ignores_unrelated_config_drift_and_bundle_sw
     drifted.performance.control_plane_threads =
         live.performance.control_plane_threads.saturating_add(1);
     let drifted_bundle = runtime_bundle_from_config("drifted.yaml", &drifted);
+    let current_runtime = runtime_handle.current_view();
     let full_reload_issues = QUICListener::validate_startup_owned_reload_compatibility(
-        runtime_handle.current().as_ref(),
+        current_runtime.bundle(),
         &drifted_bundle,
     );
     assert!(
@@ -517,33 +518,18 @@ async fn runtime_bundle_cert_reload_ignores_unrelated_config_drift_and_bundle_sw
         "expected a full reload blocker from on-disk drift, got: {full_reload_issues:?}"
     );
 
-    let generation_before = runtime_handle.generation();
-    let tls_generation_before = runtime_handle
-        .current()
-        .shared_state
+    let generation_before = runtime_handle.current_generation();
+    let live_runtime = runtime_handle.current_view();
+    let tls_generation_before = live_runtime
+        .shared_services()
         .listener_tls_store
         .generation(&state.primary_listener_label)
         .unwrap_or(0);
 
     let response = QUICListener::reload_listener_certs(
-        runtime_handle
-            .current()
-            .shared_state
-            .generation_state()
-            .listener_runtime_configs
-            .as_ref(),
-        runtime_handle
-            .current()
-            .shared_state
-            .shared_services()
-            .listener_tls_store
-            .as_ref(),
-        runtime_handle
-            .current()
-            .shared_state
-            .shared_services()
-            .metrics
-            .as_ref(),
+        live_runtime.state().listener_runtime_configs.as_ref(),
+        live_runtime.shared_services().listener_tls_store.as_ref(),
+        live_runtime.shared_services().metrics.as_ref(),
     );
     assert_eq!(response.status(), StatusCode::ACCEPTED);
 
@@ -556,15 +542,14 @@ async fn runtime_bundle_cert_reload_ignores_unrelated_config_drift_and_bundle_sw
     let payload: serde_json::Value = serde_json::from_slice(&body).expect("response json");
     assert_eq!(payload["reloaded"], serde_json::Value::Bool(true));
 
-    let current_runtime = runtime_handle.current();
-    assert_eq!(current_runtime.generation, generation_before);
+    let current_runtime = runtime_handle.current_view();
+    assert_eq!(current_runtime.generation(), generation_before);
     assert_eq!(
-        current_runtime.runtime_config.observability.metrics.path,
+        current_runtime.runtime_config().observability.metrics.path,
         "/metrics-live"
     );
     assert!(
         current_runtime
-            .shared_state
             .shared_services()
             .listener_tls_store
             .generation(&state.primary_listener_label)

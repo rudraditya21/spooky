@@ -93,7 +93,7 @@ impl RuntimeBundleHandle {
         }
     }
 
-    pub fn current(&self) -> Arc<RuntimeBundle> {
+    pub(crate) fn current(&self) -> Arc<RuntimeBundle> {
         self.inner
             .read()
             .map(|bundle| Arc::clone(&*bundle))
@@ -108,10 +108,6 @@ impl RuntimeBundleHandle {
 
     pub fn current_generation(&self) -> u64 {
         self.current_view().generation()
-    }
-
-    pub fn generation(&self) -> u64 {
-        self.current_generation()
     }
 
     pub fn with_current_generation<R>(&self, f: impl FnOnce(ActiveRuntimeGeneration) -> R) -> R {

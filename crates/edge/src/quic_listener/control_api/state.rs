@@ -112,6 +112,16 @@ impl ControlApiState {
             .unwrap_or_else(|| Arc::clone(&self.metrics))
     }
 
+    pub(super) fn current_watchdog(&self) -> Arc<WatchdogCoordinator> {
+        self.with_current_generation(|runtime| runtime.map(|view| view.shared.watchdog.clone()))
+            .unwrap_or_else(|| Arc::clone(&self.watchdog))
+    }
+
+    pub(super) fn current_resilience(&self) -> Arc<RuntimeResilience> {
+        self.with_current_generation(|runtime| runtime.map(|view| view.state.resilience.clone()))
+            .unwrap_or_else(|| Arc::clone(&self.resilience))
+    }
+
     pub(super) fn current_primary_listener_label(&self) -> Option<String> {
         self.with_current_generation(|runtime| {
             runtime.and_then(|view| {

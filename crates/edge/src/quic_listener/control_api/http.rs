@@ -366,20 +366,18 @@ impl QUICListener {
         req: Request<Incoming>,
         state: &ControlApiState,
     ) -> Response<Full<Bytes>> {
-        if state.runtime_bundle.is_some() {
-            return Self::handle_runtime_control_api_request(req, state);
-        }
         let paths = state.current_paths();
         let path = req.uri().path();
+        let watchdog = state.current_watchdog();
 
         if req.method() == Method::GET && path == paths.health_path.as_str() {
             let response = json!({
                 "status": "ok",
                 "uptime_ms": state.started_at.elapsed().as_millis() as u64,
                 "watchdog": {
-                    "enabled": state.watchdog.enabled(),
-                    "degraded": state.watchdog.is_degraded(),
-                    "restart_requested": state.watchdog.restart_requested(),
+                    "enabled": watchdog.enabled(),
+                    "degraded": watchdog.is_degraded(),
+                    "restart_requested": watchdog.restart_requested(),
                 },
             });
             return Self::json_response(StatusCode::OK, response);
@@ -387,7 +385,7 @@ impl QUICListener {
 
         if req.method() == Method::GET && path == paths.ready_path.as_str() {
             let (healthy_backends, total_backends) = state.snapshot_backend_health();
-            let restart_requested = state.watchdog.restart_requested();
+            let restart_requested = watchdog.restart_requested();
             let ready = !restart_requested && (total_backends == 0 || healthy_backends > 0);
             let response = json!({
                 "ready": ready,
@@ -434,44 +432,79 @@ impl QUICListener {
                     )
                 })
                 .collect::<serde_json::Map<String, serde_json::Value>>();
-            let response = json!({
-                "uptime_ms": state.started_at.elapsed().as_millis() as u64,
-                "workers": {
-                    "expected": state.expected_workers,
-                },
-                "watchdog": {
-                    "enabled": state.watchdog.enabled(),
-                    "degraded": state.watchdog.is_degraded(),
-                    "restart_requested": state.watchdog.restart_requested(),
-                    "restart_reason": state.watchdog.restart_reason(),
-                    "restart_requested_at_ms": state.watchdog.restart_requested_at_ms(),
-                },
-                "adaptive_admission": {
-                    "enabled": state.resilience.adaptive_admission.enabled(),
-                    "current_limit": state.resilience.adaptive_admission.current_limit(),
-                    "inflight_percent": state.resilience.adaptive_admission.inflight_percent(),
-                },
-                "backends": {
-                    "healthy": healthy_backends,
-                    "total": total_backends,
-                },
-                "metrics": {
-                    "requests_total": state.metrics.requests_total.load(Ordering::Relaxed),
-                    "requests_success": state.metrics.requests_success.load(Ordering::Relaxed),
-                    "requests_failure": state.metrics.requests_failure.load(Ordering::Relaxed),
-                    "active_connections": state.metrics.active_connections.load(Ordering::Relaxed),
-                    "backend_timeouts": state.metrics.backend_timeouts.load(Ordering::Relaxed),
-                    "backend_errors": state.metrics.backend_errors.load(Ordering::Relaxed),
-                },
-                "tls": {
-                    "listeners": tls_listeners,
-                },
-                "extension_model": {
-                    "status": "non_goal",
-                    "details": "No plugin/middleware ABI is exposed in-process today; extension support remains a deliberate non-goal until a safe isolation model is designed.",
-                },
-            });
-            return Self::json_response(StatusCode::OK, response);
+            let resilience = state.current_resilience();
+            let metrics = state.current_metrics();
+            let mut response = serde_json::Map::from_iter([
+                (
+                    "uptime_ms".to_string(),
+                    json!(state.started_at.elapsed().as_millis() as u64),
+                ),
+                (
+                    "workers".to_string(),
+                    json!({
+                        "expected": state.expected_workers,
+                    }),
+                ),
+                (
+                    "watchdog".to_string(),
+                    json!({
+                        "enabled": watchdog.enabled(),
+                        "degraded": watchdog.is_degraded(),
+                        "restart_requested": watchdog.restart_requested(),
+                        "restart_reason": watchdog.restart_reason(),
+                        "restart_requested_at_ms": watchdog.restart_requested_at_ms(),
+                    }),
+                ),
+                (
+                    "adaptive_admission".to_string(),
+                    json!({
+                        "enabled": resilience.adaptive_admission.enabled(),
+                        "current_limit": resilience.adaptive_admission.current_limit(),
+                        "inflight_percent": resilience.adaptive_admission.inflight_percent(),
+                    }),
+                ),
+                (
+                    "backends".to_string(),
+                    json!({
+                        "healthy": healthy_backends,
+                        "total": total_backends,
+                    }),
+                ),
+                (
+                    "metrics".to_string(),
+                    json!({
+                        "requests_total": metrics.requests_total.load(Ordering::Relaxed),
+                        "requests_success": metrics.requests_success.load(Ordering::Relaxed),
+                        "requests_failure": metrics.requests_failure.load(Ordering::Relaxed),
+                        "active_connections": metrics.active_connections.load(Ordering::Relaxed),
+                        "backend_timeouts": metrics.backend_timeouts.load(Ordering::Relaxed),
+                        "backend_errors": metrics.backend_errors.load(Ordering::Relaxed),
+                    }),
+                ),
+                (
+                    "tls".to_string(),
+                    json!({
+                        "listeners": tls_listeners,
+                    }),
+                ),
+                (
+                    "extension_model".to_string(),
+                    json!({
+                        "status": "non_goal",
+                        "details": "No plugin/middleware ABI is exposed in-process today; extension support remains a deliberate non-goal until a safe isolation model is designed.",
+                    }),
+                ),
+            ]);
+            if let Some(runtime) = state.current_generation() {
+                response.insert(
+                    "runtime".to_string(),
+                    json!({
+                        "generation": runtime.generation(),
+                        "config_path": runtime.startup().config_path,
+                    }),
+                );
+            }
+            return Self::json_response(StatusCode::OK, serde_json::Value::Object(response));
         }
 
         if req.method() == Method::POST && path == paths.reload_certs_path.as_str() {
@@ -495,192 +528,6 @@ impl QUICListener {
             );
         }
 
-        if req.method() == Method::POST && path == paths.restart_path.as_str() {
-            if !Self::control_api_is_authorized(&req, state) {
-                return Self::json_response(
-                    StatusCode::UNAUTHORIZED,
-                    json!({
-                        "accepted": false,
-                        "error": "unauthorized",
-                    }),
-                );
-            }
-            if !state.watchdog.enabled() {
-                return Self::json_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    json!({
-                        "accepted": false,
-                        "error": "watchdog disabled",
-                    }),
-                );
-            }
-
-            let accepted = state.watchdog.request_restart("admin_runtime_api");
-            return Self::json_response(
-                if accepted {
-                    StatusCode::ACCEPTED
-                } else {
-                    StatusCode::CONFLICT
-                },
-                json!({
-                    "accepted": accepted,
-                    "restart_requested": state.watchdog.restart_requested(),
-                    "reason": if accepted { "admin_runtime_api" } else { "restart pending or cooldown active" },
-                }),
-            );
-        }
-
-        match Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(Full::new(Bytes::from_static(b"not found\n")))
-        {
-            Ok(resp) => resp,
-            Err(_) => Response::new(Full::new(Bytes::from_static(b"not found\n"))),
-        }
-    }
-
-    fn handle_runtime_control_api_request(
-        req: Request<Incoming>,
-        state: &ControlApiState,
-    ) -> Response<Full<Bytes>> {
-        let paths = state.current_paths();
-        let path = req.uri().path();
-        let Some(runtime_bundle_handle) = state.runtime_bundle.as_ref() else {
-            return Self::json_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                json!({
-                    "error": "runtime bundle missing",
-                }),
-            );
-        };
-        let runtime = runtime_bundle_handle.current_view();
-        let shared = runtime.shared_services();
-        let generation = runtime.state();
-
-        if req.method() == Method::GET && path == paths.health_path.as_str() {
-            let response = json!({
-                "status": "ok",
-                "uptime_ms": state.started_at.elapsed().as_millis() as u64,
-                "watchdog": {
-                    "enabled": shared.watchdog.enabled(),
-                    "degraded": shared.watchdog.is_degraded(),
-                    "restart_requested": shared.watchdog.restart_requested(),
-                },
-            });
-            return Self::json_response(StatusCode::OK, response);
-        }
-
-        if req.method() == Method::GET && path == paths.ready_path.as_str() {
-            let (healthy_backends, total_backends) = state.snapshot_backend_health();
-            let restart_requested = shared.watchdog.restart_requested();
-            let ready = !restart_requested && (total_backends == 0 || healthy_backends > 0);
-            let response = json!({
-                "ready": ready,
-                "healthy_backends": healthy_backends,
-                "total_backends": total_backends,
-                "restart_requested": restart_requested,
-            });
-            return Self::json_response(
-                if ready {
-                    StatusCode::OK
-                } else {
-                    StatusCode::SERVICE_UNAVAILABLE
-                },
-                response,
-            );
-        }
-
-        if req.method() == Method::GET && path == paths.runtime_path.as_str() {
-            if !Self::control_api_is_authorized(&req, state) {
-                return Self::json_response(
-                    StatusCode::UNAUTHORIZED,
-                    json!({
-                        "error": "unauthorized",
-                    }),
-                );
-            }
-            let (healthy_backends, total_backends) = state.snapshot_backend_health();
-            let tls_listeners = shared
-                .listener_tls_store
-                .snapshot()
-                .into_iter()
-                .map(|(listener, inventory)| {
-                    (
-                        listener.clone(),
-                        json!({
-                            "default_cert": inventory.default_identity.identity.cert_path,
-                            "default_key": inventory.default_identity.identity.key_path,
-                            "default_cert_not_after_unix_seconds": inventory.default_identity.metadata.not_after_unix_seconds,
-                            "sni_names": inventory.sni_identities.keys().cloned().collect::<Vec<_>>(),
-                            "client_auth_enabled": inventory.listener_tls.client_auth.enabled,
-                            "require_client_cert": inventory.listener_tls.client_auth.require_client_cert,
-                            "generation": shared.listener_tls_store.generation(&listener).unwrap_or(0),
-                        }),
-                    )
-                })
-                .collect::<serde_json::Map<String, serde_json::Value>>();
-            let response = json!({
-                "uptime_ms": state.started_at.elapsed().as_millis() as u64,
-                "workers": {
-                    "expected": state.expected_workers,
-                },
-                "watchdog": {
-                    "enabled": shared.watchdog.enabled(),
-                    "degraded": shared.watchdog.is_degraded(),
-                    "restart_requested": shared.watchdog.restart_requested(),
-                    "restart_reason": shared.watchdog.restart_reason(),
-                    "restart_requested_at_ms": shared.watchdog.restart_requested_at_ms(),
-                },
-                "adaptive_admission": {
-                    "enabled": generation.resilience.adaptive_admission.enabled(),
-                    "current_limit": generation.resilience.adaptive_admission.current_limit(),
-                    "inflight_percent": generation.resilience.adaptive_admission.inflight_percent(),
-                },
-                "backends": {
-                    "healthy": healthy_backends,
-                    "total": total_backends,
-                },
-                "metrics": {
-                    "requests_total": shared.metrics.requests_total.load(Ordering::Relaxed),
-                    "requests_success": shared.metrics.requests_success.load(Ordering::Relaxed),
-                    "requests_failure": shared.metrics.requests_failure.load(Ordering::Relaxed),
-                    "active_connections": shared.metrics.active_connections.load(Ordering::Relaxed),
-                    "backend_timeouts": shared.metrics.backend_timeouts.load(Ordering::Relaxed),
-                    "backend_errors": shared.metrics.backend_errors.load(Ordering::Relaxed),
-                },
-                "tls": {
-                    "listeners": tls_listeners,
-                },
-                "runtime": {
-                    "generation": runtime.generation(),
-                    "config_path": runtime.startup().config_path,
-                },
-                "extension_model": {
-                    "status": "non_goal",
-                    "details": "No plugin/middleware ABI is exposed in-process today; extension support remains a deliberate non-goal until a safe isolation model is designed.",
-                },
-            });
-            return Self::json_response(StatusCode::OK, response);
-        }
-
-        if req.method() == Method::POST && path == paths.reload_certs_path.as_str() {
-            if !Self::control_api_is_authorized(&req, state) {
-                return Self::json_response(
-                    StatusCode::UNAUTHORIZED,
-                    json!({
-                        "reloaded": false,
-                        "error": "unauthorized",
-                    }),
-                );
-            }
-
-            return Self::reload_listener_certs(
-                generation.listener_runtime_configs.as_ref(),
-                shared.listener_tls_store.as_ref(),
-                shared.metrics.as_ref(),
-            );
-        }
-
         if req.method() == Method::POST && path == paths.reload_path.as_str() {
             if !Self::control_api_is_authorized(&req, state) {
                 return Self::json_response(
@@ -691,6 +538,25 @@ impl QUICListener {
                     }),
                 );
             }
+
+            let Some(runtime_bundle_handle) = state.runtime_bundle.as_ref() else {
+                return match Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Full::new(Bytes::from_static(b"not found\n")))
+                {
+                    Ok(resp) => resp,
+                    Err(_) => Response::new(Full::new(Bytes::from_static(b"not found\n"))),
+                };
+            };
+            let Some(runtime) = state.current_generation() else {
+                return Self::json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({
+                        "reloaded": false,
+                        "error": "runtime generation unavailable",
+                    }),
+                );
+            };
 
             let plan = match Self::build_runtime_reload_plan(&runtime) {
                 Ok(plan) => plan,
@@ -761,7 +627,7 @@ impl QUICListener {
                     }),
                 );
             }
-            if !shared.watchdog.enabled() {
+            if !watchdog.enabled() {
                 return Self::json_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     json!({
@@ -771,7 +637,7 @@ impl QUICListener {
                 );
             }
 
-            let accepted = shared.watchdog.request_restart("admin_runtime_api");
+            let accepted = watchdog.request_restart("admin_runtime_api");
             return Self::json_response(
                 if accepted {
                     StatusCode::ACCEPTED
@@ -780,7 +646,7 @@ impl QUICListener {
                 },
                 json!({
                     "accepted": accepted,
-                    "restart_requested": shared.watchdog.restart_requested(),
+                    "restart_requested": watchdog.restart_requested(),
                     "reason": if accepted { "admin_runtime_api" } else { "restart pending or cooldown active" },
                 }),
             );
