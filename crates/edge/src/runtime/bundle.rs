@@ -4,7 +4,10 @@ use spooky_config::runtime::{ListenerRuntimeConfig, RuntimeConfig};
 use spooky_errors::ProxyError;
 
 use crate::runtime::{
-    generation::{RuntimeGenerationView, StartupOwnedRuntimeState},
+    generation::{
+        RuntimeGenerationState, RuntimeGenerationView, RuntimeSharedServices,
+        StartupOwnedRuntimeState,
+    },
     shared_state::SharedRuntimeState,
     tasks::RuntimeTaskRegistry,
 };
@@ -38,6 +41,45 @@ impl RuntimeBundle {
 }
 
 #[derive(Clone)]
+pub struct ActiveRuntimeGeneration {
+    bundle: Arc<RuntimeBundle>,
+}
+
+impl ActiveRuntimeGeneration {
+    pub fn bundle(&self) -> &RuntimeBundle {
+        self.bundle.as_ref()
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.bundle.generation
+    }
+
+    pub fn startup(&self) -> &StartupOwnedRuntimeState {
+        &self.bundle.startup
+    }
+
+    pub fn runtime_config(&self) -> &RuntimeConfig {
+        &self.bundle.runtime_config
+    }
+
+    pub fn shared_services(&self) -> &RuntimeSharedServices {
+        self.bundle.shared_state.shared_services()
+    }
+
+    pub fn state(&self) -> &RuntimeGenerationState {
+        self.bundle.shared_state.generation_state()
+    }
+
+    pub fn view(&self) -> RuntimeGenerationView<'_> {
+        self.bundle.generation_view()
+    }
+
+    pub fn listener_runtime_config(&self, label: &str) -> Option<ListenerRuntimeConfig> {
+        self.bundle.listener_runtime_config(label)
+    }
+}
+
+#[derive(Clone)]
 pub struct RuntimeBundleHandle {
     inner: Arc<RwLock<Arc<RuntimeBundle>>>,
 }
@@ -56,13 +98,26 @@ impl RuntimeBundleHandle {
             .unwrap_or_else(|_| panic!("runtime bundle lock poisoned"))
     }
 
+    pub fn current_view(&self) -> ActiveRuntimeGeneration {
+        ActiveRuntimeGeneration {
+            bundle: self.current(),
+        }
+    }
+
+    pub fn current_generation(&self) -> u64 {
+        self.current_view().generation()
+    }
+
     pub fn generation(&self) -> u64 {
-        self.current().generation
+        self.current_generation()
+    }
+
+    pub fn with_current_generation<R>(&self, f: impl FnOnce(ActiveRuntimeGeneration) -> R) -> R {
+        f(self.current_view())
     }
 
     pub fn with_current_view<R>(&self, f: impl FnOnce(RuntimeGenerationView<'_>) -> R) -> R {
-        let current = self.current();
-        f(current.generation_view())
+        self.with_current_generation(|current| f(current.view()))
     }
 
     pub fn replace(

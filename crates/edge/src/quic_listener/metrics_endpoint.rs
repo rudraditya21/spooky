@@ -213,8 +213,8 @@ impl QUICListener {
         runtime_bundle
             .map(|handle| {
                 handle
-                    .current()
-                    .runtime_config
+                    .current_view()
+                    .runtime_config()
                     .observability
                     .metrics
                     .clone()
@@ -230,13 +230,13 @@ impl QUICListener {
         startup_metrics: Arc<Metrics>,
     ) -> MetricsEndpointState {
         if let Some(handle) = runtime_bundle {
-            let runtime = handle.current();
-            let endpoint = &runtime.runtime_config.observability.metrics;
+            let runtime = handle.current_view();
+            let endpoint = &runtime.runtime_config().observability.metrics;
             return MetricsEndpointState {
                 metrics_path: endpoint.path.clone(),
                 max_connections: endpoint.max_connections.max(1),
                 connection_timeout: Duration::from_millis(endpoint.connection_timeout_ms.max(1)),
-                metrics: runtime.shared_state.shared_services().metrics.clone(),
+                metrics: runtime.shared_services().metrics.clone(),
             };
         }
 

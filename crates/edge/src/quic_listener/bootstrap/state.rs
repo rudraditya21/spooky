@@ -85,9 +85,9 @@ pub(in crate::quic_listener) fn bootstrap_connection_state(
         upstream_pools,
         routing_index,
     ) = if let Some(handle) = runtime_bundle {
-        let runtime = handle.current();
-        let shared = runtime.shared_state.shared_services();
-        let generation = runtime.shared_state.generation_state();
+        let runtime = handle.current_view();
+        let shared = runtime.shared_services();
+        let generation = runtime.state();
         (
             runtime.listener_runtime_config(listener_label)?,
             shared.listener_tls_store.clone(),

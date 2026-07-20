@@ -304,9 +304,8 @@ impl QUICListener {
             return self.sync_tls_reload_state_if_needed();
         };
 
-        let runtime = runtime_bundle.current();
+        let runtime = runtime_bundle.current_view();
         let current_tls_generation = runtime
-            .shared_state
             .shared_services()
             .listener_tls_store
             .generation(&self.listener_label)
@@ -316,7 +315,7 @@ impl QUICListener {
                     self.listener_label
                 ))
             })?;
-        if runtime.generation == self.runtime_generation
+        if runtime.generation() == self.runtime_generation
             && current_tls_generation == self.tls_reload_generation
         {
             return Ok(());
@@ -329,8 +328,8 @@ impl QUICListener {
             )));
         };
 
-        let shared = runtime.shared_state.shared_services();
-        let generation = runtime.shared_state.generation_state();
+        let shared = runtime.shared_services();
+        let generation = runtime.state();
         self.config = listener_config;
         self.listener_tls_store = Arc::clone(&shared.listener_tls_store);
         self.transport_pool = Arc::clone(&shared.transport_pool);
@@ -368,7 +367,7 @@ impl QUICListener {
             settings.new_connections_burst,
         );
         self.quic_config = Self::build_quic_config(&self.config)?;
-        self.runtime_generation = runtime.generation;
+        self.runtime_generation = runtime.generation();
         self.tls_reload_generation = current_tls_generation;
         info!(
             "Reloaded runtime configuration for listener {} at generation {}",

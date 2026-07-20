@@ -63,13 +63,17 @@ impl Drop for ConnectionSlotGuard {
 }
 
 impl ControlApiState {
-    pub(super) fn current_runtime(&self) -> Option<Arc<RuntimeBundle>> {
-        self.runtime_bundle.as_ref().map(|handle| handle.current())
+    pub(super) fn current_runtime(
+        &self,
+    ) -> Option<crate::runtime::bundle::ActiveRuntimeGeneration> {
+        self.runtime_bundle
+            .as_ref()
+            .map(|handle| handle.current_view())
     }
 
     pub(super) fn current_control_api(&self) -> ControlApiConfig {
         self.current_runtime()
-            .map(|runtime| runtime.runtime_config.observability.control_api.clone())
+            .map(|runtime| runtime.runtime_config().observability.control_api.clone())
             .unwrap_or_else(|| self.control_api.clone())
     }
 
@@ -79,13 +83,7 @@ impl ControlApiState {
 
     pub(super) fn current_listener_tls_store(&self) -> Arc<ListenerTlsReloadStore> {
         self.current_runtime()
-            .map(|runtime| {
-                runtime
-                    .shared_state
-                    .shared_services()
-                    .listener_tls_store
-                    .clone()
-            })
+            .map(|runtime| runtime.shared_services().listener_tls_store.clone())
             .unwrap_or_else(|| Arc::clone(&self.listener_tls_store))
     }
 
@@ -93,19 +91,13 @@ impl ControlApiState {
         &self,
     ) -> Arc<HashMap<String, ListenerRuntimeConfig>> {
         self.current_runtime()
-            .map(|runtime| {
-                runtime
-                    .shared_state
-                    .generation_state()
-                    .listener_runtime_configs
-                    .clone()
-            })
+            .map(|runtime| runtime.state().listener_runtime_configs.clone())
             .unwrap_or_else(|| Arc::clone(&self.listener_runtime_configs))
     }
 
     pub(super) fn current_metrics(&self) -> Arc<Metrics> {
         self.current_runtime()
-            .map(|runtime| runtime.shared_state.shared_services().metrics.clone())
+            .map(|runtime| runtime.shared_services().metrics.clone())
             .unwrap_or_else(|| Arc::clone(&self.metrics))
     }
 
@@ -113,7 +105,7 @@ impl ControlApiState {
         self.current_runtime()
             .and_then(|runtime| {
                 runtime
-                    .runtime_config
+                    .runtime_config()
                     .primary_listener_runtime_config()
                     .map(|listener| QUICListener::listener_label(&listener))
             })
@@ -124,12 +116,7 @@ impl ControlApiState {
         if let Some(runtime) = self.current_runtime() {
             let mut healthy = 0usize;
             let mut total = 0usize;
-            for pool in runtime
-                .shared_state
-                .generation_state()
-                .upstream_pools
-                .values()
-            {
+            for pool in runtime.state().upstream_pools.values() {
                 let guard = match pool.read() {
                     Ok(guard) => guard,
                     Err(_) => continue,

@@ -553,10 +553,9 @@ impl QUICListener {
                 }),
             );
         };
-        let runtime = runtime_bundle_handle.current();
-        let shared_state = &runtime.shared_state;
-        let shared = shared_state.shared_services();
-        let generation = shared_state.generation_state();
+        let runtime = runtime_bundle_handle.current_view();
+        let shared = runtime.shared_services();
+        let generation = runtime.state();
 
         if req.method() == Method::GET && path == paths.health_path.as_str() {
             let response = json!({
@@ -653,8 +652,8 @@ impl QUICListener {
                     "listeners": tls_listeners,
                 },
                 "runtime": {
-                    "generation": runtime.generation,
-                    "config_path": runtime.startup.config_path,
+                    "generation": runtime.generation(),
+                    "config_path": runtime.startup().config_path,
                 },
                 "extension_model": {
                     "status": "non_goal",
@@ -693,7 +692,7 @@ impl QUICListener {
                 );
             }
 
-            let config_path = runtime.startup.config_path.clone();
+            let config_path = runtime.startup().config_path.clone();
             let config = match read_config(&config_path) {
                 Ok(config) => config,
                 Err(err) => {
@@ -740,7 +739,7 @@ impl QUICListener {
                 }
             };
             let next_runtime = RuntimeBundle {
-                generation: runtime.generation.saturating_add(1),
+                generation: runtime.generation().saturating_add(1),
                 startup: crate::runtime::generation::StartupOwnedRuntimeState {
                     config_path,
                     log_config: config.log.clone(),
@@ -748,7 +747,8 @@ impl QUICListener {
                 runtime_config,
                 shared_state: Arc::clone(&next_shared_state),
             };
-            if let Some(err) = Self::validate_runtime_reload_compatibility(&runtime, &next_runtime)
+            if let Some(err) =
+                Self::validate_runtime_reload_compatibility(runtime.bundle(), &next_runtime)
             {
                 return Self::json_response(
                     StatusCode::CONFLICT,
@@ -759,7 +759,7 @@ impl QUICListener {
                 );
             }
             if let Some(err) =
-                Self::validate_control_api_reload_compatibility(&runtime, &next_runtime)
+                Self::validate_control_api_reload_compatibility(runtime.bundle(), &next_runtime)
             {
                 return Self::json_response(
                     StatusCode::CONFLICT,
@@ -769,7 +769,8 @@ impl QUICListener {
                     }),
                 );
             }
-            if let Some(err) = Self::validate_metrics_reload_compatibility(&runtime, &next_runtime)
+            if let Some(err) =
+                Self::validate_metrics_reload_compatibility(runtime.bundle(), &next_runtime)
             {
                 return Self::json_response(
                     StatusCode::CONFLICT,
@@ -780,7 +781,7 @@ impl QUICListener {
                 );
             }
             let startup_owned_issues =
-                Self::validate_startup_owned_reload_compatibility(&runtime, &next_runtime);
+                Self::validate_startup_owned_reload_compatibility(runtime.bundle(), &next_runtime);
             if !startup_owned_issues.is_empty() {
                 return Self::json_response(
                     StatusCode::CONFLICT,
@@ -790,7 +791,7 @@ impl QUICListener {
                     }),
                 );
             }
-            let current_log_level = runtime.startup.log_config.level.clone();
+            let current_log_level = runtime.startup().log_config.level.clone();
             let next_log_level = next_runtime.startup.log_config.level.clone();
 
             QUICListener::spawn_generation_background_tasks_for_runtime(
