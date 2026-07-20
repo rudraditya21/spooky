@@ -1,6 +1,7 @@
 use std::sync::atomic::AtomicUsize;
 
 use super::*;
+use crate::runtime::{bundle::ActiveRuntimeGeneration, generation::RuntimeGenerationView};
 
 #[derive(Clone)]
 pub(super) struct ControlApiPaths {
@@ -63,18 +64,27 @@ impl Drop for ConnectionSlotGuard {
 }
 
 impl ControlApiState {
-    pub(super) fn current_runtime(
-        &self,
-    ) -> Option<crate::runtime::bundle::ActiveRuntimeGeneration> {
+    pub(super) fn current_generation(&self) -> Option<ActiveRuntimeGeneration> {
         self.runtime_bundle
             .as_ref()
             .map(|handle| handle.current_view())
     }
 
+    pub(super) fn with_current_generation<R>(
+        &self,
+        f: impl FnOnce(Option<RuntimeGenerationView<'_>>) -> R,
+    ) -> R {
+        match self.runtime_bundle.as_ref() {
+            Some(handle) => handle.with_current_view(|view| f(Some(view))),
+            None => f(None),
+        }
+    }
+
     pub(super) fn current_control_api(&self) -> ControlApiConfig {
-        self.current_runtime()
-            .map(|runtime| runtime.runtime_config().observability.control_api.clone())
-            .unwrap_or_else(|| self.control_api.clone())
+        self.with_current_generation(|runtime| {
+            runtime.map(|view| view.runtime_config.observability.control_api.clone())
+        })
+        .unwrap_or_else(|| self.control_api.clone())
     }
 
     pub(super) fn current_paths(&self) -> ControlApiPaths {
@@ -82,38 +92,39 @@ impl ControlApiState {
     }
 
     pub(super) fn current_listener_tls_store(&self) -> Arc<ListenerTlsReloadStore> {
-        self.current_runtime()
-            .map(|runtime| runtime.shared_services().listener_tls_store.clone())
-            .unwrap_or_else(|| Arc::clone(&self.listener_tls_store))
+        self.with_current_generation(|runtime| {
+            runtime.map(|view| view.shared.listener_tls_store.clone())
+        })
+        .unwrap_or_else(|| Arc::clone(&self.listener_tls_store))
     }
 
     pub(super) fn current_listener_runtime_configs(
         &self,
     ) -> Arc<HashMap<String, ListenerRuntimeConfig>> {
-        self.current_runtime()
-            .map(|runtime| runtime.state().listener_runtime_configs.clone())
-            .unwrap_or_else(|| Arc::clone(&self.listener_runtime_configs))
+        self.with_current_generation(|runtime| {
+            runtime.map(|view| view.state.listener_runtime_configs.clone())
+        })
+        .unwrap_or_else(|| Arc::clone(&self.listener_runtime_configs))
     }
 
     pub(super) fn current_metrics(&self) -> Arc<Metrics> {
-        self.current_runtime()
-            .map(|runtime| runtime.shared_services().metrics.clone())
+        self.with_current_generation(|runtime| runtime.map(|view| view.shared.metrics.clone()))
             .unwrap_or_else(|| Arc::clone(&self.metrics))
     }
 
     pub(super) fn current_primary_listener_label(&self) -> Option<String> {
-        self.current_runtime()
-            .and_then(|runtime| {
-                runtime
-                    .runtime_config()
+        self.with_current_generation(|runtime| {
+            runtime.and_then(|view| {
+                view.runtime_config
                     .primary_listener_runtime_config()
                     .map(|listener| QUICListener::listener_label(&listener))
             })
-            .or_else(|| Some(self.primary_listener_label.clone()))
+        })
+        .or_else(|| Some(self.primary_listener_label.clone()))
     }
 
     pub(super) fn snapshot_backend_health(&self) -> (usize, usize) {
-        if let Some(runtime) = self.current_runtime() {
+        if let Some(runtime) = self.current_generation() {
             let mut healthy = 0usize;
             let mut total = 0usize;
             for pool in runtime.state().upstream_pools.values() {

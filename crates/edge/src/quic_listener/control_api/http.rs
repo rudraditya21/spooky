@@ -692,12 +692,18 @@ impl QUICListener {
                 );
             }
 
-            let config_path = runtime.startup().config_path.clone();
-            let config = match read_config(&config_path) {
-                Ok(config) => config,
+            let plan = match Self::build_runtime_reload_plan(&runtime) {
+                Ok(plan) => plan,
                 Err(err) => {
+                    let status = if err.starts_with("Configuration validation failed:")
+                        || err.starts_with("Runtime configuration normalization failed:")
+                    {
+                        StatusCode::BAD_REQUEST
+                    } else {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    };
                     return Self::json_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
+                        status,
                         json!({
                             "reloaded": false,
                             "error": err,
@@ -705,51 +711,7 @@ impl QUICListener {
                     );
                 }
             };
-            if let Err(err) = spooky_config::validator::validate(&config) {
-                return Self::json_response(
-                    StatusCode::BAD_REQUEST,
-                    json!({
-                        "reloaded": false,
-                        "error": format!("Configuration validation failed: {err}"),
-                    }),
-                );
-            }
-            let runtime_config = match RuntimeConfig::from_config(&config) {
-                Ok(runtime_config) => runtime_config,
-                Err(err) => {
-                    return Self::json_response(
-                        StatusCode::BAD_REQUEST,
-                        json!({
-                            "reloaded": false,
-                            "error": format!("Runtime configuration normalization failed: {err}"),
-                        }),
-                    );
-                }
-            };
-            let next_shared_state = match QUICListener::build_shared_state(&runtime_config) {
-                Ok(shared_state) => Arc::new(shared_state),
-                Err(err) => {
-                    return Self::json_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        json!({
-                            "reloaded": false,
-                            "error": err.to_string(),
-                        }),
-                    );
-                }
-            };
-            let next_runtime = RuntimeBundle {
-                generation: runtime.generation().saturating_add(1),
-                startup: crate::runtime::generation::StartupOwnedRuntimeState {
-                    config_path,
-                    log_config: config.log.clone(),
-                },
-                runtime_config,
-                shared_state: Arc::clone(&next_shared_state),
-            };
-            if let Some(err) =
-                Self::validate_runtime_reload_compatibility(runtime.bundle(), &next_runtime)
-            {
+            if let Err(err) = Self::validate_runtime_reload_plan(&runtime, &plan.next_runtime) {
                 return Self::json_response(
                     StatusCode::CONFLICT,
                     json!({
@@ -758,47 +720,9 @@ impl QUICListener {
                     }),
                 );
             }
-            if let Some(err) =
-                Self::validate_control_api_reload_compatibility(runtime.bundle(), &next_runtime)
-            {
-                return Self::json_response(
-                    StatusCode::CONFLICT,
-                    json!({
-                        "reloaded": false,
-                        "error": err,
-                    }),
-                );
-            }
-            if let Some(err) =
-                Self::validate_metrics_reload_compatibility(runtime.bundle(), &next_runtime)
-            {
-                return Self::json_response(
-                    StatusCode::CONFLICT,
-                    json!({
-                        "reloaded": false,
-                        "error": err,
-                    }),
-                );
-            }
-            let startup_owned_issues =
-                Self::validate_startup_owned_reload_compatibility(runtime.bundle(), &next_runtime);
-            if !startup_owned_issues.is_empty() {
-                return Self::json_response(
-                    StatusCode::CONFLICT,
-                    json!({
-                        "reloaded": false,
-                        "error": startup_owned_issues.join("; "),
-                    }),
-                );
-            }
-            let current_log_level = runtime.startup().log_config.level.clone();
-            let next_log_level = next_runtime.startup.log_config.level.clone();
-
-            QUICListener::spawn_generation_background_tasks_for_runtime(
-                &next_runtime.runtime_config,
-                next_runtime.shared_state.as_ref(),
-            );
-            let generation = match runtime_bundle_handle.replace(next_runtime) {
+            let current_log_level = plan.current_log_level.clone();
+            let next_log_level = plan.next_log_level.clone();
+            let generation = match Self::apply_runtime_reload_plan(runtime_bundle_handle, plan) {
                 Ok(generation) => generation,
                 Err(err) => {
                     return Self::json_response(

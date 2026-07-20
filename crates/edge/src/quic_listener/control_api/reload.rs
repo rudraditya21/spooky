@@ -1,6 +1,75 @@
 use super::*;
+use crate::runtime::bundle::{ActiveRuntimeGeneration, RuntimeBundleHandle};
+
+pub(super) struct RuntimeReloadPlan {
+    pub(super) next_runtime: RuntimeBundle,
+    pub(super) current_log_level: String,
+    pub(super) next_log_level: String,
+}
 
 impl QUICListener {
+    pub(super) fn build_runtime_reload_plan(
+        current: &ActiveRuntimeGeneration,
+    ) -> Result<RuntimeReloadPlan, String> {
+        let config_path = current.startup().config_path.clone();
+        let config = read_config(&config_path)?;
+        spooky_config::validator::validate(&config)
+            .map_err(|err| format!("Configuration validation failed: {err}"))?;
+        let runtime_config = RuntimeConfig::from_config(&config)
+            .map_err(|err| format!("Runtime configuration normalization failed: {err}"))?;
+        let next_shared_state = QUICListener::build_shared_state(&runtime_config)
+            .map(Arc::new)
+            .map_err(|err| err.to_string())?;
+        let current_log_level = current.startup().log_config.level.clone();
+        let next_log_level = config.log.level.clone();
+
+        Ok(RuntimeReloadPlan {
+            next_runtime: RuntimeBundle {
+                generation: current.generation().saturating_add(1),
+                startup: crate::runtime::generation::StartupOwnedRuntimeState {
+                    config_path,
+                    log_config: config.log.clone(),
+                },
+                runtime_config,
+                shared_state: next_shared_state,
+            },
+            current_log_level,
+            next_log_level,
+        })
+    }
+
+    pub(super) fn validate_runtime_reload_plan(
+        current: &ActiveRuntimeGeneration,
+        next: &RuntimeBundle,
+    ) -> Result<(), String> {
+        if let Some(err) = Self::validate_runtime_reload_compatibility(current.bundle(), next) {
+            return Err(err);
+        }
+        if let Some(err) = Self::validate_control_api_reload_compatibility(current.bundle(), next) {
+            return Err(err);
+        }
+        if let Some(err) = Self::validate_metrics_reload_compatibility(current.bundle(), next) {
+            return Err(err);
+        }
+        let startup_owned_issues =
+            Self::validate_startup_owned_reload_compatibility(current.bundle(), next);
+        if !startup_owned_issues.is_empty() {
+            return Err(startup_owned_issues.join("; "));
+        }
+        Ok(())
+    }
+
+    pub(super) fn apply_runtime_reload_plan(
+        runtime_bundle_handle: &RuntimeBundleHandle,
+        plan: RuntimeReloadPlan,
+    ) -> Result<u64, ProxyError> {
+        QUICListener::spawn_generation_background_tasks_for_runtime(
+            &plan.next_runtime.runtime_config,
+            plan.next_runtime.shared_state.as_ref(),
+        );
+        runtime_bundle_handle.replace(plan.next_runtime)
+    }
+
     pub(super) fn validate_runtime_reload_compatibility(
         current: &RuntimeBundle,
         next: &RuntimeBundle,
