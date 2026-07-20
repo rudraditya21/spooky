@@ -1,6 +1,5 @@
 use std::{
     convert::Infallible,
-    net::SocketAddr,
     pin::Pin,
     sync::{
         Arc, RwLock,
@@ -12,7 +11,7 @@ use std::{
 
 use bytes::Bytes;
 use http::{Request, Response, StatusCode};
-use http_body_util::{BodyExt, Full, combinators::BoxBody};
+use http_body_util::{BodyExt, Full};
 use hyper::{
     body::{Body, Frame, Incoming},
     client::conn::http1 as client_http1,
@@ -22,34 +21,21 @@ use hyper::{
 };
 use hyper_util::rt::TokioIo;
 use log::{debug, error, info, warn};
-use spooky_bridge::{
-    h3_to_h1::build_h1_request,
-    h3_to_h2::build_h2_request_for_target,
-    request::{
-        RequestBuildInput, RequestBuildPolicies, RequestBuildTarget, RequestForwardedContext,
-        RequestTraceContext,
-    },
-    response::{
-        ResponseBodyMode, ResponseBodyPolicy, ResponseNormalizationInput,
-        ResponseNormalizationProtocol, ResponseProtocolConstraints, normalize_upstream_response,
-    },
+use spooky_bridge::response::{
+    ResponseBodyMode, ResponseBodyPolicy, ResponseNormalizationInput,
+    ResponseNormalizationProtocol, ResponseProtocolConstraints, normalize_upstream_response,
 };
-use spooky_config::{
-    backend_endpoint::{BackendEndpoint, BackendScheme},
-    runtime::{ListenerRuntimeConfig, RuntimeUpstreamPolicy},
-};
+use spooky_config::{backend_endpoint::BackendScheme, runtime::ListenerRuntimeConfig};
 use spooky_errors::{ProxyError, classify_upstream_proxy_error};
 use spooky_lb::upstream_pool::UpstreamPool;
 
 pub(super) use super::bootstrap::{BootstrapConnectionState, BootstrapStartupState};
 use super::{
     QUICListener,
-    admission::{
-        AdmissionPolicyDecision, admission_rejection_response,
-        evaluate_forwarding_pre_admission_policy,
-    },
     bootstrap::{
-        BootstrapRequestIntake, bootstrap_error_response, prepare_bootstrap_request_intake,
+        BootstrapBuildRequestInput, BootstrapPolicyEvaluationInput, BootstrapPreparedRoute,
+        BootstrapRequestIntake, build_bootstrap_upstream_request,
+        evaluate_bootstrap_request_policy, prepare_bootstrap_request_intake,
     },
     bootstrap::{
         PreparedBootstrapListenerStartup, prepare_bootstrap_listener_startup,
@@ -70,8 +56,7 @@ use crate::{
                 checked_request_body_ingress, checked_response_body_guardrails,
             },
             outcome::{
-                AdmissionOutcomeClass, OutcomeBackendTarget, OutcomeRouteTarget,
-                observe_admission_outcome, observe_backend_response_status,
+                OutcomeBackendTarget, OutcomeRouteTarget, observe_backend_response_status,
                 observe_proxy_error_outcome, observe_status_outcome,
             },
         },
@@ -92,7 +77,7 @@ type BootstrapServiceFuture = Pin<
     >,
 >;
 
-struct BootstrapStreamingBody {
+pub(in crate::quic_listener) struct BootstrapStreamingBody {
     inner: Incoming,
     guardrails: Option<ResponseBodyGuardrailConfig>,
     declared_content_length: Option<usize>,
@@ -111,7 +96,7 @@ struct BootstrapBackendAccounting {
 }
 
 impl BootstrapStreamingBody {
-    fn new(inner: Incoming) -> Self {
+    pub(in crate::quic_listener) fn new(inner: Incoming) -> Self {
         Self {
             inner,
             guardrails: None,
@@ -238,56 +223,6 @@ pub(in crate::quic_listener) fn boxed_full(
     body: Bytes,
 ) -> http_body_util::combinators::BoxBody<Bytes, Infallible> {
     Full::new(body).map_err(|never| match never {}).boxed()
-}
-
-fn bootstrap_bridge_headers(headers: &http::HeaderMap) -> Vec<quiche::h3::Header> {
-    headers
-        .iter()
-        .map(|(name, value)| quiche::h3::Header::new(name.as_str().as_bytes(), value.as_bytes()))
-        .collect()
-}
-
-fn bootstrap_request_build_target<'a>(
-    endpoint: &'a BackendEndpoint,
-    upstream_policy: &'a RuntimeUpstreamPolicy,
-) -> RequestBuildTarget<'a> {
-    RequestBuildTarget {
-        endpoint,
-        policies: RequestBuildPolicies {
-            host_policy: &upstream_policy.host.0,
-            forwarded_header_policy: &upstream_policy.forwarded_headers.0,
-        },
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn bootstrap_request_build_input<'a>(
-    method: &'a str,
-    path: &'a str,
-    authority: Option<&'a str>,
-    headers: &'a [quiche::h3::Header],
-    body: BoxBody<Bytes, Infallible>,
-    content_length: Option<usize>,
-    request_id: u64,
-    traceparent: Option<&'a str>,
-    peer: SocketAddr,
-) -> RequestBuildInput<'a, BoxBody<Bytes, Infallible>> {
-    RequestBuildInput {
-        method,
-        path,
-        authority,
-        headers,
-        body,
-        content_length,
-        body_mode: RequestBuildInput::<BoxBody<Bytes, Infallible>>::body_mode_for_length(
-            content_length,
-        ),
-        trace: RequestTraceContext {
-            request_id,
-            traceparent,
-        },
-        forwarded: RequestForwardedContext { client_addr: peer },
-    }
 }
 
 fn bootstrap_route_target<'a>(route: &'a str) -> OutcomeRouteTarget<'a> {
@@ -520,294 +455,38 @@ impl QUICListener {
                                     Err(response) => return Ok(response),
                                 };
 
-                                let bootstrap_error = |status: StatusCode, body: &'static [u8]| {
-                                    Ok(bootstrap_error_response(&alt, status, body))
-                                };
-
-                                let lb_header_lookup = |name: &str| {
-                                    req.headers()
-                                        .get(name)
-                                        .and_then(|value| value.to_str().ok())
-                                        .map(str::to_string)
-                                };
-                                let (
+                                let BootstrapPreparedRoute {
+                                    endpoint,
                                     backend_addr,
                                     backend_index,
                                     upstream_name,
                                     upstream_policy,
                                     upstream_pool,
-                                ) = match Self::resolve_bootstrap_target(
-                                    super::forwarding::BootstrapResolutionInput {
-                                        method: &method,
-                                        path: &path,
-                                        authority: authority.as_deref(),
-                                        header_lookup: Some(&lb_header_lookup),
+                                } = match evaluate_bootstrap_request_policy(
+                                    BootstrapPolicyEvaluationInput {
+                                        intake: &BootstrapRequestIntake {
+                                            method: method.clone(),
+                                            path: path.clone(),
+                                            authority: authority.clone(),
+                                            content_length,
+                                            suppress_downstream_body,
+                                            is_websocket_upgrade,
+                                            client_upgrade: None,
+                                        },
+                                        peer,
+                                        headers: req.headers(),
                                         routing_index: &routing_index,
                                         upstream_pools: &upstream_pools,
                                         upstream_policies: &upstream_policies,
-                                        metrics: &metrics,
-                                        elapsed: Duration::from_millis(0),
+                                        backend_endpoints: &backend_endpoints,
+                                        metrics: metrics.as_ref(),
+                                        resilience: resilience.as_ref(),
+                                        request_start,
+                                        alt_svc: &alt,
                                     },
                                 ) {
-                                    Ok(value) => (
-                                        value.backend_addr,
-                                        value.backend_index,
-                                        value.upstream_name,
-                                        value.upstream_policy,
-                                        value.upstream_pool,
-                                    ),
-                                    Err(err) => {
-                                        let (status, body) =
-                                            Self::bootstrap_route_resolution_error_response(&err);
-                                        return bootstrap_error(status, body);
-                                    }
-                                };
-
-                                let admission = evaluate_forwarding_pre_admission_policy(
-                                    &upstream_policy,
-                                    Some(&lb_header_lookup),
-                                    &resilience.brownout,
-                                    resilience.adaptive_admission.inflight_percent(),
-                                    &upstream_name,
-                                    resilience.shed_retry_after_seconds,
-                                    &resilience.scoped_rate_limits,
-                                    |rule| {
-                                        Self::resolve_scoped_rate_limit_key(
-                                            rule,
-                                            &upstream_name,
-                                            &method,
-                                            &path,
-                                            authority.as_deref(),
-                                            peer,
-                                            Some(&lb_header_lookup),
-                                        )
-                                    },
-                                );
-                                metrics.set_brownout_active(resilience.brownout.is_active());
-                                let rejection_response = admission_rejection_response(&admission);
-                                match admission {
-                                    AdmissionPolicyDecision::AdmitReady => {}
-                                    AdmissionPolicyDecision::Unauthorized(_) => {
-                                        metrics.inc_policy_denied();
-                                        let _ = observe_admission_outcome(
-                                            metrics.as_ref(),
-                                            bootstrap_route_target(&upstream_name),
-                                            Some(bootstrap_backend_target(
-                                                &upstream_name,
-                                                &backend_addr,
-                                                backend_index,
-                                            )),
-                                            request_start.elapsed(),
-                                            StatusCode::UNAUTHORIZED,
-                                            AdmissionOutcomeClass::AuthDenied,
-                                        );
-                                        warn!(
-                                            "Bootstrap request route={} denied by auth policy",
-                                            upstream_name
-                                        );
-                                        let Some(response) = rejection_response.as_ref() else {
-                                            warn!(
-                                                "Bootstrap request route={} missing admission rejection response for unauthorized decision",
-                                                upstream_name
-                                            );
-                                            return Ok(Response::builder()
-                                                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                                .header("alt-svc", &alt)
-                                                .body(boxed_full(Bytes::from_static(
-                                                    b"internal proxy error\n",
-                                                )))
-                                                .unwrap_or_else(|_| {
-                                                    Response::new(boxed_full(Bytes::from_static(
-                                                        b"error\n",
-                                                    )))
-                                                }));
-                                        };
-                                        let Some(challenge) = response.www_authenticate else {
-                                            warn!(
-                                                "Bootstrap request route={} missing auth challenge in admission rejection response",
-                                                upstream_name
-                                            );
-                                            return Ok(Response::builder()
-                                                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                                .header("alt-svc", &alt)
-                                                .body(boxed_full(Bytes::from_static(
-                                                    b"internal proxy error\n",
-                                                )))
-                                                .unwrap_or_else(|_| {
-                                                    Response::new(boxed_full(Bytes::from_static(
-                                                        b"error\n",
-                                                    )))
-                                                }));
-                                        };
-                                        return Ok(Response::builder()
-                                            .status(response.status)
-                                            .header("alt-svc", &alt)
-                                            .header("www-authenticate", challenge)
-                                            .body(boxed_full(Bytes::from_static(response.body)))
-                                            .unwrap_or_else(|_| {
-                                                Response::new(boxed_full(Bytes::from_static(
-                                                    b"error\n",
-                                                )))
-                                            }));
-                                    }
-                                    AdmissionPolicyDecision::RateLimited(decision) => {
-                                        metrics.inc_request_rate_limited();
-                                        let _ = observe_admission_outcome(
-                                            metrics.as_ref(),
-                                            bootstrap_route_target(&upstream_name),
-                                            Some(bootstrap_backend_target(
-                                                &upstream_name,
-                                                &backend_addr,
-                                                backend_index,
-                                            )),
-                                            request_start.elapsed(),
-                                            StatusCode::TOO_MANY_REQUESTS,
-                                            AdmissionOutcomeClass::RateLimited,
-                                        );
-                                        warn!(
-                                            "Bootstrap request route={} scoped rate limit exceeded by rule={}",
-                                            decision.route, decision.rule_name
-                                        );
-                                        let Some(response) = rejection_response.as_ref() else {
-                                            warn!(
-                                                "Bootstrap request route={} missing admission rejection response for rate-limited decision",
-                                                upstream_name
-                                            );
-                                            return Ok(Response::builder()
-                                                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                                .header("alt-svc", &alt)
-                                                .body(boxed_full(Bytes::from_static(
-                                                    b"internal proxy error\n",
-                                                )))
-                                                .unwrap_or_else(|_| {
-                                                    Response::new(boxed_full(Bytes::from_static(
-                                                        b"error\n",
-                                                    )))
-                                                }));
-                                        };
-                                        let Some(retry_after_seconds) =
-                                            response.retry_after_seconds
-                                        else {
-                                            warn!(
-                                                "Bootstrap request route={} missing retry-after in rate-limited admission rejection response",
-                                                upstream_name
-                                            );
-                                            return Ok(Response::builder()
-                                                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                                .header("alt-svc", &alt)
-                                                .body(boxed_full(Bytes::from_static(
-                                                    b"internal proxy error\n",
-                                                )))
-                                                .unwrap_or_else(|_| {
-                                                    Response::new(boxed_full(Bytes::from_static(
-                                                        b"error\n",
-                                                    )))
-                                                }));
-                                        };
-                                        return Ok(Response::builder()
-                                            .status(response.status)
-                                            .header("alt-svc", &alt)
-                                            .header("retry-after", retry_after_seconds.to_string())
-                                            .body(boxed_full(Bytes::from_static(response.body)))
-                                            .unwrap_or_else(|_| {
-                                                Response::new(boxed_full(Bytes::from_static(
-                                                    b"error\n",
-                                                )))
-                                            }));
-                                    }
-                                    AdmissionPolicyDecision::Overloaded(decision) => {
-                                        let _ = observe_admission_outcome(
-                                            metrics.as_ref(),
-                                            bootstrap_route_target(&upstream_name),
-                                            Some(bootstrap_backend_target(
-                                                &upstream_name,
-                                                &backend_addr,
-                                                backend_index,
-                                            )),
-                                            request_start.elapsed(),
-                                            StatusCode::SERVICE_UNAVAILABLE,
-                                            AdmissionOutcomeClass::OverloadShed {
-                                                reason: Some(decision.reason.metrics_reason()),
-                                            },
-                                        );
-                                        resilience
-                                            .adaptive_admission
-                                            .observe(request_start.elapsed(), true);
-                                        let Some(response) = rejection_response.as_ref() else {
-                                            warn!(
-                                                "Bootstrap request route={} missing admission rejection response for overload decision",
-                                                upstream_name
-                                            );
-                                            return Ok(Response::builder()
-                                                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                                .header("alt-svc", &alt)
-                                                .body(boxed_full(Bytes::from_static(
-                                                    b"internal proxy error\n",
-                                                )))
-                                                .unwrap_or_else(|_| {
-                                                    Response::new(boxed_full(Bytes::from_static(
-                                                        b"error\n",
-                                                    )))
-                                                }));
-                                        };
-                                        let Some(retry_after_seconds) =
-                                            response.retry_after_seconds
-                                        else {
-                                            warn!(
-                                                "Bootstrap request route={} missing retry-after in overload admission rejection response",
-                                                upstream_name
-                                            );
-                                            return Ok(Response::builder()
-                                                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                                .header("alt-svc", &alt)
-                                                .body(boxed_full(Bytes::from_static(
-                                                    b"internal proxy error\n",
-                                                )))
-                                                .unwrap_or_else(|_| {
-                                                    Response::new(boxed_full(Bytes::from_static(
-                                                        b"error\n",
-                                                    )))
-                                                }));
-                                        };
-                                        return Ok(Response::builder()
-                                            .status(response.status)
-                                            .header("alt-svc", &alt)
-                                            .header("retry-after", retry_after_seconds.to_string())
-                                            .body(boxed_full(Bytes::from_static(response.body)))
-                                            .unwrap_or_else(|_| {
-                                                Response::new(boxed_full(Bytes::from_static(
-                                                    b"error\n",
-                                                )))
-                                            }));
-                                    }
-                                }
-
-                                let endpoint = match backend_endpoints.get(&backend_addr) {
-                                    Some(ep) => ep.clone(),
-                                    None => {
-                                        let _ = observe_proxy_error_outcome(
-                                            metrics.as_ref(),
-                                            bootstrap_route_target(&upstream_name),
-                                            Some(bootstrap_backend_target(
-                                                &upstream_name,
-                                                &backend_addr,
-                                                backend_index,
-                                            )),
-                                            request_start.elapsed(),
-                                            Some(StatusCode::BAD_GATEWAY),
-                                            &ProxyError::Transport("no endpoint".into()),
-                                            None,
-                                        );
-                                        return Ok(Response::builder()
-                                            .status(StatusCode::BAD_GATEWAY)
-                                            .header("alt-svc", &alt)
-                                            .body(boxed_full(Bytes::from_static(b"no endpoint\n")))
-                                            .unwrap_or_else(|_| {
-                                                Response::new(boxed_full(Bytes::from_static(
-                                                    b"error\n",
-                                                )))
-                                            }));
-                                    }
+                                    Ok(prepared) => prepared,
+                                    Err(response) => return Ok(response),
                                 };
 
                                 let request_path = if path.is_empty() { "/" } else { &path };
@@ -866,127 +545,71 @@ impl QUICListener {
                                     .get("traceparent")
                                     .and_then(|value| value.to_str().ok())
                                     .map(str::to_string);
-                                let bridge_headers = bootstrap_bridge_headers(req.headers());
-                                let request_target =
-                                    bootstrap_request_build_target(&endpoint, &upstream_policy);
-                                let upstream_req = if is_websocket_upgrade {
-                                    match build_h1_request(
-                                        request_target,
-                                        bootstrap_request_build_input(
-                                            &method,
-                                            &path,
-                                            authority.as_deref(),
-                                            &bridge_headers,
-                                            boxed_full(Bytes::new()),
+                                let intake_for_build = BootstrapRequestIntake {
+                                    method: method.clone(),
+                                    path: path.clone(),
+                                    authority: authority.clone(),
+                                    content_length,
+                                    suppress_downstream_body,
+                                    is_websocket_upgrade,
+                                    client_upgrade: None,
+                                };
+                                let upstream_req = match build_bootstrap_upstream_request(
+                                    BootstrapBuildRequestInput {
+                                        request: req,
+                                        intake: &intake_for_build,
+                                        prepared_route: &BootstrapPreparedRoute {
+                                            endpoint: endpoint.clone(),
+                                            backend_addr: backend_addr.clone(),
+                                            backend_index,
+                                            upstream_name: upstream_name.clone(),
+                                            upstream_policy: upstream_policy.clone(),
+                                            upstream_pool: Arc::clone(&upstream_pool),
+                                        },
+                                        request_id,
+                                        traceparent: traceparent.as_deref(),
+                                        peer,
+                                    },
+                                ) {
+                                    Ok(request) => request,
+                                    Err(err) => {
+                                        warn!("Bootstrap request build failed: {}", err);
+                                        let (status, body) = if is_websocket_upgrade
+                                            && matches!(err, spooky_bridge::BridgeError::Build(_))
+                                        {
+                                            (
+                                                StatusCode::BAD_GATEWAY,
+                                                b"request build error\n".as_slice(),
+                                            )
+                                        } else {
+                                            (
+                                                StatusCode::BAD_REQUEST,
+                                                b"invalid request\n".as_slice(),
+                                            )
+                                        };
+                                        let proxy_err = ProxyError::from(err);
+                                        let _ = observe_proxy_error_outcome(
+                                            metrics.as_ref(),
+                                            bootstrap_route_target(&upstream_name),
+                                            Some(bootstrap_backend_target(
+                                                &upstream_name,
+                                                &backend_addr,
+                                                backend_index,
+                                            )),
+                                            request_start.elapsed(),
+                                            Some(status),
+                                            &proxy_err,
                                             None,
-                                            request_id,
-                                            traceparent.as_deref(),
-                                            peer,
-                                        ),
-                                    ) {
-                                        Ok(request) => request,
-                                        Err(err) => {
-                                            warn!("Bootstrap request build failed: {}", err);
-                                            let (status, body) = match err {
-                                                spooky_bridge::BridgeError::Build(_) => (
-                                                    StatusCode::BAD_GATEWAY,
-                                                    b"request build error\n".as_slice(),
-                                                ),
-                                                _ => (
-                                                    StatusCode::BAD_REQUEST,
-                                                    b"invalid request\n".as_slice(),
-                                                ),
-                                            };
-                                            let proxy_err = ProxyError::from(err);
-                                            let _ = observe_proxy_error_outcome(
-                                                metrics.as_ref(),
-                                                bootstrap_route_target(&upstream_name),
-                                                Some(bootstrap_backend_target(
-                                                    &upstream_name,
-                                                    &backend_addr,
-                                                    backend_index,
-                                                )),
-                                                request_start.elapsed(),
-                                                Some(status),
-                                                &proxy_err,
-                                                None,
-                                            );
-                                            return Ok(Response::builder()
-                                                .status(status)
-                                                .header("alt-svc", &alt)
-                                                .body(boxed_full(Bytes::copy_from_slice(body)))
-                                                .unwrap_or_else(|_| {
-                                                    Response::new(boxed_full(Bytes::from_static(
-                                                        b"error\n",
-                                                    )))
-                                                }));
-                                        }
-                                    }
-                                } else {
-                                    let bridge_body = BootstrapStreamingBody::new(req.into_body())
-                                        .map_err(|never| match never {})
-                                        .boxed();
-                                    let build_result = if endpoint.scheme() == BackendScheme::Http {
-                                        build_h1_request(
-                                            request_target,
-                                            bootstrap_request_build_input(
-                                                &method,
-                                                &path,
-                                                authority.as_deref(),
-                                                &bridge_headers,
-                                                bridge_body,
-                                                None,
-                                                request_id,
-                                                traceparent.as_deref(),
-                                                peer,
-                                            ),
-                                        )
-                                    } else {
-                                        build_h2_request_for_target(
-                                            request_target,
-                                            bootstrap_request_build_input(
-                                                &method,
-                                                &path,
-                                                authority.as_deref(),
-                                                &bridge_headers,
-                                                bridge_body,
-                                                None,
-                                                request_id,
-                                                traceparent.as_deref(),
-                                                peer,
-                                            ),
-                                        )
-                                    };
-                                    match build_result {
-                                        Ok(request) => request,
-                                        Err(err) => {
-                                            warn!("Bootstrap request build failed: {}", err);
-                                            let proxy_err = ProxyError::from(err);
-                                            let _ = observe_proxy_error_outcome(
-                                                metrics.as_ref(),
-                                                bootstrap_route_target(&upstream_name),
-                                                Some(bootstrap_backend_target(
-                                                    &upstream_name,
-                                                    &backend_addr,
-                                                    backend_index,
-                                                )),
-                                                request_start.elapsed(),
-                                                Some(StatusCode::BAD_REQUEST),
-                                                &proxy_err,
-                                                None,
-                                            );
-                                            return Ok(Response::builder()
-                                                .status(StatusCode::BAD_REQUEST)
-                                                .header("alt-svc", &alt)
-                                                .body(boxed_full(Bytes::from_static(
-                                                    b"invalid request\n",
+                                        );
+                                        return Ok(Response::builder()
+                                            .status(status)
+                                            .header("alt-svc", &alt)
+                                            .body(boxed_full(Bytes::copy_from_slice(body)))
+                                            .unwrap_or_else(|_| {
+                                                Response::new(boxed_full(Bytes::from_static(
+                                                    b"error\n",
                                                 )))
-                                                .unwrap_or_else(|_| {
-                                                    Response::new(boxed_full(Bytes::from_static(
-                                                        b"error\n",
-                                                    )))
-                                                }));
-                                        }
+                                            }));
                                     }
                                 };
                                 let mut upstream_resp = if is_websocket_upgrade {
