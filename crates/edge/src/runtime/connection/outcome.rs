@@ -407,12 +407,10 @@ pub(crate) fn observe_backend_response_status(
     let pool = upstream_pool?;
     let mut pool = pool.write().ok()?;
     match outcome_from_status(status) {
-        crate::runtime::health::HealthClassification::Success => {
-            pool.pool.mark_success(backend_index)
+        crate::runtime::health::HealthClassification::Success => pool.mark_backend_healthy(backend_index),
+        crate::runtime::health::HealthClassification::Failure => {
+            pool.mark_backend_request_failure(backend_index, HealthFailureReason::HttpStatus5xx)
         }
-        crate::runtime::health::HealthClassification::Failure => pool
-            .pool
-            .mark_request_failure(backend_index, HealthFailureReason::HttpStatus5xx),
         crate::runtime::health::HealthClassification::Neutral => None,
     }
 }
@@ -440,8 +438,7 @@ pub(crate) fn observe_classified_backend_failure(
     }
     let pool = upstream_pool?;
     let mut pool = pool.write().ok()?;
-    pool.pool
-        .mark_request_failure(backend_index, health_mapping.failure_reason)
+    pool.mark_backend_request_failure(backend_index, health_mapping.failure_reason)
 }
 
 pub(crate) fn log_backend_health_transition(addr: &str, transition: HealthTransition) {

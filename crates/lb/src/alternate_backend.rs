@@ -53,8 +53,7 @@ pub fn choose_alternate_backend(
 
     if policy.healthy_fallback {
         let fallback_candidate = pool
-            .pool
-            .healthy_indices_iter()
+            .healthy_backend_indices_iter()
             .find(|index| !is_excluded(*index, excluded_indices));
         if let Some(index) = fallback_candidate {
             return AlternateBackendDecision::Select(AlternateBackendChoice {
@@ -64,7 +63,7 @@ pub fn choose_alternate_backend(
         }
     }
 
-    if pool.pool.healthy_len() == 0 {
+    if pool.membership_summary().healthy_backends == 0 {
         AlternateBackendDecision::DoNotSelect {
             denial: AlternateBackendFailureReason::NoHealthyBackends,
         }

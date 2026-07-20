@@ -293,7 +293,7 @@ impl QUICListener {
         };
         match choose_alternate_backend(&pool, &[primary_index], None) {
             AlternateBackendDecision::Select(choice) => {
-                if let Some(address) = pool.pool.address(choice.index) {
+                if let Some(address) = pool.backend_address(choice.index) {
                     ResolvedAlternateBackend::Selected {
                         address: address.to_string(),
                     }

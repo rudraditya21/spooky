@@ -354,11 +354,10 @@ impl QUICListener {
     }
 
     fn no_healthy_servers_error(pool: &UpstreamPool) -> ProxyError {
-        let total = pool.pool.len();
-        let healthy = pool.pool.healthy_len();
+        let summary = pool.membership_summary();
         error!(
             "no healthy backends available: {}/{} backends healthy",
-            healthy, total
+            summary.healthy_backends, summary.total_backends
         );
         ProxyError::Transport("no healthy servers".into())
     }

@@ -5,7 +5,19 @@ use spooky_config::runtime::{
     RuntimeRequestKeySpec, RuntimeUpstream,
 };
 
-use crate::{backend::BackendState, backend_pool::BackendPool, load_balancing::LoadBalancing};
+use crate::{
+    backend::{BackendState, HealthTransition},
+    backend_pool::BackendPool,
+    health::HealthFailureReason,
+    load_balancing::LoadBalancing,
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UpstreamPoolMembershipSummary {
+    pub total_backends: usize,
+    pub healthy_backends: usize,
+    pub membership_epoch: u64,
+}
 
 pub struct UpstreamPool {
     pub pool: BackendPool,
@@ -58,6 +70,45 @@ impl UpstreamPool {
 
     pub fn finish_request(&mut self, index: usize, latency: Duration, status: Option<u16>) {
         self.pool.finish_request(index, latency, status);
+    }
+
+    pub fn mark_backend_healthy(&mut self, index: usize) -> Option<HealthTransition> {
+        self.pool.mark_success(index)
+    }
+
+    pub fn mark_backend_failure_from_active_check(
+        &mut self,
+        index: usize,
+    ) -> Option<HealthTransition> {
+        self.pool.mark_failure(index)
+    }
+
+    pub fn mark_backend_request_failure(
+        &mut self,
+        index: usize,
+        reason: HealthFailureReason,
+    ) -> Option<HealthTransition> {
+        self.pool.mark_request_failure(index, reason)
+    }
+
+    pub fn backend_address(&self, index: usize) -> Option<&str> {
+        self.pool.address(index)
+    }
+
+    pub fn backend_indices(&self) -> Vec<usize> {
+        self.pool.all_indices()
+    }
+
+    pub fn healthy_backend_indices_iter(&self) -> impl Iterator<Item = usize> + '_ {
+        self.pool.healthy_indices_iter()
+    }
+
+    pub fn membership_summary(&self) -> UpstreamPoolMembershipSummary {
+        UpstreamPoolMembershipSummary {
+            total_backends: self.pool.len(),
+            healthy_backends: self.pool.healthy_len(),
+            membership_epoch: self.pool.membership_epoch(),
+        }
     }
 
     pub fn lb_policy(&self) -> &RuntimeLoadBalancingPolicy {

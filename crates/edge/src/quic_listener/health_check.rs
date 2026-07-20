@@ -35,8 +35,8 @@ impl QUICListener {
                 Ok(pool) => pool,
                 Err(_) => continue,
             };
-            for index in pool.pool.all_indices() {
-                let Some(address) = pool.pool.address(index).map(str::to_string) else {
+            for index in pool.backend_indices() {
+                let Some(address) = pool.backend_address(index).map(str::to_string) else {
                     continue;
                 };
                 let Some(health) = backend_health_checks.get(&address) else {
@@ -231,13 +231,13 @@ impl QUICListener {
                                     HealthClassification::Success => {
                                         task_metrics.inc_health_check_success();
                                         job.consecutive_failures = 0;
-                                        pool.pool.mark_success(job.index)
+                                        pool.mark_backend_healthy(job.index)
                                     }
                                     HealthClassification::Failure => {
                                         task_metrics.inc_health_check_failure();
                                         job.consecutive_failures =
                                             job.consecutive_failures.saturating_add(1);
-                                        pool.pool.mark_failure(job.index)
+                                        pool.mark_backend_failure_from_active_check(job.index)
                                     }
                                     HealthClassification::Neutral => {
                                         job.consecutive_failures = 0;
