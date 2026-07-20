@@ -936,7 +936,7 @@ mod tests {
         let mut pools = HashMap::new();
         pools.insert("api".to_string(), Arc::clone(&pool));
 
-        let transition = coordinator.apply_request_feedback(
+        let transition = apply_backend_request_feedback(
             Some(&pool),
             Some(0),
             &BackendRequestFeedback::failure(
@@ -948,7 +948,7 @@ mod tests {
         );
         assert!(transition.is_none());
 
-        let transition = coordinator.apply_request_feedback(
+        let transition = apply_backend_request_feedback(
             Some(&pool),
             Some(0),
             &BackendRequestFeedback::failure(
@@ -960,7 +960,7 @@ mod tests {
         );
         assert!(transition.is_none());
 
-        let transition = coordinator.apply_request_feedback(
+        let transition = apply_backend_request_feedback(
             Some(&pool),
             Some(0),
             &BackendRequestFeedback::failure(
@@ -997,7 +997,7 @@ mod tests {
         let mut pools = HashMap::new();
         pools.insert("api".to_string(), Arc::clone(&pool));
 
-        let transition = coordinator.apply_request_feedback(
+        let transition = apply_backend_request_feedback(
             Some(&pool),
             Some(0),
             &BackendRequestFeedback::failure(
