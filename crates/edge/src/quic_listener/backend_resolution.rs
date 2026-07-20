@@ -4,8 +4,8 @@ use log::{debug, error};
 
 use super::*;
 use crate::runtime::backend::lifecycle::{
-    BackendDnsLookupResult, BackendDnsRefreshApplication, BackendLifecycleCoordinator,
-    RuntimeBackendLifecycleState, log_backend_dns_refresh, observe_backend_dns_refresh,
+    BackendDnsRefreshApplication, BackendLifecycleCoordinator, RuntimeBackendLifecycleState,
+    log_backend_dns_refresh, observe_backend_dns_refresh,
 };
 
 impl QUICListener {
@@ -78,24 +78,19 @@ async fn refresh_backend_hostname(
     backend_lifecycle: &BackendLifecycleCoordinator,
     backend_dns_resolver: &SharedDnsResolver,
 ) -> BackendDnsRefreshApplication {
-    let lookup_result = match tokio::net::lookup_host((
+    let resolved_addrs = match tokio::net::lookup_host((
         backend.resolution.authority_host.as_str(),
         0,
     ))
     .await
     {
-        Ok(addrs) => {
-            let resolved = addrs
+        Ok(addrs) => Ok(
+            addrs
                 .map(|addr| SocketAddr::new(addr.ip(), backend.resolution.authority_port))
-                .collect::<Vec<_>>();
-            if resolved.is_empty() {
-                BackendDnsLookupResult::EmptyAnswer
-            } else {
-                BackendDnsLookupResult::Resolved(resolved)
-            }
-        }
-        Err(err) => BackendDnsLookupResult::LookupFailed(err.to_string()),
+                .collect::<Vec<_>>(),
+        ),
+        Err(err) => Err(err.to_string()),
     };
 
-    backend_lifecycle.apply_refresh(backend, lookup_result, backend_dns_resolver, transport_pool)
+    backend_lifecycle.apply_refresh(backend, resolved_addrs, backend_dns_resolver, transport_pool)
 }

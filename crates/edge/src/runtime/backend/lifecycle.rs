@@ -86,13 +86,6 @@ pub struct ActiveHealthCheckEvaluation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BackendDnsLookupResult {
-    Resolved(Vec<SocketAddr>),
-    EmptyAnswer,
-    LookupFailed(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendDnsRefreshApplication {
     Updated {
         backend_addr: String,
@@ -156,13 +149,13 @@ impl BackendLifecycleCoordinator {
     pub fn apply_refresh(
         &self,
         backend: &RuntimeBackendLifecycleState,
-        lookup_result: BackendDnsLookupResult,
+        resolved_addrs: Result<Vec<SocketAddr>, String>,
         backend_dns_resolver: &SharedDnsResolver,
         transport_pool: &UpstreamTransportPool,
     ) -> BackendDnsRefreshApplication {
         apply_backend_dns_refresh(
             backend,
-            lookup_result,
+            resolved_addrs,
             self.resolution_store.as_ref(),
             backend_dns_resolver,
             transport_pool,
@@ -282,24 +275,24 @@ pub fn apply_backend_health_observation(
 
 pub fn apply_backend_dns_refresh(
     backend: &RuntimeBackendLifecycleState,
-    lookup_result: BackendDnsLookupResult,
+    resolved_addrs: Result<Vec<SocketAddr>, String>,
     resolution_store: &RuntimeBackendResolutionStore,
     backend_dns_resolver: &SharedDnsResolver,
     transport_pool: &UpstreamTransportPool,
 ) -> BackendDnsRefreshApplication {
-    match lookup_result {
-        BackendDnsLookupResult::LookupFailed(error) => BackendDnsRefreshApplication::LookupFailed {
+    match resolved_addrs {
+        Err(error) => BackendDnsRefreshApplication::LookupFailed {
             backend_addr: backend.identity.backend_addr.clone(),
             authority_host: backend.resolution.authority_host.clone(),
             retained_addrs: backend.resolution.resolved_addrs.clone(),
             error,
         },
-        BackendDnsLookupResult::EmptyAnswer => BackendDnsRefreshApplication::EmptyAnswerRetained {
+        Ok(resolved) if resolved.is_empty() => BackendDnsRefreshApplication::EmptyAnswerRetained {
             backend_addr: backend.identity.backend_addr.clone(),
             authority_host: backend.resolution.authority_host.clone(),
             retained_addrs: backend.resolution.resolved_addrs.clone(),
         },
-        BackendDnsLookupResult::Resolved(resolved) => {
+        Ok(resolved) => {
             let refreshed_at = SystemTime::now();
             let Some(mutation) = resolution_store.apply_resolution_refresh(
                 &backend.identity.backend_addr,
