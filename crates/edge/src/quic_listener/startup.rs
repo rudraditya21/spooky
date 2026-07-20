@@ -461,7 +461,6 @@ impl QUICListener {
             h3_config,
             transport_pool: Arc::clone(&shared_services.transport_pool),
             backend_endpoints: Arc::clone(&generation_state.backend_endpoints),
-            backend_resolution_store: Arc::clone(&shared_services.backend_resolution_store),
             backend_dns_resolver: shared_services.backend_dns_resolver.clone(),
             upstream_policies: Arc::clone(&generation_state.upstream_policies),
             upstream_pools: generation_state.upstream_pools.clone(),

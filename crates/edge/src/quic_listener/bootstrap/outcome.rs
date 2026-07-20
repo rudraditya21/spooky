@@ -8,7 +8,8 @@ use crate::{
     Metrics, OverloadShedReason,
     runtime::connection::outcome::{
         AdmissionOutcomeClass, OutcomeBackendTarget, OutcomeRouteTarget, observe_admission_outcome,
-        observe_backend_response_status, observe_proxy_error_outcome, observe_status_outcome,
+        observe_backend_response_status_and_log, observe_proxy_error_outcome,
+        observe_status_outcome,
     },
 };
 
@@ -118,23 +119,16 @@ pub(in crate::quic_listener) fn observe_bootstrap_dispatch_failure(
             &prepared_route.backend_addr,
             &classified,
         );
-        if let Some(transition) =
-            crate::runtime::connection::outcome::observe_classified_backend_failure(
-                crate::runtime::connection::outcome::ClassifiedBackendFailureInput {
-                    metrics_phase: "bootstrap",
-                    backend_addr: &prepared_route.backend_addr,
-                    backend_index: prepared_route.backend_index,
-                    upstream_pool: Some(&prepared_route.upstream_pool),
-                    metrics,
-                    classified: &classified,
-                },
-            )
-        {
-            crate::runtime::connection::outcome::log_backend_health_transition(
-                &prepared_route.backend_addr,
-                transition,
-            );
-        }
+        let _ = crate::runtime::connection::outcome::observe_classified_backend_failure_and_log(
+            crate::runtime::connection::outcome::ClassifiedBackendFailureInput {
+                metrics_phase: "bootstrap",
+                backend_addr: &prepared_route.backend_addr,
+                backend_index: prepared_route.backend_index,
+                upstream_pool: Some(&prepared_route.upstream_pool),
+                metrics,
+                classified: &classified,
+            },
+        );
     } else {
         log::warn!(
             "Bootstrap upstream error route={} backend={}: {}",
@@ -158,19 +152,14 @@ pub(in crate::quic_listener) fn observe_bootstrap_response_status(
         request_start.elapsed(),
         status,
     );
-    if let Some(transition) = observe_backend_response_status(
+    let _ = observe_backend_response_status_and_log(
         crate::runtime::connection::outcome::BackendHealthObservationInput {
             backend_addr: &prepared_route.backend_addr,
             backend_index: prepared_route.backend_index,
             upstream_pool: Some(&prepared_route.upstream_pool),
             status,
         },
-    ) {
-        crate::runtime::connection::outcome::log_backend_health_transition(
-            &prepared_route.backend_addr,
-            transition,
-        );
-    }
+    );
 }
 
 pub(in crate::quic_listener) fn observe_bootstrap_response_prebuffer_overflow(

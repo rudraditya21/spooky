@@ -211,12 +211,10 @@ impl QUICListener {
                             job.consecutive_failures = evaluation.next_consecutive_failures;
                             job.next_due_at = Instant::now() + evaluation.next_delay;
 
-                            if let Some(transition) = transition {
-                                crate::runtime::connection::outcome::log_backend_health_transition(
-                                    &job.backend_identity,
-                                    transition,
-                                );
-                            }
+                            let _ = crate::runtime::connection::outcome::log_backend_health_transition_result(
+                                &job.backend_identity,
+                                transition,
+                            );
                         }
                     }
                 },

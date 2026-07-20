@@ -27,6 +27,18 @@ use crate::{
     },
 };
 
+fn emit_backend_health_transition(
+    backend_addr: &str,
+    transition: Option<HealthTransition>,
+) -> Option<HealthTransition> {
+    if let Some(transition) = transition {
+        log_backend_health_transition(backend_addr, &transition);
+        Some(transition)
+    } else {
+        None
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CanonicalRouteOutcome {
     Success,
@@ -435,6 +447,12 @@ pub(crate) fn observe_backend_response_status(
     apply_backend_health_observation(upstream_pool, Some(backend_index), &observation)
 }
 
+pub(crate) fn observe_backend_response_status_and_log(
+    input: BackendHealthObservationInput<'_>,
+) -> Option<HealthTransition> {
+    emit_backend_health_transition(input.backend_addr, observe_backend_response_status(input))
+}
+
 pub(crate) fn record_classified_backend_failure_metrics(
     metrics_phase: &str,
     backend_addr: &str,
@@ -477,7 +495,23 @@ pub(crate) fn observe_classified_backend_failure(
     apply_backend_request_feedback(upstream_pool, Some(backend_index), &feedback)
 }
 
-pub(crate) fn log_backend_health_transition(addr: &str, transition: HealthTransition) {
+pub(crate) fn observe_classified_backend_failure_and_log(
+    input: ClassifiedBackendFailureInput<'_>,
+) -> Option<HealthTransition> {
+    emit_backend_health_transition(
+        input.backend_addr,
+        observe_classified_backend_failure(input),
+    )
+}
+
+pub(crate) fn log_backend_health_transition_result(
+    backend_addr: &str,
+    transition: Option<HealthTransition>,
+) -> Option<HealthTransition> {
+    emit_backend_health_transition(backend_addr, transition)
+}
+
+pub(crate) fn log_backend_health_transition(addr: &str, transition: &HealthTransition) {
     match transition {
         HealthTransition::BecameHealthy => {
             info!("Backend {} became healthy", addr);

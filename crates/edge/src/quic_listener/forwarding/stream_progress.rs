@@ -888,7 +888,7 @@ impl QUICListener {
                         if let Some(req) = streams.get(&stream_id) {
                             if let (Some(addr), Some(idx)) = (&req.backend_addr, req.backend_index)
                             {
-                                let transition = crate::runtime::connection::outcome::observe_backend_response_status(
+                                let _ = crate::runtime::connection::outcome::observe_backend_response_status_and_log(
                                     crate::runtime::connection::outcome::BackendHealthObservationInput {
                                         backend_addr: addr,
                                         backend_index: idx,
@@ -896,9 +896,6 @@ impl QUICListener {
                                         status,
                                     },
                                 );
-                                if let Some(t) = transition {
-                                    crate::runtime::connection::outcome::log_backend_health_transition(addr, t);
-                                }
                             }
                             let _ = crate::runtime::connection::outcome::observe_status_outcome(
                                 metrics,

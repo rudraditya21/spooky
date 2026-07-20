@@ -70,7 +70,6 @@ pub(in crate::quic_listener) struct ForwardingSharedCtx<'a> {
 pub(in crate::quic_listener) struct ForwardingExecutionCtx<'a> {
     pub(in crate::quic_listener) transport_pool: Arc<UpstreamTransportPool>,
     pub(in crate::quic_listener) backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
-    pub(in crate::quic_listener) backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
     pub(in crate::quic_listener) upstream_inflight: &'a HashMap<String, Arc<Semaphore>>,
     pub(in crate::quic_listener) global_inflight: Arc<Semaphore>,
     pub(in crate::quic_listener) backend_timeout: Duration,
@@ -587,7 +586,6 @@ impl QUICListener {
         connection: &mut QuicConnection,
         transport_pool: Arc<UpstreamTransportPool>,
         backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
-        backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
         upstream_policies: Arc<HashMap<String, RuntimeUpstreamPolicy>>,
         upstream_pools: &HashMap<String, Arc<RwLock<UpstreamPool>>>,
         upstream_inflight: &HashMap<String, Arc<Semaphore>>,
@@ -633,7 +631,6 @@ impl QUICListener {
         let exec_ctx = ForwardingExecutionCtx {
             transport_pool: Arc::clone(&transport_pool),
             backend_endpoints: Arc::clone(&backend_endpoints),
-            backend_resolution_store: Arc::clone(&backend_resolution_store),
             upstream_inflight,
             global_inflight: Arc::clone(&global_inflight),
             backend_timeout,

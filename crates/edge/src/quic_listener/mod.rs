@@ -65,7 +65,6 @@ use crate::{
     resilience::runtime::RuntimeResilience,
     routing::{decision::RouteDecisionReason, index::RouteIndex},
     runtime::{
-        backend::store::RuntimeBackendResolutionStore,
         bundle::{RuntimeBundle, RuntimeBundleHandle},
         connection::{
             guardrails::{
@@ -391,7 +390,6 @@ impl QUICListener {
                 &mut connection,
                 Arc::clone(&transport_pool),
                 Arc::clone(&self.backend_endpoints),
-                Arc::clone(&self.backend_resolution_store),
                 Arc::clone(&self.upstream_policies),
                 &self.upstream_pools,
                 &self.upstream_inflight,
@@ -433,7 +431,6 @@ impl QUICListener {
         let exec_ctx = ForwardingExecutionCtx {
             transport_pool: Arc::clone(&self.transport_pool),
             backend_endpoints: Arc::clone(&self.backend_endpoints),
-            backend_resolution_store: Arc::clone(&self.backend_resolution_store),
             upstream_inflight: &self.upstream_inflight,
             global_inflight: Arc::clone(&self.global_inflight),
             backend_timeout: self.backend_timeout,
@@ -490,7 +487,6 @@ impl QUICListener {
         let exec_ctx = ForwardingExecutionCtx {
             transport_pool: Arc::clone(&self.transport_pool),
             backend_endpoints: Arc::clone(&self.backend_endpoints),
-            backend_resolution_store: Arc::clone(&self.backend_resolution_store),
             upstream_inflight: &self.upstream_inflight,
             global_inflight: Arc::clone(&self.global_inflight),
             backend_timeout: self.backend_timeout,

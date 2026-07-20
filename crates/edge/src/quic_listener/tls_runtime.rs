@@ -334,7 +334,6 @@ impl QUICListener {
         self.listener_tls_store = Arc::clone(&shared.listener_tls_store);
         self.transport_pool = Arc::clone(&shared.transport_pool);
         self.backend_endpoints = Arc::clone(&generation.backend_endpoints);
-        self.backend_resolution_store = Arc::clone(&shared.backend_resolution_store);
         self.backend_dns_resolver = shared.backend_dns_resolver.clone();
         self.upstream_policies = Arc::clone(&generation.upstream_policies);
         self.upstream_pools = generation.upstream_pools.clone();

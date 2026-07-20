@@ -127,10 +127,6 @@ impl BackendLifecycleCoordinator {
         Self { resolution_store }
     }
 
-    pub fn resolution_store(&self) -> &Arc<RuntimeBackendResolutionStore> {
-        &self.resolution_store
-    }
-
     pub fn backend(&self, backend_addr: &str) -> Option<RuntimeBackendLifecycleState> {
         self.resolution_store.backend(backend_addr)
     }
@@ -231,7 +227,7 @@ impl BackendLifecycleCoordinator {
         BackendLifecycleInventorySnapshot { backends }
     }
 
-    pub fn apply_refresh(
+    pub(crate) fn apply_refresh(
         &self,
         backend: &RuntimeBackendLifecycleState,
         resolved_addrs: Result<Vec<SocketAddr>, String>,
@@ -247,26 +243,7 @@ impl BackendLifecycleCoordinator {
         )
     }
 
-    pub fn apply_request_accounting(
-        &self,
-        upstream_pool: Option<&Arc<RwLock<UpstreamPool>>>,
-        backend_index: Option<usize>,
-        elapsed: Duration,
-        status: Option<u16>,
-    ) {
-        apply_backend_request_accounting(upstream_pool, backend_index, elapsed, status);
-    }
-
-    pub fn apply_request_feedback(
-        &self,
-        upstream_pool: Option<&Arc<RwLock<UpstreamPool>>>,
-        backend_index: Option<usize>,
-        feedback: &BackendRequestFeedback,
-    ) -> Option<HealthTransition> {
-        apply_backend_request_feedback(upstream_pool, backend_index, feedback)
-    }
-
-    pub fn apply_health_observation(
+    pub(crate) fn apply_health_observation(
         &self,
         upstream_pool: Option<&Arc<RwLock<UpstreamPool>>>,
         backend_index: Option<usize>,
@@ -276,7 +253,7 @@ impl BackendLifecycleCoordinator {
     }
 }
 
-pub fn apply_backend_request_accounting(
+pub(crate) fn apply_backend_request_accounting(
     upstream_pool: Option<&Arc<RwLock<UpstreamPool>>>,
     backend_index: Option<usize>,
     elapsed: Duration,
@@ -289,7 +266,7 @@ pub fn apply_backend_request_accounting(
     }
 }
 
-pub fn apply_backend_request_feedback(
+pub(crate) fn apply_backend_request_feedback(
     upstream_pool: Option<&Arc<RwLock<UpstreamPool>>>,
     backend_index: Option<usize>,
     feedback: &BackendRequestFeedback,
@@ -307,7 +284,7 @@ pub fn apply_backend_request_feedback(
     }
 }
 
-pub fn evaluate_active_health_check(
+pub(crate) fn evaluate_active_health_check(
     identity: BackendIdentity,
     outcome: BackendHealthObservationOutcome,
     reason: Option<spooky_lb::health::HealthFailureReason>,
@@ -328,7 +305,7 @@ pub fn evaluate_active_health_check(
     }
 }
 
-pub fn apply_backend_health_observation(
+pub(crate) fn apply_backend_health_observation(
     upstream_pool: Option<&Arc<RwLock<UpstreamPool>>>,
     backend_index: Option<usize>,
     observation: &BackendHealthObservation,
@@ -358,7 +335,7 @@ pub fn apply_backend_health_observation(
     }
 }
 
-pub fn apply_backend_dns_refresh(
+pub(crate) fn apply_backend_dns_refresh(
     backend: &RuntimeBackendLifecycleState,
     resolved_addrs: Result<Vec<SocketAddr>, String>,
     resolution_store: &RuntimeBackendResolutionStore,
@@ -465,7 +442,10 @@ pub fn apply_backend_dns_refresh(
     }
 }
 
-pub fn observe_backend_dns_refresh(metrics: &Metrics, outcome: &BackendDnsRefreshApplication) {
+pub(crate) fn observe_backend_dns_refresh(
+    metrics: &Metrics,
+    outcome: &BackendDnsRefreshApplication,
+) {
     match outcome {
         BackendDnsRefreshApplication::Updated {
             backend_addr,
@@ -504,7 +484,7 @@ pub fn observe_backend_dns_refresh(metrics: &Metrics, outcome: &BackendDnsRefres
     }
 }
 
-pub fn log_backend_dns_refresh(outcome: &BackendDnsRefreshApplication) {
+pub(crate) fn log_backend_dns_refresh(outcome: &BackendDnsRefreshApplication) {
     match outcome {
         BackendDnsRefreshApplication::Updated {
             backend_addr,

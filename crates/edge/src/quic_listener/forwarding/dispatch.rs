@@ -407,7 +407,6 @@ impl QUICListener {
         let route_name = pending_forward.upstream_name.to_string();
         let backend_timeout = exec_ctx.backend_timeout;
         let backend_endpoints = Arc::clone(&exec_ctx.backend_endpoints);
-        let _backend_resolutions = Arc::clone(&exec_ctx.backend_resolution_store);
         let transport = Arc::clone(&exec_ctx.transport_pool);
         let hedge_delay = resilience.hedging_delay;
         let alternate_backend = req.upstream_pool.as_ref().map(|upstream_pool| {

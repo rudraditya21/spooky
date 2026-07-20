@@ -20,8 +20,8 @@ use crate::{
     resilience::runtime::RuntimeResilience,
     routing::index::RouteIndex,
     runtime::{
-        backend::store::RuntimeBackendResolutionStore, bundle::RuntimeBundleHandle,
-        connection::quic::QuicConnection, tls::store::ListenerTlsReloadStore,
+        bundle::RuntimeBundleHandle, connection::quic::QuicConnection,
+        tls::store::ListenerTlsReloadStore,
     },
     watchdog::coordinator::WatchdogCoordinator,
 };
@@ -39,7 +39,6 @@ pub struct QUICListener {
     pub h3_config: Arc<quiche::h3::Config>,
     pub transport_pool: Arc<UpstreamTransportPool>,
     pub backend_endpoints: Arc<HashMap<String, BackendEndpoint>>,
-    pub backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
     pub backend_dns_resolver: SharedDnsResolver,
     pub upstream_policies: Arc<HashMap<String, RuntimeUpstreamPolicy>>,
     pub upstream_pools: HashMap<String, Arc<RwLock<UpstreamPool>>>,
