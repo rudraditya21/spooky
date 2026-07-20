@@ -64,7 +64,7 @@ impl QUICListener {
             Self::spawn_backend_dns_refresh(
                 runtime.runtime_config(),
                 Arc::clone(&shared.transport_pool),
-                Arc::clone(&shared.backend_resolution_store),
+                Arc::clone(&shared.backend_lifecycle),
                 shared.backend_dns_resolver.clone(),
                 Arc::clone(&shared.metrics),
                 Arc::clone(&task_registry),

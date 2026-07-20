@@ -19,7 +19,10 @@ use crate::{
     resilience::runtime::RuntimeResilience,
     routing::index::RouteIndex,
     runtime::{
-        backend::store::RuntimeBackendResolutionStore, tasks::RuntimeTaskRegistry,
+        backend::{
+            lifecycle::BackendLifecycleCoordinator, store::RuntimeBackendResolutionStore,
+        },
+        tasks::RuntimeTaskRegistry,
         tls::store::ListenerTlsReloadStore,
     },
     watchdog::coordinator::WatchdogCoordinator,
@@ -35,6 +38,7 @@ pub struct StartupOwnedRuntimeState {
 pub struct RuntimeSharedServices {
     pub listener_tls_store: Arc<ListenerTlsReloadStore>,
     pub transport_pool: Arc<UpstreamTransportPool>,
+    pub backend_lifecycle: Arc<BackendLifecycleCoordinator>,
     pub backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
     pub backend_dns_resolver: SharedDnsResolver,
     pub metrics: Arc<Metrics>,

@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     sync::{Arc, RwLock},
     time::{Duration, SystemTime},
@@ -120,6 +121,81 @@ pub enum BackendDnsRefreshApplication {
         retained_addrs: Vec<SocketAddr>,
         error: String,
     },
+}
+
+#[derive(Debug, Clone)]
+pub struct BackendLifecycleCoordinator {
+    resolution_store: Arc<RuntimeBackendResolutionStore>,
+}
+
+impl BackendLifecycleCoordinator {
+    pub fn new(resolution_store: Arc<RuntimeBackendResolutionStore>) -> Self {
+        Self { resolution_store }
+    }
+
+    pub fn resolution_store(&self) -> &Arc<RuntimeBackendResolutionStore> {
+        &self.resolution_store
+    }
+
+    pub fn backend(&self, backend_addr: &str) -> Option<RuntimeBackendLifecycleState> {
+        self.resolution_store.backend(backend_addr)
+    }
+
+    pub fn hostname_backends(&self) -> Vec<RuntimeBackendLifecycleState> {
+        self.resolution_store.hostname_backends()
+    }
+
+    pub fn snapshot_backend(&self, backend_addr: &str) -> Option<BackendLifecycleSnapshot> {
+        self.backend(backend_addr).map(|backend| backend.snapshot())
+    }
+
+    pub fn snapshot_all(&self) -> HashMap<String, BackendLifecycleSnapshot> {
+        self.resolution_store.snapshot()
+    }
+
+    pub fn apply_refresh(
+        &self,
+        backend: &RuntimeBackendLifecycleState,
+        lookup_result: BackendDnsLookupResult,
+        backend_dns_resolver: &SharedDnsResolver,
+        transport_pool: &UpstreamTransportPool,
+    ) -> BackendDnsRefreshApplication {
+        apply_backend_dns_refresh(
+            backend,
+            lookup_result,
+            self.resolution_store.as_ref(),
+            backend_dns_resolver,
+            transport_pool,
+        )
+    }
+
+    pub fn apply_request_accounting(
+        &self,
+        upstream_pool: Option<&Arc<RwLock<UpstreamPool>>>,
+        backend_index: Option<usize>,
+        elapsed: Duration,
+        status: Option<u16>,
+    ) {
+        apply_backend_request_accounting(upstream_pool, backend_index, elapsed, status);
+    }
+
+    pub fn apply_request_feedback(
+        &self,
+        upstream_pool: Option<&Arc<RwLock<UpstreamPool>>>,
+        backend_index: Option<usize>,
+        feedback: &BackendRequestFeedback,
+    ) -> Option<HealthTransition> {
+        apply_backend_request_feedback(upstream_pool, backend_index, feedback)
+    }
+
+    pub fn apply_health_observation(
+        &self,
+        upstream_pool: Option<&Arc<RwLock<UpstreamPool>>>,
+        backend_index: Option<usize>,
+        observation: &BackendHealthObservation,
+    ) -> Option<HealthTransition> {
+        apply_backend_health_observation(upstream_pool, backend_index, observation)
+    }
 }
 
 pub fn apply_backend_request_accounting(
@@ -500,6 +576,27 @@ mod tests {
         assert_eq!(state.membership, BackendMembershipState::Active);
         assert_eq!(state.health, BackendHealthState::Unknown);
         assert!(state.resolution.is_hostname());
+    }
+
+    #[test]
+    fn lifecycle_coordinator_exposes_backend_snapshots() {
+        let store = Arc::new(RuntimeBackendResolutionStore::new([
+            RuntimeBackendResolution::hostname(
+                "https://backend.internal:8443".to_string(),
+                "backend.internal".to_string(),
+                8443,
+            ),
+        ]));
+        let coordinator = BackendLifecycleCoordinator::new(Arc::clone(&store));
+
+        let snapshot = coordinator
+            .snapshot_backend("https://backend.internal:8443")
+            .expect("backend snapshot");
+        assert_eq!(snapshot.identity.backend_addr, "https://backend.internal:8443");
+
+        let all = coordinator.snapshot_all();
+        assert_eq!(all.len(), 1);
+        assert!(all.contains_key("https://backend.internal:8443"));
     }
 
     #[test]

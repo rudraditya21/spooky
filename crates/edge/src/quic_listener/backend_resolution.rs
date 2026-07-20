@@ -4,15 +4,15 @@ use log::{debug, error};
 
 use super::*;
 use crate::runtime::backend::lifecycle::{
-    BackendDnsLookupResult, BackendDnsRefreshApplication, RuntimeBackendLifecycleState,
-    apply_backend_dns_refresh, log_backend_dns_refresh, observe_backend_dns_refresh,
+    BackendDnsLookupResult, BackendDnsRefreshApplication, BackendLifecycleCoordinator,
+    RuntimeBackendLifecycleState, log_backend_dns_refresh, observe_backend_dns_refresh,
 };
 
 impl QUICListener {
     pub(super) fn spawn_backend_dns_refresh(
         config: &RuntimeConfig,
         transport_pool: Arc<UpstreamTransportPool>,
-        backend_resolution_store: Arc<RuntimeBackendResolutionStore>,
+        backend_lifecycle: Arc<BackendLifecycleCoordinator>,
         backend_dns_resolver: SharedDnsResolver,
         metrics: Arc<Metrics>,
         task_registry: Arc<RuntimeTaskRegistry>,
@@ -21,7 +21,7 @@ impl QUICListener {
             return;
         }
 
-        if backend_resolution_store.hostname_backends().is_empty() {
+        if backend_lifecycle.hostname_backends().is_empty() {
             debug!("backend DNS refresh disabled: no hostname-based backends configured");
             return;
         }
@@ -54,11 +54,11 @@ impl QUICListener {
 
                 loop {
                     ticker.tick().await;
-                    for backend in backend_resolution_store.hostname_backends() {
+                    for backend in backend_lifecycle.hostname_backends() {
                         let outcome = refresh_backend_hostname(
                             &backend,
                             &transport_pool,
-                            &backend_resolution_store,
+                            &backend_lifecycle,
                             &backend_dns_resolver,
                         )
                         .await;
@@ -75,7 +75,7 @@ impl QUICListener {
 async fn refresh_backend_hostname(
     backend: &RuntimeBackendLifecycleState,
     transport_pool: &UpstreamTransportPool,
-    backend_resolution_store: &RuntimeBackendResolutionStore,
+    backend_lifecycle: &BackendLifecycleCoordinator,
     backend_dns_resolver: &SharedDnsResolver,
 ) -> BackendDnsRefreshApplication {
     let lookup_result = match tokio::net::lookup_host((
@@ -97,11 +97,5 @@ async fn refresh_backend_hostname(
         Err(err) => BackendDnsLookupResult::LookupFailed(err.to_string()),
     };
 
-    apply_backend_dns_refresh(
-        backend,
-        lookup_result,
-        backend_resolution_store,
-        backend_dns_resolver,
-        transport_pool,
-    )
+    backend_lifecycle.apply_refresh(backend, lookup_result, backend_dns_resolver, transport_pool)
 }
