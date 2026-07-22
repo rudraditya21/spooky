@@ -1,10 +1,21 @@
 use std::time::Duration;
 
-use super::{config_invalid, require_nonzero_u64, unsupported_policy};
+use super::config_invalid;
 use crate::{
     config::Resilience,
     runtime::RuntimeConfigError,
 };
+
+fn require_nonzero_u64(name: &str, value: u64) -> Result<(), RuntimeConfigError> {
+    if value == 0 {
+        return Err(config_invalid(format!("{name} must be greater than 0")));
+    }
+    Ok(())
+}
+
+fn unsupported_policy(message: impl Into<String>) -> RuntimeConfigError {
+    RuntimeConfigError::UnsupportedPolicyCombination(message.into())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeWatchdogPolicy {

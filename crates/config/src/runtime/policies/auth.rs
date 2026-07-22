@@ -1,9 +1,29 @@
 use std::time::Duration;
 
-use super::{
-    config_invalid, normalize_nonempty_string_vec, normalize_optional_string,
-};
+use super::{config_invalid, normalize_optional_string};
 use crate::runtime::RuntimeConfigError;
+
+fn normalize_string_vec(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn normalize_nonempty_string_vec(
+    field_name: &str,
+    values: &[String],
+) -> Result<Vec<String>, RuntimeConfigError> {
+    let normalized = normalize_string_vec(values);
+    if normalized.len() != values.len() {
+        return Err(config_invalid(format!(
+            "{field_name} must not contain empty values"
+        )));
+    }
+    Ok(normalized)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RuntimeApiKeyAuth {

@@ -1,13 +1,31 @@
 use std::time::Duration;
 
-use super::{
-    config_invalid, require_nonzero_u32, require_nonzero_u64, require_nonzero_usize,
-    RuntimeBackendDnsPolicy,
-};
+use super::{config_invalid, RuntimeBackendDnsPolicy};
 use crate::{
     config::Performance,
     runtime::RuntimeConfigError,
 };
+
+fn require_nonzero_u64(name: &str, value: u64) -> Result<(), RuntimeConfigError> {
+    if value == 0 {
+        return Err(config_invalid(format!("{name} must be greater than 0")));
+    }
+    Ok(())
+}
+
+fn require_nonzero_usize(name: &str, value: usize) -> Result<(), RuntimeConfigError> {
+    if value == 0 {
+        return Err(config_invalid(format!("{name} must be greater than 0")));
+    }
+    Ok(())
+}
+
+fn require_nonzero_u32(name: &str, value: u32) -> Result<(), RuntimeConfigError> {
+    if value == 0 {
+        return Err(config_invalid(format!("{name} must be greater than 0")));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeTransportPolicy {

@@ -37,89 +37,11 @@ fn config_invalid(message: impl Into<String>) -> RuntimeConfigError {
     RuntimeConfigError::ConfigInvalid(message.into())
 }
 
-fn unsupported_policy(message: impl Into<String>) -> RuntimeConfigError {
-    RuntimeConfigError::UnsupportedPolicyCombination(message.into())
-}
-
-fn require_nonzero_u64(name: &str, value: u64) -> Result<(), RuntimeConfigError> {
-    if value == 0 {
-        return Err(config_invalid(format!("{name} must be greater than 0")));
-    }
-    Ok(())
-}
-
-fn require_nonzero_usize(name: &str, value: usize) -> Result<(), RuntimeConfigError> {
-    if value == 0 {
-        return Err(config_invalid(format!("{name} must be greater than 0")));
-    }
-    Ok(())
-}
-
-fn require_nonzero_u32(name: &str, value: u32) -> Result<(), RuntimeConfigError> {
-    if value == 0 {
-        return Err(config_invalid(format!("{name} must be greater than 0")));
-    }
-    Ok(())
-}
-
 fn normalize_optional_string(value: Option<&str>) -> Option<String> {
     value
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
-}
-
-fn normalize_string_vec(values: &[String]) -> Vec<String> {
-    values
-        .iter()
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
-fn normalize_nonempty_string_vec(
-    field_name: &str,
-    values: &[String],
-) -> Result<Vec<String>, RuntimeConfigError> {
-    let normalized = normalize_string_vec(values);
-    if normalized.len() != values.len() {
-        return Err(config_invalid(format!(
-            "{field_name} must not contain empty values"
-        )));
-    }
-    Ok(normalized)
-}
-
-fn is_valid_http_token(value: &str) -> bool {
-    !value.is_empty()
-        && value
-            .bytes()
-            .all(|byte| matches!(byte, b'!' | b'#'..=b'\'' | b'*' | b'+' | b'-' | b'.' | b'0'..=b'9' | b'A'..=b'Z' | b'^' | b'_' | b'`' | b'a'..=b'z' | b'|' | b'~'))
-}
-
-fn is_valid_connect_authority(authority: &str) -> bool {
-    let Some((host, port)) = authority.rsplit_once(':') else {
-        return false;
-    };
-    !host.trim().is_empty() && port.parse::<u16>().ok().is_some_and(|parsed| parsed > 0)
-}
-
-fn is_valid_request_key_spec(key_spec: &str) -> bool {
-    let key_spec = key_spec.trim().to_ascii_lowercase();
-    matches!(
-        key_spec.as_str(),
-        "path"
-            | "authority"
-            | "method"
-            | "cid"
-            | "sticky-cid"
-            | "peer_ip"
-            | "client_ip"
-            | "bearer_token"
-    ) || key_spec.split_once(':').is_some_and(|(source, key_name)| {
-        !key_name.trim().is_empty() && matches!(source.trim(), "header" | "cookie" | "query")
-    })
 }
 
 fn normalize_route_host(raw: &str) -> String {
