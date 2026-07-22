@@ -5,8 +5,7 @@ use spooky_config::runtime::RuntimeConfig;
 use spooky_errors::ProxyError;
 
 use super::{
-    QUICListener,
-    runtime_handle,
+    QUICListener, runtime_handle,
     runtime_state::{ControlPlaneBootstrap, WatchdogServiceCtx},
     spawn_supervised_async_task,
 };
@@ -61,7 +60,10 @@ impl QUICListener {
 
     pub(super) fn spawn_generation_background_tasks(bootstrap: &ControlPlaneBootstrap<'_>) {
         bootstrap.with_runtime_view(|runtime| {
-            Self::configure_expected_workers(runtime.watchdog().as_ref(), runtime.expected_workers());
+            Self::configure_expected_workers(
+                runtime.watchdog().as_ref(),
+                runtime.expected_workers(),
+            );
             let task_registry = runtime.generation_tasks();
             Self::spawn_backend_dns_refresh(
                 runtime.runtime_config(),
@@ -113,7 +115,12 @@ impl QUICListener {
         let spawn_state = WatchdogSpawnState {
             service: WatchdogServiceState {
                 config: WatchdogRuntimeConfig::from(
-                    &service_ctx.runtime.runtime_config().policies.admission.watchdog,
+                    &service_ctx
+                        .runtime
+                        .runtime_config()
+                        .policies
+                        .admission
+                        .watchdog,
                 ),
                 metrics: service_ctx.runtime.metrics(),
                 resilience: service_ctx.runtime.resilience(),

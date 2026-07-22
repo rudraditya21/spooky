@@ -98,11 +98,12 @@ fn control_api_state_with_runtime_bundle(
 ) -> ControlApiState {
     let startup_bundle = runtime_bundle_from_config("startup.yaml", startup);
     let reloaded_bundle = runtime_bundle_from_config("reloaded.yaml", reloaded);
-    let runtime_ctx = crate::quic_listener::runtime_state::ControlPlaneRuntimeCtx::from_runtime_sources(
-        &startup_bundle.runtime_config,
-        startup_bundle.shared_state.as_ref(),
-        Some(Arc::new(RuntimeBundleHandle::new(reloaded_bundle))),
-    );
+    let runtime_ctx =
+        crate::quic_listener::runtime_state::ControlPlaneRuntimeCtx::from_runtime_sources(
+            &startup_bundle.runtime_config,
+            startup_bundle.shared_state.as_ref(),
+            Some(Arc::new(RuntimeBundleHandle::new(reloaded_bundle))),
+        );
 
     ControlApiState::new(runtime_ctx)
 }
@@ -111,11 +112,12 @@ fn runtime_bundle_control_api_state(
     bundle: RuntimeBundle,
 ) -> (ControlApiState, Arc<RuntimeBundleHandle>) {
     let runtime_handle = Arc::new(RuntimeBundleHandle::new(bundle.clone()));
-    let runtime_ctx = crate::quic_listener::runtime_state::ControlPlaneRuntimeCtx::from_runtime_sources(
-        &bundle.runtime_config,
-        bundle.shared_state.as_ref(),
-        Some(Arc::clone(&runtime_handle)),
-    );
+    let runtime_ctx =
+        crate::quic_listener::runtime_state::ControlPlaneRuntimeCtx::from_runtime_sources(
+            &bundle.runtime_config,
+            bundle.shared_state.as_ref(),
+            Some(Arc::clone(&runtime_handle)),
+        );
     let state = ControlApiState::new(runtime_ctx);
     (state, runtime_handle)
 }

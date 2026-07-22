@@ -28,7 +28,9 @@ pub(super) type ControlApiState = ControlApiServiceCtx;
 
 impl ControlApiServiceCtx {
     #[cfg(test)]
-    pub(super) fn current_generation(&self) -> Option<crate::runtime::bundle::ActiveRuntimeGeneration> {
+    pub(super) fn current_generation(
+        &self,
+    ) -> Option<crate::runtime::bundle::ActiveRuntimeGeneration> {
         self.current_service_state().generation
     }
 

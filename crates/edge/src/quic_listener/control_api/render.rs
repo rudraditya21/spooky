@@ -315,7 +315,9 @@ impl ControlApiBackendInventoryPayload {
                     last_refresh_success_at_unix_seconds: backend
                         .resolution
                         .last_refresh_success_at
-                        .and_then(|time| time.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+                        .and_then(|time| {
+                            time.duration_since(std::time::SystemTime::UNIX_EPOCH).ok()
+                        })
                         .map(|duration| duration.as_secs()),
                     placements: backend
                         .placements

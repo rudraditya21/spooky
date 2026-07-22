@@ -53,7 +53,9 @@ impl QUICListener {
             Method::POST if path == paths.reload_certs_path.as_str() => {
                 Some(ControlApiRoute::ReloadCerts)
             }
-            Method::POST if path == paths.reload_path.as_str() => Some(ControlApiRoute::ReloadRuntime),
+            Method::POST if path == paths.reload_path.as_str() => {
+                Some(ControlApiRoute::ReloadRuntime)
+            }
             Method::POST if path == paths.restart_path.as_str() => Some(ControlApiRoute::Restart),
             _ => None,
         }
@@ -82,7 +84,10 @@ impl QUICListener {
             }),
             ControlApiRoute::Health | ControlApiRoute::Ready => unreachable!(),
         };
-        Err(Box::new(Self::json_response(StatusCode::UNAUTHORIZED, response)))
+        Err(Box::new(Self::json_response(
+            StatusCode::UNAUTHORIZED,
+            response,
+        )))
     }
 
     pub(super) fn gate_control_api_request(

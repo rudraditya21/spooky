@@ -8,10 +8,10 @@ use tokio_rustls::TlsAcceptor;
 use super::*;
 
 mod auth;
-mod http;
 mod context;
-mod render;
+mod http;
 mod reload;
+mod render;
 mod service;
 mod state;
 

@@ -21,7 +21,9 @@ impl QUICListener {
             .runtime
             .runtime_config()
             .primary_listener_runtime_config()
-            .ok_or_else(|| ProxyError::Transport("no effective listeners configured".to_string()))?;
+            .ok_or_else(|| {
+                ProxyError::Transport("no effective listeners configured".to_string())
+            })?;
         let primary_listener_label = Self::listener_label(&listener_config);
         if startup_state.endpoint.enabled
             && startup_state
@@ -160,7 +162,9 @@ impl QUICListener {
                         &active_connections,
                         max_connections,
                     ) {
-                        runtime_state.metrics().inc_control_api_connection_limit_drop();
+                        runtime_state
+                            .metrics()
+                            .inc_control_api_connection_limit_drop();
                         warn!(
                             "Control API endpoint dropped connection from {} due to max connection limit ({})",
                             peer, max_connections
@@ -169,13 +173,8 @@ impl QUICListener {
                     }
 
                     tokio::spawn(async move {
-                        Self::serve_control_api_connection(
-                            state,
-                            active_connections,
-                            stream,
-                            peer,
-                        )
-                        .await;
+                        Self::serve_control_api_connection(state, active_connections, stream, peer)
+                            .await;
                     });
                 }
             },
@@ -220,7 +219,8 @@ impl QUICListener {
             error!("Control API endpoint missing live primary listener label for TLS selection");
             return;
         };
-        let Some(server_config) = listener_tls_store.bootstrap_server_config(&primary_listener_label)
+        let Some(server_config) =
+            listener_tls_store.bootstrap_server_config(&primary_listener_label)
         else {
             error!(
                 "Control API endpoint missing live TLS config for listener {}",
@@ -232,7 +232,10 @@ impl QUICListener {
         let tls_stream = match acceptor.accept(stream).await {
             Ok(stream) => stream,
             Err(err) => {
-                error!("Control API endpoint TLS handshake failed from {}: {}", peer, err);
+                error!(
+                    "Control API endpoint TLS handshake failed from {}: {}",
+                    peer, err
+                );
                 return;
             }
         };

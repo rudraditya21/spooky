@@ -6,8 +6,8 @@ use std::{
 };
 
 use spooky_config::runtime::{ListenerRuntimeConfig, RuntimeConfig};
-use spooky_lb::upstream_pool::UpstreamPool;
 use spooky_errors::ProxyError;
+use spooky_lb::upstream_pool::UpstreamPool;
 use spooky_transport::{SharedDnsResolver, UpstreamTransportPool};
 
 use crate::{
@@ -36,8 +36,7 @@ pub(super) struct ControlPlaneRuntimeView {
     upstream_pools: HashMap<String, Arc<RwLock<UpstreamPool>>>,
     listener_runtime_configs: Arc<HashMap<String, ListenerRuntimeConfig>>,
     backend_endpoints: Arc<HashMap<String, spooky_config::backend_endpoint::BackendEndpoint>>,
-    backend_health_checks:
-        Arc<HashMap<String, spooky_config::runtime::RuntimeBackendHealthCheck>>,
+    backend_health_checks: Arc<HashMap<String, spooky_config::runtime::RuntimeBackendHealthCheck>>,
     generation_tasks: Arc<RuntimeTaskRegistry>,
     listener_tls_store: Arc<ListenerTlsReloadStore>,
     primary_listener_label: Option<String>,
@@ -183,7 +182,10 @@ impl ControlPlaneRuntimeCtx {
         runtime_bundle: Option<Arc<RuntimeBundleHandle>>,
     ) -> Self {
         Self {
-            startup_view: ControlPlaneRuntimeView::from_runtime_sources(runtime_config, shared_state),
+            startup_view: ControlPlaneRuntimeView::from_runtime_sources(
+                runtime_config,
+                shared_state,
+            ),
             runtime_bundle,
         }
     }
@@ -196,7 +198,9 @@ impl ControlPlaneRuntimeCtx {
     }
 
     pub(super) fn current_generation(&self) -> Option<ActiveRuntimeGeneration> {
-        self.runtime_bundle.as_ref().map(|handle| handle.current_view())
+        self.runtime_bundle
+            .as_ref()
+            .map(|handle| handle.current_view())
     }
 
     pub(super) fn runtime_bundle_handle(&self) -> Option<&Arc<RuntimeBundleHandle>> {

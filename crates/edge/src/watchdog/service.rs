@@ -36,9 +36,8 @@ pub(crate) async fn run_watchdog_service(state: WatchdogServiceState) {
         watchdog_config.restart_cooldown_ms,
     );
 
-    let mut interval = tokio::time::interval(Duration::from_millis(
-        watchdog_config.check_interval_ms,
-    ));
+    let mut interval =
+        tokio::time::interval(Duration::from_millis(watchdog_config.check_interval_ms));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let restart_program = watchdog_config
         .restart_command

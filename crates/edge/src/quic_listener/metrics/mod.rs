@@ -3,8 +3,8 @@ use std::{
     time::Duration,
 };
 
-use bytes::Bytes;
 use ::http::{Response, StatusCode};
+use bytes::Bytes;
 use http_body_util::Full;
 use hyper::{Request, body::Incoming, server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
@@ -21,6 +21,6 @@ use super::{
 };
 use crate::Metrics;
 
+mod http;
 mod service;
 mod state;
-mod http;

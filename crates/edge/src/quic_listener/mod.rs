@@ -53,6 +53,8 @@ use tokio::{
 use tokio_rustls::TlsAcceptor;
 use tracing::{Instrument, info_span};
 
+#[cfg(test)]
+use crate::runtime::bundle::RuntimeBundleHandle;
 use crate::{
     ChannelBody, Metrics, OverloadShedReason, REQUEST_ID_COUNTER, RouteOutcome,
     cid_radix::CidRadix,
@@ -90,8 +92,6 @@ use crate::{
     },
     watchdog::coordinator::WatchdogCoordinator,
 };
-#[cfg(test)]
-use crate::runtime::bundle::RuntimeBundleHandle;
 
 mod admission;
 mod async_runtime;
