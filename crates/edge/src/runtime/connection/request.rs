@@ -20,11 +20,25 @@ use crate::{
         auth::{ExternalAuthFailureDisposition, ExternalAuthResult, PendingHeaderMutation},
         response::{ResponseChunk, UpstreamResult},
         stream::{
-            LegacyRequestLifecycle, RequestBodyRuntime, RequestExecutionState,
-            StreamAdmissionState, StreamPhase, TunnelMode,
+            LegacyRequestLifecycle, RequestBodyRuntime, RequestBodyState, RequestContext,
+            RequestExecutionState, RequestMode, RoutingSnapshot, StreamAdmissionState, StreamPhase,
+            TunnelMode,
         },
     },
 };
+
+pub(crate) enum IntakeExecutionSeed {
+    AwaitingAuth {
+        pending_forward: Arc<PendingForward>,
+        auth_result_rx: oneshot::Receiver<ExternalAuthResult>,
+        auth_abort: AbortHandle,
+        auth_disposition: ExternalAuthFailureDisposition,
+        auth_deadline: Instant,
+    },
+    ReadyForForwarding {
+        pending_forward: Arc<PendingForward>,
+    },
+}
 
 pub struct RequestEnvelope {
     pub request_id: u64,
@@ -63,7 +77,7 @@ impl RequestEnvelope {
         self.request_id
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, dead_code)]
     pub(crate) fn new_legacy(
         request_id: u64,
         trace_id: Option<String>,
@@ -134,6 +148,106 @@ impl RequestEnvelope {
                     body_bytes_received: 0,
                     last_body_activity: start,
                     request_fin_received,
+                },
+                pending_forward,
+                auth_result_rx,
+                auth_abort,
+                auth_disposition,
+                auth_deadline,
+                backend_request_started: false,
+                backend_request_finished: false,
+                global_inflight_permit: None,
+                upstream_inflight_permit: None,
+                adaptive_admission_permit: None,
+                route_queue_permit: None,
+                upstream_result_rx: None,
+                response_chunk_rx: None,
+                response_headers_sent: false,
+                pending_chunk: None,
+            }),
+        }
+    }
+
+    pub(crate) fn from_intake_legacy(
+        context: RequestContext,
+        routing: RoutingSnapshot,
+        upstream_pool: Arc<RwLock<UpstreamPool>>,
+        request_mode: RequestMode,
+        request_body: RequestBodyState,
+        routing_transparency_enabled: bool,
+        routing_transparency_include_reason: bool,
+        retry_count: u8,
+        error_kind: Option<&'static str>,
+        execution: IntakeExecutionSeed,
+    ) -> Self {
+        let (
+            admission_state,
+            pending_forward,
+            auth_result_rx,
+            auth_abort,
+            auth_disposition,
+            auth_deadline,
+        ) = match execution {
+            IntakeExecutionSeed::AwaitingAuth {
+                pending_forward,
+                auth_result_rx,
+                auth_abort,
+                auth_disposition,
+                auth_deadline,
+            } => (
+                StreamAdmissionState::WaitingForAuth,
+                Some(pending_forward),
+                Some(auth_result_rx),
+                Some(auth_abort),
+                Some(auth_disposition),
+                Some(auth_deadline),
+            ),
+            IntakeExecutionSeed::ReadyForForwarding { pending_forward } => (
+                StreamAdmissionState::ReadyToForward,
+                Some(pending_forward),
+                None,
+                None,
+                None,
+                None,
+            ),
+        };
+
+        Self {
+            request_id: context.request_id,
+            trace_id: context.trace_id,
+            span_id: context.span_id,
+            traceparent: context.traceparent,
+            trace_span: context.trace_span,
+            method: context.method,
+            path: context.path,
+            authority: context.authority,
+            backend_addr: Some(routing.backend_addr),
+            backend_index: Some(routing.backend_index),
+            upstream_name: Some(routing.upstream_name),
+            route_reason: Some(routing.route_reason),
+            route_path_len: Some(routing.route_path_len),
+            route_host_specific: Some(routing.route_host_specific),
+            backend_lb: routing.backend_lb,
+            upstream_pool: Some(upstream_pool),
+            routing_transparency_enabled,
+            routing_transparency_include_reason,
+            response_status: None,
+            start: context.start,
+            total_request_deadline: context.total_request_deadline,
+            bodyless_mode: request_mode.bodyless_mode(),
+            tunnel_mode: request_mode.tunnel_mode(),
+            retry_count,
+            error_kind,
+            execution: RequestExecutionState::Legacy(LegacyRequestLifecycle {
+                phase: StreamPhase::ReceivingRequest,
+                admission_state,
+                request_body_runtime: RequestBodyRuntime {
+                    body_tx: None,
+                    body_buf: VecDeque::new(),
+                    body_buf_bytes: 0,
+                    body_bytes_received: 0,
+                    last_body_activity: context.start,
+                    request_fin_received: request_body.request_fin_received(),
                 },
                 pending_forward,
                 auth_result_rx,

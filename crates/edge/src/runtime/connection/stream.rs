@@ -6,6 +6,7 @@ use tokio::{
     sync::{OwnedSemaphorePermit, mpsc, oneshot},
     task::AbortHandle,
 };
+use tracing::Span;
 
 use crate::{
     resilience::{adaptive_admission::AdaptivePermit, route_queue::RouteQueuePermit},
@@ -58,12 +59,51 @@ pub enum RequestMode {
 
 #[allow(dead_code)]
 impl RequestMode {
+    pub fn from_intake(
+        tunnel_mode: TunnelMode,
+        method: &str,
+        content_length: Option<usize>,
+    ) -> Self {
+        match tunnel_mode {
+            TunnelMode::Connect => Self::ConnectTunnel,
+            TunnelMode::Websocket => Self::WebsocketTunnel,
+            TunnelMode::None
+                if content_length.unwrap_or(0) == 0
+                    && (method.eq_ignore_ascii_case("GET")
+                        || method.eq_ignore_ascii_case("HEAD")) =>
+            {
+                Self::HeadLike
+            }
+            TunnelMode::None => Self::Normal,
+        }
+    }
+
     pub fn is_tunnel(self) -> bool {
         matches!(self, Self::ConnectTunnel | Self::WebsocketTunnel)
     }
 
     pub fn suppresses_response_body(self) -> bool {
         matches!(self, Self::HeadLike)
+    }
+
+    pub fn bodyless_mode(self) -> bool {
+        matches!(self, Self::HeadLike)
+    }
+
+    pub fn tunnel_mode(self) -> TunnelMode {
+        match self {
+            Self::Normal | Self::HeadLike => TunnelMode::None,
+            Self::ConnectTunnel => TunnelMode::Connect,
+            Self::WebsocketTunnel => TunnelMode::Websocket,
+        }
+    }
+
+    pub fn initial_body_state(self) -> RequestBodyState {
+        if self.bodyless_mode() {
+            RequestBodyState::FinReceived
+        } else {
+            RequestBodyState::Open
+        }
     }
 }
 
@@ -78,6 +118,10 @@ pub enum RequestBodyState {
 
 #[allow(dead_code)]
 impl RequestBodyState {
+    pub fn request_fin_received(self) -> bool {
+        matches!(self, Self::FinReceived | Self::ClosedToUpstream)
+    }
+
     pub fn can_accept_downstream_body(self) -> bool {
         matches!(self, Self::Open | Self::Buffered)
     }
@@ -158,6 +202,7 @@ pub struct RequestContext {
     pub trace_id: Option<String>,
     pub span_id: Option<String>,
     pub traceparent: Option<String>,
+    pub trace_span: Option<Span>,
     pub method: String,
     pub path: String,
     pub authority: Option<String>,
