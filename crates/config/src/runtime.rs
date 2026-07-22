@@ -1,22 +1,16 @@
 use std::{collections::HashMap, fmt, net::IpAddr};
 
-use crate::{
-    backend_endpoint::BackendEndpoint,
-    config::{
-        Backend, ClientAuth, Config, ForwardedHeaderPolicy, Listen, LoadBalancing, Observability,
-        Performance, ProtocolPolicy, Resilience, Security, TlsCertificate, Upstream,
-        UpstreamHostPolicy, UpstreamHostPolicyMode, UpstreamTls,
-    },
+use crate::config::{
+    Backend, ClientAuth, Config, ForwardedHeaderPolicy, Listen, Observability, Performance,
+    ProtocolPolicy, Resilience, Security, TlsCertificate, Upstream, UpstreamHostPolicy,
+    UpstreamHostPolicyMode, UpstreamTls,
 };
 
-#[path = "runtime/listeners.rs"]
 mod listeners;
-#[path = "runtime/policies.rs"]
 mod policies;
-#[path = "runtime/upstreams.rs"]
 mod upstreams;
 
-pub use policies::{
+pub use self::policies::{
     RuntimeAdmissionPolicy, RuntimeAlternateBackendPolicy, RuntimeApiKeyAuth, RuntimeAuthPolicy,
     RuntimeBackendAddressKind, RuntimeBackendConnectionPolicy, RuntimeBackendDnsPolicy,
     RuntimeBackendEndpoint, RuntimeBackendHealthCheck, RuntimeBackendTlsPolicy,
@@ -285,8 +279,8 @@ mod tests {
 
     use super::{listeners::runtime_listeners, *};
     use crate::config::{
-        Config, ForwardedHeaderPolicyMode, Listen, RouteMatch, Tls, TlsCertificate, Upstream,
-        UpstreamHostPolicyMode,
+        Config, ForwardedHeaderPolicyMode, Listen, LoadBalancing, RouteMatch, Tls, TlsCertificate,
+        Upstream, UpstreamHostPolicyMode,
     };
 
     fn sample_config() -> Config {
