@@ -17,7 +17,7 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResolvedBackendTransport {
+enum ResolvedBackendTransport {
     Http1,
     H2,
 }
@@ -38,12 +38,12 @@ impl<'a> TransportExecutionTarget<'a> {
 }
 
 pub struct TransportExecutionResult {
-    pub transport: ResolvedBackendTransport,
+    transport: ResolvedBackendTransport,
     response: hyper::Response<Incoming>,
 }
 
 impl TransportExecutionResult {
-    pub fn new(
+    fn new(
         transport: ResolvedBackendTransport,
         response: hyper::Response<Incoming>,
     ) -> Self {
@@ -56,30 +56,50 @@ impl TransportExecutionResult {
     pub fn into_response(self) -> hyper::Response<Incoming> {
         self.response
     }
+
+    pub fn protocol_name(&self) -> &'static str {
+        match self.transport {
+            ResolvedBackendTransport::Http1 => "http1",
+            ResolvedBackendTransport::H2 => "h2",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransportClientRotation {
+enum TransportClientRotationState {
     MissingBackend,
-    Recreated {
-        transport: ResolvedBackendTransport,
-    },
+    Recreated,
     Rotated {
-        transport: ResolvedBackendTransport,
         previous_generation: u64,
         current_generation: u64,
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransportClientRotation {
+    transport: Option<ResolvedBackendTransport>,
+    state: TransportClientRotationState,
+}
+
 impl TransportClientRotation {
     pub fn rotated(self) -> bool {
-        !matches!(self, Self::MissingBackend)
+        !matches!(self.state, TransportClientRotationState::MissingBackend)
     }
 
-    pub fn transport(self) -> Option<ResolvedBackendTransport> {
-        match self {
-            Self::MissingBackend => None,
-            Self::Recreated { transport } | Self::Rotated { transport, .. } => Some(transport),
+    pub fn protocol_name(self) -> Option<&'static str> {
+        self.transport.map(|transport| match transport {
+            ResolvedBackendTransport::Http1 => "http1",
+            ResolvedBackendTransport::H2 => "h2",
+        })
+    }
+
+    pub fn generations(self) -> Option<(u64, u64)> {
+        match self.state {
+            TransportClientRotationState::Rotated {
+                previous_generation,
+                current_generation,
+            } => Some((previous_generation, current_generation)),
+            _ => None,
         }
     }
 }
@@ -91,7 +111,7 @@ pub struct UpstreamTransportPool {
 }
 
 impl UpstreamTransportPool {
-    pub fn new<I>(
+    pub fn new_from_runtime_backends<I>(
         backends: I,
         backend_tls: HashMap<String, TlsClientConfig>,
         max_inflight: usize,
@@ -101,9 +121,9 @@ impl UpstreamTransportPool {
         dns_resolver: SharedDnsResolver,
     ) -> Result<Self, String>
     where
-        I: IntoIterator<Item = (String, ResolvedBackendTransport)>,
+        I: IntoIterator<Item = (String, RuntimeBackendTransportKind)>,
     {
-        Self::new_with_observer(
+        Self::new_runtime_with_observer(
             backends,
             backend_tls,
             max_inflight,
@@ -116,7 +136,7 @@ impl UpstreamTransportPool {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn new_with_observer<I>(
+    fn new_runtime_with_observer<I>(
         backends: I,
         backend_tls: HashMap<String, TlsClientConfig>,
         max_inflight: usize,
@@ -127,13 +147,14 @@ impl UpstreamTransportPool {
         connect_observer: Option<ConnectObserver>,
     ) -> Result<Self, String>
     where
-        I: IntoIterator<Item = (String, ResolvedBackendTransport)>,
+        I: IntoIterator<Item = (String, RuntimeBackendTransportKind)>,
     {
         let mut backend_transports = HashMap::new();
         let mut h1_backends = Vec::new();
         let mut h2_backends = Vec::new();
 
-        for (backend, transport) in backends {
+        for (backend, runtime_transport) in backends {
+            let transport = Self::resolve_runtime_transport(runtime_transport);
             backend_transports.insert(backend.clone(), transport);
             match transport {
                 ResolvedBackendTransport::Http1 => h1_backends.push(backend),
@@ -168,6 +189,15 @@ impl UpstreamTransportPool {
         })
     }
 
+    fn resolve_runtime_transport(
+        transport: RuntimeBackendTransportKind,
+    ) -> ResolvedBackendTransport {
+        match transport {
+            RuntimeBackendTransportKind::Http1 => ResolvedBackendTransport::Http1,
+            RuntimeBackendTransportKind::H2 => ResolvedBackendTransport::H2,
+        }
+    }
+
     pub fn from_runtime_upstreams<'a, I>(
         upstreams: I,
         connection_policy: &RuntimeBackendConnectionPolicy,
@@ -183,12 +213,8 @@ impl UpstreamTransportPool {
         for upstream in upstreams {
             for backend in &upstream.backends {
                 let backend_addr = backend.backend.address.clone();
-                let transport = match backend.endpoint.transport_kind {
-                    RuntimeBackendTransportKind::Http1 => ResolvedBackendTransport::Http1,
-                    RuntimeBackendTransportKind::H2 => ResolvedBackendTransport::H2,
-                };
-                backends.push((backend_addr.clone(), transport));
-                if matches!(transport, ResolvedBackendTransport::H2) {
+                backends.push((backend_addr.clone(), backend.endpoint.transport_kind));
+                if matches!(backend.endpoint.transport_kind, RuntimeBackendTransportKind::H2) {
                     backend_tls.insert(
                         backend_addr,
                         TlsClientConfig::from(&upstream.policy_set.transport.tls),
@@ -197,7 +223,7 @@ impl UpstreamTransportPool {
             }
         }
 
-        Self::new_with_observer(
+        Self::new_runtime_with_observer(
             backends,
             backend_tls,
             connection_policy.max_inflight,
@@ -209,7 +235,7 @@ impl UpstreamTransportPool {
         )
     }
 
-    pub fn resolve_backend_transport(
+    fn resolve_backend_transport(
         &self,
         target: TransportExecutionTarget<'_>,
     ) -> Option<ResolvedBackendTransport> {
@@ -248,25 +274,37 @@ impl UpstreamTransportPool {
                 .rotate_backend_client(target.backend())
                 .map(|rotated| {
                     if rotated {
-                        TransportClientRotation::Recreated {
-                            transport: ResolvedBackendTransport::Http1,
+                        TransportClientRotation {
+                            transport: Some(ResolvedBackendTransport::Http1),
+                            state: TransportClientRotationState::Recreated,
                         }
                     } else {
-                        TransportClientRotation::MissingBackend
+                        TransportClientRotation {
+                            transport: None,
+                            state: TransportClientRotationState::MissingBackend,
+                        }
                     }
                 }),
             Some(ResolvedBackendTransport::H2) => self
                 .h2_pool
                 .rotate_backend_client(target.backend())
                 .map(|rotation| match rotation {
-                    Some(rotation) => TransportClientRotation::Rotated {
-                        transport: ResolvedBackendTransport::H2,
-                        previous_generation: rotation.previous_generation,
-                        current_generation: rotation.current_generation,
+                    Some(rotation) => TransportClientRotation {
+                        transport: Some(ResolvedBackendTransport::H2),
+                        state: TransportClientRotationState::Rotated {
+                            previous_generation: rotation.previous_generation,
+                            current_generation: rotation.current_generation,
+                        },
                     },
-                    None => TransportClientRotation::MissingBackend,
+                    None => TransportClientRotation {
+                        transport: None,
+                        state: TransportClientRotationState::MissingBackend,
+                    },
                 }),
-            None => Ok(TransportClientRotation::MissingBackend),
+            None => Ok(TransportClientRotation {
+                transport: None,
+                state: TransportClientRotationState::MissingBackend,
+            }),
         }
     }
 }

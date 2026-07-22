@@ -550,11 +550,11 @@ mod tests {
 
     use spooky_config::{
         config::{Backend, Config, HealthCheck, Listen, LoadBalancing, RouteMatch, Tls, Upstream},
-        runtime::RuntimeConfig,
+        runtime::{RuntimeBackendTransportKind, RuntimeConfig},
     };
     use spooky_transport::{
         h2_client::SharedDnsResolver,
-        transport_pool::{ResolvedBackendTransport, UpstreamTransportPool},
+        transport_pool::UpstreamTransportPool,
     };
 
     use super::*;
@@ -628,8 +628,8 @@ mod tests {
     }
 
     fn test_transport_pool(backend_addr: &str) -> UpstreamTransportPool {
-        UpstreamTransportPool::new(
-            [(backend_addr.to_string(), ResolvedBackendTransport::Http1)],
+        UpstreamTransportPool::new_from_runtime_backends(
+            [(backend_addr.to_string(), RuntimeBackendTransportKind::Http1)],
             HashMap::new(),
             32,
             8,
