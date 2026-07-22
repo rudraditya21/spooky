@@ -11,7 +11,7 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response, body::Incoming, service::service_fn};
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use spooky_config::runtime::RuntimeBackendTransportKind;
+use spooky_config::runtime::{RuntimeBackendConnectionPolicy, RuntimeBackendTransportKind};
 use spooky_errors::{PoolError, ProxyError};
 use spooky_transport::{SharedDnsResolver, UpstreamTransportPool};
 use tokio::net::TcpListener;
@@ -51,6 +51,16 @@ impl ConcurrencyTracker {
 fn loopback_bind_restricted(err: &std::io::Error) -> bool {
     err.kind() == std::io::ErrorKind::PermissionDenied
         || matches!(err.raw_os_error(), Some(1) | Some(13))
+}
+
+fn test_connection_policy() -> RuntimeBackendConnectionPolicy {
+    RuntimeBackendConnectionPolicy {
+        max_inflight: 1,
+        max_idle_per_backend: 64,
+        pool_idle_timeout: Duration::from_secs(30),
+        connect_timeout: Duration::from_secs(2),
+        execution_timeout: Duration::from_secs(5),
+    }
 }
 
 async fn start_h2_server(tracker: Arc<ConcurrencyTracker>) -> std::io::Result<u16> {
@@ -99,11 +109,7 @@ async fn pool_limits_inflight_per_backend() {
         UpstreamTransportPool::new_from_runtime_backends(
             [(backend.clone(), RuntimeBackendTransportKind::H2)],
             HashMap::new(),
-            1,
-            64,
-            Duration::from_secs(30),
-            Duration::from_secs(2),
-            Duration::from_secs(5),
+            test_connection_policy(),
             SharedDnsResolver::new(),
         )
         .expect("pool"),
@@ -152,11 +158,7 @@ async fn pool_rejects_unknown_backend() {
             RuntimeBackendTransportKind::H2,
         )],
         HashMap::new(),
-        1,
-        64,
-        Duration::from_secs(30),
-        Duration::from_secs(2),
-        Duration::from_secs(5),
+        test_connection_policy(),
         SharedDnsResolver::new(),
     )
     .expect("pool");
@@ -188,11 +190,7 @@ async fn pool_reports_overload_when_inflight_is_exhausted() {
         UpstreamTransportPool::new_from_runtime_backends(
             [(backend.clone(), RuntimeBackendTransportKind::H2)],
             HashMap::new(),
-            1,
-            64,
-            Duration::from_secs(30),
-            Duration::from_secs(2),
-            Duration::from_secs(5),
+            test_connection_policy(),
             SharedDnsResolver::new(),
         )
         .expect("pool"),

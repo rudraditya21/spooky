@@ -626,11 +626,13 @@ mod tests {
         UpstreamTransportPool::new_from_runtime_backends(
             [(backend_addr.to_string(), RuntimeBackendTransportKind::Http1)],
             HashMap::new(),
-            32,
-            8,
-            Duration::from_secs(30),
-            Duration::from_secs(2),
-            Duration::from_secs(5),
+            spooky_config::runtime::RuntimeBackendConnectionPolicy {
+                max_inflight: 32,
+                max_idle_per_backend: 8,
+                pool_idle_timeout: Duration::from_secs(30),
+                connect_timeout: Duration::from_secs(2),
+                execution_timeout: Duration::from_secs(5),
+            },
             SharedDnsResolver::new(),
         )
         .expect("transport pool")

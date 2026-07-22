@@ -77,6 +77,16 @@ fn reserve_unused_port() -> u16 {
         .port()
 }
 
+fn test_connection_policy(max_inflight: usize) -> spooky_config::runtime::RuntimeBackendConnectionPolicy {
+    spooky_config::runtime::RuntimeBackendConnectionPolicy {
+        max_inflight,
+        max_idle_per_backend: 64,
+        pool_idle_timeout: Duration::from_secs(30),
+        connect_timeout: Duration::from_secs(2),
+        execution_timeout: Duration::from_secs(5),
+    }
+}
+
 fn build_pool(
     backends: impl IntoIterator<Item = (String, RuntimeBackendTransportKind)>,
     max_inflight: usize,
@@ -85,11 +95,7 @@ fn build_pool(
     UpstreamTransportPool::new_from_runtime_backends(
         backends,
         HashMap::new(),
-        max_inflight,
-        64,
-        Duration::from_secs(30),
-        Duration::from_secs(2),
-        Duration::from_secs(5),
+        test_connection_policy(max_inflight),
         resolver,
     )
     .expect("transport pool")

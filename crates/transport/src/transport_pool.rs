@@ -59,11 +59,7 @@ impl UpstreamTransportPool {
     pub fn new_from_runtime_backends<I>(
         backends: I,
         backend_tls: HashMap<String, TlsClientConfig>,
-        max_inflight: usize,
-        max_idle_per_backend: usize,
-        pool_idle_timeout: Duration,
-        connect_timeout: Duration,
-        execution_timeout: Duration,
+        connection_policy: RuntimeBackendConnectionPolicy,
         dns_resolver: SharedDnsResolver,
     ) -> Result<Self, String>
     where
@@ -72,11 +68,11 @@ impl UpstreamTransportPool {
         Self::new_runtime_with_observer(
             backends,
             backend_tls,
-            max_inflight,
-            max_idle_per_backend,
-            pool_idle_timeout,
-            connect_timeout,
-            execution_timeout,
+            connection_policy.max_inflight,
+            connection_policy.max_idle_per_backend,
+            connection_policy.pool_idle_timeout,
+            connection_policy.connect_timeout,
+            connection_policy.execution_timeout,
             dns_resolver,
             None,
         )
