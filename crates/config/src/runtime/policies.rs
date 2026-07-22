@@ -800,6 +800,7 @@ pub struct RuntimeBackendConnectionPolicy {
     pub max_idle_per_backend: usize,
     pub pool_idle_timeout: Duration,
     pub connect_timeout: Duration,
+    pub execution_timeout: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -988,6 +989,7 @@ impl RuntimeTransportPolicy {
                 max_idle_per_backend: performance.h2_pool_max_idle_per_backend,
                 pool_idle_timeout: Duration::from_millis(performance.h2_pool_idle_timeout_ms),
                 connect_timeout: Duration::from_millis(performance.backend_connect_timeout_ms),
+                execution_timeout: Duration::from_millis(performance.backend_timeout_ms),
             },
             backend_dns: RuntimeBackendDnsPolicy {
                 refresh_enabled: performance.backend_dns_refresh_enabled,

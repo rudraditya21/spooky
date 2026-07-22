@@ -22,50 +22,39 @@ pub(in crate::quic_listener) struct BootstrapDispatchInput<'a> {
 async fn dispatch_bootstrap_http(
     input: BootstrapDispatchInput<'_>,
 ) -> Result<Response<Incoming>, Response<BoxBody<Bytes, Infallible>>> {
-    match tokio::time::timeout(
-        input.dispatch_ctx.request.runtime.backend_timeout,
-        input
-            .dispatch_ctx
-            .request
-            .runtime
-            .transport_pool
-            .execute(
-                TransportExecutionTarget::new(&input.prepared_route.backend_addr),
-                input.upstream_req,
-            ),
-    )
+    match input
+        .dispatch_ctx
+        .request
+        .runtime
+        .transport_pool
+        .execute(
+            TransportExecutionTarget::new(&input.prepared_route.backend_addr),
+            input.upstream_req,
+        )
     .await
     {
-        Ok(Ok(result)) => Ok(result.into_response()),
-        Ok(Err(err)) => {
-            let proxy_err = ProxyError::Pool(err);
+        Ok(result) => Ok(result.into_response()),
+        Err(proxy_err) => {
+            let status = match proxy_err {
+                ProxyError::Timeout => StatusCode::GATEWAY_TIMEOUT,
+                _ => StatusCode::BAD_GATEWAY,
+            };
             observe_bootstrap_dispatch_failure(
                 input.prepared_route,
                 input.dispatch_ctx.request.runtime.metrics.as_ref(),
                 input.dispatch_ctx.request.request_start,
                 input.dispatch_ctx.request_id,
-                StatusCode::BAD_GATEWAY,
+                status,
                 &proxy_err,
             );
             Err(bootstrap_error_response(
                 &input.dispatch_ctx.request.runtime.alt_svc,
-                StatusCode::BAD_GATEWAY,
-                b"upstream error\n",
-            ))
-        }
-        Err(_) => {
-            observe_bootstrap_dispatch_failure(
-                input.prepared_route,
-                input.dispatch_ctx.request.runtime.metrics.as_ref(),
-                input.dispatch_ctx.request.request_start,
-                input.dispatch_ctx.request_id,
-                StatusCode::GATEWAY_TIMEOUT,
-                &ProxyError::Timeout,
-            );
-            Err(bootstrap_error_response(
-                &input.dispatch_ctx.request.runtime.alt_svc,
-                StatusCode::GATEWAY_TIMEOUT,
-                b"upstream timeout\n",
+                status,
+                if matches!(proxy_err, ProxyError::Timeout) {
+                    b"upstream timeout\n"
+                } else {
+                    b"upstream error\n"
+                },
             ))
         }
     }

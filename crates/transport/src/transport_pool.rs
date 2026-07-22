@@ -8,7 +8,7 @@ use hyper::{
 use spooky_config::runtime::{
     RuntimeBackendConnectionPolicy, RuntimeBackendTransportKind, RuntimeUpstream,
 };
-pub use spooky_errors::PoolError;
+pub use spooky_errors::{PoolError, ProxyError};
 
 use crate::{
     client_rotation::{BackendClientRotation, BackendClientRotationState},
@@ -99,6 +99,7 @@ pub struct UpstreamTransportPool {
     backend_entries: HashMap<String, BackendTransportEntry>,
     h1_pool: H1Pool,
     h2_pool: H2Pool,
+    execution_timeout: Duration,
 }
 
 impl UpstreamTransportPool {
@@ -109,6 +110,7 @@ impl UpstreamTransportPool {
         max_idle_per_backend: usize,
         pool_idle_timeout: Duration,
         connect_timeout: Duration,
+        execution_timeout: Duration,
         dns_resolver: SharedDnsResolver,
     ) -> Result<Self, String>
     where
@@ -121,6 +123,7 @@ impl UpstreamTransportPool {
             max_idle_per_backend,
             pool_idle_timeout,
             connect_timeout,
+            execution_timeout,
             dns_resolver,
             None,
         )
@@ -134,6 +137,7 @@ impl UpstreamTransportPool {
         max_idle_per_backend: usize,
         pool_idle_timeout: Duration,
         connect_timeout: Duration,
+        execution_timeout: Duration,
         dns_resolver: SharedDnsResolver,
         connect_observer: Option<ConnectObserver>,
     ) -> Result<Self, String>
@@ -177,6 +181,7 @@ impl UpstreamTransportPool {
             backend_entries,
             h1_pool,
             h2_pool,
+            execution_timeout,
         })
     }
 
@@ -221,6 +226,7 @@ impl UpstreamTransportPool {
             connection_policy.max_idle_per_backend,
             connection_policy.pool_idle_timeout,
             connection_policy.connect_timeout,
+            connection_policy.execution_timeout,
             dns_resolver,
             connect_observer,
         )
@@ -234,23 +240,23 @@ impl UpstreamTransportPool {
         &self,
         target: TransportExecutionTarget<'_>,
         req: Request<BoxBody<Bytes, Infallible>>,
-    ) -> Result<TransportExecutionResult, PoolError> {
+    ) -> Result<TransportExecutionResult, ProxyError> {
         match self.backend_entry(target) {
             Some(BackendTransportEntry::Http1) => self
-                .h1_pool
-                .send(target.backend(), req)
+                .execute_with_timeout(target.backend(), self.h1_pool.send(target.backend(), req))
                 .await
                 .map(|response| {
                     TransportExecutionResult::new(ResolvedBackendTransport::Http1, response)
                 }),
             Some(BackendTransportEntry::H2) => self
-                .h2_pool
-                .send(target.backend(), req)
+                .execute_with_timeout(target.backend(), self.h2_pool.send(target.backend(), req))
                 .await
                 .map(|response| {
                     TransportExecutionResult::new(ResolvedBackendTransport::H2, response)
                 }),
-            None => Err(PoolError::UnknownBackend(target.backend().to_string())),
+            None => Err(ProxyError::Pool(PoolError::UnknownBackend(
+                target.backend().to_string(),
+            ))),
         }
     }
 
@@ -289,5 +295,19 @@ impl UpstreamTransportPool {
             transport,
             rotation,
         }
+    }
+
+    async fn execute_with_timeout<F>(
+        &self,
+        _backend: &str,
+        send: F,
+    ) -> Result<hyper::Response<Incoming>, ProxyError>
+    where
+        F: std::future::Future<Output = Result<hyper::Response<Incoming>, PoolError>>,
+    {
+        tokio::time::timeout(self.execution_timeout, send)
+            .await
+            .map_err(|_| ProxyError::Timeout)?
+            .map_err(ProxyError::Pool)
     }
 }

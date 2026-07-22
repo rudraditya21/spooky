@@ -635,6 +635,7 @@ mod tests {
             8,
             Duration::from_secs(30),
             Duration::from_secs(2),
+            Duration::from_secs(5),
             SharedDnsResolver::new(),
         )
         .expect("transport pool")

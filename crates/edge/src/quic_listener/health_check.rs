@@ -33,7 +33,6 @@ impl QUICListener {
             // underneath this identity without changing health ownership.
             backend_identity: String,
             health_uri: String,
-            timeout: Duration,
             base_interval_ms: u64,
             consecutive_failures: u32,
             next_due_at: Instant,
@@ -80,7 +79,6 @@ impl QUICListener {
                     index,
                     backend_identity: address,
                     health_uri: endpoint.uri_for_path(&health.path),
-                    timeout: health.timeout,
                     base_interval_ms,
                     consecutive_failures: 0,
                     next_due_at,
@@ -134,17 +132,15 @@ impl QUICListener {
                                 Err(_) => continue,
                             };
 
-                            let result = tokio::time::timeout(
-                                job.timeout,
-                                transport_pool.execute(
+                            let result = transport_pool
+                                .execute(
                                     TransportExecutionTarget::new(&job.backend_identity),
                                     request,
-                                ),
-                            )
-                            .await;
+                                )
+                                .await;
 
                             let evaluation = match result {
-                                Ok(Ok(result)) => {
+                                Ok(result) => {
                                     let response = result.into_response();
                                     let outcome = match classify_active_health_check_response(
                                         response.status(),
@@ -167,32 +163,22 @@ impl QUICListener {
                                         job.consecutive_failures,
                                     )
                                 }
-                                Ok(Err(PoolError::Send(send_err))) => {
+                                Err(proxy_err) => {
+                                    let failure_reason =
+                                        if matches!(proxy_err, ProxyError::Timeout) {
+                                            HealthFailureReason::Timeout
+                                        } else {
+                                            HealthFailureReason::Transport
+                                        };
                                     Self::evaluate_failed_health_check(
                                         &job.backend_identity,
                                         task_metrics.as_ref(),
                                         job.base_interval_ms,
                                         job.consecutive_failures,
-                                        ProxyError::Pool(PoolError::Send(send_err)),
-                                        HealthFailureReason::Transport,
+                                        proxy_err,
+                                        failure_reason,
                                     )
                                 }
-                                Ok(Err(pool_err)) => Self::evaluate_failed_health_check(
-                                    &job.backend_identity,
-                                    task_metrics.as_ref(),
-                                    job.base_interval_ms,
-                                    job.consecutive_failures,
-                                    ProxyError::Pool(pool_err),
-                                    HealthFailureReason::Transport,
-                                ),
-                                Err(_) => Self::evaluate_failed_health_check(
-                                    &job.backend_identity,
-                                    task_metrics.as_ref(),
-                                    job.base_interval_ms,
-                                    job.consecutive_failures,
-                                    ProxyError::Timeout,
-                                    HealthFailureReason::Timeout,
-                                ),
                             };
 
                             let transition = backend_lifecycle.apply_health_observation(

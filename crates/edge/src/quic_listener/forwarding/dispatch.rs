@@ -53,7 +53,6 @@ struct RetryExecutionCtx<'a> {
     pending_forward: &'a PendingForward,
     circuit_breakers: Arc<crate::resilience::circuit_breaker::CircuitBreakers>,
     transport: Arc<UpstreamTransportPool>,
-    backend_timeout: Duration,
 }
 
 #[derive(Clone, Copy)]
@@ -160,24 +159,20 @@ impl QUICListener {
         request: UpstreamRequest,
         circuit_breakers: Arc<crate::resilience::circuit_breaker::CircuitBreakers>,
         transport: Arc<UpstreamTransportPool>,
-        backend_timeout: Duration,
     ) -> Result<Response<Incoming>, ProxyError> {
         if !circuit_breakers.allow_request(&backend) {
             return Err(ProxyError::Pool(PoolError::CircuitOpen(backend)));
         }
 
-        let send_result = tokio::time::timeout(
-            backend_timeout,
-            transport.execute(TransportExecutionTarget::new(&backend), request),
-        )
-        .await
-        .map(|result| result.map(|execution| execution.into_response()))
-        .map_err(|_| ProxyError::Timeout);
+        let send_result = transport
+            .execute(TransportExecutionTarget::new(&backend), request)
+            .await
+            .map(|execution| execution.into_response());
         match &send_result {
-            Ok(Ok(_)) => circuit_breakers.record_success(&backend),
+            Ok(_) => circuit_breakers.record_success(&backend),
             _ => circuit_breakers.record_failure(&backend),
         }
-        Ok(send_result??)
+        send_result
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -347,7 +342,6 @@ impl QUICListener {
             pending_forward,
             circuit_breakers,
             transport,
-            backend_timeout,
         } = retry_ctx;
         let retry_decision = policy.retry_after_error(
             &primary_err,
@@ -390,7 +384,6 @@ impl QUICListener {
             retry_request,
             circuit_breakers,
             transport,
-            backend_timeout,
         )
         .await
     }
@@ -483,7 +476,6 @@ impl QUICListener {
                                 request,
                                 Arc::clone(&cb),
                                 Arc::clone(&transport),
-                                backend_timeout,
                             );
                             tokio::pin!(primary_fut);
                             let hedge_sleep = tokio::time::sleep(hedge_delay);
@@ -509,7 +501,6 @@ impl QUICListener {
                                             hedge_request,
                                             Arc::clone(&cb),
                                             Arc::clone(&transport),
-                                            backend_timeout,
                                         );
                                         tokio::pin!(hedge_fut);
                                         tokio::select! {
@@ -573,7 +564,6 @@ impl QUICListener {
                                     request,
                                     Arc::clone(&cb),
                                     Arc::clone(&transport),
-                                    backend_timeout,
                                 )
                                 .await?
                             }
@@ -588,7 +578,6 @@ impl QUICListener {
                                 request,
                                 Arc::clone(&cb),
                                 Arc::clone(&transport),
-                                backend_timeout,
                             )
                             .await
                             {
@@ -606,7 +595,6 @@ impl QUICListener {
                                             pending_forward: pending_forward_for_upstream.as_ref(),
                                             circuit_breakers: Arc::clone(&cb),
                                             transport: Arc::clone(&transport),
-                                            backend_timeout,
                                         },
                                     )
                                     .await?,
@@ -622,7 +610,6 @@ impl QUICListener {
                                 request,
                                 Arc::clone(&cb),
                                 Arc::clone(&transport),
-                                backend_timeout,
                             )
                             .await
                             {
@@ -640,7 +627,6 @@ impl QUICListener {
                                             pending_forward: pending_forward_for_upstream.as_ref(),
                                             circuit_breakers: Arc::clone(&cb),
                                             transport: Arc::clone(&transport),
-                                            backend_timeout,
                                         },
                                     )
                                     .await?,
