@@ -1,11 +1,9 @@
 use std::{collections::HashMap, fmt, net::IpAddr};
 
-use crate::{
-    config::{
-        Backend, ClientAuth, Config, ForwardedHeaderPolicy, Listen, Observability, Performance,
-        ProtocolPolicy, Resilience, Security, TlsCertificate, Upstream,
-        UpstreamHostPolicy, UpstreamHostPolicyMode, UpstreamTls,
-    },
+use crate::config::{
+    Backend, ClientAuth, Config, ForwardedHeaderPolicy, Listen, Observability, Performance,
+    ProtocolPolicy, Resilience, Security, TlsCertificate, Upstream, UpstreamHostPolicy,
+    UpstreamHostPolicyMode, UpstreamTls,
 };
 
 mod listeners;
@@ -277,6 +275,7 @@ pub struct RuntimeUpstreamPolicy {
 // integration-test crate.
 #[cfg(test)]
 mod tests {
+    use crate::config::LoadBalancing;
     use std::time::Duration;
 
     use super::{listeners::runtime_listeners, *};
