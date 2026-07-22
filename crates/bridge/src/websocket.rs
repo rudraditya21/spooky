@@ -1,3 +1,9 @@
+//! Canonical websocket and upgrade detection helpers for bridge callers.
+//!
+//! This module owns request-shape inspection for websocket tunneling semantics.
+//! Transport execution and tunnel I/O stay outside this crate; callers should
+//! use these helpers only to decide whether websocket-specific bridging rules apply.
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum H3WebsocketRequestKind {
     None,
