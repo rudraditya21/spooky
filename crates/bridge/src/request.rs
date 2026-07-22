@@ -1,3 +1,9 @@
+//! Canonical upstream request-building surface.
+//!
+//! This module owns request-shaping inputs, host/forwarded-header policy
+//! application, and the stable entrypoints callers should use. Protocol-specific
+//! H1/H2 encoding details are delegated to internal builder modules.
+
 use std::{convert::Infallible, net::SocketAddr};
 
 use bytes::Bytes;
@@ -12,8 +18,23 @@ use crate::{
     BridgeError,
     forwarded::{ForwardedHeaderChains, ForwardedHeaderValues, build_forwarded_header_values},
     headers::{connection_header_tokens, should_strip_request_header},
+    h3_to_h1, h3_to_h2,
     host::resolve_upstream_host_value,
 };
+
+pub fn build_h1_request(
+    target: RequestBuildTarget<'_>,
+    input: RequestBuildInput<'_, BoxBody<Bytes, Infallible>>,
+) -> Result<http::Request<BoxBody<Bytes, Infallible>>, BridgeError> {
+    h3_to_h1::build_h1_request(target, input)
+}
+
+pub fn build_h2_request_for_target(
+    target: RequestBuildTarget<'_>,
+    input: RequestBuildInput<'_, BoxBody<Bytes, Infallible>>,
+) -> Result<http::Request<BoxBody<Bytes, Infallible>>, BridgeError> {
+    h3_to_h2::build_h2_request_for_target(target, input)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RequestBodyMode {

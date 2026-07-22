@@ -18,7 +18,7 @@ use crate::{
 /// For plain requests: strips hop-by-hop headers and adds `TE: trailers`.
 /// For WebSocket legacy upgrades (`GET` + `Upgrade: websocket`): preserves
 /// `Connection` and `Upgrade` so the H1 upstream can complete the handshake.
-pub fn build_h1_request(
+pub(crate) fn build_h1_request(
     target: RequestBuildTarget<'_>,
     input: RequestBuildInput<'_, BoxBody<Bytes, Infallible>>,
 ) -> Result<Request<BoxBody<Bytes, Infallible>>, BridgeError> {

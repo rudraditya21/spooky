@@ -112,13 +112,13 @@ impl PendingForward {
     ) -> Result<Request<BoxBody<Bytes, Infallible>>, ProxyError> {
         let headers = self.request_headers();
         if endpoint.scheme() == BackendScheme::Http {
-            spooky_bridge::h3_to_h1::build_h1_request(
+            spooky_bridge::request::build_h1_request(
                 self.request_build_target(endpoint),
                 self.request_build_input(&self.method, &headers, body, content_length),
             )
             .map_err(ProxyError::from)
         } else {
-            spooky_bridge::h3_to_h2::build_h2_request_for_target(
+            spooky_bridge::request::build_h2_request_for_target(
                 self.request_build_target(endpoint),
                 self.request_build_input(&self.method, &headers, body, content_length),
             )
@@ -151,7 +151,7 @@ impl PendingForward {
             request_headers.push(quiche::h3::Header::new(b"connection", b"upgrade"));
         }
 
-        spooky_bridge::h3_to_h1::build_h1_request(
+        spooky_bridge::request::build_h1_request(
             self.request_build_target(endpoint),
             self.request_build_input(
                 "GET",

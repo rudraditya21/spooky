@@ -5,7 +5,7 @@ use http::{
     header::{CONTENT_LENGTH, HOST, TE},
 };
 use quiche::h3::Header;
-use spooky_bridge::h3_to_h1::build_h1_request;
+use spooky_bridge::request::build_h1_request;
 use spooky_config::{
     backend_endpoint::BackendEndpoint,
     config::{ForwardedHeaderPolicy, UpstreamHostPolicy},
