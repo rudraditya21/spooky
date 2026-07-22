@@ -12,6 +12,7 @@ use super::*;
 mod auth;
 mod http;
 mod context;
+mod render;
 mod reload;
 mod service;
 mod state;

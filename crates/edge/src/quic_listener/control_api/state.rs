@@ -74,18 +74,10 @@ impl ControlApiServiceCtx {
         self.current_runtime_view().watchdog()
     }
 
-    pub(super) fn current_resilience(&self) -> Arc<RuntimeResilience> {
-        self.current_runtime_view().resilience()
-    }
-
     pub(super) fn current_primary_listener_label(&self) -> Option<String> {
         self.current_runtime_view()
             .primary_listener_label()
             .map(ToOwned::to_owned)
-    }
-
-    pub(super) fn current_expected_workers(&self) -> usize {
-        self.current_runtime_view().expected_workers()
     }
 
     pub(super) fn snapshot_backend_inventory(&self) -> BackendLifecycleInventorySnapshot {
