@@ -4,7 +4,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use http::{Response, StatusCode};
+use ::http::{Response, StatusCode};
 use http_body_util::Full;
 use hyper::{Request, body::Incoming, server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
@@ -23,3 +23,4 @@ use crate::Metrics;
 
 mod service;
 mod state;
+mod http;
