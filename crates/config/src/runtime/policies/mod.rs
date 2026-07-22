@@ -7,8 +7,6 @@ mod timeouts;
 mod transport;
 mod watchdog;
 
-use std::time::Duration;
-
 use super::*;
 pub use self::admission::{
     RuntimeAdmissionPolicy, RuntimeBrownoutPolicy, RuntimeCircuitBreakerPolicy,
@@ -19,10 +17,13 @@ pub use self::auth::{
     RuntimeApiKeyAuth, RuntimeAuthPolicy, RuntimeExternalAuth, RuntimeExternalAuthFailureMode,
     RuntimeExternalAuthRequestHeader, RuntimeJwtAuth,
 };
+pub use self::backend::{
+    RuntimeBackendAddressKind, RuntimeBackendDnsPolicy, RuntimeBackendEndpoint,
+    RuntimeBackendHealthCheck, RuntimeBackendTlsPolicy,
+};
 pub use self::timeouts::RuntimeTimeoutPolicy;
 pub use self::transport::{
-    RuntimeBackendConnectionPolicy, RuntimeBackendDnsPolicy, RuntimeConnectionLimits,
-    RuntimeTransportPolicy,
+    RuntimeBackendConnectionPolicy, RuntimeConnectionLimits, RuntimeTransportPolicy,
 };
 
 fn config_invalid(message: impl Into<String>) -> RuntimeConfigError {
@@ -315,154 +316,6 @@ pub struct RuntimeAlternateBackendPolicy {
 pub enum RuntimeBackendTransportKind {
     Http1,
     H2,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RuntimeBackendAddressKind {
-    Hostname,
-    IpLiteral,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeBackendEndpoint {
-    pub configured_address: String,
-    pub canonical: BackendEndpoint,
-    pub origin: String,
-    pub authority_host: String,
-    pub authority_port: u16,
-    pub address_kind: RuntimeBackendAddressKind,
-    pub transport_kind: RuntimeBackendTransportKind,
-}
-
-impl RuntimeBackendEndpoint {
-    pub(crate) fn normalize(
-        upstream_name: &str,
-        backend_id: &str,
-        address: &str,
-    ) -> Result<Self, RuntimeConfigError> {
-        let canonical = BackendEndpoint::parse(address).map_err(|reason| {
-            RuntimeConfigError::BackendAddressInvalid {
-                upstream: upstream_name.to_string(),
-                backend: backend_id.to_string(),
-                address: address.to_string(),
-                reason,
-            }
-        })?;
-        let authority_host = canonical.authority_host().to_string();
-        let authority_port = canonical.authority_port();
-        let address_kind = if canonical.authority_is_ip_literal() {
-            RuntimeBackendAddressKind::IpLiteral
-        } else {
-            RuntimeBackendAddressKind::Hostname
-        };
-        let transport_kind = match canonical.scheme() {
-            crate::backend_endpoint::BackendScheme::Http => RuntimeBackendTransportKind::Http1,
-            crate::backend_endpoint::BackendScheme::Https => RuntimeBackendTransportKind::H2,
-        };
-        let origin = canonical.origin();
-
-        Ok(Self {
-            configured_address: address.to_string(),
-            canonical,
-            origin,
-            authority_host,
-            authority_port,
-            address_kind,
-            transport_kind,
-        })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeBackendHealthCheck {
-    pub path: String,
-    pub interval: Duration,
-    pub timeout: Duration,
-    pub failure_threshold: u32,
-    pub success_threshold: u32,
-    pub cooldown: Duration,
-}
-
-impl RuntimeBackendHealthCheck {
-    pub(crate) fn normalize(
-        upstream_name: &str,
-        backend_id: &str,
-        health_check: &crate::config::HealthCheck,
-    ) -> Result<Self, RuntimeConfigError> {
-        if health_check.interval == 0 {
-            return Err(config_invalid(format!(
-                "health check interval is invalid (0) for backend '{backend_id}' in upstream '{upstream_name}'"
-            )));
-        }
-        if health_check.timeout_ms == 0 {
-            return Err(config_invalid(format!(
-                "health check timeout is invalid (0) for backend '{backend_id}' in upstream '{upstream_name}'"
-            )));
-        }
-        if health_check.failure_threshold == 0 {
-            return Err(config_invalid(format!(
-                "health check failure threshold is invalid (0) for backend '{backend_id}' in upstream '{upstream_name}'"
-            )));
-        }
-        if health_check.success_threshold == 0 {
-            return Err(config_invalid(format!(
-                "health check success threshold is invalid (0) for backend '{backend_id}' in upstream '{upstream_name}'"
-            )));
-        }
-
-        Ok(Self {
-            path: if health_check.path.trim().is_empty() {
-                "/".to_string()
-            } else {
-                health_check.path.clone()
-            },
-            interval: Duration::from_millis(health_check.interval),
-            timeout: Duration::from_millis(health_check.timeout_ms),
-            failure_threshold: health_check.failure_threshold,
-            success_threshold: health_check.success_threshold,
-            cooldown: Duration::from_millis(health_check.cooldown_ms),
-        })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn as_config(&self) -> crate::config::HealthCheck {
-        crate::config::HealthCheck {
-            path: self.path.clone(),
-            interval: self.interval.as_millis().try_into().unwrap_or(u64::MAX),
-            timeout_ms: self.timeout.as_millis().try_into().unwrap_or(u64::MAX),
-            failure_threshold: self.failure_threshold,
-            success_threshold: self.success_threshold,
-            cooldown_ms: self.cooldown.as_millis().try_into().unwrap_or(u64::MAX),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeBackendTlsPolicy {
-    pub verify_certificates: bool,
-    pub strict_sni: bool,
-    pub ca_file: Option<String>,
-    pub ca_dir: Option<String>,
-}
-
-impl RuntimeBackendTlsPolicy {
-    pub fn from_effective_tls(effective_tls: &UpstreamTls) -> Self {
-        Self {
-            verify_certificates: effective_tls.verify_certificates,
-            strict_sni: effective_tls.strict_sni,
-            ca_file: effective_tls.ca_file.clone(),
-            ca_dir: effective_tls.ca_dir.clone(),
-        }
-    }
-
-    pub fn as_upstream_tls(&self) -> UpstreamTls {
-        UpstreamTls {
-            verify_certificates: self.verify_certificates,
-            strict_sni: self.strict_sni,
-            ca_file: self.ca_file.clone(),
-            ca_dir: self.ca_dir.clone(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

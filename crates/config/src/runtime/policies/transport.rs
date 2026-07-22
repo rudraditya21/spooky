@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use super::{
     config_invalid, require_nonzero_u32, require_nonzero_u64, require_nonzero_usize,
+    RuntimeBackendDnsPolicy,
 };
 use crate::{
     config::Performance,
@@ -56,12 +57,6 @@ pub struct RuntimeBackendConnectionPolicy {
     pub pool_idle_timeout: Duration,
     pub connect_timeout: Duration,
     pub execution_timeout: Duration,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeBackendDnsPolicy {
-    pub refresh_enabled: bool,
-    pub refresh_interval: Duration,
 }
 
 impl RuntimeTransportPolicy {
@@ -246,12 +241,7 @@ impl RuntimeTransportPolicy {
                 connect_timeout: Duration::from_millis(performance.backend_connect_timeout_ms),
                 execution_timeout: Duration::from_millis(performance.backend_timeout_ms),
             },
-            backend_dns: RuntimeBackendDnsPolicy {
-                refresh_enabled: performance.backend_dns_refresh_enabled,
-                refresh_interval: Duration::from_millis(
-                    performance.backend_dns_refresh_interval_ms,
-                ),
-            },
+            backend_dns: RuntimeBackendDnsPolicy::from_performance(performance),
         })
     }
 }

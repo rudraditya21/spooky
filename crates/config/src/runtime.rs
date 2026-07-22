@@ -1,7 +1,6 @@
 use std::{collections::HashMap, fmt, net::IpAddr};
 
 use crate::{
-    backend_endpoint::BackendEndpoint,
     config::{
         Backend, ClientAuth, Config, ForwardedHeaderPolicy, Listen, LoadBalancing, Observability,
         Performance, ProtocolPolicy, Resilience, Security, TlsCertificate, Upstream,
