@@ -18,6 +18,7 @@ pub(in crate::quic_listener) use self::resolve::BootstrapResolutionInput;
 pub(in crate::quic_listener) use self::resolve::RouteResolutionRequest as TestRouteResolutionRequest;
 use super::*;
 use crate::runtime::connection::{
+    auth::ExternalAuthFailureDisposition,
     outcome::{
         BackendRequestFinishInput, OutcomeBackendTarget, OutcomeRouteTarget,
         finish_backend_request_accounting, observe_admission_outcome, observe_proxy_error_outcome,
@@ -27,35 +28,32 @@ use crate::runtime::connection::{
 };
 
 pub(super) fn abort_stream(req: &mut RequestEnvelope, metrics: &Metrics) -> StreamPhase {
-    let phase = req.phase.clone();
-    if req.backend_request_started && !req.backend_request_finished {
+    let phase = req.phase();
+    if req.backend_request_started() && !req.backend_request_finished() {
         finish_backend_request_accounting(BackendRequestFinishInput {
             upstream_pool: req.upstream_pool.as_ref(),
             backend_index: req.backend_index,
             elapsed: req.start.elapsed(),
             status: req.response_status.or(Some(503)),
         });
-        req.backend_request_finished = true;
+        req.set_backend_request_state(true, true);
     }
-    if req.body_buf_bytes > 0 {
-        metrics.release_request_buffer(req.body_buf_bytes);
-        req.body_buf_bytes = 0;
+    if req.body_buf_bytes() > 0 {
+        metrics.release_request_buffer(req.body_buf_bytes());
+        req.set_body_buf_bytes(0);
     }
-    req.body_buf.clear();
-    req.body_tx = None;
-    req.auth_result_rx = None;
-    if let Some(abort) = req.auth_abort.take() {
+    req.body_buf_mut().clear();
+    req.clear_body_tx();
+    req.clear_auth_result_rx();
+    if let Some(abort) = req.take_auth_abort() {
         abort.abort();
     }
-    req.upstream_result_rx = None;
-    req.response_chunk_rx = None;
-    req.pending_chunk = None;
-    req.pending_forward = None;
-    req.auth_deadline = None;
-    req.global_inflight_permit = None;
-    req.upstream_inflight_permit = None;
-    req.adaptive_admission_permit = None;
-    req.route_queue_permit = None;
+    req.clear_upstream_result_rx();
+    req.clear_response_chunk_rx();
+    req.set_pending_chunk(None);
+    req.clear_pending_forward();
+    req.set_auth_deadline(None);
+    req.clear_dispatch_permits();
     phase
 }
 
@@ -240,7 +238,7 @@ impl QUICListener {
     ) -> Result<bool, quiche::h3::Error> {
         let metrics = shared_ctx.metrics.as_ref();
         let resilience = shared_ctx.resilience;
-        let Some(pending_forward) = req.pending_forward.as_ref().cloned() else {
+        let Some(pending_forward) = req.pending_forward().cloned() else {
             let _ = observe_proxy_error_outcome(
                 metrics,
                 OutcomeRouteTarget::UNROUTED,
@@ -525,26 +523,19 @@ impl QUICListener {
             }
         };
 
-        req.backend_request_started = true;
-        req.backend_request_finished = false;
-        req.body_tx = body_tx;
-        req.upstream_result_rx = Some(result_rx);
-        req.global_inflight_permit = Some(global_permit);
-        req.upstream_inflight_permit = Some(upstream_permit);
-        req.adaptive_admission_permit = Some(adaptive_permit);
-        req.route_queue_permit = Some(route_queue_permit);
-        req.admission_state = StreamAdmissionState::ReadyToForward;
-        req.phase = if req.request_fin_received {
-            StreamPhase::AwaitingUpstream
-        } else {
-            StreamPhase::ReceivingRequest
-        };
+        req.transition_to_dispatching(
+            body_tx,
+            result_rx,
+            global_permit,
+            upstream_permit,
+            adaptive_permit,
+            route_queue_permit,
+        );
         Self::flush_request_buffer(req, metrics);
-        if req.request_fin_received && req.body_buf.is_empty() {
-            req.body_tx = None;
-            req.phase = StreamPhase::AwaitingUpstream;
+        if req.request_fin_received() && req.body_buf().is_empty() {
+            req.clear_body_tx();
+            req.set_phase_legacy(StreamPhase::AwaitingUpstream);
         }
-        req.auth_abort = None;
         Ok(true)
     }
 
@@ -797,7 +788,7 @@ impl QUICListener {
                                 bodyless_mode,
                                 request_fin_received,
                                 pending_forward,
-                                auth_fail_open,
+                                auth_fail_open: _,
                             },
                         auth_start,
                         auth_requested,
@@ -807,27 +798,23 @@ impl QUICListener {
                         auth_result_rx,
                         auth_abort,
                         auth_deadline,
-                        auth_fail_open,
+                        auth_disposition,
                         admission_state,
                     ) = match auth_start {
                         Some(start) => (
                             Some(start.rx),
                             Some(start.abort),
                             Some(start.deadline),
-                            start.fail_open,
+                            Some(ExternalAuthFailureDisposition::from_fail_open(
+                                start.fail_open,
+                            )),
                             StreamAdmissionState::WaitingForAuth,
                         ),
-                        None => (
-                            None,
-                            None,
-                            None,
-                            auth_fail_open,
-                            StreamAdmissionState::ReadyToForward,
-                        ),
+                        None => (None, None, None, None, StreamAdmissionState::ReadyToForward),
                     };
                     connection.streams.insert(
                         stream_id,
-                        RequestEnvelope {
+                        RequestEnvelope::new_legacy(
                             request_id,
                             trace_id,
                             span_id,
@@ -836,47 +823,31 @@ impl QUICListener {
                             method,
                             path,
                             authority,
-                            body_tx: None,
-                            body_buf: std::collections::VecDeque::new(),
-                            body_buf_bytes: 0,
-                            body_bytes_received: 0,
-                            last_body_activity: request_start,
-                            backend_addr: Some(backend_addr),
-                            backend_index: Some(backend_index),
-                            upstream_name: Some(upstream_name),
-                            route_reason: Some(route_reason),
-                            route_path_len: Some(route_path_len),
-                            route_host_specific: Some(route_host_specific),
-                            backend_lb: Some(backend_lb),
-                            upstream_pool: Some(upstream_pool),
+                            Some(backend_addr),
+                            Some(backend_index),
+                            Some(upstream_name),
+                            Some(route_reason),
+                            Some(route_path_len),
+                            Some(route_host_specific),
+                            Some(backend_lb),
+                            Some(upstream_pool),
                             routing_transparency_enabled,
                             routing_transparency_include_reason,
-                            response_status: None,
-                            backend_request_started: false,
-                            backend_request_finished: false,
-                            global_inflight_permit: None,
-                            upstream_inflight_permit: None,
-                            adaptive_admission_permit: None,
-                            route_queue_permit: None,
-                            start: request_start,
-                            total_request_deadline: request_start + backend_total_request_timeout,
+                            request_start,
+                            request_start + backend_total_request_timeout,
                             bodyless_mode,
                             tunnel_mode,
-                            retry_count: 0,
-                            error_kind: None,
-                            pending_forward: Some(pending_forward),
-                            auth_result_rx,
-                            auth_abort,
-                            auth_fail_open,
-                            auth_deadline,
-                            phase: StreamPhase::ReceivingRequest,
+                            0,
+                            None,
+                            StreamPhase::ReceivingRequest,
                             admission_state,
                             request_fin_received,
-                            upstream_result_rx: None,
-                            response_chunk_rx: None,
-                            response_headers_sent: false,
-                            pending_chunk: None,
-                        },
+                            Some(pending_forward),
+                            auth_result_rx,
+                            auth_abort,
+                            auth_disposition,
+                            auth_deadline,
+                        ),
                     );
                     if !auth_requested {
                         let keep_stream = if let Some(req) = connection.streams.get_mut(&stream_id)
@@ -915,7 +886,7 @@ impl QUICListener {
                             let mut payload_too_large = None::<(String, Duration)>;
                             if let Some(req) = connection.streams.get_mut(&stream_id) {
                                 if read > 0 {
-                                    req.last_body_activity = Instant::now();
+                                    req.set_last_body_activity(Instant::now());
                                 }
                                 if req.bodyless_mode && read > 0 {
                                     reject_body_for_bodyless = Some((
@@ -935,9 +906,10 @@ impl QUICListener {
                                         },
                                         RequestBodyGuardrailInput {
                                             elapsed: req.start.elapsed(),
-                                            idle_for: Instant::now()
-                                                .saturating_duration_since(req.last_body_activity),
-                                            bytes_received: req.body_bytes_received,
+                                            idle_for: Instant::now().saturating_duration_since(
+                                                req.last_body_activity(),
+                                            ),
+                                            bytes_received: req.body_bytes_received(),
                                             buffered_bytes: 0,
                                             next_chunk_bytes: read,
                                             declared_content_length: None,
@@ -958,7 +930,7 @@ impl QUICListener {
                                             ));
                                         }
                                         Ok(next_state) => {
-                                            req.body_bytes_received = next_state.bytes_received;
+                                            req.set_body_bytes_received(next_state.bytes_received);
 
                                             for chunk_slice in
                                                 body_buf[..read].chunks(REQUEST_CHUNK_BYTES_LIMIT)
@@ -1154,17 +1126,17 @@ impl QUICListener {
                 },
                 Ok((stream_id, quiche::h3::Event::Finished)) => {
                     if let Some(req) = connection.streams.get_mut(&stream_id) {
-                        req.request_fin_received = true;
+                        req.set_request_fin_received(true);
 
                         Self::flush_request_buffer(req, &metrics);
                         // If buffer is now empty, drop body_tx to signal end-of-body.
-                        if req.body_buf.is_empty() {
-                            req.body_tx = None;
+                        if req.body_buf().is_empty() {
+                            req.clear_body_tx();
                         }
                         // Only move to AwaitingUpstream once auth has allowed the request
                         // and an upstream task/body channel actually exists.
-                        if req.admission_state == StreamAdmissionState::ReadyToForward {
-                            req.phase = StreamPhase::AwaitingUpstream;
+                        if req.admission_state() == StreamAdmissionState::ReadyToForward {
+                            req.set_phase_legacy(StreamPhase::AwaitingUpstream);
                         }
                         // Upstream polling and response dispatch are handled entirely
                         // by advance_streams_non_blocking, called unconditionally below.

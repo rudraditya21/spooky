@@ -464,23 +464,24 @@ impl QUICListener {
         let resilience = shared_ctx.resilience;
         let routing_index = shared_ctx.routing_index;
         let upstream_pools = shared_ctx.upstream_pools;
-        let Some(rx) = &mut req.response_chunk_rx else {
-            return false;
-        };
-
         let mut terminal = false;
         loop {
-            let chunk = match req.pending_chunk.take() {
+            let chunk = match req.take_pending_chunk() {
                 Some(c) => c,
-                None => match rx.try_recv() {
-                    Ok(c) => c,
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        req.phase = StreamPhase::Failed;
-                        terminal = true;
-                        break;
+                None => {
+                    let Some(rx) = req.response_chunk_rx_mut() else {
+                        return false;
+                    };
+                    match rx.try_recv() {
+                        Ok(c) => c,
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => {
+                            req.set_phase_legacy(StreamPhase::Failed);
+                            terminal = true;
+                            break;
+                        }
                     }
-                },
+                }
             };
             match chunk {
                 ResponseChunk::Start { status, headers } => {
@@ -494,10 +495,10 @@ impl QUICListener {
                     }
                     match h3.send_response(quic, stream_id, &h3_headers, false) {
                         Ok(_) => {
-                            req.response_headers_sent = true;
+                            req.set_response_headers_sent(true);
                         }
                         Err(quiche::h3::Error::StreamBlocked) => {
-                            req.pending_chunk = Some(ResponseChunk::Start { status, headers });
+                            req.set_pending_chunk(Some(ResponseChunk::Start { status, headers }));
                             break;
                         }
                         Err(err) => {
@@ -505,7 +506,7 @@ impl QUICListener {
                                 "HTTP/3 send_response protocol error on stream {}: {:?}",
                                 stream_id, err
                             );
-                            req.phase = StreamPhase::Failed;
+                            req.set_phase_legacy(StreamPhase::Failed);
                             metrics.inc_backend_error();
                             let _ = crate::runtime::connection::outcome::observe_status_outcome(
                                 metrics,
@@ -525,7 +526,7 @@ impl QUICListener {
                 ResponseChunk::Data(data) => match h3.send_body(quic, stream_id, &data, false) {
                     Ok(_) => {}
                     Err(quiche::h3::Error::StreamBlocked) => {
-                        req.pending_chunk = Some(ResponseChunk::Data(data));
+                        req.set_pending_chunk(Some(ResponseChunk::Data(data)));
                         break;
                     }
                     Err(err) => {
@@ -533,7 +534,7 @@ impl QUICListener {
                             "HTTP/3 send_body data protocol error on stream {}: {:?}",
                             stream_id, err
                         );
-                        req.phase = StreamPhase::Failed;
+                        req.set_phase_legacy(StreamPhase::Failed);
                         metrics.inc_backend_error();
                         let _ = crate::runtime::connection::outcome::observe_status_outcome(
                             metrics,
@@ -559,7 +560,7 @@ impl QUICListener {
                     match h3.send_additional_headers(quic, stream_id, &h3_headers, false, false) {
                         Ok(_) => {}
                         Err(quiche::h3::Error::StreamBlocked) => {
-                            req.pending_chunk = Some(ResponseChunk::Trailers { headers });
+                            req.set_pending_chunk(Some(ResponseChunk::Trailers { headers }));
                             break;
                         }
                         Err(err) => {
@@ -567,7 +568,7 @@ impl QUICListener {
                                 "HTTP/3 send_additional_headers protocol error on stream {}: {:?}",
                                 stream_id, err
                             );
-                            req.phase = StreamPhase::Failed;
+                            req.set_phase_legacy(StreamPhase::Failed);
                             metrics.inc_backend_error();
                             let _ = crate::runtime::connection::outcome::observe_status_outcome(
                                 metrics,
@@ -588,12 +589,12 @@ impl QUICListener {
                 }
                 ResponseChunk::End => match h3.send_body(quic, stream_id, b"", true) {
                     Ok(_) => {
-                        req.phase = StreamPhase::Completed;
+                        req.set_phase_legacy(StreamPhase::Completed);
                         terminal = true;
                         break;
                     }
                     Err(quiche::h3::Error::StreamBlocked) => {
-                        req.pending_chunk = Some(ResponseChunk::End);
+                        req.set_pending_chunk(Some(ResponseChunk::End));
                         break;
                     }
                     Err(err) => {
@@ -601,7 +602,7 @@ impl QUICListener {
                             "HTTP/3 send_body end protocol error on stream {}: {:?}",
                             stream_id, err
                         );
-                        req.phase = StreamPhase::Failed;
+                        req.set_phase_legacy(StreamPhase::Failed);
                         metrics.inc_backend_error();
                         let _ = crate::runtime::connection::outcome::observe_status_outcome(
                             metrics,
@@ -621,7 +622,7 @@ impl QUICListener {
                 },
                 ResponseChunk::Error(err) => {
                     let classified = classify_upstream_proxy_error(&err);
-                    if !req.response_headers_sent {
+                    if !req.response_headers_sent() {
                         let (status, body): (http::StatusCode, &[u8]) =
                             match (&err, classified.as_ref()) {
                                 (ProxyError::Pool(PoolError::BackendOverloaded(_)), _) => (
@@ -639,7 +640,7 @@ impl QUICListener {
                     } else {
                         let _ = h3.send_body(quic, stream_id, b"", true);
                     }
-                    req.phase = StreamPhase::Failed;
+                    req.set_phase_legacy(StreamPhase::Failed);
                     let upstream_name = routing_index.lookup(&req.path, req.authority.as_deref());
                     let upstream_pool = upstream_name.and_then(|n| upstream_pools.get(n));
                     if let (Some(addr), Some(idx), Some(classified)) = (

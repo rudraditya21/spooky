@@ -74,8 +74,8 @@ impl QUICListener {
             RequestBodyGuardrailInput {
                 elapsed: Duration::ZERO,
                 idle_for: Duration::ZERO,
-                bytes_received: req.body_bytes_received,
-                buffered_bytes: req.body_buf_bytes,
+                bytes_received: req.body_bytes_received(),
+                buffered_bytes: req.body_buf_bytes(),
                 next_chunk_bytes: chunk_len,
                 declared_content_length: None,
                 exempt_from_body_size_cap: false,
@@ -95,8 +95,8 @@ impl QUICListener {
                 Ok(_) => unreachable!("handled Ok state before request buffer error mapping"),
             });
         };
-        req.body_buf_bytes = next_state.buffered_bytes;
-        req.body_buf.push_back(chunk);
+        req.set_body_buf_bytes(next_state.buffered_bytes);
+        req.body_buf_mut().push_back(chunk);
         Ok(())
     }
 
@@ -107,7 +107,7 @@ impl QUICListener {
         max_request_body_bytes: usize,
         request_buffer_global_cap_bytes: usize,
     ) -> Result<(), RequestBufferError> {
-        if let Some(tx) = &req.body_tx {
+        if let Some(tx) = req.body_tx().cloned() {
             match tx.try_send(chunk) {
                 Ok(()) => Ok(()),
                 Err(TrySendError::Full(chunk)) => Self::push_request_chunk(
@@ -118,12 +118,12 @@ impl QUICListener {
                     request_buffer_global_cap_bytes,
                 ),
                 Err(TrySendError::Closed(_chunk)) => {
-                    if req.body_buf_bytes > 0 {
-                        metrics.release_request_buffer(req.body_buf_bytes);
+                    if req.body_buf_bytes() > 0 {
+                        metrics.release_request_buffer(req.body_buf_bytes());
                     }
-                    req.body_tx = None;
-                    req.body_buf.clear();
-                    req.body_buf_bytes = 0;
+                    req.clear_body_tx();
+                    req.body_buf_mut().clear();
+                    req.set_body_buf_bytes(0);
                     Ok(())
                 }
             }
@@ -142,31 +142,31 @@ impl QUICListener {
         req: &mut RequestEnvelope,
         metrics: &Metrics,
     ) {
-        let Some(tx) = req.body_tx.as_ref() else {
+        let Some(tx) = req.body_tx().cloned() else {
             return;
         };
 
         loop {
-            let Some(chunk) = req.body_buf.pop_front() else {
+            let Some(chunk) = req.body_buf_mut().pop_front() else {
                 break;
             };
             let len = chunk.len();
             match tx.try_send(chunk) {
                 Ok(()) => {
-                    req.body_buf_bytes = req.body_buf_bytes.saturating_sub(len);
+                    req.set_body_buf_bytes(req.body_buf_bytes().saturating_sub(len));
                     metrics.release_request_buffer(len);
                 }
                 Err(TrySendError::Full(chunk)) => {
-                    req.body_buf.push_front(chunk);
+                    req.body_buf_mut().push_front(chunk);
                     break;
                 }
                 Err(TrySendError::Closed(_chunk)) => {
-                    if req.body_buf_bytes > 0 {
-                        metrics.release_request_buffer(req.body_buf_bytes);
+                    if req.body_buf_bytes() > 0 {
+                        metrics.release_request_buffer(req.body_buf_bytes());
                     }
-                    req.body_buf.clear();
-                    req.body_buf_bytes = 0;
-                    req.body_tx = None;
+                    req.body_buf_mut().clear();
+                    req.set_body_buf_bytes(0);
+                    req.clear_body_tx();
                     break;
                 }
             }
@@ -207,8 +207,8 @@ impl QUICListener {
         for stream_id in stream_ids {
             let now = Instant::now();
             if let Some(req) = streams.get(&stream_id)
-                && req.phase == StreamPhase::ReceivingRequest
-                && !req.request_fin_received
+                && req.phase() == StreamPhase::ReceivingRequest
+                && !req.request_fin_received()
                 && !req.bodyless_mode
             {
                 let timeout_decision = evaluate_request_body_timeouts(
@@ -223,9 +223,9 @@ impl QUICListener {
                     },
                     RequestBodyGuardrailInput {
                         elapsed: req.start.elapsed(),
-                        idle_for: now.saturating_duration_since(req.last_body_activity),
-                        bytes_received: req.body_bytes_received,
-                        buffered_bytes: req.body_buf_bytes,
+                        idle_for: now.saturating_duration_since(req.last_body_activity()),
+                        bytes_received: req.body_bytes_received(),
+                        buffered_bytes: req.body_buf_bytes(),
                         next_chunk_bytes: 0,
                         declared_content_length: None,
                         exempt_from_body_size_cap: false,
@@ -329,25 +329,25 @@ impl QUICListener {
 
             if let Some(req) = streams.get_mut(&stream_id) {
                 Self::flush_request_buffer(req, metrics);
-                if req.request_fin_received && req.body_buf.is_empty() {
-                    req.body_tx = None;
+                if req.request_fin_received() && req.body_buf().is_empty() {
+                    req.clear_body_tx();
                 }
             }
 
             let auth_ready: Option<ExternalAuthResult> = if streams
                 .get(&stream_id)
-                .is_some_and(|req| req.admission_state == StreamAdmissionState::WaitingForAuth)
+                .is_some_and(|req| req.admission_state() == StreamAdmissionState::WaitingForAuth)
             {
                 if streams
                     .get(&stream_id)
-                    .and_then(|req| req.auth_deadline)
+                    .and_then(RequestEnvelope::auth_deadline)
                     .is_some_and(|deadline| Instant::now() >= deadline)
                 {
                     Some(Err(ProxyError::Timeout))
                 } else {
                     streams
                         .get_mut(&stream_id)
-                        .and_then(|req| req.auth_result_rx.as_mut())
+                        .and_then(RequestEnvelope::auth_result_rx_mut)
                         .and_then(|rx| match rx.try_recv() {
                             Ok(result) => Some(result),
                             Err(oneshot::error::TryRecvError::Empty) => None,
@@ -389,7 +389,7 @@ impl QUICListener {
             let upstream_ready: Option<UpstreamResult> = if can_poll_upstream {
                 streams
                     .get_mut(&stream_id)
-                    .and_then(|req| req.upstream_result_rx.as_mut())
+                    .and_then(RequestEnvelope::upstream_result_rx_mut)
                     .and_then(|rx| match rx.try_recv() {
                         Ok(result) => Some(result),
                         Err(oneshot::error::TryRecvError::Empty) => None,
@@ -408,7 +408,7 @@ impl QUICListener {
                 record_forwarding_policy_metrics(metrics, &forward_result.policy);
 
                 if let Some(req) = streams.get_mut(&stream_id) {
-                    req.upstream_result_rx = None;
+                    req.clear_upstream_result_rx();
                     req.retry_count = forward_result.policy.retry.count;
                     req.error_kind = match &forward_result.forward {
                         Err(ProxyError::Timeout) => Some("timeout"),
@@ -656,17 +656,21 @@ impl QUICListener {
                                 }
                             }
                             if let Some(req) = streams.get_mut(&stream_id) {
-                                req.response_chunk_rx = None;
-                                req.response_headers_sent = true;
-                                req.phase = StreamPhase::Completed;
+                                req.transition_to_streaming_response(
+                                    None,
+                                    true,
+                                    StreamPhase::Completed,
+                                );
                                 req.response_status = Some(status.as_u16());
                             }
                             immediate_terminal = true;
                         } else if let Some(chunk_rx) = prebuilt_response_chunk_rx {
                             if let Some(req) = streams.get_mut(&stream_id) {
-                                req.response_chunk_rx = Some(chunk_rx);
-                                req.response_headers_sent = true;
-                                req.phase = StreamPhase::SendingResponse;
+                                req.transition_to_streaming_response(
+                                    Some(chunk_rx),
+                                    true,
+                                    StreamPhase::SendingResponse,
+                                );
                                 req.response_status = Some(status.as_u16());
                             }
                         } else {
@@ -878,9 +882,11 @@ impl QUICListener {
                             }
 
                             if let Some(req) = streams.get_mut(&stream_id) {
-                                req.response_chunk_rx = Some(chunk_rx);
-                                req.response_headers_sent = !defer_headers_until_body_validated;
-                                req.phase = StreamPhase::SendingResponse;
+                                req.transition_to_streaming_response(
+                                    Some(chunk_rx),
+                                    !defer_headers_until_body_validated,
+                                    StreamPhase::SendingResponse,
+                                );
                                 req.response_status = Some(status.as_u16());
                             }
                         }

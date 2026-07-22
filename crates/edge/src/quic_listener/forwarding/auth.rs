@@ -452,21 +452,21 @@ impl QUICListener {
         shared_ctx: &ForwardingSharedCtx<'_>,
     ) -> Result<bool, quiche::h3::Error> {
         let metrics = shared_ctx.metrics.as_ref();
-        req.auth_result_rx = None;
-        if let Some(abort) = req.auth_abort.take() {
+        req.clear_auth_result_rx();
+        if let Some(abort) = req.take_auth_abort() {
             abort.abort();
         }
-        req.auth_deadline = None;
+        req.set_auth_deadline(None);
         let completion = evaluate_external_auth_completion(
             result,
-            ExternalAuthFailureDisposition::from_fail_open(req.auth_fail_open),
+            ExternalAuthFailureDisposition::from_fail_open(req.auth_fail_open()),
         );
         match completion {
             ExternalAuthCompletion::Allow {
                 request_header_mutations,
             } => {
                 metrics.inc_external_auth_allowed();
-                if let Some(pending_forward) = req.pending_forward.as_mut() {
+                if let Some(pending_forward) = req.pending_forward_mut() {
                     merge_auth_request_mutations(
                         &mut Arc::make_mut(pending_forward).auth_header_mutations,
                         request_header_mutations,
@@ -475,7 +475,7 @@ impl QUICListener {
                 Self::materialize_forward_after_auth(stream_id, req, h3, quic, exec_ctx, shared_ctx)
             }
             ExternalAuthCompletion::Respond(decision) => {
-                req.admission_state = StreamAdmissionState::Denied;
+                req.set_admission_state_legacy(StreamAdmissionState::Denied);
                 req.response_status = Some(decision.status().as_u16());
                 metrics.inc_policy_denied();
                 metrics.inc_external_auth_denied();
@@ -542,7 +542,7 @@ impl QUICListener {
                         );
                     }
                 }
-                req.admission_state = StreamAdmissionState::Denied;
+                req.set_admission_state_legacy(StreamAdmissionState::Denied);
                 req.response_status = Some(status.as_u16());
                 let _ = observe_admission_outcome(
                     metrics,
