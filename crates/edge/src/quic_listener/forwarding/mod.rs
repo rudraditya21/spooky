@@ -12,13 +12,12 @@ use http_body_util::Full;
 use spooky_config::config::ScopedRateLimitScope;
 use spooky_errors::ClassifiedUpstreamProxyError;
 
-use self::prepare::{PreparedRequest, StartedAuthRequest};
+use self::prepare::StartedRequestEnvelope;
 pub(in crate::quic_listener) use self::resolve::BootstrapResolutionInput;
 #[cfg(test)]
 pub(in crate::quic_listener) use self::resolve::RouteResolutionRequest as TestRouteResolutionRequest;
 use super::*;
 use crate::runtime::connection::{
-    auth::ExternalAuthFailureDisposition,
     outcome::{
         BackendRequestFinishInput, OutcomeBackendTarget, OutcomeRouteTarget,
         finish_backend_request_accounting, observe_admission_outcome, observe_proxy_error_outcome,
@@ -765,91 +764,19 @@ impl QUICListener {
                         request_start,
                         &metrics,
                         pre_auth,
+                        routing_transparency_enabled,
+                        routing_transparency_include_reason,
+                        backend_total_request_timeout,
                     )? {
                         Some(started_auth) => started_auth,
                         None => continue,
                     };
-                    let StartedAuthRequest {
-                        request:
-                            PreparedRequest {
-                                upstream_name,
-                                backend_addr,
-                                backend_index,
-                                upstream_pool,
-                                backend_lb,
-                                route_path_len,
-                                route_host_specific,
-                                route_reason,
-                                request_id,
-                                trace_id,
-                                span_id,
-                                traceparent,
-                                trace_span,
-                                bodyless_mode,
-                                request_fin_received,
-                                pending_forward,
-                                auth_fail_open: _,
-                            },
-                        auth_start,
-                        auth_requested,
+                    let StartedRequestEnvelope {
+                        envelope,
+                        should_materialize_forward,
                     } = started_auth;
-
-                    let (
-                        auth_result_rx,
-                        auth_abort,
-                        auth_deadline,
-                        auth_disposition,
-                        admission_state,
-                    ) = match auth_start {
-                        Some(start) => (
-                            Some(start.rx),
-                            Some(start.abort),
-                            Some(start.deadline),
-                            Some(ExternalAuthFailureDisposition::from_fail_open(
-                                start.fail_open,
-                            )),
-                            StreamAdmissionState::WaitingForAuth,
-                        ),
-                        None => (None, None, None, None, StreamAdmissionState::ReadyToForward),
-                    };
-                    connection.streams.insert(
-                        stream_id,
-                        RequestEnvelope::new_legacy(
-                            request_id,
-                            trace_id,
-                            span_id,
-                            traceparent,
-                            trace_span,
-                            method,
-                            path,
-                            authority,
-                            Some(backend_addr),
-                            Some(backend_index),
-                            Some(upstream_name),
-                            Some(route_reason),
-                            Some(route_path_len),
-                            Some(route_host_specific),
-                            Some(backend_lb),
-                            Some(upstream_pool),
-                            routing_transparency_enabled,
-                            routing_transparency_include_reason,
-                            request_start,
-                            request_start + backend_total_request_timeout,
-                            bodyless_mode,
-                            tunnel_mode,
-                            0,
-                            None,
-                            StreamPhase::ReceivingRequest,
-                            admission_state,
-                            request_fin_received,
-                            Some(pending_forward),
-                            auth_result_rx,
-                            auth_abort,
-                            auth_disposition,
-                            auth_deadline,
-                        ),
-                    );
-                    if !auth_requested {
+                    connection.streams.insert(stream_id, envelope);
+                    if should_materialize_forward {
                         let keep_stream = if let Some(req) = connection.streams.get_mut(&stream_id)
                         {
                             Self::materialize_forward_after_auth(

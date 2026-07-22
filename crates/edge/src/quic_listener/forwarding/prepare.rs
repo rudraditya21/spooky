@@ -2,16 +2,11 @@ use std::convert::Infallible;
 
 use http_body_util::Full;
 use spooky_config::runtime::RuntimeExternalAuth;
-use tracing::Span;
 
-use super::{
-    auth::{AuthStart, start_external_auth_task},
-    resolve::ForwardingResolvedTarget,
-    *,
-};
+use super::{auth::start_external_auth_task, resolve::ForwardingResolvedTarget, *};
 use crate::{
     quic_listener::admission::{
-        AdmissionPolicyDecision, admission_rejection_response,
+        AdmissionPolicyDecision, AdmissionRejectionResponse, admission_rejection_response,
         evaluate_forwarding_pre_admission_policy,
     },
     runtime::connection::{
@@ -23,39 +18,86 @@ use crate::{
             AdmissionOutcomeClass, OutcomeBackendTarget, OutcomeRouteTarget,
             observe_admission_outcome,
         },
-        request::PendingForward,
+        request::{IntakeExecutionSeed, PendingForward, RequestEnvelope},
+        stream::{
+            DispatchReadyState, RequestContext, RequestIntakeState, RequestMode, RoutingSnapshot,
+        },
     },
 };
 
-pub(super) struct PreparedRequest {
-    pub(super) upstream_name: String,
-    pub(super) backend_addr: String,
-    pub(super) backend_index: usize,
+pub(super) struct IntakeRequestCandidate {
+    pub(super) state: RequestIntakeState,
+}
+
+impl IntakeRequestCandidate {
+    fn request_id(&self) -> u64 {
+        self.state.context.request_id
+    }
+}
+
+pub(super) struct DispatchReadyCandidate {
+    pub(super) state: DispatchReadyState,
+    pub(super) routing: RoutingSnapshot,
     pub(super) upstream_pool: Arc<RwLock<UpstreamPool>>,
-    pub(super) backend_lb: String,
-    pub(super) route_path_len: usize,
-    pub(super) route_host_specific: bool,
-    pub(super) route_reason: String,
-    pub(super) request_id: u64,
-    pub(super) trace_id: Option<String>,
-    pub(super) span_id: Option<String>,
-    pub(super) traceparent: Option<String>,
-    pub(super) trace_span: Option<Span>,
-    pub(super) bodyless_mode: bool,
-    pub(super) request_fin_received: bool,
-    pub(super) pending_forward: Arc<PendingForward>,
-    pub(super) auth_fail_open: bool,
 }
 
-pub(super) struct PreAuthRequest {
-    pub(super) request: PreparedRequest,
-    pub(super) external_auth: Option<RuntimeExternalAuth>,
+impl DispatchReadyCandidate {
+    fn request_id(&self) -> u64 {
+        self.state.context.request_id
+    }
+
+    fn upstream_name(&self) -> &str {
+        &self.routing.upstream_name
+    }
+
+    fn backend_addr(&self) -> &str {
+        &self.routing.backend_addr
+    }
+
+    fn backend_index(&self) -> usize {
+        self.routing.backend_index
+    }
+
+    fn into_envelope(
+        self,
+        routing_transparency_enabled: bool,
+        routing_transparency_include_reason: bool,
+        execution: IntakeExecutionSeed,
+    ) -> RequestEnvelope {
+        RequestEnvelope::from_intake_legacy(
+            self.state.context,
+            self.routing,
+            self.upstream_pool,
+            self.state.request_mode,
+            self.state.request_body,
+            routing_transparency_enabled,
+            routing_transparency_include_reason,
+            0,
+            None,
+            execution,
+        )
+    }
 }
 
-pub(super) struct StartedAuthRequest {
-    pub(super) request: PreparedRequest,
-    pub(super) auth_start: Option<AuthStart>,
-    pub(super) auth_requested: bool,
+pub(super) struct ExternalAuthCandidate {
+    pub(super) request: DispatchReadyCandidate,
+    pub(super) external_auth: RuntimeExternalAuth,
+    pub(super) auth_disposition: ExternalAuthFailureDisposition,
+}
+
+pub(super) struct LocalRejectionCandidate {
+    pub(super) response: AdmissionRejectionResponse,
+}
+
+pub(super) enum PreAdmissionNextState {
+    LocallyRejected(LocalRejectionCandidate),
+    RequiresExternalAuth(ExternalAuthCandidate),
+    ReadyForPostAuthAdmission(DispatchReadyCandidate),
+}
+
+pub(super) struct StartedRequestEnvelope {
+    pub(super) envelope: RequestEnvelope,
+    pub(super) should_materialize_forward: bool,
 }
 
 impl PendingForward {
@@ -165,6 +207,88 @@ impl PendingForward {
 }
 
 impl QUICListener {
+    fn build_request_intake(
+        quic_trace_id: &str,
+        request_start: Instant,
+        method: &str,
+        path: &str,
+        authority: Option<&str>,
+        headers: &[quiche::h3::Header],
+        content_length: Option<usize>,
+        tunnel_mode: TunnelMode,
+        tracing_enabled: bool,
+    ) -> IntakeRequestCandidate {
+        let request_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let request_mode = RequestMode::from_intake(tunnel_mode, method, content_length);
+        let incoming_traceparent =
+            extract_header_value(headers, b"traceparent").and_then(parse_traceparent);
+        let trace_id = incoming_traceparent
+            .as_ref()
+            .map(|(trace_id, _)| trace_id.clone())
+            .or_else(|| tracing_enabled.then(|| generated_trace_id(quic_trace_id, request_id)));
+        let span_id = trace_id.as_ref().map(|_| generated_span_id(request_id));
+        let traceparent = trace_id
+            .as_ref()
+            .zip(span_id.as_ref())
+            .map(|(trace_id, span_id)| format!("00-{trace_id}-{span_id}-01"));
+        let trace_span = trace_id
+            .as_ref()
+            .zip(span_id.as_ref())
+            .map(|(trace_id, span_id)| {
+                info_span!(
+                    "spooky.request",
+                    request_id = request_id,
+                    trace_id = %trace_id,
+                    span_id = %span_id,
+                    method = %method,
+                    path = %path
+                )
+            });
+
+        IntakeRequestCandidate {
+            state: RequestIntakeState {
+                context: RequestContext {
+                    request_id,
+                    trace_id,
+                    span_id,
+                    traceparent,
+                    trace_span,
+                    method: method.to_string(),
+                    path: path.to_string(),
+                    authority: authority.map(str::to_string),
+                    start: request_start,
+                    total_request_deadline: request_start,
+                },
+                request_mode,
+                request_body: request_mode.initial_body_state(),
+            },
+        }
+    }
+
+    fn build_dispatch_ready_candidate(
+        intake: IntakeRequestCandidate,
+        routing: RoutingSnapshot,
+        upstream_pool: Arc<RwLock<UpstreamPool>>,
+        pending_forward: Arc<PendingForward>,
+    ) -> DispatchReadyCandidate {
+        let RequestIntakeState {
+            context,
+            request_mode,
+            request_body,
+        } = intake.state;
+        DispatchReadyCandidate {
+            state: DispatchReadyState {
+                context,
+                routing: routing.clone(),
+                request_mode,
+                request_body,
+                pending_forward,
+            },
+            routing,
+            upstream_pool,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn prepare_request_for_auth(
         stream_id: u64,
@@ -186,7 +310,18 @@ impl QUICListener {
         upstream_pools: &HashMap<String, Arc<RwLock<UpstreamPool>>>,
         metrics: &Metrics,
         resilience: &RuntimeResilience,
-    ) -> Result<Option<PreAuthRequest>, quiche::h3::Error> {
+    ) -> Result<Option<PreAdmissionNextState>, quiche::h3::Error> {
+        let intake = Self::build_request_intake(
+            quic_trace_id,
+            request_start,
+            method,
+            path,
+            authority,
+            headers,
+            content_length,
+            tunnel_mode,
+            tracing_enabled,
+        );
         let lb_header_lookup = |name: &str| {
             headers
                 .iter()
@@ -220,6 +355,15 @@ impl QUICListener {
                 backend_index,
                 backend_lb,
             }) => {
+                let routing = RoutingSnapshot {
+                    backend_addr: backend_addr.clone(),
+                    backend_index,
+                    upstream_name: upstream_name.clone(),
+                    route_reason: route_reason.clone(),
+                    route_path_len,
+                    route_host_specific,
+                    backend_lb: Some(backend_lb.clone()),
+                };
                 let admission = evaluate_forwarding_pre_admission_policy(
                     &upstream_policy,
                     Some(&lb_header_lookup),
@@ -278,8 +422,11 @@ impl QUICListener {
                             )?;
                             return Ok(None);
                         };
-                        Self::send_admission_rejection_response(h3, quic, stream_id, response)?;
-                        return Ok(None);
+                        return Ok(Some(PreAdmissionNextState::LocallyRejected(
+                            LocalRejectionCandidate {
+                                response: response.clone(),
+                            },
+                        )));
                     }
                     AdmissionPolicyDecision::RateLimited(decision) => {
                         metrics.inc_request_rate_limited();
@@ -315,8 +462,11 @@ impl QUICListener {
                             )?;
                             return Ok(None);
                         };
-                        Self::send_admission_rejection_response(h3, quic, stream_id, response)?;
-                        return Ok(None);
+                        return Ok(Some(PreAdmissionNextState::LocallyRejected(
+                            LocalRejectionCandidate {
+                                response: response.clone(),
+                            },
+                        )));
                     }
                     AdmissionPolicyDecision::Overloaded(decision) => {
                         let _ = observe_admission_outcome(
@@ -349,54 +499,22 @@ impl QUICListener {
                             )?;
                             return Ok(None);
                         };
-                        Self::send_admission_rejection_response(h3, quic, stream_id, response)?;
                         resilience
                             .adaptive_admission
                             .observe(request_start.elapsed(), true);
-                        return Ok(None);
+                        return Ok(Some(PreAdmissionNextState::LocallyRejected(
+                            LocalRejectionCandidate {
+                                response: response.clone(),
+                            },
+                        )));
                     }
                 }
 
-                let request_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-                let incoming_traceparent =
-                    extract_header_value(headers, b"traceparent").and_then(parse_traceparent);
-                let trace_id = incoming_traceparent
-                    .as_ref()
-                    .map(|(trace_id, _)| trace_id.clone())
-                    .or_else(|| {
-                        tracing_enabled.then(|| generated_trace_id(quic_trace_id, request_id))
-                    });
-                let span_id = trace_id.as_ref().map(|_| generated_span_id(request_id));
-                let traceparent = trace_id
-                    .as_ref()
-                    .zip(span_id.as_ref())
-                    .map(|(trace_id, span_id)| format!("00-{trace_id}-{span_id}-01"));
-                let trace_span =
-                    trace_id
-                        .as_ref()
-                        .zip(span_id.as_ref())
-                        .map(|(trace_id, span_id)| {
-                            info_span!(
-                                "spooky.request",
-                                request_id = request_id,
-                                trace_id = %trace_id,
-                                span_id = %span_id,
-                                method = %method,
-                                path = %path
-                            )
-                        });
-                let bodyless_mode = !is_tunnel_mode(tunnel_mode)
-                    && is_bodyless_request_mode(method, content_length);
-                let request_fin_received = bodyless_mode;
                 let external_auth = upstream_policy.upstream_auth.external_auth.clone();
-                let auth_fail_open = external_auth
+                let auth_disposition = external_auth
                     .as_ref()
-                    .map(|auth| {
-                        ExternalAuthTaskConfig::from_external_auth(auth)
-                            .disposition
-                            .fail_open()
-                    })
-                    .unwrap_or(false);
+                    .map(|auth| ExternalAuthTaskConfig::from_external_auth(auth).disposition);
+                let request_id = intake.request_id();
                 let pending_forward = Arc::new(PendingForward {
                     method: Arc::<str>::from(method),
                     path: Arc::<str>::from(path),
@@ -411,35 +529,44 @@ impl QUICListener {
                     backend_lb: Some(Arc::<str>::from(backend_lb.as_str())),
                     client_addr: peer_address,
                     request_id,
-                    trace_id: trace_id.as_deref().map(Arc::<str>::from),
-                    span_id: span_id.as_deref().map(Arc::<str>::from),
-                    traceparent: traceparent.as_deref().map(Arc::<str>::from),
+                    trace_id: intake
+                        .state
+                        .context
+                        .trace_id
+                        .as_deref()
+                        .map(Arc::<str>::from),
+                    span_id: intake
+                        .state
+                        .context
+                        .span_id
+                        .as_deref()
+                        .map(Arc::<str>::from),
+                    traceparent: intake
+                        .state
+                        .context
+                        .traceparent
+                        .as_deref()
+                        .map(Arc::<str>::from),
                     host_policy: upstream_policy.host.0.clone(),
                     forwarded_header_policy: upstream_policy.forwarded_headers.0.clone(),
                     auth_header_mutations: Vec::new(),
                 });
+                let dispatch_ready = Self::build_dispatch_ready_candidate(
+                    intake,
+                    routing,
+                    upstream_pool,
+                    pending_forward,
+                );
 
-                Some(PreAuthRequest {
-                    request: PreparedRequest {
-                        upstream_name,
-                        backend_addr,
-                        backend_index,
-                        upstream_pool,
-                        backend_lb,
-                        route_path_len,
-                        route_host_specific,
-                        route_reason,
-                        request_id,
-                        trace_id,
-                        span_id,
-                        traceparent,
-                        trace_span,
-                        bodyless_mode,
-                        request_fin_received,
-                        pending_forward,
-                        auth_fail_open,
-                    },
-                    external_auth,
+                Some(match (external_auth, auth_disposition) {
+                    (Some(external_auth), Some(auth_disposition)) => {
+                        PreAdmissionNextState::RequiresExternalAuth(ExternalAuthCandidate {
+                            request: dispatch_ready,
+                            external_auth,
+                            auth_disposition,
+                        })
+                    }
+                    _ => PreAdmissionNextState::ReadyForPostAuthAdmission(dispatch_ready),
                 })
             }
             Err(err) => {
@@ -471,87 +598,134 @@ impl QUICListener {
         quic: &mut quiche::Connection,
         request_start: Instant,
         metrics: &Metrics,
-        pre_auth: PreAuthRequest,
-    ) -> Result<Option<StartedAuthRequest>, quiche::h3::Error> {
-        let PreAuthRequest {
-            request,
-            external_auth,
-        } = pre_auth;
-        let auth_fail_open = request.auth_fail_open;
-        let auth_start = if let Some(external_auth) = external_auth {
-            match start_external_auth_task(Arc::clone(&request.pending_forward), external_auth) {
-                Ok(start) => Some(start),
-                Err(err) => {
-                    match evaluate_external_auth_completion(
-                        Err(err),
-                        ExternalAuthFailureDisposition::from_fail_open(auth_fail_open),
-                    ) {
-                        ExternalAuthCompletion::FailOpen { timed_out, error } => {
-                            metrics.inc_external_auth_error();
-                            if timed_out {
-                                warn!(
-                                    "request_id={} route={} external auth startup failed open: timeout",
-                                    request.request_id, request.upstream_name
-                                );
-                            } else if let Some(error) = error {
-                                warn!(
-                                    "request_id={} route={} external auth startup failed open: {:?}",
-                                    request.request_id, request.upstream_name, error
-                                );
+        pre_auth: PreAdmissionNextState,
+        routing_transparency_enabled: bool,
+        routing_transparency_include_reason: bool,
+        backend_total_request_timeout: Duration,
+    ) -> Result<Option<StartedRequestEnvelope>, quiche::h3::Error> {
+        match pre_auth {
+            PreAdmissionNextState::LocallyRejected(rejection) => {
+                Self::send_admission_rejection_response(h3, quic, stream_id, &rejection.response)?;
+                Ok(None)
+            }
+            PreAdmissionNextState::ReadyForPostAuthAdmission(request) => {
+                let mut request = request;
+                request.state.context.total_request_deadline =
+                    request.state.context.start + backend_total_request_timeout;
+                let pending_forward = Arc::clone(&request.state.pending_forward);
+                Ok(Some(StartedRequestEnvelope {
+                    envelope: request.into_envelope(
+                        routing_transparency_enabled,
+                        routing_transparency_include_reason,
+                        IntakeExecutionSeed::ReadyForForwarding { pending_forward },
+                    ),
+                    should_materialize_forward: true,
+                }))
+            }
+            PreAdmissionNextState::RequiresExternalAuth(request) => {
+                let mut request = request;
+                request.request.state.context.total_request_deadline =
+                    request.request.state.context.start + backend_total_request_timeout;
+                let pending_forward = Arc::clone(&request.request.state.pending_forward);
+                let auth_disposition = request.auth_disposition;
+                let auth_start = match start_external_auth_task(
+                    pending_forward,
+                    request.external_auth,
+                ) {
+                    Ok(start) => Some(start),
+                    Err(err) => {
+                        match evaluate_external_auth_completion(Err(err), auth_disposition) {
+                            ExternalAuthCompletion::FailOpen { timed_out, error } => {
+                                metrics.inc_external_auth_error();
+                                if timed_out {
+                                    warn!(
+                                        "request_id={} route={} external auth startup failed open: timeout",
+                                        request.request.request_id(),
+                                        request.request.upstream_name()
+                                    );
+                                } else if let Some(error) = error {
+                                    warn!(
+                                        "request_id={} route={} external auth startup failed open: {:?}",
+                                        request.request.request_id(),
+                                        request.request.upstream_name(),
+                                        error
+                                    );
+                                }
+                                None
                             }
-                            None
-                        }
-                        ExternalAuthCompletion::Reject {
-                            status,
-                            body,
-                            timed_out,
-                            error,
-                        } => {
-                            metrics.inc_external_auth_error();
-                            let _ = observe_admission_outcome(
-                                metrics,
-                                OutcomeRouteTarget {
-                                    route: &request.upstream_name,
-                                },
-                                Some(OutcomeBackendTarget {
-                                    upstream: &request.upstream_name,
-                                    backend_addr: Some(request.backend_addr.as_str()),
-                                    backend_index: Some(request.backend_index),
-                                }),
-                                request_start.elapsed(),
+                            ExternalAuthCompletion::Reject {
                                 status,
-                                AdmissionOutcomeClass::Failed { timed_out },
-                            );
-                            if let Some(error) = error {
-                                error!(
-                                    "request_id={} route={} external auth startup failed: {:?}",
-                                    request.request_id, request.upstream_name, error
+                                body,
+                                timed_out,
+                                error,
+                            } => {
+                                metrics.inc_external_auth_error();
+                                let _ = observe_admission_outcome(
+                                    metrics,
+                                    OutcomeRouteTarget {
+                                        route: request.request.upstream_name(),
+                                    },
+                                    Some(OutcomeBackendTarget {
+                                        upstream: request.request.upstream_name(),
+                                        backend_addr: Some(request.request.backend_addr()),
+                                        backend_index: Some(request.request.backend_index()),
+                                    }),
+                                    request_start.elapsed(),
+                                    status,
+                                    AdmissionOutcomeClass::Failed { timed_out },
                                 );
-                            } else {
-                                error!(
-                                    "request_id={} route={} external auth startup failed",
-                                    request.request_id, request.upstream_name
-                                );
+                                if let Some(error) = error {
+                                    error!(
+                                        "request_id={} route={} external auth startup failed: {:?}",
+                                        request.request.request_id(),
+                                        request.request.upstream_name(),
+                                        error
+                                    );
+                                } else {
+                                    error!(
+                                        "request_id={} route={} external auth startup failed",
+                                        request.request.request_id(),
+                                        request.request.upstream_name()
+                                    );
+                                }
+                                Self::send_simple_response(h3, quic, stream_id, status, body)?;
+                                return Ok(None);
                             }
-                            Self::send_simple_response(h3, quic, stream_id, status, body)?;
-                            return Ok(None);
-                        }
-                        ExternalAuthCompletion::Allow { .. }
-                        | ExternalAuthCompletion::Respond(_) => {
-                            unreachable!("startup failure must resolve to fail-open or rejection")
+                            ExternalAuthCompletion::Allow { .. }
+                            | ExternalAuthCompletion::Respond(_) => {
+                                unreachable!(
+                                    "startup failure must resolve to fail-open or rejection"
+                                )
+                            }
                         }
                     }
-                }
+                };
+                let should_materialize_forward = auth_start.is_none();
+                let pending_forward = Arc::clone(&request.request.state.pending_forward);
+                let envelope = if let Some(start) = auth_start {
+                    request.request.into_envelope(
+                        routing_transparency_enabled,
+                        routing_transparency_include_reason,
+                        IntakeExecutionSeed::AwaitingAuth {
+                            pending_forward,
+                            auth_result_rx: start.rx,
+                            auth_abort: start.abort,
+                            auth_disposition,
+                            auth_deadline: start.deadline,
+                        },
+                    )
+                } else {
+                    request.request.into_envelope(
+                        routing_transparency_enabled,
+                        routing_transparency_include_reason,
+                        IntakeExecutionSeed::ReadyForForwarding { pending_forward },
+                    )
+                };
+                Ok(Some(StartedRequestEnvelope {
+                    envelope,
+                    should_materialize_forward,
+                }))
             }
-        } else {
-            None
-        };
-        let auth_requested = auth_start.is_some();
-
-        Ok(Some(StartedAuthRequest {
-            request,
-            auth_start,
-            auth_requested,
-        }))
+        }
     }
 }

@@ -30,7 +30,6 @@ pub(super) struct AuthStart {
     pub(super) rx: oneshot::Receiver<ExternalAuthResult>,
     pub(super) abort: AbortHandle,
     pub(super) deadline: Instant,
-    pub(super) fail_open: bool,
 }
 
 struct AuthHttpClient {
@@ -437,7 +436,6 @@ pub(super) fn start_external_auth_task(
         rx,
         abort: join.abort_handle(),
         deadline: Instant::now() + task_config.timeout,
-        fail_open: task_config.disposition.fail_open(),
     })
 }
 

@@ -117,6 +117,7 @@ pub(in crate::quic_listener) fn is_head_method(method: &str) -> bool {
     method.eq_ignore_ascii_case("HEAD")
 }
 
+#[cfg(test)]
 pub(in crate::quic_listener) fn is_bodyless_request_mode(
     method: &str,
     content_length: Option<usize>,
