@@ -566,7 +566,7 @@ mod tests {
                     weight: 1,
                     health_check: Some(HealthCheck {
                         path: "/health".to_string(),
-                        interval: 0,
+                        interval: 1,
                         timeout_ms: 1000,
                         failure_threshold: 1,
                         success_threshold: 1,
@@ -598,9 +598,22 @@ mod tests {
         })
         .expect("runtime config");
 
+        let mut runtime_upstream = runtime
+            .upstreams
+            .get("api")
+            .expect("upstream")
+            .clone();
+        runtime_upstream.backends[0].backend.health_check = Some(HealthCheck {
+            path: "/health".to_string(),
+            interval: 0,
+            timeout_ms: 1000,
+            failure_threshold: 1,
+            success_threshold: 1,
+            cooldown_ms: 0,
+        });
+
         Arc::new(RwLock::new(
-            UpstreamPool::from_runtime_upstream(runtime.upstreams.get("api").expect("upstream"))
-                .expect("pool"),
+            UpstreamPool::from_runtime_upstream(&runtime_upstream).expect("pool"),
         ))
     }
 
