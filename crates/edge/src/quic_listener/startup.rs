@@ -10,7 +10,9 @@ use socket2::{Domain, Protocol, Socket, Type};
 use spooky_config::runtime::{ListenerRuntimeConfig, RuntimeBackendAddressKind, RuntimeConfig};
 use spooky_errors::ProxyError;
 use spooky_lb::upstream_pool::UpstreamPool;
-use spooky_transport::{h2_client::SharedDnsResolver, transport_pool::UpstreamTransportPool};
+use spooky_transport::{
+    ConnectObservation, ConnectObserver, SharedDnsResolver, transport_pool::UpstreamTransportPool,
+};
 use tokio::sync::Semaphore;
 
 use crate::{
@@ -250,16 +252,15 @@ impl QUICListener {
             &backend_resolution_store,
         )));
         let connect_metrics = Arc::clone(&metrics);
-        let connect_observer: spooky_transport::h2_client::ConnectObserver = Arc::new(
-            move |observation: spooky_transport::h2_client::ConnectObservation| {
+        let connect_observer: ConnectObserver =
+            Arc::new(move |observation: ConnectObservation| {
                 Self::record_backend_connect(
                     &connect_metrics,
                     &observation.backend,
                     &observation.hostname,
                     observation.resolved_addr,
                 );
-            },
-        );
+            });
         let transport_pool = Arc::new(
             UpstreamTransportPool::from_runtime_upstreams(
                 config.upstreams.values(),

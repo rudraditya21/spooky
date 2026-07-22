@@ -9,19 +9,15 @@ use spooky_config::runtime::{
     RuntimeBackendConnectionPolicy, RuntimeBackendTransportKind, RuntimeUpstream,
 };
 pub use spooky_errors::{PoolError, ProxyError};
-
-use crate::{
-    client_rotation::{BackendClientRotation, BackendClientRotationState},
-    h1_pool::H1Pool,
-    h2_client::{ConnectObserver, SharedDnsResolver, TlsClientConfig},
-    h2_pool::H2Pool,
+pub use crate::h2_client::{
+    ConnectObservation, ConnectObserver, SharedDnsResolver, TlsClientConfig,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ResolvedBackendTransport {
-    Http1,
-    H2,
-}
+use crate::{
+    client_rotation::BackendClientRotation,
+    h1_pool::H1Pool,
+    h2_pool::H2Pool,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BackendTransportEntry {
@@ -29,65 +25,28 @@ enum BackendTransportEntry {
     H2,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TransportExecutionTarget<'a> {
-    backend: &'a str,
-}
-
-impl<'a> TransportExecutionTarget<'a> {
-    pub fn new(backend: &'a str) -> Self {
-        Self { backend }
-    }
-
-    pub fn backend(&self) -> &'a str {
-        self.backend
-    }
-}
-
-pub struct TransportExecutionResult {
-    transport: ResolvedBackendTransport,
+struct TransportExecutionResult {
     response: hyper::Response<Incoming>,
 }
 
 impl TransportExecutionResult {
-    fn new(
-        transport: ResolvedBackendTransport,
-        response: hyper::Response<Incoming>,
-    ) -> Self {
-        Self {
-            transport,
-            response,
-        }
+    fn new(response: hyper::Response<Incoming>) -> Self {
+        Self { response }
     }
 
-    pub fn into_response(self) -> hyper::Response<Incoming> {
+    fn into_response(self) -> hyper::Response<Incoming> {
         self.response
-    }
-
-    pub fn protocol_name(&self) -> &'static str {
-        match self.transport {
-            ResolvedBackendTransport::Http1 => "http1",
-            ResolvedBackendTransport::H2 => "h2",
-        }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransportClientRotation {
-    transport: Option<ResolvedBackendTransport>,
     rotation: BackendClientRotation,
 }
 
 impl TransportClientRotation {
     pub fn rotated(self) -> bool {
         self.rotation.changed()
-    }
-
-    pub fn protocol_name(self) -> Option<&'static str> {
-        self.transport.map(|transport| match transport {
-            ResolvedBackendTransport::Http1 => "http1",
-            ResolvedBackendTransport::H2 => "h2",
-        })
     }
 
     pub fn generations(self) -> Option<(u64, u64)> {
@@ -108,7 +67,7 @@ impl UpstreamTransportPool {
         backend: &str,
         req: Request<BoxBody<Bytes, Infallible>>,
     ) -> Result<hyper::Response<Incoming>, ProxyError> {
-        self.execute(TransportExecutionTarget::new(backend), req)
+        self.execute(backend, req)
             .await
             .map(TransportExecutionResult::into_response)
     }
@@ -242,69 +201,51 @@ impl UpstreamTransportPool {
         )
     }
 
-    fn backend_entry(&self, target: TransportExecutionTarget<'_>) -> Option<BackendTransportEntry> {
-        self.backend_entries.get(target.backend()).copied()
+    fn backend_entry(&self, backend: &str) -> Option<BackendTransportEntry> {
+        self.backend_entries.get(backend).copied()
     }
 
-    pub async fn execute(
+    async fn execute(
         &self,
-        target: TransportExecutionTarget<'_>,
+        backend: &str,
         req: Request<BoxBody<Bytes, Infallible>>,
     ) -> Result<TransportExecutionResult, ProxyError> {
-        match self.backend_entry(target) {
+        match self.backend_entry(backend) {
             Some(BackendTransportEntry::Http1) => self
-                .execute_with_timeout(target.backend(), self.h1_pool.send(target.backend(), req))
+                .execute_with_timeout(backend, self.h1_pool.send(backend, req))
                 .await
-                .map(|response| {
-                    TransportExecutionResult::new(ResolvedBackendTransport::Http1, response)
-                }),
+                .map(TransportExecutionResult::new),
             Some(BackendTransportEntry::H2) => self
-                .execute_with_timeout(target.backend(), self.h2_pool.send(target.backend(), req))
+                .execute_with_timeout(backend, self.h2_pool.send(backend, req))
                 .await
-                .map(|response| {
-                    TransportExecutionResult::new(ResolvedBackendTransport::H2, response)
-                }),
+                .map(TransportExecutionResult::new),
             None => Err(ProxyError::Pool(PoolError::UnknownBackend(
-                target.backend().to_string(),
+                backend.to_string(),
             ))),
         }
     }
 
-    pub fn rotate_backend_client(
+    pub fn rotate_backend_client_for_backend(
         &self,
-        target: TransportExecutionTarget<'_>,
+        backend: &str,
     ) -> Result<TransportClientRotation, String> {
-        match self.backend_entry(target) {
+        match self.backend_entry(backend) {
             Some(BackendTransportEntry::Http1) => self
                 .h1_pool
-                .rotate_backend_client(target.backend())
-                .map(|rotation| Self::transport_rotation(ResolvedBackendTransport::Http1, rotation)),
+                .rotate_backend_client(backend)
+                .map(Self::transport_rotation),
             Some(BackendTransportEntry::H2) => self
                 .h2_pool
-                .rotate_backend_client(target.backend())
-                .map(|rotation| Self::transport_rotation(ResolvedBackendTransport::H2, rotation)),
+                .rotate_backend_client(backend)
+                .map(Self::transport_rotation),
             None => Ok(TransportClientRotation {
-                transport: None,
                 rotation: BackendClientRotation::missing_backend(),
             }),
         }
     }
 
-    fn transport_rotation(
-        transport: ResolvedBackendTransport,
-        rotation: BackendClientRotation,
-    ) -> TransportClientRotation {
-        let transport = match rotation.state() {
-            BackendClientRotationState::MissingBackend => None,
-            BackendClientRotationState::Recreated | BackendClientRotationState::Rotated { .. } => {
-                Some(transport)
-            }
-        };
-
-        TransportClientRotation {
-            transport,
-            rotation,
-        }
+    fn transport_rotation(rotation: BackendClientRotation) -> TransportClientRotation {
+        TransportClientRotation { rotation }
     }
 
     async fn execute_with_timeout<F>(

@@ -28,7 +28,7 @@ struct BackendHandle {
     inflight: Arc<Semaphore>,
 }
 
-pub struct H1Pool {
+pub(crate) struct H1Pool {
     backends: HashMap<String, BackendHandle>,
     max_idle_per_backend: usize,
     pool_idle_timeout: Duration,
@@ -38,29 +38,7 @@ pub struct H1Pool {
 }
 
 impl H1Pool {
-    pub fn new<I>(
-        backends: I,
-        max_inflight: usize,
-        max_idle_per_backend: usize,
-        pool_idle_timeout: Duration,
-        connect_timeout: Duration,
-        dns_resolver: SharedDnsResolver,
-    ) -> Self
-    where
-        I: IntoIterator<Item = String>,
-    {
-        Self::new_with_observer(
-            backends,
-            max_inflight,
-            max_idle_per_backend,
-            pool_idle_timeout,
-            connect_timeout,
-            dns_resolver,
-            None,
-        )
-    }
-
-    pub fn new_with_observer<I>(
+    pub(crate) fn new_with_observer<I>(
         backends: I,
         max_inflight: usize,
         max_idle_per_backend: usize,
@@ -102,7 +80,7 @@ impl H1Pool {
         }
     }
 
-    pub async fn send(
+    pub(crate) async fn send(
         &self,
         backend: &str,
         req: Request<BoxBody<Bytes, Infallible>>,
@@ -114,7 +92,10 @@ impl H1Pool {
         client.send(req).await.map_err(PoolError::Send)
     }
 
-    pub fn rotate_backend_client(&self, backend: &str) -> Result<BackendClientRotation, String> {
+    pub(crate) fn rotate_backend_client(
+        &self,
+        backend: &str,
+    ) -> Result<BackendClientRotation, String> {
         let Some(handle) = self.backends.get(backend) else {
             return Ok(BackendClientRotation::missing_backend());
         };

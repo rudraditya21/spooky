@@ -11,10 +11,9 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response, body::Incoming, service::service_fn};
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use spooky_transport::{
-    h2_client::{SharedDnsResolver, TlsClientConfig},
-    h2_pool::{H2Pool, PoolError},
-};
+use spooky_config::runtime::RuntimeBackendTransportKind;
+use spooky_errors::{PoolError, ProxyError};
+use spooky_transport::{SharedDnsResolver, UpstreamTransportPool};
 use tokio::net::TcpListener;
 
 struct ConcurrencyTracker {
@@ -97,13 +96,14 @@ async fn pool_limits_inflight_per_backend() {
     let backend = format!("127.0.0.1:{port}");
 
     let pool = Arc::new(
-        H2Pool::new(
-            vec![backend.clone()],
-            HashMap::from([(backend.clone(), TlsClientConfig::default())]),
+        UpstreamTransportPool::new_from_runtime_backends(
+            [(backend.clone(), RuntimeBackendTransportKind::H2)],
+            HashMap::new(),
             1,
             64,
             Duration::from_secs(30),
             Duration::from_secs(2),
+            Duration::from_secs(5),
             SharedDnsResolver::new(),
         )
         .expect("pool"),
@@ -121,11 +121,11 @@ async fn pool_limits_inflight_per_backend() {
 
     let pool1 = pool.clone();
     let backend1 = backend.clone();
-    let r1 = tokio::spawn(async move { pool1.send(&backend1, req1).await });
+    let r1 = tokio::spawn(async move { pool1.send_backend_request(&backend1, req1).await });
 
     let pool2 = pool.clone();
     let backend2 = backend.clone();
-    let r2 = tokio::spawn(async move { pool2.send(&backend2, req2).await });
+    let r2 = tokio::spawn(async move { pool2.send_backend_request(&backend2, req2).await });
 
     let (r1, r2) = tokio::join!(r1, r2);
     let r1 = r1.unwrap();
@@ -135,8 +135,8 @@ async fn pool_limits_inflight_per_backend() {
         "at least one request should be admitted"
     );
     assert!(
-        matches!(r1, Err(PoolError::BackendOverloaded(_)))
-            || matches!(r2, Err(PoolError::BackendOverloaded(_))),
+        matches!(r1, Err(ProxyError::Pool(PoolError::BackendOverloaded(_))))
+            || matches!(r2, Err(ProxyError::Pool(PoolError::BackendOverloaded(_)))),
         "one request should be rejected by backend inflight admission"
     );
 
@@ -146,13 +146,17 @@ async fn pool_limits_inflight_per_backend() {
 
 #[tokio::test]
 async fn pool_rejects_unknown_backend() {
-    let pool = H2Pool::new(
-        vec!["127.0.0.1:12345".to_string()],
-        HashMap::from([("127.0.0.1:12345".to_string(), TlsClientConfig::default())]),
+    let pool = UpstreamTransportPool::new_from_runtime_backends(
+        [(
+            "127.0.0.1:12345".to_string(),
+            RuntimeBackendTransportKind::H2,
+        )],
+        HashMap::new(),
         1,
         64,
         Duration::from_secs(30),
         Duration::from_secs(2),
+        Duration::from_secs(5),
         SharedDnsResolver::new(),
     )
     .expect("pool");
@@ -162,9 +166,11 @@ async fn pool_rejects_unknown_backend() {
         .body(Full::new(Bytes::new()).boxed())
         .unwrap();
 
-    let err = pool.send("127.0.0.1:9999", req).await.unwrap_err();
+    let err = pool.send_backend_request("127.0.0.1:9999", req).await.unwrap_err();
     match err {
-        PoolError::UnknownBackend(name) => assert_eq!(name, "127.0.0.1:9999"),
+        ProxyError::Pool(PoolError::UnknownBackend(name)) => {
+            assert_eq!(name, "127.0.0.1:9999")
+        }
         _ => panic!("unexpected error"),
     }
 }
@@ -179,13 +185,14 @@ async fn pool_reports_overload_when_inflight_is_exhausted() {
     };
     let backend = format!("127.0.0.1:{port}");
     let pool = Arc::new(
-        H2Pool::new(
-            vec![backend.clone()],
-            HashMap::from([(backend.clone(), TlsClientConfig::default())]),
+        UpstreamTransportPool::new_from_runtime_backends(
+            [(backend.clone(), RuntimeBackendTransportKind::H2)],
+            HashMap::new(),
             1,
             64,
             Duration::from_secs(30),
             Duration::from_secs(2),
+            Duration::from_secs(5),
             SharedDnsResolver::new(),
         )
         .expect("pool"),
@@ -204,11 +211,15 @@ async fn pool_reports_overload_when_inflight_is_exhausted() {
 
     let pool_task = Arc::clone(&pool);
     let backend_task = backend.clone();
-    let handle = tokio::spawn(async move { pool_task.send(&backend_task, req1).await });
+    let handle =
+        tokio::spawn(async move { pool_task.send_backend_request(&backend_task, req1).await });
 
     tokio::time::sleep(Duration::from_millis(10)).await;
-    let overload = pool.send(&backend, req2).await;
-    assert!(matches!(overload, Err(PoolError::BackendOverloaded(_))));
+    let overload = pool.send_backend_request(&backend, req2).await;
+    assert!(matches!(
+        overload,
+        Err(ProxyError::Pool(PoolError::BackendOverloaded(_)))
+    ));
 
     let _ = handle.await.expect("request task join");
 }

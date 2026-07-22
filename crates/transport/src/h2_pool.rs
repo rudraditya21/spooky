@@ -33,7 +33,7 @@ struct BackendHandle {
 // When DNS refresh updates a hostname's address set, new connects pick up the
 // refreshed resolver results, while already-pooled H2 connections may continue
 // using older addresses until Hyper retires them via the normal idle timeout.
-pub struct H2Pool {
+pub(crate) struct H2Pool {
     backends: HashMap<String, BackendHandle>,
     max_idle_per_backend: usize,
     pool_idle_timeout: Duration,
@@ -43,32 +43,8 @@ pub struct H2Pool {
 }
 
 impl H2Pool {
-    pub fn new<I>(
-        backends: I,
-        backend_tls: HashMap<String, TlsClientConfig>,
-        max_inflight: usize,
-        max_idle_per_backend: usize,
-        pool_idle_timeout: Duration,
-        connect_timeout: Duration,
-        dns_resolver: SharedDnsResolver,
-    ) -> Result<Self, String>
-    where
-        I: IntoIterator<Item = String>,
-    {
-        Self::new_with_observer(
-            backends,
-            backend_tls,
-            max_inflight,
-            max_idle_per_backend,
-            pool_idle_timeout,
-            connect_timeout,
-            dns_resolver,
-            None,
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
-    pub fn new_with_observer<I>(
+    pub(crate) fn new_with_observer<I>(
         backends: I,
         backend_tls: HashMap<String, TlsClientConfig>,
         max_inflight: usize,
@@ -116,11 +92,12 @@ impl H2Pool {
         })
     }
 
-    pub fn has_backend(&self, backend: &str) -> bool {
+    #[allow(dead_code)]
+    pub(crate) fn has_backend(&self, backend: &str) -> bool {
         self.backends.contains_key(backend)
     }
 
-    pub fn rotate_backend_client(
+    pub(crate) fn rotate_backend_client(
         &self,
         backend: &str,
     ) -> Result<BackendClientRotation, String> {
@@ -150,7 +127,7 @@ impl H2Pool {
         ))
     }
 
-    pub async fn send(
+    pub(crate) async fn send(
         &self,
         backend: &str,
         req: Request<BoxBody<Bytes, Infallible>>,

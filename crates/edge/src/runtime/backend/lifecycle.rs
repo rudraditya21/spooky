@@ -7,7 +7,7 @@ use std::{
 
 use log::{debug, info, warn};
 use spooky_lb::{backend::HealthTransition, upstream_pool::UpstreamPool};
-use spooky_transport::{h2_client::SharedDnsResolver, transport_pool::UpstreamTransportPool};
+use spooky_transport::{SharedDnsResolver, transport_pool::UpstreamTransportPool};
 
 use super::{
     event::{
@@ -386,10 +386,8 @@ pub(crate) fn apply_backend_dns_refresh(
             let client_rotated = if matches!(result.outcome, BackendRefreshOutcome::Updated { .. })
             {
                 matches!(
-                    transport_pool.rotate_backend_client(
-                        spooky_transport::transport_pool::TransportExecutionTarget::new(
-                            &result.identity.backend_addr,
-                        ),
+                    transport_pool.rotate_backend_client_for_backend(
+                        &result.identity.backend_addr,
                     ),
                     Ok(rotation) if rotation.rotated()
                 )
@@ -552,10 +550,7 @@ mod tests {
         config::{Backend, Config, HealthCheck, Listen, LoadBalancing, RouteMatch, Tls, Upstream},
         runtime::{RuntimeBackendTransportKind, RuntimeConfig},
     };
-    use spooky_transport::{
-        h2_client::SharedDnsResolver,
-        transport_pool::UpstreamTransportPool,
-    };
+    use spooky_transport::{SharedDnsResolver, transport_pool::UpstreamTransportPool};
 
     use super::*;
     use crate::runtime::backend::event::{BackendHealthObservationOutcome, BackendRequestFeedback};
