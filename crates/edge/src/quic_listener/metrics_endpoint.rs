@@ -16,10 +16,10 @@ use super::{
     QUICListener,
     runtime_endpoint::RuntimeConnectionSlotGuard,
     runtime_handle,
-    runtime_state::{CanonicalRuntimeView, ControlPlaneBootstrap},
+    runtime_state::{ControlPlaneBootstrap, MetricsServiceCtx},
     spawn_supervised_async_task,
 };
-use crate::{Metrics, runtime::bundle::RuntimeBundleHandle};
+use crate::Metrics;
 
 struct MetricsEndpointBinding {
     bind: String,
@@ -33,15 +33,25 @@ pub(super) struct MetricsEndpointState {
     pub(super) metrics: Arc<Metrics>,
 }
 
+impl MetricsServiceCtx {
+    fn current_state(&self) -> MetricsEndpointState {
+        let runtime = self.runtime.current_view();
+        MetricsEndpointState {
+            endpoint: runtime.runtime_config().observability.metrics.clone(),
+            metrics: runtime.metrics(),
+        }
+    }
+}
+
 impl QUICListener {
     pub(super) fn spawn_metrics_endpoint(
         bootstrap: &ControlPlaneBootstrap<'_>,
     ) -> Result<(), ProxyError> {
-        let startup_state = bootstrap.with_runtime_view(Self::metrics_endpoint_state_from_runtime);
+        let service_ctx = bootstrap.metrics_service_ctx();
+        let startup_state = service_ctx.current_state();
         if bootstrap.runtime_bundle.is_none() && !startup_state.endpoint.enabled {
             return Ok(());
         }
-        let runtime_bundle = bootstrap.runtime_bundle.clone();
         let required = startup_state.endpoint.required;
 
         let handle = match runtime_handle() {
@@ -88,8 +98,7 @@ impl QUICListener {
 
                 loop {
                     let runtime_state = Self::current_metrics_endpoint_state(
-                        runtime_bundle.as_ref(),
-                        &startup_state,
+                        &service_ctx,
                     );
                     let endpoint = &runtime_state.endpoint;
                     let desired_bind = format!("{}:{}", endpoint.address, endpoint.port);
@@ -156,8 +165,7 @@ impl QUICListener {
                         }
                     };
                     let runtime_state = Self::current_metrics_endpoint_state(
-                        runtime_bundle.as_ref(),
-                        &startup_state,
+                        &service_ctx,
                     );
                     let active_connections = Arc::clone(&binding.active_connections);
                     if !Self::try_claim_runtime_connection_slot(
@@ -204,26 +212,10 @@ impl QUICListener {
         Ok(())
     }
 
-    fn metrics_endpoint_state_from_runtime(
-        runtime: CanonicalRuntimeView<'_>,
-    ) -> MetricsEndpointState {
-        MetricsEndpointState {
-            endpoint: runtime.runtime_config().observability.metrics.clone(),
-            metrics: runtime.shared_services().metrics.clone(),
-        }
-    }
-
     pub(super) fn current_metrics_endpoint_state(
-        runtime_bundle: Option<&Arc<RuntimeBundleHandle>>,
-        startup_state: &MetricsEndpointState,
+        service_ctx: &MetricsServiceCtx,
     ) -> MetricsEndpointState {
-        runtime_bundle
-            .map(|handle| {
-                handle.with_current_view(|view| {
-                    Self::metrics_endpoint_state_from_runtime(CanonicalRuntimeView::Active(view))
-                })
-            })
-            .unwrap_or_else(|| startup_state.clone())
+        service_ctx.current_state()
     }
 
     fn handle_metrics_request(

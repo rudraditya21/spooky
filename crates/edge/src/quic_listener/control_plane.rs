@@ -3,7 +3,10 @@ use std::sync::Arc;
 use spooky_config::runtime::RuntimeConfig;
 use spooky_errors::ProxyError;
 
-use super::{QUICListener, runtime_state::ControlPlaneBootstrap};
+use super::{
+    QUICListener,
+    runtime_state::{ControlPlaneBootstrap, WatchdogServiceCtx},
+};
 use crate::runtime::{bundle::RuntimeBundleHandle, shared_state::SharedRuntimeState};
 
 impl QUICListener {
@@ -43,48 +46,32 @@ impl QUICListener {
         );
         Self::spawn_generation_background_tasks(&bootstrap);
         Self::spawn_metrics_endpoint(&bootstrap)?;
-        Self::spawn_control_api_endpoint(
-            bootstrap.runtime_config,
-            bootstrap.shared_state,
-            bootstrap.runtime_bundle,
-            bootstrap.worker_count,
-        )?;
+        Self::spawn_control_api_endpoint(&bootstrap)?;
         Ok(())
     }
 
     pub(super) fn spawn_generation_background_tasks(bootstrap: &ControlPlaneBootstrap<'_>) {
         bootstrap.with_runtime_view(|runtime| {
-            Self::configure_expected_workers_from_runtime(
-                runtime.runtime_config(),
-                runtime.shared_services().watchdog.as_ref(),
-            );
-            let shared = runtime.shared_services();
-            let generation = runtime.generation_state();
-            let task_registry = Arc::clone(&generation.generation_tasks);
+            Self::configure_expected_workers(runtime.watchdog().as_ref(), runtime.expected_workers());
+            let task_registry = runtime.generation_tasks();
             Self::spawn_backend_dns_refresh(
                 runtime.runtime_config(),
-                Arc::clone(&shared.transport_pool),
-                Arc::clone(&shared.backend_lifecycle),
-                shared.backend_dns_resolver.clone(),
-                Arc::clone(&shared.metrics),
+                runtime.transport_pool(),
+                runtime.backend_lifecycle(),
+                runtime.backend_dns_resolver(),
+                runtime.metrics(),
                 Arc::clone(&task_registry),
             );
             Self::spawn_health_checks(
-                generation.upstream_pools.clone(),
-                Arc::clone(&shared.transport_pool),
-                Arc::clone(&generation.backend_endpoints),
-                Arc::clone(&generation.backend_health_checks),
-                Arc::clone(&shared.backend_lifecycle),
-                Arc::clone(&shared.metrics),
+                runtime.upstream_pools().clone(),
+                runtime.transport_pool(),
+                runtime.backend_endpoints(),
+                runtime.backend_health_checks(),
+                runtime.backend_lifecycle(),
+                runtime.metrics(),
                 Arc::clone(&task_registry),
             );
-            Self::spawn_watchdog(
-                runtime.runtime_config(),
-                Arc::clone(&shared.metrics),
-                Arc::clone(&generation.resilience),
-                Arc::clone(&shared.watchdog),
-                task_registry,
-            );
+            Self::spawn_watchdog(WatchdogServiceCtx::new(runtime, task_registry));
         });
     }
 
@@ -111,21 +98,5 @@ impl QUICListener {
         worker_count: usize,
     ) {
         watchdog.set_expected_workers(worker_count.max(1));
-    }
-
-    fn configure_expected_workers_from_runtime(
-        config: &RuntimeConfig,
-        watchdog: &crate::watchdog::coordinator::WatchdogCoordinator,
-    ) {
-        Self::configure_expected_workers(
-            watchdog,
-            config
-                .policies
-                .transport
-                .worker_threads
-                .max(1)
-                .saturating_mul(config.policies.transport.packet_shards_per_worker.max(1))
-                .max(1),
-        );
     }
 }

@@ -8,6 +8,7 @@ use super::{
     state::{ConnectionSlotGuard, ControlApiListenerBinding, ControlApiPaths, ControlApiState},
     *,
 };
+use crate::quic_listener::runtime_state::ControlPlaneBootstrap;
 
 impl QUICListener {
     pub(super) fn apply_live_log_level_reload(
@@ -36,27 +37,22 @@ impl QUICListener {
         Some(token)
     }
 
-    pub(crate) fn spawn_control_api_endpoint(
-        config: &RuntimeConfig,
-        shared_state: &SharedRuntimeState,
-        runtime_bundle: Option<Arc<RuntimeBundleHandle>>,
-        worker_count: usize,
+    pub(in crate::quic_listener) fn spawn_control_api_endpoint(
+        bootstrap: &ControlPlaneBootstrap<'_>,
     ) -> Result<(), ProxyError> {
-        let endpoint = &config.observability.control_api;
-        if runtime_bundle.is_none() && !endpoint.enabled {
+        let state = bootstrap.control_api_service_ctx();
+        let endpoint = state.current_control_api();
+        if bootstrap.runtime_bundle.is_none() && !endpoint.enabled {
             return Ok(());
         }
         let required = endpoint.required;
-        let startup_endpoint = endpoint.clone();
-        let listener_config = config.primary_listener_runtime_config().ok_or_else(|| {
+        let listener_config = state.current_runtime_view().runtime_config().primary_listener_runtime_config().ok_or_else(|| {
             ProxyError::Transport("no effective listeners configured".to_string())
         })?;
         let primary_listener_label = Self::listener_label(&listener_config);
-        let shared = shared_state.shared_services();
-        let generation = shared_state.generation_state();
-        if startup_endpoint.enabled
-            && shared
-                .listener_tls_store
+        if endpoint.enabled
+            && state
+                .current_listener_tls_store()
                 .bootstrap_server_config(&primary_listener_label)
                 .is_none()
         {
@@ -70,20 +66,6 @@ impl QUICListener {
             error!("{}", msg);
             return Ok(());
         }
-        let state = ControlApiState {
-            control_api: endpoint.clone(),
-            metrics: Arc::clone(&shared.metrics),
-            resilience: Arc::clone(&generation.resilience),
-            watchdog: Arc::clone(&shared.watchdog),
-            backend_lifecycle: Arc::clone(&shared.backend_lifecycle),
-            upstream_pools: generation.upstream_pools.clone(),
-            listener_runtime_configs: Arc::clone(&generation.listener_runtime_configs),
-            listener_tls_store: Arc::clone(&shared.listener_tls_store),
-            primary_listener_label,
-            expected_workers: worker_count.max(1),
-            started_at: Instant::now(),
-            runtime_bundle,
-        };
 
         let handle = match runtime_handle() {
             Some(handle) => handle,
@@ -97,8 +79,8 @@ impl QUICListener {
             }
         };
 
-        let initial_binding = if startup_endpoint.enabled {
-            let bind = format!("{}:{}", startup_endpoint.address, startup_endpoint.port);
+        let initial_binding = if endpoint.enabled {
+            let bind = format!("{}:{}", endpoint.address, endpoint.port);
             match Self::bind_tcp_listener(&bind, Some(&handle), "control API endpoint") {
                 Ok(listener) => Some(ControlApiListenerBinding {
                     bind,
@@ -120,7 +102,7 @@ impl QUICListener {
         spawn_supervised_async_task(
             &handle,
             "control-api-endpoint",
-            Some(Arc::clone(&shared.metrics)),
+            Some(state.current_metrics()),
             async move {
                 let mut listener_binding = initial_binding;
 
@@ -448,7 +430,7 @@ impl QUICListener {
                 (
                     "workers".to_string(),
                     json!({
-                        "expected": state.expected_workers,
+                        "expected": state.current_expected_workers(),
                     }),
                 ),
                 (
@@ -575,7 +557,7 @@ impl QUICListener {
                 );
             }
 
-            let Some(runtime_bundle_handle) = state.runtime_bundle.as_ref() else {
+            let Some(runtime_bundle_handle) = state.runtime_bundle_handle() else {
                 return match Response::builder()
                     .status(StatusCode::NOT_FOUND)
                     .body(Full::new(Bytes::from_static(b"not found\n")))

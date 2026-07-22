@@ -79,7 +79,6 @@ use crate::{
         },
         health::{HealthClassification, outcome_from_status},
         listener::QUICListener,
-        shared_state::SharedRuntimeState,
         tasks::RuntimeTaskRegistry,
         tls::{
             inventory::{

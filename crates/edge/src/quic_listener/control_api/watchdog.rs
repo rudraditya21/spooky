@@ -1,4 +1,5 @@
 use super::*;
+use crate::quic_listener::runtime_state::WatchdogServiceCtx;
 
 impl QUICListener {
     pub(super) fn watchdog_restart_env(
@@ -16,14 +17,12 @@ impl QUICListener {
         env_vars
     }
 
-    pub(crate) fn spawn_watchdog(
-        config: &RuntimeConfig,
-        metrics: Arc<Metrics>,
-        resilience: Arc<RuntimeResilience>,
-        watchdog: Arc<WatchdogCoordinator>,
-        task_registry: Arc<RuntimeTaskRegistry>,
-    ) {
-        let watchdog_config = WatchdogRuntimeConfig::from(&config.policies.admission.watchdog);
+    pub(in crate::quic_listener) fn spawn_watchdog(service_ctx: WatchdogServiceCtx) {
+        let watchdog_config =
+            WatchdogRuntimeConfig::from(&service_ctx.runtime.runtime_config().policies.admission.watchdog);
+        let metrics = service_ctx.runtime.metrics();
+        let resilience = service_ctx.runtime.resilience();
+        let watchdog = service_ctx.runtime.watchdog();
         if !watchdog_config.enabled || !watchdog.enabled() {
             return;
         }
@@ -204,6 +203,6 @@ impl QUICListener {
                 }
             },
         );
-        task_registry.register(registration);
+        service_ctx.task_registry.register(registration);
     }
 }
