@@ -1,47 +1,20 @@
-use std::{
-    sync::{Arc, atomic::AtomicUsize},
-    time::Duration,
-};
+use super::*;
 
-use bytes::Bytes;
-use http::{Response, StatusCode};
-use http_body_util::Full;
-use hyper::{Request, body::Incoming, server::conn::http1, service::service_fn};
-use hyper_util::rt::TokioIo;
-use log::{debug, error, info};
-use spooky_config::config::MetricsEndpoint;
-use spooky_errors::ProxyError;
-
-use super::{
-    QUICListener,
-    runtime_endpoint::RuntimeConnectionSlotGuard,
-    runtime_handle,
-    runtime_state::{CanonicalRuntimeView, ControlPlaneBootstrap},
-    spawn_supervised_async_task,
-};
-use crate::{Metrics, runtime::bundle::RuntimeBundleHandle};
-
-struct MetricsEndpointBinding {
+pub(super) struct MetricsEndpointBinding {
     bind: String,
     listener: tokio::net::TcpListener,
     active_connections: Arc<AtomicUsize>,
 }
 
-#[derive(Clone)]
-pub(super) struct MetricsEndpointState {
-    pub(super) endpoint: MetricsEndpoint,
-    pub(super) metrics: Arc<Metrics>,
-}
-
 impl QUICListener {
-    pub(super) fn spawn_metrics_endpoint(
+    pub(in crate::quic_listener) fn spawn_metrics_endpoint(
         bootstrap: &ControlPlaneBootstrap<'_>,
     ) -> Result<(), ProxyError> {
-        let startup_state = bootstrap.with_runtime_view(Self::metrics_endpoint_state_from_runtime);
+        let service_ctx = bootstrap.metrics_service_ctx();
+        let startup_state = service_ctx.current_state();
         if bootstrap.runtime_bundle.is_none() && !startup_state.endpoint.enabled {
             return Ok(());
         }
-        let runtime_bundle = bootstrap.runtime_bundle.clone();
         let required = startup_state.endpoint.required;
 
         let handle = match runtime_handle() {
@@ -87,10 +60,7 @@ impl QUICListener {
                 let mut listener_binding = initial_binding;
 
                 loop {
-                    let runtime_state = Self::current_metrics_endpoint_state(
-                        runtime_bundle.as_ref(),
-                        &startup_state,
-                    );
+                    let runtime_state = Self::current_metrics_endpoint_state(&service_ctx);
                     let endpoint = &runtime_state.endpoint;
                     let desired_bind = format!("{}:{}", endpoint.address, endpoint.port);
 
@@ -155,10 +125,7 @@ impl QUICListener {
                             continue;
                         }
                     };
-                    let runtime_state = Self::current_metrics_endpoint_state(
-                        runtime_bundle.as_ref(),
-                        &startup_state,
-                    );
+                    let runtime_state = Self::current_metrics_endpoint_state(&service_ctx);
                     let active_connections = Arc::clone(&binding.active_connections);
                     if !Self::try_claim_runtime_connection_slot(
                         &active_connections,
@@ -202,53 +169,5 @@ impl QUICListener {
             },
         );
         Ok(())
-    }
-
-    fn metrics_endpoint_state_from_runtime(
-        runtime: CanonicalRuntimeView<'_>,
-    ) -> MetricsEndpointState {
-        MetricsEndpointState {
-            endpoint: runtime.runtime_config().observability.metrics.clone(),
-            metrics: runtime.shared_services().metrics.clone(),
-        }
-    }
-
-    pub(super) fn current_metrics_endpoint_state(
-        runtime_bundle: Option<&Arc<RuntimeBundleHandle>>,
-        startup_state: &MetricsEndpointState,
-    ) -> MetricsEndpointState {
-        runtime_bundle
-            .map(|handle| {
-                handle.with_current_view(|view| {
-                    Self::metrics_endpoint_state_from_runtime(CanonicalRuntimeView::Active(view))
-                })
-            })
-            .unwrap_or_else(|| startup_state.clone())
-    }
-
-    fn handle_metrics_request(
-        req: Request<Incoming>,
-        metrics_path: &str,
-        metrics: Arc<Metrics>,
-    ) -> Response<Full<Bytes>> {
-        if req.uri().path() != metrics_path {
-            return match Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(Full::new(Bytes::from_static(b"not found\n")))
-            {
-                Ok(resp) => resp,
-                Err(_) => Response::new(Full::new(Bytes::from_static(b"not found\n"))),
-            };
-        }
-
-        let body = metrics.render_prometheus();
-        match Response::builder()
-            .status(StatusCode::OK)
-            .header("content-type", "text/plain; version=0.0.4")
-            .body(Full::new(Bytes::from(body)))
-        {
-            Ok(resp) => resp,
-            Err(_) => Response::new(Full::new(Bytes::from_static(b"failed to render metrics\n"))),
-        }
     }
 }

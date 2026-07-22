@@ -53,6 +53,8 @@ use tokio::{
 use tokio_rustls::TlsAcceptor;
 use tracing::{Instrument, info_span};
 
+#[cfg(test)]
+use crate::runtime::bundle::RuntimeBundleHandle;
 use crate::{
     ChannelBody, Metrics, OverloadShedReason, REQUEST_ID_COUNTER, RouteOutcome,
     cid_radix::CidRadix,
@@ -65,7 +67,7 @@ use crate::{
     resilience::runtime::RuntimeResilience,
     routing::{decision::RouteDecisionReason, index::RouteIndex},
     runtime::{
-        bundle::{RuntimeBundle, RuntimeBundleHandle},
+        bundle::RuntimeBundle,
         connection::{
             guardrails::{
                 BodyLimitKind, REQUEST_BODY_TOO_LARGE_BODY, RequestBodyGuardrailConfig,
@@ -79,7 +81,6 @@ use crate::{
         },
         health::{HealthClassification, outcome_from_status},
         listener::QUICListener,
-        shared_state::SharedRuntimeState,
         tasks::RuntimeTaskRegistry,
         tls::{
             inventory::{
@@ -89,7 +90,7 @@ use crate::{
             store::{ListenerTlsReloadState, ListenerTlsReloadStore},
         },
     },
-    watchdog::{config::WatchdogRuntimeConfig, coordinator::WatchdogCoordinator, time::now_millis},
+    watchdog::coordinator::WatchdogCoordinator,
 };
 
 mod admission;
@@ -102,7 +103,7 @@ mod control_api;
 mod control_plane;
 mod forwarding;
 mod health_check;
-mod metrics_endpoint;
+mod metrics;
 mod protocol;
 mod runtime_endpoint;
 mod runtime_state;

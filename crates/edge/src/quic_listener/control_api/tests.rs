@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{collections::HashMap, ffi::OsString, path::Path, sync::Arc};
 
 use http_body_util::BodyExt;
 use log::LevelFilter;
@@ -98,64 +98,36 @@ fn control_api_state_with_runtime_bundle(
 ) -> ControlApiState {
     let startup_bundle = runtime_bundle_from_config("startup.yaml", startup);
     let reloaded_bundle = runtime_bundle_from_config("reloaded.yaml", reloaded);
-    let startup_shared = startup_bundle.shared_state.shared_services();
-    let startup_generation = startup_bundle.shared_state.generation_state();
-    let listener_config = startup_bundle
-        .runtime_config
-        .primary_listener_runtime_config()
-        .expect("listener runtime config");
+    let runtime_ctx =
+        crate::quic_listener::runtime_state::ControlPlaneRuntimeCtx::from_runtime_sources(
+            &startup_bundle.runtime_config,
+            startup_bundle.shared_state.as_ref(),
+            Some(Arc::new(RuntimeBundleHandle::new(reloaded_bundle))),
+        );
 
-    ControlApiState {
-        control_api: startup_bundle
-            .runtime_config
-            .observability
-            .control_api
-            .clone(),
-        metrics: Arc::clone(&startup_shared.metrics),
-        resilience: Arc::clone(&startup_generation.resilience),
-        watchdog: Arc::clone(&startup_shared.watchdog),
-        backend_lifecycle: Arc::clone(&startup_shared.backend_lifecycle),
-        upstream_pools: startup_generation.upstream_pools.clone(),
-        listener_runtime_configs: Arc::clone(&startup_generation.listener_runtime_configs),
-        listener_tls_store: Arc::clone(&startup_shared.listener_tls_store),
-        primary_listener_label: QUICListener::listener_label(&listener_config),
-        expected_workers: 1,
-        started_at: Instant::now(),
-        runtime_bundle: Some(Arc::new(RuntimeBundleHandle::new(reloaded_bundle))),
-    }
+    ControlApiState::new(runtime_ctx)
 }
 
 fn runtime_bundle_control_api_state(
     bundle: RuntimeBundle,
 ) -> (ControlApiState, Arc<RuntimeBundleHandle>) {
-    let bundle_shared = bundle.shared_state.shared_services();
-    let bundle_generation = bundle.shared_state.generation_state();
-    let listener_config = bundle
-        .runtime_config
-        .primary_listener_runtime_config()
-        .expect("listener runtime config");
     let runtime_handle = Arc::new(RuntimeBundleHandle::new(bundle.clone()));
-    let state = ControlApiState {
-        control_api: bundle.runtime_config.observability.control_api.clone(),
-        metrics: Arc::clone(&bundle_shared.metrics),
-        resilience: Arc::clone(&bundle_generation.resilience),
-        watchdog: Arc::clone(&bundle_shared.watchdog),
-        backend_lifecycle: Arc::clone(&bundle_shared.backend_lifecycle),
-        upstream_pools: bundle_generation.upstream_pools.clone(),
-        listener_runtime_configs: Arc::clone(&bundle_generation.listener_runtime_configs),
-        listener_tls_store: Arc::clone(&bundle_shared.listener_tls_store),
-        primary_listener_label: QUICListener::listener_label(&listener_config),
-        expected_workers: 1,
-        started_at: Instant::now(),
-        runtime_bundle: Some(Arc::clone(&runtime_handle)),
-    };
+    let runtime_ctx =
+        crate::quic_listener::runtime_state::ControlPlaneRuntimeCtx::from_runtime_sources(
+            &bundle.runtime_config,
+            bundle.shared_state.as_ref(),
+            Some(Arc::clone(&runtime_handle)),
+        );
+    let state = ControlApiState::new(runtime_ctx);
     (state, runtime_handle)
 }
 
 #[test]
 fn watchdog_restart_env_keeps_path_when_present() {
-    let env =
-        QUICListener::watchdog_restart_env(Some(OsString::from("/usr/bin:/bin")), "timeout_spike");
+    let env = crate::watchdog::service::watchdog_restart_env(
+        Some(OsString::from("/usr/bin:/bin")),
+        "timeout_spike",
+    );
     let map: HashMap<OsString, OsString> = env.into_iter().collect();
 
     assert_eq!(
@@ -170,7 +142,7 @@ fn watchdog_restart_env_keeps_path_when_present() {
 
 #[test]
 fn watchdog_restart_env_omits_path_when_missing() {
-    let env = QUICListener::watchdog_restart_env(None, "poll_stall");
+    let env = crate::watchdog::service::watchdog_restart_env(None, "poll_stall");
     let map: HashMap<OsString, OsString> = env.into_iter().collect();
 
     assert!(!map.contains_key(&OsString::from("PATH")));
@@ -262,7 +234,6 @@ fn control_api_state_uses_live_primary_listener_label_after_runtime_swap() {
 
     let state = control_api_state_with_runtime_bundle(&startup, &reloaded);
 
-    assert_eq!(state.primary_listener_label, "127.0.0.1:9889");
     assert_eq!(
         state.current_primary_listener_label().as_deref(),
         Some("127.0.0.1:9890")
@@ -562,10 +533,13 @@ async fn runtime_bundle_cert_reload_ignores_unrelated_config_drift_and_bundle_sw
 
     let generation_before = runtime_handle.current_generation();
     let live_runtime = runtime_handle.current_view();
+    let primary_listener_label = state
+        .current_primary_listener_label()
+        .expect("primary listener label");
     let tls_generation_before = live_runtime
         .shared_services()
         .listener_tls_store
-        .generation(&state.primary_listener_label)
+        .generation(&primary_listener_label)
         .unwrap_or(0);
 
     let response = QUICListener::reload_listener_certs(
@@ -594,7 +568,7 @@ async fn runtime_bundle_cert_reload_ignores_unrelated_config_drift_and_bundle_sw
         current_runtime
             .shared_services()
             .listener_tls_store
-            .generation(&state.primary_listener_label)
+            .generation(&primary_listener_label)
             .unwrap_or(0)
             > tls_generation_before,
         "expected cert reload to rotate the live listener TLS generation"

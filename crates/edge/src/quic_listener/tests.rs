@@ -517,8 +517,6 @@ fn metrics_endpoint_state_prefers_reloaded_runtime_settings() {
     let startup_runtime = RuntimeConfig::from_config(&startup).expect("startup runtime");
     let startup_shared =
         Arc::new(super::QUICListener::build_shared_state(&startup_runtime).expect("shared"));
-    let startup_metrics = Arc::clone(&startup_shared.shared_services().metrics);
-
     let mut reloaded = startup.clone();
     reloaded.observability.metrics.enabled = true;
     reloaded.observability.metrics.path = "/metrics-live".to_string();
@@ -533,20 +531,14 @@ fn metrics_endpoint_state_prefers_reloaded_runtime_settings() {
     )
     .expect("reloaded bundle");
     let runtime_handle = Arc::new(super::RuntimeBundleHandle::new(reloaded_bundle));
-
-    let state = super::QUICListener::current_metrics_endpoint_state(
-        Some(&runtime_handle),
-        &super::metrics_endpoint::MetricsEndpointState {
-            endpoint: spooky_config::config::MetricsEndpoint {
-                enabled: true,
-                path: "/metrics-startup".to_string(),
-                max_connections: 5,
-                connection_timeout_ms: 500,
-                ..Default::default()
-            },
-            metrics: startup_metrics,
-        },
+    let runtime_ctx = super::runtime_state::ControlPlaneRuntimeCtx::from_runtime_sources(
+        &startup_runtime,
+        startup_shared.as_ref(),
+        Some(Arc::clone(&runtime_handle)),
     );
+    let service_ctx = super::runtime_state::MetricsServiceCtx::new(runtime_ctx);
+
+    let state = super::QUICListener::current_metrics_endpoint_state(&service_ctx);
 
     assert_eq!(state.endpoint.path, "/metrics-live");
     assert_eq!(state.endpoint.max_connections, 29);
