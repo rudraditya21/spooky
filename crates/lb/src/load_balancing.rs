@@ -1,3 +1,9 @@
+//! Canonical load-balancing strategy façade.
+//!
+//! Strategy-specific implementations stay internal; callers should choose and
+//! query strategies through [`LoadBalancing`] instead of depending on
+//! algorithm-specific state.
+
 use crate::{
     algorithms::{
         consistent_hash::ConsistentHash, latency_aware::LatencyAware,

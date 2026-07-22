@@ -374,8 +374,7 @@ impl QUICListener {
         }
         .ok_or_else(|| Self::no_healthy_servers_error(pool))?;
         let backend_addr = pool
-            .pool
-            .address(idx)
+            .backend_address(idx)
             .map(str::to_string)
             .ok_or_else(|| ProxyError::Transport("invalid server address".into()))?;
         Ok(SelectedBackend {
@@ -393,7 +392,7 @@ impl QUICListener {
         let mut pool = upstream_pool
             .write()
             .map_err(|_| ProxyError::Transport("upstream pool lock poisoned".into()))?;
-        if pool.pool.is_empty() {
+        if pool.is_empty() {
             return Err(Self::no_servers_in_upstream_error());
         }
         let plan = Self::build_backend_selection_plan(request, &pool);

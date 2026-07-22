@@ -1,3 +1,9 @@
+//! Alternate-backend selection façade.
+//!
+//! This module owns retry/hedge follow-up backend choice on top of
+//! [`UpstreamPool`]. It consumes pool-level read APIs and does not mutate pool
+//! internals directly.
+
 use crate::upstream_pool::UpstreamPool;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -84,8 +90,6 @@ mod tests {
     };
 
     use super::*;
-    use crate::health::HealthFailureReason;
-
     fn upstream(lb_type: &str, backends: &[&str]) -> Upstream {
         Upstream {
             tls: None,
@@ -227,12 +231,8 @@ mod tests {
         )))
         .expect("pool");
 
-        let _ = pool
-            .pool
-            .mark_failure_with_reason(0, HealthFailureReason::Transport);
-        let _ = pool
-            .pool
-            .mark_failure_with_reason(1, HealthFailureReason::Transport);
+        let _ = pool.mark_backend_failure_from_active_check(0);
+        let _ = pool.mark_backend_failure_from_active_check(1);
 
         let decision = choose_alternate_backend(&pool, &[], None);
         assert_eq!(

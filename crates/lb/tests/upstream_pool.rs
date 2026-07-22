@@ -4,7 +4,7 @@ use spooky_config::{
     config::{Backend, Config, HealthCheck, Listen, RouteMatch, Tls},
     runtime::RuntimeConfig,
 };
-use spooky_lb::{load_balancing::LoadBalancing, upstream_pool::UpstreamPool};
+use spooky_lb::upstream_pool::UpstreamPool;
 
 #[test]
 fn upstream_pool_from_config() {
@@ -78,11 +78,8 @@ fn upstream_pool_from_config() {
 
     let upstream_pool =
         UpstreamPool::from_runtime_upstream(runtime.upstreams.get("api").unwrap()).unwrap();
-    assert!(matches!(
-        upstream_pool.load_balancer,
-        LoadBalancing::RoundRobin(_)
-    ));
-    assert_eq!(upstream_pool.pool.len(), 2);
-    assert_eq!(upstream_pool.pool.address(0), Some("127.0.0.1:8001"));
-    assert_eq!(upstream_pool.pool.address(1), Some("127.0.0.1:8002"));
+    assert_eq!(upstream_pool.load_balancer_name(), "round-robin");
+    assert_eq!(upstream_pool.backend_count(), 2);
+    assert_eq!(upstream_pool.backend_address(0), Some("127.0.0.1:8001"));
+    assert_eq!(upstream_pool.backend_address(1), Some("127.0.0.1:8002"));
 }
