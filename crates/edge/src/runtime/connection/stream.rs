@@ -1,5 +1,6 @@
-use std::{sync::Arc, time::Instant};
+use std::{collections::VecDeque, sync::Arc, time::Instant};
 
+use bytes::Bytes;
 use http::StatusCode;
 use tokio::{
     sync::{OwnedSemaphorePermit, mpsc, oneshot},
@@ -190,10 +191,10 @@ pub struct AuthWaitState {
     pub request_mode: RequestMode,
     pub request_body: RequestBodyState,
     pub pending_forward: Arc<PendingForward>,
-    pub auth_result_rx: oneshot::Receiver<ExternalAuthResult>,
+    pub(crate) auth_result_rx: oneshot::Receiver<ExternalAuthResult>,
     pub auth_abort: AbortHandle,
     pub auth_deadline: Instant,
-    pub auth_disposition: ExternalAuthFailureDisposition,
+    pub(crate) auth_disposition: ExternalAuthFailureDisposition,
 }
 
 #[allow(dead_code)]
@@ -203,6 +204,15 @@ pub struct DispatchReadyState {
     pub request_mode: RequestMode,
     pub request_body: RequestBodyState,
     pub pending_forward: Arc<PendingForward>,
+}
+
+pub struct RequestBodyRuntime {
+    pub body_tx: Option<mpsc::Sender<Bytes>>,
+    pub body_buf: VecDeque<Bytes>,
+    pub body_buf_bytes: usize,
+    pub body_bytes_received: usize,
+    pub last_body_activity: Instant,
+    pub request_fin_received: bool,
 }
 
 #[allow(dead_code)]
@@ -233,9 +243,10 @@ pub struct AwaitingUpstreamState {
     pub routing: RoutingSnapshot,
     pub request_mode: RequestMode,
     pub request_body: RequestBodyState,
+    pub request_body_runtime: RequestBodyRuntime,
     pub pending_forward: Arc<PendingForward>,
     pub permits: AdmissionPermits,
-    pub upstream_result_rx: oneshot::Receiver<UpstreamResult>,
+    pub(crate) upstream_result_rx: oneshot::Receiver<UpstreamResult>,
     pub backend_accounting: BackendAccountingState,
 }
 
@@ -244,11 +255,34 @@ pub struct ResponseStreamingState {
     pub context: RequestContext,
     pub routing: RoutingSnapshot,
     pub request_mode: RequestMode,
+    pub request_body_runtime: RequestBodyRuntime,
+    pub permits: AdmissionPermits,
     pub response_status: StatusCode,
     pub emission: ResponseEmissionState,
-    pub response_chunk_rx: mpsc::Receiver<ResponseChunk>,
-    pub pending_chunk: Option<ResponseChunk>,
+    pub(crate) response_chunk_rx: mpsc::Receiver<ResponseChunk>,
+    pub(crate) pending_chunk: Option<ResponseChunk>,
     pub backend_accounting: BackendAccountingState,
+}
+
+pub struct LegacyRequestLifecycle {
+    pub phase: StreamPhase,
+    pub admission_state: StreamAdmissionState,
+    pub request_body_runtime: RequestBodyRuntime,
+    pub pending_forward: Option<Arc<PendingForward>>,
+    pub(crate) auth_result_rx: Option<oneshot::Receiver<ExternalAuthResult>>,
+    pub auth_abort: Option<AbortHandle>,
+    pub(crate) auth_disposition: Option<ExternalAuthFailureDisposition>,
+    pub auth_deadline: Option<Instant>,
+    pub backend_request_started: bool,
+    pub backend_request_finished: bool,
+    pub global_inflight_permit: Option<OwnedSemaphorePermit>,
+    pub upstream_inflight_permit: Option<OwnedSemaphorePermit>,
+    pub adaptive_admission_permit: Option<AdaptivePermit>,
+    pub route_queue_permit: Option<RouteQueuePermit>,
+    pub(crate) upstream_result_rx: Option<oneshot::Receiver<UpstreamResult>>,
+    pub(crate) response_chunk_rx: Option<mpsc::Receiver<ResponseChunk>>,
+    pub response_headers_sent: bool,
+    pub(crate) pending_chunk: Option<ResponseChunk>,
 }
 
 #[allow(dead_code)]
@@ -345,6 +379,9 @@ pub enum RequestExecutionState {
     DispatchReady(DispatchReadyState),
     AwaitingUpstream(AwaitingUpstreamState),
     StreamingResponse(ResponseStreamingState),
+    /// Migration shim used while handlers are incrementally rewritten away
+    /// from the legacy field-oriented request execution model.
+    Legacy(LegacyRequestLifecycle),
     Terminal(TerminalState),
 }
 
@@ -366,6 +403,7 @@ impl RequestExecutionState {
             Self::AwaitingUpstream(state) => state.backend_accounting.should_finalize(),
             Self::StreamingResponse(state) => state.backend_accounting.should_finalize(),
             Self::Terminal(state) => state.should_finalize_backend_accounting(),
+            Self::Legacy(state) => state.backend_request_started && !state.backend_request_finished,
             Self::Intake(_) | Self::AwaitingAuth(_) | Self::DispatchReady(_) => false,
         }
     }
@@ -378,6 +416,10 @@ impl RequestExecutionState {
             Self::AwaitingUpstream(state) => {
                 state.request_mode.is_tunnel() && state.request_body.can_accept_downstream_body()
             }
+            Self::Legacy(state) => {
+                state.phase == StreamPhase::ReceivingRequest
+                    && !state.request_body_runtime.request_fin_received
+            }
             Self::StreamingResponse(_) | Self::Terminal(_) => false,
         }
     }
@@ -387,11 +429,37 @@ impl RequestExecutionState {
             Self::AwaitingUpstream(state) => {
                 state.request_mode.is_tunnel() || state.request_body.forwarding_complete()
             }
+            Self::Legacy(state) => state.admission_state == StreamAdmissionState::ReadyToForward,
             _ => false,
         }
     }
 
     pub fn can_emit_response(&self) -> bool {
-        matches!(self, Self::StreamingResponse(_))
+        matches!(self, Self::StreamingResponse(_) | Self::Legacy(_))
+    }
+
+    pub fn phase(&self) -> StreamPhase {
+        match self {
+            Self::Intake(_) | Self::AwaitingAuth(_) | Self::DispatchReady(_) => {
+                StreamPhase::ReceivingRequest
+            }
+            Self::AwaitingUpstream(_) => StreamPhase::AwaitingUpstream,
+            Self::StreamingResponse(_) => StreamPhase::SendingResponse,
+            Self::Legacy(state) => state.phase.clone(),
+            Self::Terminal(TerminalState::Completed(_)) => StreamPhase::Completed,
+            Self::Terminal(_) => StreamPhase::Failed,
+        }
+    }
+
+    pub fn admission_state(&self) -> StreamAdmissionState {
+        match self {
+            Self::AwaitingAuth(_) => StreamAdmissionState::WaitingForAuth,
+            Self::DispatchReady(_) | Self::AwaitingUpstream(_) | Self::StreamingResponse(_) => {
+                StreamAdmissionState::ReadyToForward
+            }
+            Self::Terminal(TerminalState::Rejected(_)) => StreamAdmissionState::Denied,
+            Self::Legacy(state) => state.admission_state.clone(),
+            Self::Intake(_) | Self::Terminal(_) => StreamAdmissionState::ReadyToForward,
+        }
     }
 }
