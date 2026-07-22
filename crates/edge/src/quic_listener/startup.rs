@@ -252,15 +252,14 @@ impl QUICListener {
             &backend_resolution_store,
         )));
         let connect_metrics = Arc::clone(&metrics);
-        let connect_observer: ConnectObserver =
-            Arc::new(move |observation: ConnectObservation| {
-                Self::record_backend_connect(
-                    &connect_metrics,
-                    &observation.backend,
-                    &observation.hostname,
-                    observation.resolved_addr,
-                );
-            });
+        let connect_observer: ConnectObserver = Arc::new(move |observation: ConnectObservation| {
+            Self::record_backend_connect(
+                &connect_metrics,
+                &observation.backend,
+                &observation.hostname,
+                observation.resolved_addr,
+            );
+        });
         let transport_pool = Arc::new(
             UpstreamTransportPool::from_runtime_upstreams(
                 config.upstreams.values(),

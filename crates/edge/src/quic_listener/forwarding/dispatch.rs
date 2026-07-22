@@ -163,9 +163,7 @@ impl QUICListener {
             return Err(ProxyError::Pool(PoolError::CircuitOpen(backend)));
         }
 
-        let send_result = transport
-            .send_backend_request(&backend, request)
-            .await;
+        let send_result = transport.send_backend_request(&backend, request).await;
         match &send_result {
             Ok(_) => circuit_breakers.record_success(&backend),
             _ => circuit_breakers.record_failure(&backend),
@@ -377,13 +375,7 @@ impl QUICListener {
             "request_id={} retrying request on alternate backend: route={} reason={:?}",
             request_id, route_name, retry_reason
         );
-        Self::send_upstream_request(
-            retry_backend,
-            retry_request,
-            circuit_breakers,
-            transport,
-        )
-        .await
+        Self::send_upstream_request(retry_backend, retry_request, circuit_breakers, transport).await
     }
 
     pub(super) fn spawn_upstream_forward_task(

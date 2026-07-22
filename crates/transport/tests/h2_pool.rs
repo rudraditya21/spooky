@@ -168,7 +168,10 @@ async fn pool_rejects_unknown_backend() {
         .body(Full::new(Bytes::new()).boxed())
         .unwrap();
 
-    let err = pool.send_backend_request("127.0.0.1:9999", req).await.unwrap_err();
+    let err = pool
+        .send_backend_request("127.0.0.1:9999", req)
+        .await
+        .unwrap_err();
     match err {
         ProxyError::Pool(PoolError::UnknownBackend(name)) => {
             assert_eq!(name, "127.0.0.1:9999")

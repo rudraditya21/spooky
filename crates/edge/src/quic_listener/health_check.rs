@@ -159,12 +159,12 @@ impl QUICListener {
                                     )
                                 }
                                 Err(proxy_err) => {
-                                    let failure_reason =
-                                        if matches!(proxy_err, ProxyError::Timeout) {
-                                            HealthFailureReason::Timeout
-                                        } else {
-                                            HealthFailureReason::Transport
-                                        };
+                                    let failure_reason = if matches!(proxy_err, ProxyError::Timeout)
+                                    {
+                                        HealthFailureReason::Timeout
+                                    } else {
+                                        HealthFailureReason::Transport
+                                    };
                                     Self::evaluate_failed_health_check(
                                         &job.backend_identity,
                                         task_metrics.as_ref(),

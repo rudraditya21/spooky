@@ -9,15 +9,11 @@ use spooky_config::runtime::{
     RuntimeBackendConnectionPolicy, RuntimeBackendTransportKind, RuntimeUpstream,
 };
 use spooky_errors::{PoolError, ProxyError};
+
 pub use crate::h2_client::{
     ConnectObservation, ConnectObserver, SharedDnsResolver, TlsClientConfig,
 };
-
-use crate::{
-    client_rotation::BackendClientRotation,
-    h1_pool::H1Pool,
-    h2_pool::H2Pool,
-};
+use crate::{client_rotation::BackendClientRotation, h1_pool::H1Pool, h2_pool::H2Pool};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BackendTransportEntry {
@@ -134,9 +130,7 @@ impl UpstreamTransportPool {
         })
     }
 
-    fn resolve_runtime_transport(
-        transport: RuntimeBackendTransportKind,
-    ) -> BackendTransportEntry {
+    fn resolve_runtime_transport(transport: RuntimeBackendTransportKind) -> BackendTransportEntry {
         match transport {
             RuntimeBackendTransportKind::Http1 => BackendTransportEntry::Http1,
             RuntimeBackendTransportKind::H2 => BackendTransportEntry::H2,
@@ -159,7 +153,10 @@ impl UpstreamTransportPool {
             for backend in &upstream.backends {
                 let backend_addr = backend.backend.address.clone();
                 backends.push((backend_addr.clone(), backend.endpoint.transport_kind));
-                if matches!(backend.endpoint.transport_kind, RuntimeBackendTransportKind::H2) {
+                if matches!(
+                    backend.endpoint.transport_kind,
+                    RuntimeBackendTransportKind::H2
+                ) {
                     backend_tls.insert(
                         backend_addr,
                         TlsClientConfig::from(&upstream.policy_set.transport.tls),
@@ -191,22 +188,21 @@ impl UpstreamTransportPool {
         req: Request<BoxBody<Bytes, Infallible>>,
     ) -> Result<hyper::Response<Incoming>, ProxyError> {
         match self.backend_entry(backend) {
-            Some(BackendTransportEntry::Http1) => self
-                .execute_with_timeout(backend, self.h1_pool.send(backend, req))
-                .await,
-            Some(BackendTransportEntry::H2) => self
-                .execute_with_timeout(backend, self.h2_pool.send(backend, req))
-                .await,
+            Some(BackendTransportEntry::Http1) => {
+                self.execute_with_timeout(backend, self.h1_pool.send(backend, req))
+                    .await
+            }
+            Some(BackendTransportEntry::H2) => {
+                self.execute_with_timeout(backend, self.h2_pool.send(backend, req))
+                    .await
+            }
             None => Err(ProxyError::Pool(PoolError::UnknownBackend(
                 backend.to_string(),
             ))),
         }
     }
 
-    pub fn rotate_backend_client(
-        &self,
-        backend: &str,
-    ) -> Result<TransportClientRotation, String> {
+    pub fn rotate_backend_client(&self, backend: &str) -> Result<TransportClientRotation, String> {
         match self.backend_entry(backend) {
             Some(BackendTransportEntry::Http1) => self
                 .h1_pool

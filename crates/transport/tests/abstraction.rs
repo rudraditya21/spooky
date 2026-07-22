@@ -60,8 +60,9 @@ fn loopback_bind_restricted(err: &std::io::Error) -> bool {
         || matches!(err.raw_os_error(), Some(1) | Some(13))
 }
 
-fn request(uri: &str) -> Request<http_body_util::combinators::BoxBody<Bytes, std::convert::Infallible>>
-{
+fn request(
+    uri: &str,
+) -> Request<http_body_util::combinators::BoxBody<Bytes, std::convert::Infallible>> {
     Request::builder()
         .method("GET")
         .uri(uri)
@@ -77,7 +78,9 @@ fn reserve_unused_port() -> u16 {
         .port()
 }
 
-fn test_connection_policy(max_inflight: usize) -> spooky_config::runtime::RuntimeBackendConnectionPolicy {
+fn test_connection_policy(
+    max_inflight: usize,
+) -> spooky_config::runtime::RuntimeBackendConnectionPolicy {
     spooky_config::runtime::RuntimeBackendConnectionPolicy {
         max_inflight,
         max_idle_per_backend: 64,
@@ -163,9 +166,9 @@ async fn start_h2_server(
                     if let Some(tracker) = &tracker {
                         tracker.exit();
                     }
-                    Ok::<_, std::convert::Infallible>(Response::new(Full::new(
-                        Bytes::from_static(body),
-                    )))
+                    Ok::<_, std::convert::Infallible>(Response::new(Full::new(Bytes::from_static(
+                        body,
+                    ))))
                 }
             });
 
@@ -390,7 +393,10 @@ async fn canonical_error_mapping_is_consistent() {
         Err(err) => panic!("failed to start h1 overload server: {err}"),
     };
     let h1_overload_pool = Arc::new(build_pool(
-        [("h1-overload".to_string(), RuntimeBackendTransportKind::Http1)],
+        [(
+            "h1-overload".to_string(),
+            RuntimeBackendTransportKind::Http1,
+        )],
         1,
         SharedDnsResolver::new(),
     ));
@@ -418,14 +424,17 @@ async fn canonical_error_mapping_is_consistent() {
     assert_eq!(h1_tracker.max.load(Ordering::SeqCst), 0);
 
     let h2_tracker = Arc::new(ConcurrencyTracker::new());
-    let h2_overload_port =
-        match start_h2_server(b"h2", Duration::from_millis(50), Some(Arc::clone(&h2_tracker)))
-            .await
-        {
-            Ok(port) => port,
-            Err(err) if loopback_bind_restricted(&err) => return,
-            Err(err) => panic!("failed to start h2 overload server: {err}"),
-        };
+    let h2_overload_port = match start_h2_server(
+        b"h2",
+        Duration::from_millis(50),
+        Some(Arc::clone(&h2_tracker)),
+    )
+    .await
+    {
+        Ok(port) => port,
+        Err(err) if loopback_bind_restricted(&err) => return,
+        Err(err) => panic!("failed to start h2 overload server: {err}"),
+    };
     let h2_overload_pool = Arc::new(build_pool(
         [("h2-overload".to_string(), RuntimeBackendTransportKind::H2)],
         1,

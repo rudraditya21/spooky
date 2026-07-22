@@ -27,7 +27,7 @@ async fn dispatch_bootstrap_http(
         .runtime
         .transport_pool
         .send_backend_request(&input.prepared_route.backend_addr, input.upstream_req)
-    .await
+        .await
     {
         Ok(response) => Ok(response),
         Err(proxy_err) => {
