@@ -136,7 +136,7 @@ pub struct RuntimeBackendTlsPolicy {
 }
 
 impl RuntimeBackendTlsPolicy {
-    pub fn from_effective_tls(effective_tls: &UpstreamTls) -> Self {
+    pub(crate) fn from_effective_tls(effective_tls: &UpstreamTls) -> Self {
         Self {
             verify_certificates: effective_tls.verify_certificates,
             strict_sni: effective_tls.strict_sni,
@@ -145,7 +145,7 @@ impl RuntimeBackendTlsPolicy {
         }
     }
 
-    pub fn as_upstream_tls(&self) -> UpstreamTls {
+    pub(crate) fn as_upstream_tls(&self) -> UpstreamTls {
         UpstreamTls {
             verify_certificates: self.verify_certificates,
             strict_sni: self.strict_sni,

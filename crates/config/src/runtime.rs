@@ -8,14 +8,11 @@ use crate::{
     },
 };
 
-#[path = "runtime/listeners.rs"]
 mod listeners;
-#[path = "runtime/policies/mod.rs"]
 mod policies;
-#[path = "runtime/upstreams.rs"]
 mod upstreams;
 
-pub use policies::{
+pub use self::policies::{
     RuntimeAdmissionPolicy, RuntimeAlternateBackendPolicy, RuntimeApiKeyAuth, RuntimeAuthPolicy,
     RuntimeBackendAddressKind, RuntimeBackendConnectionPolicy, RuntimeBackendDnsPolicy,
     RuntimeBackendEndpoint, RuntimeBackendHealthCheck, RuntimeBackendTlsPolicy,

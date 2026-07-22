@@ -7,7 +7,11 @@ mod timeouts;
 mod transport;
 mod watchdog;
 
-use super::*;
+use super::{
+    Config, ListenerRuntimeConfig, RuntimeConfigError, RuntimeForwardedHeaderPolicy,
+    RuntimeHostPolicy, RuntimeListenerTls, RuntimeProtocolPolicy,
+};
+use crate::config::UpstreamTls;
 pub use self::admission::{
     RuntimeAdmissionPolicy, RuntimeBrownoutPolicy, RuntimeRateLimitPolicy,
     RuntimeRouteQueuePolicy, RuntimeScopedRateLimitPolicy,
@@ -154,7 +158,7 @@ pub struct RuntimeUpstreamTransportPolicy {
 }
 
 impl RuntimeUpstreamTransportPolicy {
-    pub fn from_effective_tls(
+    pub(crate) fn from_effective_tls(
         effective_tls: &UpstreamTls,
         transport: &RuntimeTransportPolicy,
     ) -> Self {
@@ -199,7 +203,7 @@ pub struct RuntimeListenerPolicySet {
 }
 
 impl RuntimeListenerPolicySet {
-    pub fn from_listener_runtime_config(config: &ListenerRuntimeConfig) -> Self {
+    pub(crate) fn from_listener_runtime_config(config: &ListenerRuntimeConfig) -> Self {
         Self {
             timeouts: config.policies.timeouts.clone(),
             transport: config.policies.transport.clone(),
