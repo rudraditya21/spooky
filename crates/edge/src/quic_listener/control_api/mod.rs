@@ -5,11 +5,11 @@ use hyper_util::rt::TokioIo;
 use spooky_config::{
     config::ControlApi as ControlApiConfig, loader::read_config, runtime::RuntimeConfig,
 };
-use subtle::ConstantTimeEq;
 use tokio_rustls::TlsAcceptor;
 
 use super::*;
 
+mod auth;
 mod http;
 mod context;
 mod reload;

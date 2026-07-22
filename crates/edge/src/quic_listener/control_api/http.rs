@@ -1,4 +1,3 @@
-use ::http::{Method, header};
 use bytes::Bytes;
 use http_body_util::Full;
 
@@ -15,20 +14,6 @@ impl QUICListener {
 
         spooky_utils::logger::set_log_level(next_level)?;
         Ok(true)
-    }
-
-    pub(super) fn bearer_token_from_authorization_header(raw: &str) -> Option<&str> {
-        let raw = raw.trim();
-        let split = raw.find(char::is_whitespace)?;
-        let (scheme, rest) = raw.split_at(split);
-        if !scheme.eq_ignore_ascii_case("bearer") {
-            return None;
-        }
-        let token = rest.trim_start();
-        if token.is_empty() {
-            return None;
-        }
-        Some(token)
     }
 
     pub(super) fn json_response(
@@ -107,11 +92,13 @@ impl QUICListener {
         req: Request<Incoming>,
         state: &ControlApiState,
     ) -> Response<Full<Bytes>> {
-        let paths = state.current_paths();
-        let path = req.uri().path();
+        let route = match Self::gate_control_api_request(&req, state) {
+            Ok(route) => route,
+            Err(response) => return response,
+        };
         let watchdog = state.current_watchdog();
 
-        if req.method() == Method::GET && path == paths.health_path.as_str() {
+        if route == super::auth::ControlApiRoute::Health {
             let response = json!({
                 "status": "ok",
                 "uptime_ms": state.started_at.elapsed().as_millis() as u64,
@@ -124,7 +111,7 @@ impl QUICListener {
             return Self::json_response(StatusCode::OK, response);
         }
 
-        if req.method() == Method::GET && path == paths.ready_path.as_str() {
+        if route == super::auth::ControlApiRoute::Ready {
             let backend_summary = state.snapshot_backend_health();
             let healthy_backends = backend_summary.healthy_backends;
             let total_backends = backend_summary.total_backends;
@@ -146,15 +133,7 @@ impl QUICListener {
             );
         }
 
-        if req.method() == Method::GET && path == paths.runtime_path.as_str() {
-            if !Self::control_api_is_authorized(&req, state) {
-                return Self::json_response(
-                    StatusCode::UNAUTHORIZED,
-                    json!({
-                        "error": "unauthorized",
-                    }),
-                );
-            }
+        if route == super::auth::ControlApiRoute::Runtime {
             let backend_inventory = state.snapshot_backend_inventory();
             let backend_summary = backend_inventory.summary();
             let healthy_backends = backend_summary.healthy_backends;
@@ -283,17 +262,7 @@ impl QUICListener {
             return Self::json_response(StatusCode::OK, serde_json::Value::Object(response));
         }
 
-        if req.method() == Method::POST && path == paths.reload_certs_path.as_str() {
-            if !Self::control_api_is_authorized(&req, state) {
-                return Self::json_response(
-                    StatusCode::UNAUTHORIZED,
-                    json!({
-                        "reloaded": false,
-                        "error": "unauthorized",
-                    }),
-                );
-            }
-
+        if route == super::auth::ControlApiRoute::ReloadCerts {
             let live_tls_store = state.current_listener_tls_store();
             let live_listener_configs = state.current_listener_runtime_configs();
             let live_metrics = state.current_metrics();
@@ -304,25 +273,9 @@ impl QUICListener {
             );
         }
 
-        if req.method() == Method::POST && path == paths.reload_path.as_str() {
-            if !Self::control_api_is_authorized(&req, state) {
-                return Self::json_response(
-                    StatusCode::UNAUTHORIZED,
-                    json!({
-                        "reloaded": false,
-                        "error": "unauthorized",
-                    }),
-                );
-            }
-
+        if route == super::auth::ControlApiRoute::ReloadRuntime {
             let Some(runtime_bundle_handle) = state.runtime_bundle_handle() else {
-                return match Response::builder()
-                    .status(StatusCode::NOT_FOUND)
-                    .body(Full::new(Bytes::from_static(b"not found\n")))
-                {
-                    Ok(resp) => resp,
-                    Err(_) => Response::new(Full::new(Bytes::from_static(b"not found\n"))),
-                };
+                return Self::control_api_not_found_response();
             };
             let Some(runtime) = state.current_generation() else {
                 return Self::json_response(
@@ -388,21 +341,12 @@ impl QUICListener {
                 json!({
                     "reloaded": true,
                     "generation": generation,
-                    "path": path,
+                    "path": req.uri().path(),
                 }),
             );
         }
 
-        if req.method() == Method::POST && path == paths.restart_path.as_str() {
-            if !Self::control_api_is_authorized(&req, state) {
-                return Self::json_response(
-                    StatusCode::UNAUTHORIZED,
-                    json!({
-                        "accepted": false,
-                        "error": "unauthorized",
-                    }),
-                );
-            }
+        if route == super::auth::ControlApiRoute::Restart {
             if !watchdog.enabled() {
                 return Self::json_response(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -428,32 +372,6 @@ impl QUICListener {
             );
         }
 
-        match Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(Full::new(Bytes::from_static(b"not found\n")))
-        {
-            Ok(resp) => resp,
-            Err(_) => Response::new(Full::new(Bytes::from_static(b"not found\n"))),
-        }
-    }
-
-    pub(super) fn control_api_is_authorized(
-        req: &Request<Incoming>,
-        state: &ControlApiState,
-    ) -> bool {
-        let endpoint = state.current_control_api();
-        let Some(token) = endpoint.auth_token.as_ref() else {
-            return false;
-        };
-        let Some(header) = req.headers().get(header::AUTHORIZATION) else {
-            return false;
-        };
-        let Ok(raw) = header.to_str() else {
-            return false;
-        };
-        let Some(provided) = Self::bearer_token_from_authorization_header(raw) else {
-            return false;
-        };
-        bool::from(provided.as_bytes().ct_eq(token.as_bytes()))
+        Self::control_api_not_found_response()
     }
 }
