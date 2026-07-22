@@ -119,7 +119,7 @@ mod startup;
 mod tls_runtime;
 mod token_bucket;
 mod validation;
-pub mod workers;
+mod workers;
 
 pub use async_runtime::configure_async_runtime;
 pub(in crate::quic_listener) use async_runtime::{
@@ -150,6 +150,10 @@ pub(crate) use token_bucket::TokenBucket;
 use validation::{
     RequestBufferError, extract_header_value, generated_span_id, generated_trace_id,
     parse_traceparent, validate_request_headers,
+};
+pub use workers::{
+    ListenerWorkerGroupConfig, release_shard_queue_bytes, shard_index_for_peer,
+    spawn_listener_worker_group, try_reserve_shard_queue_bytes,
 };
 use x509_parser::{extensions::GeneralName, parse_x509_certificate};
 
