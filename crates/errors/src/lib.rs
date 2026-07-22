@@ -1,8 +1,14 @@
-pub mod bridge;
-pub mod pool;
-pub mod proxy;
-pub mod retry;
-pub mod upstream;
+//! Shared error and error-policy contract for Spooky runtime crates.
+//!
+//! Consumers should depend on the re-exported error types and classifier
+//! entrypoints from this crate root instead of reaching into module internals.
+//! Backend-selection policy types remain owned by `spooky-lb`.
+
+mod bridge;
+mod pool;
+mod proxy;
+mod retry;
+mod upstream;
 
 pub use bridge::BridgeError;
 pub use pool::PoolError;
@@ -16,10 +22,6 @@ pub use retry::{
     RetryPolicyDecision, RetryPolicyDenialReason, RetryPolicyFacts, UpstreamRetryReason,
     UpstreamRetryability, UpstreamTerminalErrorKind, classify_retryability, evaluate_hedge_policy,
     evaluate_retry_policy, is_idempotent_method, is_retryable,
-};
-pub use spooky_lb::alternate_backend::{
-    AlternateBackendChoice, AlternateBackendDecision, AlternateBackendFailureReason,
-    AlternateBackendSelectionMode,
 };
 pub use upstream::{
     UpstreamErrorCategory, UpstreamErrorClassification, UpstreamHealthFailureMapping,

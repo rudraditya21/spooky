@@ -1,3 +1,5 @@
+//! Shared upstream error-detail classification and health-mapping contract.
+
 use std::error::Error as StdError;
 
 use spooky_lb::health::HealthFailureReason;
@@ -142,7 +144,7 @@ impl UpstreamErrorClassification {
         }
     }
 
-    pub fn health_failure_mapping(self) -> UpstreamHealthFailureMapping {
+    pub(crate) fn health_failure_mapping(self) -> UpstreamHealthFailureMapping {
         match self.category {
             UpstreamErrorCategory::Timeout => UpstreamHealthFailureMapping {
                 failure_reason: HealthFailureReason::Timeout,

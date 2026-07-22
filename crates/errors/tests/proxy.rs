@@ -1,10 +1,10 @@
 use spooky_errors::{
-    AlternateBackendFailureReason, PoolError, ProxyError, RetryPolicyDecision,
-    RetryPolicyDenialReason, RetryPolicyFacts, UpstreamErrorClassification,
-    UpstreamHealthFailureMapping, UpstreamProxyErrorKind, UpstreamRetryReason,
-    UpstreamRetryability, UpstreamTerminalErrorKind, UpstreamTlsReason, classify_retryability,
-    classify_upstream_proxy_error, evaluate_retry_policy, is_retryable,
+    PoolError, ProxyError, RetryPolicyDecision, RetryPolicyDenialReason, RetryPolicyFacts,
+    UpstreamErrorClassification, UpstreamHealthFailureMapping, UpstreamProxyErrorKind,
+    UpstreamRetryReason, UpstreamRetryability, UpstreamTerminalErrorKind, UpstreamTlsReason,
+    classify_retryability, classify_upstream_proxy_error, evaluate_retry_policy, is_retryable,
 };
+use spooky_lb::alternate_backend::AlternateBackendFailureReason;
 
 #[test]
 fn pool_and_transport_errors_have_distinct_display_text() {
