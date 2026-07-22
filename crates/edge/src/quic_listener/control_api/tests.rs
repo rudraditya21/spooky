@@ -232,7 +232,6 @@ fn control_api_state_uses_live_primary_listener_label_after_runtime_swap() {
 
     let state = control_api_state_with_runtime_bundle(&startup, &reloaded);
 
-    assert_eq!(state.current_primary_listener_label().as_deref(), Some("127.0.0.1:9889"));
     assert_eq!(
         state.current_primary_listener_label().as_deref(),
         Some("127.0.0.1:9890")
