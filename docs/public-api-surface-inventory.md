@@ -1,203 +1,165 @@
 # Public API Surface Inventory
 
-Phase 2 inventory for `refactor/public-api-and-visibility-hardening`.
+Current Phase 2 surface for `refactor/public-api-and-visibility-hardening`.
 
 Scope:
 - crate `lib.rs` façades
-- top-level `mod.rs` files that currently fan out public surface area
-- current re-exports and compatibility paths that look broader than the canonical entrypoints
+- intentionally public subsystem entrypoints
+- remaining hidden or compatibility-oriented surfaces that are still exposed on purpose
 
-This document is a baseline audit. It does not change visibility yet.
+This document reflects the current branch state after the visibility-hardening work, not the original baseline audit.
 
 ## `spooky-edge`
 
-### Primary façades
+### Crate façade
 - `crates/edge/src/lib.rs`
-- `crates/edge/src/quic_listener/mod.rs`
-- `crates/edge/src/runtime/mod.rs`
-- `crates/edge/src/routing/mod.rs`
-- `crates/edge/src/resilience/mod.rs`
-- `crates/edge/src/watchdog/mod.rs`
 
-### Current public surface
-- `pub mod benchmark`
-- `pub mod body`
-- `pub mod cid_radix`
-- `pub mod constants`
-- `pub mod hash`
-- `pub mod metrics`
-- `pub mod quic_listener`
-- `pub mod resilience`
-- `pub mod routing`
-- `pub mod runtime`
-- `pub mod watchdog`
-- `pub use body::ChannelBody`
-- `pub use hash::{stable_hash_socket_addr, stable_hash64}`
-- `pub use metrics::{HealthFailureReason, Metrics, OverloadShedReason, RouteOutcome}`
-- `pub use quic_listener::configure_async_runtime`
-- `quic_listener/mod.rs` also publicly exposes:
-  - `pub mod workers`
-  - `pub use runtime_state::ListenerWorkerRuntimeState`
-  - `pub use workers::{ListenerWorkerGroupConfig, spawn_listener_worker_group}`
+### Public surface
+- modules:
+  - `benchmark`
+  - `body`
+  - `cid_radix`
+  - `constants`
+  - `hash`
+  - `metrics`
+  - `resilience`
+  - `routing`
+  - `runtime`
+  - `watchdog`
+- re-exports:
+  - `ChannelBody`
+  - `stable_hash_socket_addr`
+  - `stable_hash64`
+  - `Metrics`
+  - `OverloadShedReason`
+  - `RouteOutcome`
+  - `HealthFailureReason`
+  - `configure_async_runtime`
+  - `ListenerWorkerRuntimeState`
+  - `ListenerWorkerGroupConfig`
+  - `spawn_listener_worker_group`
+  - `release_shard_queue_bytes`
+  - `shard_index_for_peer`
+  - `try_reserve_shard_queue_bytes`
 
-### Likely canonical entrypoints
-- `configure_async_runtime`
-- listener worker startup types/functions if they are intentionally crate-external
-- `Metrics`
-- top-level stable hashing helpers if consumed outside `edge`
-- `ChannelBody`
+### Internal façades intentionally kept private
+- `quic_listener`
+- runtime connection/task/tls internals
+- bootstrap/control-plane/request-path decomposition modules under `quic_listener`
 
-### Likely leakage / visibility review targets
-- crate-wide public exposure of `runtime`, `routing`, `resilience`, and `watchdog`
-- public `benchmark` module
-- public `constants` and `cid_radix`
-- public `ListenerWorkerRuntimeState`
-- `quic_listener` as a large mixed façade instead of a narrow service entrypoint
-- top-level `routing` and `resilience` submodules are all `pub mod`, which currently exposes internal policy/mechanics as crate API
-- top-level `watchdog` submodules are all `pub mod`, including service/state/time internals
+### Phase 2 hardening result
+- `quic_listener` is no longer crate-public
+- `quic_listener::workers` is no longer a public module
+- worker/runtime entrypoints are exposed only through the crate root and listener façade re-exports
+- `HealthFailureReason` is re-exported from its owning crate path, not through `metrics`
+
+### Remaining intentional exposure
+- `runtime`, `routing`, `resilience`, and `watchdog` remain public because cross-crate tests and consumers still use stable types from those subsystems
+- `benchmark` remains public as an explicitly exposed support surface
 
 ## `spooky-config`
 
-### Primary façades
+### Crate façade
 - `crates/config/src/lib.rs`
-- `crates/config/src/runtime/policies/mod.rs`
 
-### Current public surface
-- `pub mod backend_endpoint`
-- `pub mod config`
-- `pub mod default`
-- `pub mod loader`
-- `pub mod runtime`
-- `pub mod validator`
-- `runtime/policies/mod.rs` publicly re-exports canonical runtime policy/output types:
-  - admission policies
-  - auth policies
-  - backend policies
-  - load-balancing policies
-  - resilience policies
-  - timeout policies
-  - transport policies
-  - watchdog policies
-- `runtime/policies/mod.rs` also defines and exports:
-  - `RuntimeRouteHostPattern`
-  - `RuntimeRouteMatchPolicy`
-  - `RuntimeBackendTransportKind`
-  - `RuntimeUpstreamTransportPolicy`
-  - `RuntimePolicySet`
-  - `RuntimeListenerPolicySet`
-  - `RuntimeUpstreamPolicySet`
+### Public surface
+- modules:
+  - `backend_endpoint`
+  - `config`
+  - `default`
+  - `loader`
+  - `runtime`
+  - `validator`
 
-### Likely canonical entrypoints
-- raw config types under `config`
-- loader entrypoints
-- validated runtime config/output types under `runtime`
-- backend endpoint shape if used cross-crate
+### Canonical consumer paths
+- raw config shapes from `config`
+- runtime-ready policy/config output from `runtime`
+- backend endpoint parsing/runtime shaping from `backend_endpoint`
 
-### Likely leakage / visibility review targets
-- `default` and `validator` as top-level public modules may be broader than needed
-- some `runtime/policies/mod.rs` structs may be intermediate interpreter outputs rather than stable consumer-facing API
-- route-match normalization types may belong under `runtime` but not necessarily as crate-public guarantees
+### Internal façades intentionally kept private
+- `runtime::listeners`
+- `runtime::policies` domain modules
+- `runtime::upstreams`
+
+### Phase 2 hardening result
+- runtime policy interpretation is centralized under `runtime`
+- domain interpreter modules are no longer exposed as their own public surface
+- crate-level ownership docs now direct consumers to `runtime` rather than policy internals
 
 ## `spooky-bridge`
 
-### Primary façade
+### Crate façade
 - `crates/bridge/src/lib.rs`
 
-### Current public surface
-- `pub mod h3_to_h1`
-- `pub mod h3_to_h2`
-- `pub mod request`
-- `pub mod response`
-- `pub mod websocket`
-- `pub use spooky_errors::BridgeError`
+### Public surface
+- modules:
+  - `request`
+  - `response`
+  - `websocket`
+- re-exports:
+  - `BridgeError`
 
-### Likely canonical entrypoints
-- `request`
-- `response`
-- `websocket`
-- `BridgeError`
+### Internal façades intentionally kept private
+- `h3_to_h1`
+- `h3_to_h2`
+- forwarded/header/host helper modules
 
-### Likely leakage / visibility review targets
-- public `h3_to_h1` and `h3_to_h2` modules look implementation-shaped, not policy-surface-shaped
-- host/forwarded/header internals are already private; the remaining cleanup target is protocol-specific request builder exposure
+### Phase 2 hardening result
+- protocol-specific request builder modules are internal
+- public surface is now the canonical request/response/websocket policy layer only
 
 ## `spooky-errors`
 
-### Primary façade
+### Crate façade
 - `crates/errors/src/lib.rs`
 
-### Current public surface
-- `pub mod bridge`
-- `pub mod pool`
-- `pub mod proxy`
-- `pub mod retry`
-- `pub mod upstream`
-- `pub use bridge::BridgeError`
-- `pub use pool::PoolError`
-- `pub use proxy::{ClassifiedUpstreamProxyError, ProxyError, UpstreamProxyErrorKind, classify_upstream_proxy_error, classify_upstream_send_error}`
-- `pub use retry::{HedgeOutcomeTelemetryReason, HedgePolicyDecision, HedgePolicyDenialReason, HedgePolicyFacts, HedgePrimaryState, HedgeTriggerTelemetryReason, RetryAttemptTelemetryReason, RetryPolicyDecision, RetryPolicyDenialReason, RetryPolicyFacts, UpstreamRetryReason, UpstreamRetryability, UpstreamTerminalErrorKind, classify_retryability, evaluate_hedge_policy, evaluate_retry_policy, is_idempotent_method, is_retryable}`
-- `pub use spooky_lb::alternate_backend::{AlternateBackendChoice, AlternateBackendDecision, AlternateBackendFailureReason, AlternateBackendSelectionMode}`
-- `pub use upstream::{UpstreamErrorCategory, UpstreamErrorClassification, UpstreamHealthFailureMapping, UpstreamTlsReason, classify_upstream_error_detail}`
+### Public surface
+- re-exported error and policy types from:
+  - `bridge`
+  - `pool`
+  - `proxy`
+  - `retry`
+  - `upstream`
 
-### Likely canonical entrypoints
-- `ProxyError`
-- `PoolError`
-- bridge/pool/proxy/upstream shared classifiers
-- retry/hedge policy result types if `errors` is intentionally the shared policy surface
+### Internal façades intentionally kept private
+- module files themselves are private; consumers use only crate-root re-exports
 
-### Likely leakage / visibility review targets
-- crate re-export of `spooky_lb::alternate_backend::*` crosses ownership boundaries and looks like a compatibility path
-- both `pub mod retry` and large `pub use retry::*` surface may be redundant
-- crate-level surface mixes true error types with policy evaluators and LB-owned types
+### Phase 2 hardening result
+- stale `spooky_lb::alternate_backend::*` compatibility re-exports are gone
+- formatting and normalization helpers remain internal to the module implementations
+- consumers see one shared classifier/error contract from the crate root
 
 ## `spooky-lb`
 
-### Primary façades
+### Crate façade
 - `crates/lb/src/lib.rs`
-- `crates/lb/src/algorithms/mod.rs`
 
-### Current public surface
-- `pub mod algorithms`
-- `pub mod alternate_backend`
-- `pub mod backend`
-- `pub mod backend_pool`
-- `pub mod hash`
-- `pub mod health`
-- `pub mod load_balancing`
-- `pub mod upstream_pool`
-- `algorithms/mod.rs` publicly exposes:
-  - `consistent_hash`
-  - `latency_aware`
-  - `least_connections`
-  - `random`
-  - `round_robin`
-  - `sticky_cid`
+### Public surface
+- canonical modules:
+  - `alternate_backend`
+  - `health`
+  - `load_balancing`
+  - `upstream_pool`
+- hidden compatibility/testing substrate:
+  - `algorithms`
+  - `backend`
+  - `backend_pool`
+- crate-private:
+  - `hash`
 
-### Likely canonical entrypoints
-- `upstream_pool`
-- `load_balancing`
-- `alternate_backend`
-- `health`
-
-### Likely leakage / visibility review targets
-- direct public exposure of individual algorithm modules
-- `backend` and `backend_pool` may be internal substrate rather than consumer API
-- `hash` may be implementation detail unless deliberately shared
+### Phase 2 hardening result
+- `UpstreamPool` internals are private
+- callers use narrow pool-level methods instead of reaching through internal fields
+- implementation algorithms remain exposed only as hidden compatibility/test substrate, not as the recommended crate surface
 
 ## `spooky-transport`
 
-### Primary façade
+### Crate façade
 - `crates/transport/src/lib.rs`
+- `crates/transport/src/transport_pool.rs`
 
-### Current public surface
-- private modules:
-  - `client_rotation`
-  - `h1_client`
-  - `h1_pool`
-  - `h2_client`
-  - `h2_pool`
-  - `transport_pool`
-- public re-exports from `transport_pool`:
+### Public surface
+- re-exports from owning modules:
   - `ConnectObservation`
   - `ConnectObserver`
   - `SharedDnsResolver`
@@ -205,59 +167,35 @@ This document is a baseline audit. It does not change visibility yet.
   - `TransportClientRotation`
   - `UpstreamTransportPool`
 
-### Likely canonical entrypoints
-- `UpstreamTransportPool`
-- `TlsClientConfig`
-- `SharedDnsResolver`
-- connection observation hooks if used by `edge`
+### Internal façades intentionally kept private
+- `client_rotation`
+- `h1_client`
+- `h1_pool`
+- `h2_client`
+- `h2_pool`
+- `transport_pool` module itself remains internal; only its façade types are re-exported
 
-### Likely leakage / visibility review targets
-- `TransportClientRotation` may still be more internal than desired after transport abstraction cleanup
-- confirm `ConnectObservation` / `ConnectObserver` are intentionally public and not just cross-crate plumbing
+### Phase 2 hardening result
+- protocol-specific pools/clients remain implementation details
+- DNS/connect configuration types are re-exported from their owning module path, not via a secondary `transport_pool` shim
+- internal client rotation state is no longer public
 
-## Cross-crate leakage patterns to address next
+## Summary of Resolved Baseline Leaks
 
-### 1. Whole-subsystem public modules
-Current examples:
-- `edge::runtime`
-- `edge::routing`
-- `edge::resilience`
-- `edge::watchdog`
-- `lb::algorithms`
+Resolved during this branch:
+- `edge::quic_listener` is no longer public API
+- `edge::quic_listener::workers` is no longer a public module
+- `bridge::h3_to_h1` and `bridge::h3_to_h2` are no longer public
+- `errors` no longer re-exports `lb` alternate-backend types
+- `lb::hash` is no longer public
+- `transport_pool` no longer acts as a compatibility re-export hop for DNS/connect config types
 
-These make internal organization look like external API.
+## Remaining Intentional Public Areas
 
-### 2. Compatibility re-exports that blur ownership
-Current examples:
-- `errors` re-exporting `spooky_lb::alternate_backend::*`
-- `edge::quic_listener` re-exporting worker/runtime-state details directly
+These are still public by design or current test/consumer need:
+- `edge::runtime` subsystem types
+- `edge::routing` and `edge::resilience` subsystems
+- `config::{default, validator}` modules
+- hidden-but-public `lb` substrate modules used by compatibility/tests
 
-These are the first candidates to replace with narrower canonical entrypoints.
-
-### 3. Implementation-shaped public modules
-Current examples:
-- `bridge::h3_to_h1`
-- `bridge::h3_to_h2`
-- individual LB algorithm modules
-
-These expose transport/protocol detail instead of domain contracts.
-
-### 4. Façades that are still too broad
-Current examples:
-- `edge::quic_listener`
-- `config::runtime::policies`
-
-These should stay façades, but the next step should make their outward surfaces more intentional.
-
-## Proposed hardening order
-
-1. `edge`
-2. `config`
-3. `bridge`
-4. `errors`
-5. `lb`
-6. `transport`
-
-Reason:
-- `edge` and `config` currently define the broadest visible internal surface.
-- `bridge`, `errors`, `lb`, and `transport` mostly need narrowing and ownership cleanup, not structural discovery.
+These should be treated as the current deliberate surface, not accidental leftovers from the Phase 2 refactors.
