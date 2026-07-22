@@ -17,13 +17,75 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackendTransportKind {
+pub enum ResolvedBackendTransport {
     Http1,
     H2,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransportExecutionTarget<'a> {
+    backend: &'a str,
+}
+
+impl<'a> TransportExecutionTarget<'a> {
+    pub fn new(backend: &'a str) -> Self {
+        Self { backend }
+    }
+
+    pub fn backend(&self) -> &'a str {
+        self.backend
+    }
+}
+
+pub struct TransportExecutionResult {
+    pub transport: ResolvedBackendTransport,
+    response: hyper::Response<Incoming>,
+}
+
+impl TransportExecutionResult {
+    pub fn new(
+        transport: ResolvedBackendTransport,
+        response: hyper::Response<Incoming>,
+    ) -> Self {
+        Self {
+            transport,
+            response,
+        }
+    }
+
+    pub fn into_response(self) -> hyper::Response<Incoming> {
+        self.response
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportClientRotation {
+    MissingBackend,
+    Recreated {
+        transport: ResolvedBackendTransport,
+    },
+    Rotated {
+        transport: ResolvedBackendTransport,
+        previous_generation: u64,
+        current_generation: u64,
+    },
+}
+
+impl TransportClientRotation {
+    pub fn rotated(self) -> bool {
+        !matches!(self, Self::MissingBackend)
+    }
+
+    pub fn transport(self) -> Option<ResolvedBackendTransport> {
+        match self {
+            Self::MissingBackend => None,
+            Self::Recreated { transport } | Self::Rotated { transport, .. } => Some(transport),
+        }
+    }
+}
+
 pub struct UpstreamTransportPool {
-    backend_kinds: HashMap<String, BackendTransportKind>,
+    backend_transports: HashMap<String, ResolvedBackendTransport>,
     h1_pool: H1Pool,
     h2_pool: H2Pool,
 }
@@ -39,7 +101,7 @@ impl UpstreamTransportPool {
         dns_resolver: SharedDnsResolver,
     ) -> Result<Self, String>
     where
-        I: IntoIterator<Item = (String, BackendTransportKind)>,
+        I: IntoIterator<Item = (String, ResolvedBackendTransport)>,
     {
         Self::new_with_observer(
             backends,
@@ -65,17 +127,17 @@ impl UpstreamTransportPool {
         connect_observer: Option<ConnectObserver>,
     ) -> Result<Self, String>
     where
-        I: IntoIterator<Item = (String, BackendTransportKind)>,
+        I: IntoIterator<Item = (String, ResolvedBackendTransport)>,
     {
-        let mut backend_kinds = HashMap::new();
+        let mut backend_transports = HashMap::new();
         let mut h1_backends = Vec::new();
         let mut h2_backends = Vec::new();
 
-        for (backend, kind) in backends {
-            backend_kinds.insert(backend.clone(), kind);
-            match kind {
-                BackendTransportKind::Http1 => h1_backends.push(backend),
-                BackendTransportKind::H2 => h2_backends.push(backend),
+        for (backend, transport) in backends {
+            backend_transports.insert(backend.clone(), transport);
+            match transport {
+                ResolvedBackendTransport::Http1 => h1_backends.push(backend),
+                ResolvedBackendTransport::H2 => h2_backends.push(backend),
             }
         }
 
@@ -100,7 +162,7 @@ impl UpstreamTransportPool {
         )?;
 
         Ok(Self {
-            backend_kinds,
+            backend_transports,
             h1_pool,
             h2_pool,
         })
@@ -121,12 +183,12 @@ impl UpstreamTransportPool {
         for upstream in upstreams {
             for backend in &upstream.backends {
                 let backend_addr = backend.backend.address.clone();
-                let kind = match backend.endpoint.transport_kind {
-                    RuntimeBackendTransportKind::Http1 => BackendTransportKind::Http1,
-                    RuntimeBackendTransportKind::H2 => BackendTransportKind::H2,
+                let transport = match backend.endpoint.transport_kind {
+                    RuntimeBackendTransportKind::Http1 => ResolvedBackendTransport::Http1,
+                    RuntimeBackendTransportKind::H2 => ResolvedBackendTransport::H2,
                 };
-                backends.push((backend_addr.clone(), kind));
-                if matches!(kind, BackendTransportKind::H2) {
+                backends.push((backend_addr.clone(), transport));
+                if matches!(transport, ResolvedBackendTransport::H2) {
                     backend_tls.insert(
                         backend_addr,
                         TlsClientConfig::from(&upstream.policy_set.transport.tls),
@@ -147,26 +209,64 @@ impl UpstreamTransportPool {
         )
     }
 
-    pub async fn send(
+    pub fn resolve_backend_transport(
         &self,
-        backend: &str,
+        target: TransportExecutionTarget<'_>,
+    ) -> Option<ResolvedBackendTransport> {
+        self.backend_transports.get(target.backend()).copied()
+    }
+
+    pub async fn execute(
+        &self,
+        target: TransportExecutionTarget<'_>,
         req: Request<BoxBody<Bytes, Infallible>>,
-    ) -> Result<hyper::Response<Incoming>, PoolError> {
-        match self.backend_kinds.get(backend).copied() {
-            Some(BackendTransportKind::Http1) => self.h1_pool.send(backend, req).await,
-            Some(BackendTransportKind::H2) => self.h2_pool.send(backend, req).await,
-            None => Err(PoolError::UnknownBackend(backend.to_string())),
+    ) -> Result<TransportExecutionResult, PoolError> {
+        match self.resolve_backend_transport(target) {
+            Some(ResolvedBackendTransport::Http1) => self
+                .h1_pool
+                .send(target.backend(), req)
+                .await
+                .map(|response| {
+                    TransportExecutionResult::new(ResolvedBackendTransport::Http1, response)
+                }),
+            Some(ResolvedBackendTransport::H2) => self
+                .h2_pool
+                .send(target.backend(), req)
+                .await
+                .map(|response| TransportExecutionResult::new(ResolvedBackendTransport::H2, response)),
+            None => Err(PoolError::UnknownBackend(target.backend().to_string())),
         }
     }
 
-    pub fn rotate_backend_client(&self, backend: &str) -> Result<bool, String> {
-        match self.backend_kinds.get(backend).copied() {
-            Some(BackendTransportKind::Http1) => self.h1_pool.rotate_backend_client(backend),
-            Some(BackendTransportKind::H2) => self
+    pub fn rotate_backend_client(
+        &self,
+        target: TransportExecutionTarget<'_>,
+    ) -> Result<TransportClientRotation, String> {
+        match self.resolve_backend_transport(target) {
+            Some(ResolvedBackendTransport::Http1) => self
+                .h1_pool
+                .rotate_backend_client(target.backend())
+                .map(|rotated| {
+                    if rotated {
+                        TransportClientRotation::Recreated {
+                            transport: ResolvedBackendTransport::Http1,
+                        }
+                    } else {
+                        TransportClientRotation::MissingBackend
+                    }
+                }),
+            Some(ResolvedBackendTransport::H2) => self
                 .h2_pool
-                .rotate_backend_client(backend)
-                .map(|rotation| rotation.is_some()),
-            None => Ok(false),
+                .rotate_backend_client(target.backend())
+                .map(|rotation| match rotation {
+                    Some(rotation) => TransportClientRotation::Rotated {
+                        transport: ResolvedBackendTransport::H2,
+                        previous_generation: rotation.previous_generation,
+                        current_generation: rotation.current_generation,
+                    },
+                    None => TransportClientRotation::MissingBackend,
+                }),
+            None => Ok(TransportClientRotation::MissingBackend),
         }
     }
 }

@@ -5,6 +5,7 @@ use http::{Request, Response, StatusCode};
 use http_body_util::combinators::BoxBody;
 use hyper::body::Incoming;
 use spooky_errors::ProxyError;
+use spooky_transport::transport_pool::TransportExecutionTarget;
 
 use super::{
     context::BootstrapDispatchCtx, intake::bootstrap_error_response,
@@ -28,11 +29,14 @@ async fn dispatch_bootstrap_http(
             .request
             .runtime
             .transport_pool
-            .send(&input.prepared_route.backend_addr, input.upstream_req),
+            .execute(
+                TransportExecutionTarget::new(&input.prepared_route.backend_addr),
+                input.upstream_req,
+            ),
     )
     .await
     {
-        Ok(Ok(resp)) => Ok(resp),
+        Ok(Ok(result)) => Ok(result.into_response()),
         Ok(Err(err)) => {
             let proxy_err = ProxyError::Pool(err);
             observe_bootstrap_dispatch_failure(

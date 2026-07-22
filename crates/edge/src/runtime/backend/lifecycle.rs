@@ -386,8 +386,12 @@ pub(crate) fn apply_backend_dns_refresh(
             let client_rotated = if matches!(result.outcome, BackendRefreshOutcome::Updated { .. })
             {
                 matches!(
-                    transport_pool.rotate_backend_client(&result.identity.backend_addr),
-                    Ok(true)
+                    transport_pool.rotate_backend_client(
+                        spooky_transport::transport_pool::TransportExecutionTarget::new(
+                            &result.identity.backend_addr,
+                        ),
+                    ),
+                    Ok(rotation) if rotation.rotated()
                 )
             } else {
                 false
@@ -550,7 +554,7 @@ mod tests {
     };
     use spooky_transport::{
         h2_client::SharedDnsResolver,
-        transport_pool::{BackendTransportKind, UpstreamTransportPool},
+        transport_pool::{ResolvedBackendTransport, UpstreamTransportPool},
     };
 
     use super::*;
@@ -625,7 +629,7 @@ mod tests {
 
     fn test_transport_pool(backend_addr: &str) -> UpstreamTransportPool {
         UpstreamTransportPool::new(
-            [(backend_addr.to_string(), BackendTransportKind::Http1)],
+            [(backend_addr.to_string(), ResolvedBackendTransport::Http1)],
             HashMap::new(),
             32,
             8,

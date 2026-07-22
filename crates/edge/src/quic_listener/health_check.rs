@@ -1,5 +1,6 @@
 use http_body_util::Full;
 use spooky_errors::classify_upstream_proxy_error;
+use spooky_transport::transport_pool::TransportExecutionTarget;
 
 use super::*;
 use crate::runtime::{
@@ -135,12 +136,16 @@ impl QUICListener {
 
                             let result = tokio::time::timeout(
                                 job.timeout,
-                                transport_pool.send(&job.backend_identity, request),
+                                transport_pool.execute(
+                                    TransportExecutionTarget::new(&job.backend_identity),
+                                    request,
+                                ),
                             )
                             .await;
 
                             let evaluation = match result {
-                                Ok(Ok(response)) => {
+                                Ok(Ok(result)) => {
+                                    let response = result.into_response();
                                     let outcome = match classify_active_health_check_response(
                                         response.status(),
                                     ) {

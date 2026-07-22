@@ -6,6 +6,7 @@ use spooky_errors::{
 use spooky_lb::alternate_backend::{
     AlternateBackendDecision, AlternateBackendFailureReason, choose_alternate_backend,
 };
+use spooky_transport::transport_pool::TransportExecutionTarget;
 
 use super::*;
 use crate::runtime::connection::response::ForwardingPolicyTelemetry;
@@ -165,9 +166,13 @@ impl QUICListener {
             return Err(ProxyError::Pool(PoolError::CircuitOpen(backend)));
         }
 
-        let send_result = tokio::time::timeout(backend_timeout, transport.send(&backend, request))
-            .await
-            .map_err(|_| ProxyError::Timeout);
+        let send_result = tokio::time::timeout(
+            backend_timeout,
+            transport.execute(TransportExecutionTarget::new(&backend), request),
+        )
+        .await
+        .map(|result| result.map(|execution| execution.into_response()))
+        .map_err(|_| ProxyError::Timeout);
         match &send_result {
             Ok(Ok(_)) => circuit_breakers.record_success(&backend),
             _ => circuit_breakers.record_failure(&backend),
