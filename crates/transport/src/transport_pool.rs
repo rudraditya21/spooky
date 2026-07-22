@@ -103,6 +103,16 @@ pub struct UpstreamTransportPool {
 }
 
 impl UpstreamTransportPool {
+    pub async fn send_backend_request(
+        &self,
+        backend: &str,
+        req: Request<BoxBody<Bytes, Infallible>>,
+    ) -> Result<hyper::Response<Incoming>, ProxyError> {
+        self.execute(TransportExecutionTarget::new(backend), req)
+            .await
+            .map(TransportExecutionResult::into_response)
+    }
+
     pub fn new_from_runtime_backends<I>(
         backends: I,
         backend_tls: HashMap<String, TlsClientConfig>,

@@ -6,7 +6,6 @@ use spooky_errors::{
 use spooky_lb::alternate_backend::{
     AlternateBackendDecision, AlternateBackendFailureReason, choose_alternate_backend,
 };
-use spooky_transport::transport_pool::TransportExecutionTarget;
 
 use super::*;
 use crate::runtime::connection::response::ForwardingPolicyTelemetry;
@@ -165,9 +164,8 @@ impl QUICListener {
         }
 
         let send_result = transport
-            .execute(TransportExecutionTarget::new(&backend), request)
-            .await
-            .map(|execution| execution.into_response());
+            .send_backend_request(&backend, request)
+            .await;
         match &send_result {
             Ok(_) => circuit_breakers.record_success(&backend),
             _ => circuit_breakers.record_failure(&backend),
