@@ -65,7 +65,7 @@ use crate::{
     resilience::runtime::RuntimeResilience,
     routing::{decision::RouteDecisionReason, index::RouteIndex},
     runtime::{
-        bundle::{RuntimeBundle, RuntimeBundleHandle},
+        bundle::RuntimeBundle,
         connection::{
             guardrails::{
                 BodyLimitKind, REQUEST_BODY_TOO_LARGE_BODY, RequestBodyGuardrailConfig,
@@ -90,6 +90,8 @@ use crate::{
     },
     watchdog::{config::WatchdogRuntimeConfig, coordinator::WatchdogCoordinator},
 };
+#[cfg(test)]
+use crate::runtime::bundle::RuntimeBundleHandle;
 
 mod admission;
 mod async_runtime;

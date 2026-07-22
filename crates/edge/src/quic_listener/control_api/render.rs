@@ -155,7 +155,8 @@ impl QUICListener {
     }
 
     pub(super) fn render_control_api_health(state: &ControlApiState) -> Response<Full<Bytes>> {
-        let watchdog = state.current_watchdog();
+        let runtime_state = state.current_service_state();
+        let watchdog = runtime_state.watchdog();
         let payload = ControlApiHealthPayload {
             status: "ok",
             uptime_ms: state.started_at.elapsed().as_millis() as u64,
@@ -169,8 +170,9 @@ impl QUICListener {
     }
 
     pub(super) fn render_control_api_ready(state: &ControlApiState) -> Response<Full<Bytes>> {
-        let backend_summary = state.snapshot_backend_health();
-        let restart_requested = state.current_watchdog().restart_requested();
+        let runtime_state = state.current_service_state();
+        let backend_summary = runtime_state.snapshot_backend_health();
+        let restart_requested = runtime_state.watchdog().restart_requested();
         let payload = ControlApiReadyPayload {
             ready: !restart_requested
                 && (backend_summary.total_backends == 0 || backend_summary.healthy_backends > 0),
@@ -197,19 +199,18 @@ impl QUICListener {
 }
 
 impl ControlApiRuntimePayload {
-    fn from_state(state: &ControlApiState) -> Self {
-        let runtime = state.current_runtime_view();
-        let watchdog = runtime.watchdog();
-        let resilience = runtime.resilience();
-        let metrics = runtime.metrics();
-        let listener_tls_store = runtime.listener_tls_store();
-        let backend_inventory = runtime
-            .backend_lifecycle()
-            .snapshot_inventory(runtime.upstream_pools());
+    fn from_state(service_ctx: &ControlApiState) -> Self {
+        let state = service_ctx.current_service_state();
+        let runtime = &state.runtime;
+        let watchdog = state.watchdog();
+        let resilience = state.resilience();
+        let metrics = state.metrics();
+        let listener_tls_store = state.listener_tls_store();
+        let backend_inventory = state.snapshot_backend_inventory();
         let backend_summary = backend_inventory.summary();
 
         Self {
-            uptime_ms: state.started_at.elapsed().as_millis() as u64,
+            uptime_ms: service_ctx.started_at.elapsed().as_millis() as u64,
             workers: ControlApiWorkerPayload {
                 expected: runtime.expected_workers(),
             },
@@ -269,7 +270,7 @@ impl ControlApiRuntimePayload {
                 details: "No plugin/middleware ABI is exposed in-process today; extension support remains a deliberate non-goal until a safe isolation model is designed.",
             },
             runtime: state
-                .current_generation()
+                .generation
                 .map(|active| ControlApiRuntimeGenerationPayload {
                     generation: active.generation(),
                     config_path: active.startup().config_path.clone(),

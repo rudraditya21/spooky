@@ -84,9 +84,10 @@ impl QUICListener {
     pub(super) fn handle_control_api_reload_certs(
         state: &crate::quic_listener::runtime_state::ControlApiServiceCtx,
     ) -> Response<Full<Bytes>> {
-        let live_tls_store = state.current_listener_tls_store();
-        let live_listener_configs = state.current_listener_runtime_configs();
-        let live_metrics = state.current_metrics();
+        let runtime_state = state.current_service_state();
+        let live_tls_store = runtime_state.listener_tls_store();
+        let live_listener_configs = runtime_state.listener_runtime_configs();
+        let live_metrics = runtime_state.metrics();
         Self::reload_listener_certs(
             live_listener_configs.as_ref(),
             live_tls_store.as_ref(),
@@ -98,10 +99,11 @@ impl QUICListener {
         req: &Request<Incoming>,
         state: &crate::quic_listener::runtime_state::ControlApiServiceCtx,
     ) -> Response<Full<Bytes>> {
-        let Some(runtime_bundle_handle) = state.runtime_bundle_handle() else {
+        let runtime_state = state.current_service_state();
+        let Some(runtime_bundle_handle) = runtime_state.runtime_bundle_handle().cloned() else {
             return Self::control_api_not_found_response();
         };
-        let Some(runtime) = state.current_generation() else {
+        let Some(runtime) = runtime_state.generation.clone() else {
             return Self::json_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 json!({
@@ -141,7 +143,7 @@ impl QUICListener {
         }
         let current_log_level = plan.current_log_level.clone();
         let next_log_level = plan.next_log_level.clone();
-        let generation = match Self::apply_runtime_reload_plan(runtime_bundle_handle, plan) {
+        let generation = match Self::apply_runtime_reload_plan(&runtime_bundle_handle, plan) {
             Ok(generation) => generation,
             Err(err) => {
                 return Self::json_response(
@@ -172,7 +174,7 @@ impl QUICListener {
     pub(super) fn handle_control_api_restart(
         state: &crate::quic_listener::runtime_state::ControlApiServiceCtx,
     ) -> Response<Full<Bytes>> {
-        let watchdog = state.current_watchdog();
+        let watchdog = state.current_service_state().watchdog();
         if !watchdog.enabled() {
             return Self::json_response(
                 StatusCode::SERVICE_UNAVAILABLE,

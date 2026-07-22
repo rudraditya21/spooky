@@ -40,7 +40,8 @@ impl QUICListener {
         req: &Request<Incoming>,
         state: &ControlApiState,
     ) -> Option<ControlApiRoute> {
-        let paths = state.current_paths();
+        let state = state.current_service_state();
+        let paths = state.paths;
         let path = req.uri().path();
 
         match *req.method() {
@@ -107,7 +108,7 @@ impl QUICListener {
         req: &Request<Incoming>,
         state: &ControlApiState,
     ) -> bool {
-        let endpoint = state.current_control_api();
+        let endpoint = state.current_service_state().endpoint;
         let Some(token) = endpoint.auth_token.as_ref() else {
             return false;
         };

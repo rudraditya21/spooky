@@ -1,9 +1,4 @@
 use super::*;
-use crate::runtime::{
-    backend::{
-        state::{BackendLifecycleInventorySnapshot, BackendLifecycleInventorySummary},
-    },
-};
 use crate::quic_listener::runtime_state::ControlApiServiceCtx;
 
 #[derive(Clone)]
@@ -32,62 +27,23 @@ impl ControlApiPaths {
 pub(super) type ControlApiState = ControlApiServiceCtx;
 
 impl ControlApiServiceCtx {
-    pub(super) fn current_runtime_view(&self) -> crate::quic_listener::runtime_state::ControlPlaneRuntimeView {
-        self.runtime.current_view()
-    }
-
+    #[cfg(test)]
     pub(super) fn current_generation(&self) -> Option<crate::runtime::bundle::ActiveRuntimeGeneration> {
-        self.runtime.current_generation()
+        self.current_service_state().generation
     }
 
-    pub(super) fn runtime_bundle_handle(&self) -> Option<&Arc<RuntimeBundleHandle>> {
-        self.runtime.runtime_bundle_handle()
-    }
-
+    #[cfg(test)]
     pub(super) fn current_control_api(&self) -> ControlApiConfig {
-        self.current_runtime_view()
-            .runtime_config()
-            .observability
-            .control_api
-            .clone()
+        self.current_service_state().endpoint
     }
 
+    #[cfg(test)]
     pub(super) fn current_paths(&self) -> ControlApiPaths {
-        ControlApiPaths::from_endpoint(&self.current_control_api())
+        self.current_service_state().paths
     }
 
-    pub(super) fn current_listener_tls_store(&self) -> Arc<ListenerTlsReloadStore> {
-        self.current_runtime_view().listener_tls_store()
-    }
-
-    pub(super) fn current_listener_runtime_configs(
-        &self,
-    ) -> Arc<HashMap<String, ListenerRuntimeConfig>> {
-        self.current_runtime_view().listener_runtime_configs()
-    }
-
-    pub(super) fn current_metrics(&self) -> Arc<Metrics> {
-        self.current_runtime_view().metrics()
-    }
-
-    pub(super) fn current_watchdog(&self) -> Arc<WatchdogCoordinator> {
-        self.current_runtime_view().watchdog()
-    }
-
+    #[cfg(test)]
     pub(super) fn current_primary_listener_label(&self) -> Option<String> {
-        self.current_runtime_view()
-            .primary_listener_label()
-            .map(ToOwned::to_owned)
-    }
-
-    pub(super) fn snapshot_backend_inventory(&self) -> BackendLifecycleInventorySnapshot {
-        let runtime = self.current_runtime_view();
-        runtime
-            .backend_lifecycle()
-            .snapshot_inventory(runtime.upstream_pools())
-    }
-
-    pub(super) fn snapshot_backend_health(&self) -> BackendLifecycleInventorySummary {
-        self.snapshot_backend_inventory().summary()
+        self.current_service_state().primary_listener_label
     }
 }

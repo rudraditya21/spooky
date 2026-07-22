@@ -17,15 +17,15 @@ impl QUICListener {
             return Ok(());
         }
         let required = startup_state.endpoint.required;
-        let listener_config = state
-            .current_runtime_view()
+        let listener_config = startup_state
+            .runtime
             .runtime_config()
             .primary_listener_runtime_config()
             .ok_or_else(|| ProxyError::Transport("no effective listeners configured".to_string()))?;
         let primary_listener_label = Self::listener_label(&listener_config);
         if startup_state.endpoint.enabled
-            && state
-                .current_listener_tls_store()
+            && startup_state
+                .listener_tls_store()
                 .bootstrap_server_config(&primary_listener_label)
                 .is_none()
         {
@@ -78,7 +78,7 @@ impl QUICListener {
         spawn_supervised_async_task(
             &handle,
             "control-api-endpoint",
-            Some(Arc::clone(&startup_state.metrics)),
+            Some(startup_state.metrics()),
             async move {
                 let mut listener_binding = initial_binding;
 
@@ -160,7 +160,7 @@ impl QUICListener {
                         &active_connections,
                         max_connections,
                     ) {
-                        state.current_metrics().inc_control_api_connection_limit_drop();
+                        runtime_state.metrics().inc_control_api_connection_limit_drop();
                         warn!(
                             "Control API endpoint dropped connection from {} due to max connection limit ({})",
                             peer, max_connections
@@ -213,9 +213,10 @@ impl QUICListener {
         peer: SocketAddr,
     ) {
         let _connection_guard = ConnectionSlotGuard::new(active_connections);
-        let timeout = Duration::from_millis(state.current_control_api().connection_timeout_ms.max(1));
-        let listener_tls_store = state.current_listener_tls_store();
-        let Some(primary_listener_label) = state.current_primary_listener_label() else {
+        let runtime_state = state.current_service_state();
+        let timeout = Duration::from_millis(runtime_state.endpoint.connection_timeout_ms.max(1));
+        let listener_tls_store = runtime_state.listener_tls_store();
+        let Some(primary_listener_label) = runtime_state.primary_listener_label else {
             error!("Control API endpoint missing live primary listener label for TLS selection");
             return;
         };

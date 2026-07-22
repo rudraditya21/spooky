@@ -40,10 +40,9 @@ impl QUICListener {
     fn spawn_control_plane_bootstrap(
         bootstrap: ControlPlaneBootstrap<'_>,
     ) -> Result<(), ProxyError> {
-        Self::configure_expected_workers(
-            bootstrap.shared_state.shared_services().watchdog.as_ref(),
-            bootstrap.worker_count,
-        );
+        bootstrap.with_runtime_view(|runtime| {
+            Self::configure_expected_workers(runtime.watchdog().as_ref(), bootstrap.worker_count);
+        });
         Self::spawn_generation_background_tasks(&bootstrap);
         Self::spawn_metrics_endpoint(&bootstrap)?;
         Self::spawn_control_api_endpoint(&bootstrap)?;
