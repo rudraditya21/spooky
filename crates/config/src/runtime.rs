@@ -2,8 +2,8 @@ use std::{collections::HashMap, fmt, net::IpAddr};
 
 use crate::{
     config::{
-        Backend, ClientAuth, Config, ForwardedHeaderPolicy, Listen, LoadBalancing, Observability,
-        Performance, ProtocolPolicy, Resilience, Security, TlsCertificate, Upstream,
+        Backend, ClientAuth, Config, ForwardedHeaderPolicy, Listen, Observability, Performance,
+        ProtocolPolicy, Resilience, Security, TlsCertificate, Upstream,
         UpstreamHostPolicy, UpstreamHostPolicyMode, UpstreamTls,
     },
 };
