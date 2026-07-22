@@ -598,11 +598,7 @@ mod tests {
         })
         .expect("runtime config");
 
-        let mut runtime_upstream = runtime
-            .upstreams
-            .get("api")
-            .expect("upstream")
-            .clone();
+        let mut runtime_upstream = runtime.upstreams.get("api").expect("upstream").clone();
         runtime_upstream.backends[0].backend.health_check = Some(HealthCheck {
             path: "/health".to_string(),
             interval: 0,

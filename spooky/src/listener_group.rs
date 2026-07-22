@@ -10,10 +10,11 @@ use std::{
 use log::{error, info};
 use spooky_config::runtime::{ListenerRuntimeConfig, RuntimeConfig};
 use spooky_edge::{
-    ListenerWorkerGroupConfig, ListenerWorkerRuntimeState, spawn_listener_worker_group,
+    ListenerWorkerGroupConfig, ListenerWorkerRuntimeState,
     runtime::{
         bundle::RuntimeBundleHandle, listener::QUICListener, shared_state::SharedRuntimeState,
     },
+    spawn_listener_worker_group,
 };
 
 use crate::runtime_guard;

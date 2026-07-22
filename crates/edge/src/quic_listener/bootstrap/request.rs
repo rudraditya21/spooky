@@ -13,9 +13,8 @@ use log::warn;
 use spooky_bridge::{
     BridgeError,
     request::{
-        build_h1_request, build_h2_request_for_target,
         RequestBuildInput, RequestBuildPolicies, RequestBuildTarget, RequestForwardedContext,
-        RequestTraceContext,
+        RequestTraceContext, build_h1_request, build_h2_request_for_target,
     },
 };
 use spooky_config::{

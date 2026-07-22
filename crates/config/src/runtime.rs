@@ -393,11 +393,7 @@ mod tests {
             Some("/tmp/upstream-ca.pem")
         );
         assert_eq!(
-            runtime
-                .policies
-                .transport
-                .backend_connections
-                .max_inflight,
+            runtime.policies.transport.backend_connections.max_inflight,
             runtime
                 .policies
                 .transport

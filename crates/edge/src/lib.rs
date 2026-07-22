@@ -10,11 +10,11 @@ pub mod cid_radix;
 pub mod constants;
 pub mod hash;
 pub mod metrics;
+mod quic_listener;
 pub mod resilience;
 pub mod routing;
 pub mod runtime;
 pub mod watchdog;
-mod quic_listener;
 
 pub use body::ChannelBody;
 pub(crate) use hash::REQUEST_ID_COUNTER;
@@ -22,7 +22,7 @@ pub use hash::{stable_hash_socket_addr, stable_hash64};
 pub use metrics::{Metrics, OverloadShedReason, RouteOutcome};
 pub use quic_listener::{
     ListenerWorkerGroupConfig, ListenerWorkerRuntimeState, configure_async_runtime,
-    release_shard_queue_bytes, shard_index_for_peer,
-    spawn_listener_worker_group, try_reserve_shard_queue_bytes,
+    release_shard_queue_bytes, shard_index_for_peer, spawn_listener_worker_group,
+    try_reserve_shard_queue_bytes,
 };
 pub use spooky_lb::health::HealthFailureReason;

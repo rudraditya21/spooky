@@ -35,9 +35,7 @@ pub use self::{
     transport::{RuntimeBackendConnectionPolicy, RuntimeConnectionLimits, RuntimeTransportPolicy},
     watchdog::RuntimeWatchdogPolicy,
 };
-use super::{
-    Config, ListenerRuntimeConfig, RuntimeConfigError, RuntimeListenerTls,
-};
+use super::{Config, ListenerRuntimeConfig, RuntimeConfigError, RuntimeListenerTls};
 fn config_invalid(message: impl Into<String>) -> RuntimeConfigError {
     RuntimeConfigError::ConfigInvalid(message.into())
 }

@@ -17,8 +17,8 @@ use spooky_config::{
 use crate::{
     BridgeError,
     forwarded::{ForwardedHeaderChains, ForwardedHeaderValues, build_forwarded_header_values},
-    headers::{connection_header_tokens, should_strip_request_header},
     h3_to_h1, h3_to_h2,
+    headers::{connection_header_tokens, should_strip_request_header},
     host::resolve_upstream_host_value,
 };
 
