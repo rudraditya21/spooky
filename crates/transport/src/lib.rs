@@ -1,3 +1,10 @@
+//! Canonical upstream transport façade.
+//!
+//! Callers should depend on this crate for backend request execution, backend
+//! client rotation, DNS cache coordination, and transport-scoped connection
+//! policy application. Protocol-specific H1/H2 client and pool implementations
+//! remain internal details behind [`UpstreamTransportPool`].
+
 mod client_rotation;
 mod h1_client;
 mod h1_pool;

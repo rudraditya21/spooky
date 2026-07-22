@@ -1,5 +1,5 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackendClientRotationState {
+pub(crate) enum BackendClientRotationState {
     MissingBackend,
     Recreated,
     Rotated {
@@ -9,24 +9,24 @@ pub enum BackendClientRotationState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BackendClientRotation {
+pub(crate) struct BackendClientRotation {
     state: BackendClientRotationState,
 }
 
 impl BackendClientRotation {
-    pub fn missing_backend() -> Self {
+    pub(crate) fn missing_backend() -> Self {
         Self {
             state: BackendClientRotationState::MissingBackend,
         }
     }
 
-    pub fn recreated() -> Self {
+    pub(crate) fn recreated() -> Self {
         Self {
             state: BackendClientRotationState::Recreated,
         }
     }
 
-    pub fn rotated(previous_generation: u64, current_generation: u64) -> Self {
+    pub(crate) fn rotated(previous_generation: u64, current_generation: u64) -> Self {
         Self {
             state: BackendClientRotationState::Rotated {
                 previous_generation,
@@ -35,11 +35,11 @@ impl BackendClientRotation {
         }
     }
 
-    pub fn changed(self) -> bool {
+    pub(crate) fn changed(self) -> bool {
         !matches!(self.state, BackendClientRotationState::MissingBackend)
     }
 
-    pub fn generations(self) -> Option<(u64, u64)> {
+    pub(crate) fn generations(self) -> Option<(u64, u64)> {
         match self.state {
             BackendClientRotationState::Rotated {
                 previous_generation,

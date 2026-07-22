@@ -35,6 +35,7 @@ use rustls_pki_types::pem::PemObject;
 use spooky_config::runtime::RuntimeBackendTlsPolicy;
 use tower_service::Service;
 
+/// TLS client policy applied to HTTP/2 backend connections.
 #[derive(Debug, Clone)]
 pub struct TlsClientConfig {
     pub verify_certificates: bool,
@@ -73,6 +74,8 @@ pub(crate) const DEFAULT_MAX_IDLE_PER_HOST: usize = 64;
 pub(crate) const DEFAULT_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Transport-level observation emitted when a backend connect resolves to a
+/// concrete socket address.
 #[derive(Debug, Clone)]
 pub struct ConnectObservation {
     pub backend: String,
@@ -80,25 +83,29 @@ pub struct ConnectObservation {
     pub resolved_addr: SocketAddr,
 }
 
+/// Optional hook used by transport to observe outbound backend connects.
 pub type ConnectObserver = Arc<dyn Fn(ConnectObservation) + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DnsCacheUpdate {
+pub(crate) struct DnsCacheUpdate {
     pub host: String,
     pub previous_addrs: Vec<SocketAddr>,
     pub current_addrs: Vec<SocketAddr>,
 }
 
 impl DnsCacheUpdate {
-    pub fn changed(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn changed(&self) -> bool {
         self.previous_addrs != self.current_addrs
     }
 
-    pub fn cleared(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn cleared(&self) -> bool {
         self.current_addrs.is_empty()
     }
 }
 
+/// Shared DNS cache and resolver used by backend transports.
 #[derive(Clone)]
 pub struct SharedDnsResolver {
     cache: Arc<RwLock<HashMap<String, Vec<SocketAddr>>>>,
@@ -180,7 +187,7 @@ impl SharedDnsResolver {
         let _ = self.replace_host_addrs(host, addrs);
     }
 
-    pub fn replace_host_addrs<I>(&self, host: &str, addrs: I) -> DnsCacheUpdate
+    pub(crate) fn replace_host_addrs<I>(&self, host: &str, addrs: I) -> DnsCacheUpdate
     where
         I: IntoIterator<Item = SocketAddr>,
     {
@@ -205,7 +212,8 @@ impl SharedDnsResolver {
         }
     }
 
-    pub fn remove_host(&self, host: &str) -> DnsCacheUpdate {
+    #[cfg(test)]
+    pub(crate) fn remove_host(&self, host: &str) -> DnsCacheUpdate {
         self.replace_host_addrs(host, Vec::<SocketAddr>::new())
     }
 

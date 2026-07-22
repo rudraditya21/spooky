@@ -367,7 +367,7 @@ pub(crate) fn apply_backend_dns_refresh(
                 };
             };
 
-            let _ = backend_dns_resolver.replace_host_addrs(
+            backend_dns_resolver.set_host_addrs(
                 &backend.resolution.authority_host,
                 resolved
                     .into_iter()
