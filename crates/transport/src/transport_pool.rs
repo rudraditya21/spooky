@@ -23,6 +23,12 @@ enum ResolvedBackendTransport {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackendTransportEntry {
+    Http1,
+    H2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransportExecutionTarget<'a> {
     backend: &'a str,
 }
@@ -105,7 +111,7 @@ impl TransportClientRotation {
 }
 
 pub struct UpstreamTransportPool {
-    backend_transports: HashMap<String, ResolvedBackendTransport>,
+    backend_entries: HashMap<String, BackendTransportEntry>,
     h1_pool: H1Pool,
     h2_pool: H2Pool,
 }
@@ -149,16 +155,16 @@ impl UpstreamTransportPool {
     where
         I: IntoIterator<Item = (String, RuntimeBackendTransportKind)>,
     {
-        let mut backend_transports = HashMap::new();
+        let mut backend_entries = HashMap::new();
         let mut h1_backends = Vec::new();
         let mut h2_backends = Vec::new();
 
         for (backend, runtime_transport) in backends {
-            let transport = Self::resolve_runtime_transport(runtime_transport);
-            backend_transports.insert(backend.clone(), transport);
-            match transport {
-                ResolvedBackendTransport::Http1 => h1_backends.push(backend),
-                ResolvedBackendTransport::H2 => h2_backends.push(backend),
+            let entry = Self::resolve_runtime_transport(runtime_transport);
+            backend_entries.insert(backend.clone(), entry);
+            match entry {
+                BackendTransportEntry::Http1 => h1_backends.push(backend),
+                BackendTransportEntry::H2 => h2_backends.push(backend),
             }
         }
 
@@ -183,7 +189,7 @@ impl UpstreamTransportPool {
         )?;
 
         Ok(Self {
-            backend_transports,
+            backend_entries,
             h1_pool,
             h2_pool,
         })
@@ -191,10 +197,10 @@ impl UpstreamTransportPool {
 
     fn resolve_runtime_transport(
         transport: RuntimeBackendTransportKind,
-    ) -> ResolvedBackendTransport {
+    ) -> BackendTransportEntry {
         match transport {
-            RuntimeBackendTransportKind::Http1 => ResolvedBackendTransport::Http1,
-            RuntimeBackendTransportKind::H2 => ResolvedBackendTransport::H2,
+            RuntimeBackendTransportKind::Http1 => BackendTransportEntry::Http1,
+            RuntimeBackendTransportKind::H2 => BackendTransportEntry::H2,
         }
     }
 
@@ -235,11 +241,8 @@ impl UpstreamTransportPool {
         )
     }
 
-    fn resolve_backend_transport(
-        &self,
-        target: TransportExecutionTarget<'_>,
-    ) -> Option<ResolvedBackendTransport> {
-        self.backend_transports.get(target.backend()).copied()
+    fn backend_entry(&self, target: TransportExecutionTarget<'_>) -> Option<BackendTransportEntry> {
+        self.backend_entries.get(target.backend()).copied()
     }
 
     pub async fn execute(
@@ -247,19 +250,21 @@ impl UpstreamTransportPool {
         target: TransportExecutionTarget<'_>,
         req: Request<BoxBody<Bytes, Infallible>>,
     ) -> Result<TransportExecutionResult, PoolError> {
-        match self.resolve_backend_transport(target) {
-            Some(ResolvedBackendTransport::Http1) => self
+        match self.backend_entry(target) {
+            Some(BackendTransportEntry::Http1) => self
                 .h1_pool
                 .send(target.backend(), req)
                 .await
                 .map(|response| {
                     TransportExecutionResult::new(ResolvedBackendTransport::Http1, response)
                 }),
-            Some(ResolvedBackendTransport::H2) => self
+            Some(BackendTransportEntry::H2) => self
                 .h2_pool
                 .send(target.backend(), req)
                 .await
-                .map(|response| TransportExecutionResult::new(ResolvedBackendTransport::H2, response)),
+                .map(|response| {
+                    TransportExecutionResult::new(ResolvedBackendTransport::H2, response)
+                }),
             None => Err(PoolError::UnknownBackend(target.backend().to_string())),
         }
     }
@@ -268,8 +273,8 @@ impl UpstreamTransportPool {
         &self,
         target: TransportExecutionTarget<'_>,
     ) -> Result<TransportClientRotation, String> {
-        match self.resolve_backend_transport(target) {
-            Some(ResolvedBackendTransport::Http1) => self
+        match self.backend_entry(target) {
+            Some(BackendTransportEntry::Http1) => self
                 .h1_pool
                 .rotate_backend_client(target.backend())
                 .map(|rotated| {
@@ -285,7 +290,7 @@ impl UpstreamTransportPool {
                         }
                     }
                 }),
-            Some(ResolvedBackendTransport::H2) => self
+            Some(BackendTransportEntry::H2) => self
                 .h2_pool
                 .rotate_backend_client(target.backend())
                 .map(|rotation| match rotation {
