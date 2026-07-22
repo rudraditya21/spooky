@@ -1,5 +1,3 @@
-use std::sync::atomic::AtomicUsize;
-
 use super::*;
 use crate::runtime::{
     backend::{
@@ -32,28 +30,6 @@ impl ControlApiPaths {
 }
 
 pub(super) type ControlApiState = ControlApiServiceCtx;
-
-pub(super) struct ControlApiListenerBinding {
-    pub(super) bind: String,
-    pub(super) listener: tokio::net::TcpListener,
-    pub(super) active_connections: Arc<AtomicUsize>,
-}
-
-pub(super) struct ConnectionSlotGuard {
-    active_connections: Arc<AtomicUsize>,
-}
-
-impl ConnectionSlotGuard {
-    pub(super) fn new(active_connections: Arc<AtomicUsize>) -> Self {
-        Self { active_connections }
-    }
-}
-
-impl Drop for ConnectionSlotGuard {
-    fn drop(&mut self) {
-        self.active_connections.fetch_sub(1, Ordering::AcqRel);
-    }
-}
 
 impl ControlApiServiceCtx {
     pub(super) fn current_runtime_view(&self) -> crate::quic_listener::runtime_state::ControlPlaneRuntimeView {
