@@ -14,7 +14,7 @@ use spooky_config::runtime::ListenerRuntimeConfig;
 
 use crate::{
     constants::MAX_DATAGRAM_SIZE_BYTES,
-    quic_listener::{ListenerWorkerRuntimeState, runtime_state::initialize_listener_from_runtime},
+    quic_listener::runtime_state::{ListenerWorkerRuntimeState, initialize_listener_from_runtime},
     runtime::{
         bundle::RuntimeBundleHandle, listener::QUICListener, shared_state::SharedRuntimeState,
     },

@@ -17,10 +17,12 @@ use spooky_config::runtime::{
 };
 use spooky_errors::{PoolError, ProxyError};
 
-pub use crate::h2_client::{
-    ConnectObservation, ConnectObserver, SharedDnsResolver, TlsClientConfig,
+use crate::{
+    client_rotation::BackendClientRotation,
+    h1_pool::H1Pool,
+    h2_client::{ConnectObserver, SharedDnsResolver, TlsClientConfig},
+    h2_pool::H2Pool,
 };
-use crate::{client_rotation::BackendClientRotation, h1_pool::H1Pool, h2_pool::H2Pool};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BackendTransportEntry {

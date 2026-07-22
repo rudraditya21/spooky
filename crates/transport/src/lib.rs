@@ -12,7 +12,5 @@ mod h2_client;
 mod h2_pool;
 mod transport_pool;
 
-pub use transport_pool::{
-    ConnectObservation, ConnectObserver, SharedDnsResolver, TlsClientConfig,
-    TransportClientRotation, UpstreamTransportPool,
-};
+pub use h2_client::{ConnectObservation, ConnectObserver, SharedDnsResolver, TlsClientConfig};
+pub use transport_pool::{TransportClientRotation, UpstreamTransportPool};
