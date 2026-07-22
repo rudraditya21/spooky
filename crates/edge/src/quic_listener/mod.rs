@@ -88,7 +88,7 @@ use crate::{
             store::{ListenerTlsReloadState, ListenerTlsReloadStore},
         },
     },
-    watchdog::{config::WatchdogRuntimeConfig, coordinator::WatchdogCoordinator, time::now_millis},
+    watchdog::{config::WatchdogRuntimeConfig, coordinator::WatchdogCoordinator},
 };
 
 mod admission;
