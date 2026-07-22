@@ -1,13 +1,23 @@
 use std::sync::Arc;
 
+use log::error;
 use spooky_config::runtime::RuntimeConfig;
 use spooky_errors::ProxyError;
 
 use super::{
     QUICListener,
+    runtime_handle,
     runtime_state::{ControlPlaneBootstrap, WatchdogServiceCtx},
+    spawn_supervised_async_task,
 };
-use crate::runtime::{bundle::RuntimeBundleHandle, shared_state::SharedRuntimeState};
+use crate::{
+    runtime::{bundle::RuntimeBundleHandle, shared_state::SharedRuntimeState},
+    watchdog::{
+        config::WatchdogRuntimeConfig,
+        service::run_watchdog_service,
+        state::{WatchdogServiceState, WatchdogSpawnState},
+    },
+};
 
 impl QUICListener {
     pub fn spawn_control_plane_tasks(
@@ -70,7 +80,7 @@ impl QUICListener {
                 runtime.metrics(),
                 Arc::clone(&task_registry),
             );
-            Self::spawn_watchdog(WatchdogServiceCtx::new(runtime, task_registry));
+            Self::spawn_watchdog_service(WatchdogServiceCtx::new(runtime, task_registry));
         });
     }
 
@@ -97,5 +107,38 @@ impl QUICListener {
         worker_count: usize,
     ) {
         watchdog.set_expected_workers(worker_count.max(1));
+    }
+
+    fn spawn_watchdog_service(service_ctx: WatchdogServiceCtx) {
+        let spawn_state = WatchdogSpawnState {
+            service: WatchdogServiceState {
+                config: WatchdogRuntimeConfig::from(
+                    &service_ctx.runtime.runtime_config().policies.admission.watchdog,
+                ),
+                metrics: service_ctx.runtime.metrics(),
+                resilience: service_ctx.runtime.resilience(),
+                watchdog: service_ctx.runtime.watchdog(),
+            },
+            task_registry: Arc::clone(&service_ctx.task_registry),
+        };
+        if !spawn_state.service.is_enabled() {
+            return;
+        }
+
+        let handle = match runtime_handle() {
+            Some(handle) => handle,
+            None => {
+                error!("Watchdog disabled: no Tokio runtime available");
+                return;
+            }
+        };
+
+        let registration = spawn_supervised_async_task(
+            &handle,
+            "watchdog",
+            Some(Arc::clone(&spawn_state.service.metrics)),
+            run_watchdog_service(spawn_state.service),
+        );
+        spawn_state.task_registry.register(registration);
     }
 }

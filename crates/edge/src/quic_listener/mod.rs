@@ -88,7 +88,7 @@ use crate::{
             store::{ListenerTlsReloadState, ListenerTlsReloadStore},
         },
     },
-    watchdog::{config::WatchdogRuntimeConfig, coordinator::WatchdogCoordinator},
+    watchdog::coordinator::WatchdogCoordinator,
 };
 #[cfg(test)]
 use crate::runtime::bundle::RuntimeBundleHandle;

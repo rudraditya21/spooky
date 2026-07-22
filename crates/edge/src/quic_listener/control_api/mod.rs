@@ -14,7 +14,6 @@ mod render;
 mod reload;
 mod service;
 mod state;
-mod watchdog;
 
 #[cfg(test)]
 mod tests;
