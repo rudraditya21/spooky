@@ -11,7 +11,7 @@ use spooky_config::{
     },
 };
 use spooky_lb::upstream_pool::UpstreamPool;
-use spooky_transport::{SharedDnsResolver, transport_pool::UpstreamTransportPool};
+use spooky_transport::{SharedDnsResolver, UpstreamTransportPool};
 use tokio::sync::Semaphore;
 
 use crate::{

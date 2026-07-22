@@ -44,7 +44,7 @@ use spooky_config::{
 };
 use spooky_errors::{PoolError, ProxyError};
 use spooky_lb::{health::HealthFailureReason, upstream_pool::UpstreamPool};
-use spooky_transport::{SharedDnsResolver, transport_pool::UpstreamTransportPool};
+use spooky_transport::{SharedDnsResolver, UpstreamTransportPool};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     sync::{Semaphore, mpsc, mpsc::error::TrySendError, oneshot},

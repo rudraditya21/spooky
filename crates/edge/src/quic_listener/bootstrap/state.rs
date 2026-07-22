@@ -9,7 +9,7 @@ use spooky_config::{
     runtime::{ListenerRuntimeConfig, RuntimeUpstreamPolicy},
 };
 use spooky_lb::upstream_pool::UpstreamPool;
-use spooky_transport::transport_pool::UpstreamTransportPool;
+use spooky_transport::UpstreamTransportPool;
 
 use crate::{
     Metrics,

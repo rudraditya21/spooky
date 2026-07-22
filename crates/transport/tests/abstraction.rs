@@ -246,13 +246,13 @@ fn runtime_upstream_interpretation_selects_protocol_internally() {
     .expect("transport pool");
 
     let h1_rotation = pool
-        .rotate_backend_client_for_backend("http://127.0.0.1:8080")
+        .rotate_backend_client("http://127.0.0.1:8080")
         .expect("h1 rotation");
     assert!(h1_rotation.rotated());
     assert_eq!(h1_rotation.generations(), None);
 
     let h2_rotation = pool
-        .rotate_backend_client_for_backend("https://127.0.0.1:8443")
+        .rotate_backend_client("https://127.0.0.1:8443")
         .expect("h2 rotation");
     assert!(h2_rotation.rotated());
     assert_eq!(h2_rotation.generations(), Some((0, 1)));
@@ -313,25 +313,25 @@ fn client_rotation_behavior_is_stable_across_h1_and_h2() {
     );
 
     let h1_rotation = pool
-        .rotate_backend_client_for_backend("h1-backend")
+        .rotate_backend_client("h1-backend")
         .expect("h1 rotation");
     assert!(h1_rotation.rotated());
     assert_eq!(h1_rotation.generations(), None);
 
     let h2_rotation = pool
-        .rotate_backend_client_for_backend("h2-backend")
+        .rotate_backend_client("h2-backend")
         .expect("h2 rotation");
     assert!(h2_rotation.rotated());
     assert_eq!(h2_rotation.generations(), Some((0, 1)));
 
     let h2_second_rotation = pool
-        .rotate_backend_client_for_backend("h2-backend")
+        .rotate_backend_client("h2-backend")
         .expect("second h2 rotation");
     assert!(h2_second_rotation.rotated());
     assert_eq!(h2_second_rotation.generations(), Some((1, 2)));
 
     let missing_rotation = pool
-        .rotate_backend_client_for_backend("missing")
+        .rotate_backend_client("missing")
         .expect("missing rotation should not error");
     assert!(!missing_rotation.rotated());
     assert_eq!(missing_rotation.generations(), None);
@@ -464,7 +464,7 @@ fn dns_refresh_rotation_works_through_unified_surface() {
         [std::net::SocketAddr::from(([127, 0, 0, 10], 443))],
     );
     let first_rotation = pool
-        .rotate_backend_client_for_backend(&backend)
+        .rotate_backend_client(&backend)
         .expect("first rotation");
     assert!(first_rotation.rotated());
     assert_eq!(first_rotation.generations(), Some((0, 1)));
@@ -474,7 +474,7 @@ fn dns_refresh_rotation_works_through_unified_surface() {
         [std::net::SocketAddr::from(([127, 0, 0, 11], 443))],
     );
     let second_rotation = pool
-        .rotate_backend_client_for_backend(&backend)
+        .rotate_backend_client(&backend)
         .expect("second rotation");
     assert!(second_rotation.rotated());
     assert_eq!(second_rotation.generations(), Some((1, 2)));

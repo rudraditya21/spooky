@@ -241,13 +241,13 @@ fn pool_rotates_known_backend_client_and_ignores_unknown_backend() {
     .expect("pool");
 
     assert!(
-        pool.rotate_backend_client_for_backend("127.0.0.1:12345")
+        pool.rotate_backend_client("127.0.0.1:12345")
             .expect("known backend")
             .rotated()
     );
     assert!(
         !pool
-            .rotate_backend_client_for_backend("127.0.0.1:9999")
+            .rotate_backend_client("127.0.0.1:9999")
             .expect("unknown backend should be ignored")
             .rotated()
     );

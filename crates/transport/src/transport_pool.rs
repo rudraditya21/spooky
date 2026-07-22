@@ -8,7 +8,7 @@ use hyper::{
 use spooky_config::runtime::{
     RuntimeBackendConnectionPolicy, RuntimeBackendTransportKind, RuntimeUpstream,
 };
-pub use spooky_errors::{PoolError, ProxyError};
+use spooky_errors::{PoolError, ProxyError};
 pub use crate::h2_client::{
     ConnectObservation, ConnectObserver, SharedDnsResolver, TlsClientConfig,
 };
@@ -23,20 +23,6 @@ use crate::{
 enum BackendTransportEntry {
     Http1,
     H2,
-}
-
-struct TransportExecutionResult {
-    response: hyper::Response<Incoming>,
-}
-
-impl TransportExecutionResult {
-    fn new(response: hyper::Response<Incoming>) -> Self {
-        Self { response }
-    }
-
-    fn into_response(self) -> hyper::Response<Incoming> {
-        self.response
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,9 +53,7 @@ impl UpstreamTransportPool {
         backend: &str,
         req: Request<BoxBody<Bytes, Infallible>>,
     ) -> Result<hyper::Response<Incoming>, ProxyError> {
-        self.execute(backend, req)
-            .await
-            .map(TransportExecutionResult::into_response)
+        self.execute(backend, req).await
     }
 
     pub fn new_from_runtime_backends<I>(
@@ -209,23 +193,21 @@ impl UpstreamTransportPool {
         &self,
         backend: &str,
         req: Request<BoxBody<Bytes, Infallible>>,
-    ) -> Result<TransportExecutionResult, ProxyError> {
+    ) -> Result<hyper::Response<Incoming>, ProxyError> {
         match self.backend_entry(backend) {
             Some(BackendTransportEntry::Http1) => self
                 .execute_with_timeout(backend, self.h1_pool.send(backend, req))
-                .await
-                .map(TransportExecutionResult::new),
+                .await,
             Some(BackendTransportEntry::H2) => self
                 .execute_with_timeout(backend, self.h2_pool.send(backend, req))
-                .await
-                .map(TransportExecutionResult::new),
+                .await,
             None => Err(ProxyError::Pool(PoolError::UnknownBackend(
                 backend.to_string(),
             ))),
         }
     }
 
-    pub fn rotate_backend_client_for_backend(
+    pub fn rotate_backend_client(
         &self,
         backend: &str,
     ) -> Result<TransportClientRotation, String> {

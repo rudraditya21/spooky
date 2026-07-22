@@ -35,10 +35,6 @@ impl BackendClientRotation {
         }
     }
 
-    pub fn state(self) -> BackendClientRotationState {
-        self.state
-    }
-
     pub fn changed(self) -> bool {
         !matches!(self.state, BackendClientRotationState::MissingBackend)
     }

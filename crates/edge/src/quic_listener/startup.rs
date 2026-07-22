@@ -11,7 +11,7 @@ use spooky_config::runtime::{ListenerRuntimeConfig, RuntimeBackendAddressKind, R
 use spooky_errors::ProxyError;
 use spooky_lb::upstream_pool::UpstreamPool;
 use spooky_transport::{
-    ConnectObservation, ConnectObserver, SharedDnsResolver, transport_pool::UpstreamTransportPool,
+    ConnectObservation, ConnectObserver, SharedDnsResolver, UpstreamTransportPool,
 };
 use tokio::sync::Semaphore;
 
