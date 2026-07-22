@@ -1,3 +1,10 @@
+//! Internal listener subsystem façade.
+//!
+//! This module owns startup, worker orchestration, request ingress, and
+//! control-plane wiring for the QUIC and bootstrap listeners. The crate root
+//! re-exports the narrow worker/runtime entrypoints that external callers should
+//! depend on.
+
 use core::net::SocketAddr;
 use std::{
     collections::{HashMap, HashSet},
@@ -144,7 +151,10 @@ use validation::{
     RequestBufferError, extract_header_value, generated_span_id, generated_trace_id,
     parse_traceparent, validate_request_headers,
 };
-pub use workers::{ListenerWorkerGroupConfig, spawn_listener_worker_group};
+pub use workers::{
+    ListenerWorkerGroupConfig, release_shard_queue_bytes, shard_index_for_peer,
+    spawn_listener_worker_group, try_reserve_shard_queue_bytes,
+};
 use x509_parser::{extensions::GeneralName, parse_x509_certificate};
 
 struct ListenerRuntimeSettings {
