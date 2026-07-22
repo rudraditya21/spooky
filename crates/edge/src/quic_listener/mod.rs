@@ -101,7 +101,7 @@ mod control_api;
 mod control_plane;
 mod forwarding;
 mod health_check;
-mod metrics_endpoint;
+mod metrics;
 mod protocol;
 mod runtime_endpoint;
 mod runtime_state;
