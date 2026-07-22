@@ -158,23 +158,36 @@ impl H2Pool {
         backend: &str,
         req: Request<BoxBody<Bytes, Infallible>>,
     ) -> Result<hyper::Response<Incoming>, PoolError> {
-        let handle = self
-            .backends
+        let handle = self.backend_handle(backend)?;
+        let _permit = Self::acquire_inflight_permit(handle, backend)?;
+        let client = Self::current_client(handle)?;
+        client.send(req).await.map_err(PoolError::Send)
+    }
+
+    fn backend_handle(&self, backend: &str) -> Result<&BackendHandle, PoolError> {
+        self.backends
             .get(backend)
-            .ok_or_else(|| PoolError::UnknownBackend(backend.to_string()))?;
-        let client = handle
+            .ok_or_else(|| PoolError::UnknownBackend(backend.to_string()))
+    }
+
+    fn acquire_inflight_permit(
+        handle: &BackendHandle,
+        backend: &str,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, PoolError> {
+        match Arc::clone(&handle.inflight).try_acquire_owned() {
+            Ok(permit) => Ok(permit),
+            Err(TryAcquireError::NoPermits) => {
+                Err(PoolError::BackendOverloaded(backend.to_string()))
+            }
+            Err(TryAcquireError::Closed) => Err(PoolError::InflightLimiterClosed),
+        }
+    }
+
+    fn current_client(handle: &BackendHandle) -> Result<Arc<H2Client>, PoolError> {
+        handle
             .state
             .read()
             .map(|state| Arc::clone(&state.client))
-            .map_err(|_| PoolError::InflightLimiterClosed)?;
-
-        let _permit = match Arc::clone(&handle.inflight).try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(TryAcquireError::NoPermits) => {
-                return Err(PoolError::BackendOverloaded(backend.to_string()));
-            }
-            Err(TryAcquireError::Closed) => return Err(PoolError::InflightLimiterClosed),
-        };
-        client.send(req).await.map_err(PoolError::Send)
+            .map_err(|_| PoolError::InflightLimiterClosed)
     }
 }
