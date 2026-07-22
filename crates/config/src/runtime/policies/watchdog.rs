@@ -1,10 +1,7 @@
 use std::time::Duration;
 
 use super::config_invalid;
-use crate::{
-    config::Resilience,
-    runtime::RuntimeConfigError,
-};
+use crate::{config::Resilience, runtime::RuntimeConfigError};
 
 fn require_nonzero_u64(name: &str, value: u64) -> Result<(), RuntimeConfigError> {
     if value == 0 {

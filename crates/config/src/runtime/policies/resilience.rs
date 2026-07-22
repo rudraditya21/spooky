@@ -1,10 +1,7 @@
 use std::{collections::HashMap, time::Duration};
 
 use super::config_invalid;
-use crate::{
-    config::Resilience,
-    runtime::RuntimeConfigError,
-};
+use crate::{config::Resilience, runtime::RuntimeConfigError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeCircuitBreakerPolicy {

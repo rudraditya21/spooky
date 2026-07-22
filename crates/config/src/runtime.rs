@@ -275,13 +275,12 @@ pub struct RuntimeUpstreamPolicy {
 // integration-test crate.
 #[cfg(test)]
 mod tests {
-    use crate::config::LoadBalancing;
     use std::time::Duration;
 
     use super::{listeners::runtime_listeners, *};
     use crate::config::{
-        Config, ForwardedHeaderPolicyMode, Listen, RouteMatch, Tls, TlsCertificate, Upstream,
-        UpstreamHostPolicyMode,
+        Config, ForwardedHeaderPolicyMode, Listen, LoadBalancing, RouteMatch, Tls, TlsCertificate,
+        Upstream, UpstreamHostPolicyMode,
     };
 
     fn sample_config() -> Config {

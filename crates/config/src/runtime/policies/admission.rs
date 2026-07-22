@@ -2,18 +2,14 @@ use std::{collections::HashMap, time::Duration};
 
 use super::{
     config_invalid, normalize_optional_string,
+    resilience::{
+        normalize_circuit_breaker_policy, normalize_hedging_policy, normalize_retry_budget_policy,
+    },
+    watchdog::normalize_watchdog_policy,
 };
 use crate::{
     config::Resilience,
     runtime::{RuntimeConfigError, RuntimeProtocolPolicy},
-};
-
-use super::{
-    resilience::{
-        normalize_circuit_breaker_policy, normalize_hedging_policy,
-        normalize_retry_budget_policy,
-    },
-    watchdog::normalize_watchdog_policy,
 };
 
 fn require_nonzero_usize(name: &str, value: usize) -> Result<(), RuntimeConfigError> {

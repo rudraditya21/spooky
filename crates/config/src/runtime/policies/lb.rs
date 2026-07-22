@@ -1,8 +1,5 @@
 use super::{config_invalid, normalize_optional_string};
-use crate::{
-    config::LoadBalancing,
-    runtime::RuntimeConfigError,
-};
+use crate::{config::LoadBalancing, runtime::RuntimeConfigError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeLoadBalancingStrategy {

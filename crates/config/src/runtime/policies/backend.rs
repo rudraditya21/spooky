@@ -165,9 +165,7 @@ impl RuntimeBackendDnsPolicy {
     pub(crate) fn from_performance(performance: &Performance) -> Self {
         Self {
             refresh_enabled: performance.backend_dns_refresh_enabled,
-            refresh_interval: Duration::from_millis(
-                performance.backend_dns_refresh_interval_ms,
-            ),
+            refresh_interval: Duration::from_millis(performance.backend_dns_refresh_interval_ms),
         }
     }
 }
