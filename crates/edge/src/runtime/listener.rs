@@ -10,7 +10,7 @@ use spooky_config::{
     runtime::{ListenerRuntimeConfig, RuntimeUpstreamPolicy},
 };
 use spooky_lb::upstream_pool::UpstreamPool;
-use spooky_transport::{h2_client::SharedDnsResolver, transport_pool::UpstreamTransportPool};
+use spooky_transport::{SharedDnsResolver, UpstreamTransportPool};
 use tokio::sync::Semaphore;
 
 use crate::{

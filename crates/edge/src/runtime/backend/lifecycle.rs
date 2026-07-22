@@ -7,7 +7,7 @@ use std::{
 
 use log::{debug, info, warn};
 use spooky_lb::{backend::HealthTransition, upstream_pool::UpstreamPool};
-use spooky_transport::{h2_client::SharedDnsResolver, transport_pool::UpstreamTransportPool};
+use spooky_transport::{SharedDnsResolver, UpstreamTransportPool};
 
 use super::{
     event::{
@@ -386,8 +386,10 @@ pub(crate) fn apply_backend_dns_refresh(
             let client_rotated = if matches!(result.outcome, BackendRefreshOutcome::Updated { .. })
             {
                 matches!(
-                    transport_pool.rotate_backend_client(&result.identity.backend_addr),
-                    Ok(true)
+                    transport_pool.rotate_backend_client(
+                        &result.identity.backend_addr,
+                    ),
+                    Ok(rotation) if rotation.rotated()
                 )
             } else {
                 false
@@ -546,12 +548,9 @@ mod tests {
 
     use spooky_config::{
         config::{Backend, Config, HealthCheck, Listen, LoadBalancing, RouteMatch, Tls, Upstream},
-        runtime::RuntimeConfig,
+        runtime::{RuntimeBackendTransportKind, RuntimeConfig},
     };
-    use spooky_transport::{
-        h2_client::SharedDnsResolver,
-        transport_pool::{BackendTransportKind, UpstreamTransportPool},
-    };
+    use spooky_transport::{SharedDnsResolver, UpstreamTransportPool};
 
     use super::*;
     use crate::runtime::backend::event::{BackendHealthObservationOutcome, BackendRequestFeedback};
@@ -624,13 +623,16 @@ mod tests {
     }
 
     fn test_transport_pool(backend_addr: &str) -> UpstreamTransportPool {
-        UpstreamTransportPool::new(
-            [(backend_addr.to_string(), BackendTransportKind::Http1)],
+        UpstreamTransportPool::new_from_runtime_backends(
+            [(backend_addr.to_string(), RuntimeBackendTransportKind::Http1)],
             HashMap::new(),
-            32,
-            8,
-            Duration::from_secs(30),
-            Duration::from_secs(2),
+            spooky_config::runtime::RuntimeBackendConnectionPolicy {
+                max_inflight: 32,
+                max_idle_per_backend: 8,
+                pool_idle_timeout: Duration::from_secs(30),
+                connect_timeout: Duration::from_secs(2),
+                execution_timeout: Duration::from_secs(5),
+            },
             SharedDnsResolver::new(),
         )
         .expect("transport pool")

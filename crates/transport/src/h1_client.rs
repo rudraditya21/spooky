@@ -9,7 +9,7 @@ use crate::h2_client::{
     ObservedHttpConnector, SharedDnsResolver, TokioExecutor, build_observed_http_connector,
 };
 
-pub struct H1Client {
+pub(crate) struct H1Client {
     client: Client<ObservedHttpConnector, BoxBody<Bytes, Infallible>>,
 }
 
@@ -25,7 +25,7 @@ impl Default for H1Client {
 }
 
 impl H1Client {
-    pub fn new(
+    pub(crate) fn new(
         max_idle_per_host: usize,
         pool_idle_timeout: std::time::Duration,
         connect_timeout: std::time::Duration,
@@ -40,7 +40,7 @@ impl H1Client {
         )
     }
 
-    pub fn new_with_observer(
+    pub(crate) fn new_with_observer(
         max_idle_per_host: usize,
         pool_idle_timeout: std::time::Duration,
         connect_timeout: std::time::Duration,
@@ -58,14 +58,15 @@ impl H1Client {
         Self { client }
     }
 
-    pub async fn send(
+    pub(crate) async fn send(
         &self,
         req: Request<BoxBody<Bytes, Infallible>>,
     ) -> Result<hyper::Response<hyper::body::Incoming>, hyper_util::client::legacy::Error> {
         self.client.request(req).await
     }
 
-    pub fn try_default() -> Self {
+    #[cfg(test)]
+    fn try_default() -> Self {
         Self::new(
             DEFAULT_MAX_IDLE_PER_HOST,
             DEFAULT_POOL_IDLE_TIMEOUT,

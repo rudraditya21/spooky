@@ -252,7 +252,7 @@ impl Service<Name> for SharedDnsResolver {
     }
 }
 
-pub struct H2Client {
+pub(crate) struct H2Client {
     client: Client<HttpsConnector<ObservedHttpConnector>, BoxBody<Bytes, Infallible>>,
 }
 
@@ -285,7 +285,7 @@ where
 }
 
 impl H2Client {
-    pub fn new(
+    pub(crate) fn new(
         max_idle_per_host: usize,
         pool_idle_timeout: Duration,
         connect_timeout: Duration,
@@ -302,7 +302,7 @@ impl H2Client {
         )
     }
 
-    pub fn new_with_observer(
+    pub(crate) fn new_with_observer(
         max_idle_per_host: usize,
         pool_idle_timeout: Duration,
         connect_timeout: Duration,
@@ -329,14 +329,15 @@ impl H2Client {
         Ok(Self { client })
     }
 
-    pub async fn send(
+    pub(crate) async fn send(
         &self,
         req: Request<BoxBody<Bytes, Infallible>>,
     ) -> Result<hyper::Response<hyper::body::Incoming>, hyper_util::client::legacy::Error> {
         self.client.request(req).await
     }
 
-    pub fn try_default() -> Result<Self, String> {
+    #[cfg(test)]
+    fn try_default() -> Result<Self, String> {
         Self::new(
             DEFAULT_MAX_IDLE_PER_HOST,
             DEFAULT_POOL_IDLE_TIMEOUT,

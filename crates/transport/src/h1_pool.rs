@@ -14,6 +14,7 @@ pub use spooky_errors::PoolError;
 use tokio::sync::{Semaphore, TryAcquireError};
 
 use crate::{
+    client_rotation::BackendClientRotation,
     h1_client::H1Client,
     h2_client::{ConnectObserver, SharedDnsResolver},
 };
@@ -27,7 +28,7 @@ struct BackendHandle {
     inflight: Arc<Semaphore>,
 }
 
-pub struct H1Pool {
+pub(crate) struct H1Pool {
     backends: HashMap<String, BackendHandle>,
     max_idle_per_backend: usize,
     pool_idle_timeout: Duration,
@@ -37,29 +38,7 @@ pub struct H1Pool {
 }
 
 impl H1Pool {
-    pub fn new<I>(
-        backends: I,
-        max_inflight: usize,
-        max_idle_per_backend: usize,
-        pool_idle_timeout: Duration,
-        connect_timeout: Duration,
-        dns_resolver: SharedDnsResolver,
-    ) -> Self
-    where
-        I: IntoIterator<Item = String>,
-    {
-        Self::new_with_observer(
-            backends,
-            max_inflight,
-            max_idle_per_backend,
-            pool_idle_timeout,
-            connect_timeout,
-            dns_resolver,
-            None,
-        )
-    }
-
-    pub fn new_with_observer<I>(
+    pub(crate) fn new_with_observer<I>(
         backends: I,
         max_inflight: usize,
         max_idle_per_backend: usize,
@@ -101,35 +80,24 @@ impl H1Pool {
         }
     }
 
-    pub async fn send(
+    pub(crate) async fn send(
         &self,
         backend: &str,
         req: Request<BoxBody<Bytes, Infallible>>,
     ) -> Result<hyper::Response<Incoming>, PoolError> {
-        let handle = self
-            .backends
-            .get(backend)
-            .ok_or_else(|| PoolError::UnknownBackend(backend.to_string()))?;
-        let client = handle
-            .state
-            .read()
-            .map(|state| Arc::clone(&state.client))
-            .map_err(|_| PoolError::InflightLimiterClosed)?;
-
-        let _permit = match Arc::clone(&handle.inflight).try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(TryAcquireError::NoPermits) => {
-                return Err(PoolError::BackendOverloaded(backend.to_string()));
-            }
-            Err(TryAcquireError::Closed) => return Err(PoolError::InflightLimiterClosed),
-        };
+        let handle = self.backend_handle(backend)?;
+        let _permit = Self::acquire_inflight_permit(handle, backend)?;
+        let client = Self::current_client(handle)?;
 
         client.send(req).await.map_err(PoolError::Send)
     }
 
-    pub fn rotate_backend_client(&self, backend: &str) -> Result<bool, String> {
+    pub(crate) fn rotate_backend_client(
+        &self,
+        backend: &str,
+    ) -> Result<BackendClientRotation, String> {
         let Some(handle) = self.backends.get(backend) else {
-            return Ok(false);
+            return Ok(BackendClientRotation::missing_backend());
         };
 
         let client = Arc::new(H1Client::new_with_observer(
@@ -145,6 +113,33 @@ impl H1Pool {
             .write()
             .map_err(|_| format!("backend client state poisoned for '{backend}'"))?;
         state.client = client;
-        Ok(true)
+        Ok(BackendClientRotation::recreated())
+    }
+
+    fn backend_handle(&self, backend: &str) -> Result<&BackendHandle, PoolError> {
+        self.backends
+            .get(backend)
+            .ok_or_else(|| PoolError::UnknownBackend(backend.to_string()))
+    }
+
+    fn acquire_inflight_permit(
+        handle: &BackendHandle,
+        backend: &str,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, PoolError> {
+        match Arc::clone(&handle.inflight).try_acquire_owned() {
+            Ok(permit) => Ok(permit),
+            Err(TryAcquireError::NoPermits) => {
+                Err(PoolError::BackendOverloaded(backend.to_string()))
+            }
+            Err(TryAcquireError::Closed) => Err(PoolError::InflightLimiterClosed),
+        }
+    }
+
+    fn current_client(handle: &BackendHandle) -> Result<Arc<H1Client>, PoolError> {
+        handle
+            .state
+            .read()
+            .map(|state| Arc::clone(&state.client))
+            .map_err(|_| PoolError::InflightLimiterClosed)
     }
 }

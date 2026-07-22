@@ -7,7 +7,7 @@ use std::{
 
 use spooky_config::{backend_endpoint::BackendEndpoint, runtime::RuntimeUpstreamPolicy};
 use spooky_lb::upstream_pool::UpstreamPool;
-use spooky_transport::transport_pool::UpstreamTransportPool;
+use spooky_transport::UpstreamTransportPool;
 
 use super::state::BootstrapConnectionState;
 use crate::{Metrics, resilience::runtime::RuntimeResilience, routing::index::RouteIndex};

@@ -8,74 +8,97 @@ use hyper::{
 use spooky_config::runtime::{
     RuntimeBackendConnectionPolicy, RuntimeBackendTransportKind, RuntimeUpstream,
 };
-pub use spooky_errors::PoolError;
+use spooky_errors::{PoolError, ProxyError};
 
-use crate::{
-    h1_pool::H1Pool,
-    h2_client::{ConnectObserver, SharedDnsResolver, TlsClientConfig},
-    h2_pool::H2Pool,
+pub use crate::h2_client::{
+    ConnectObservation, ConnectObserver, SharedDnsResolver, TlsClientConfig,
 };
+use crate::{client_rotation::BackendClientRotation, h1_pool::H1Pool, h2_pool::H2Pool};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackendTransportKind {
+enum BackendTransportEntry {
     Http1,
     H2,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransportClientRotation {
+    rotation: BackendClientRotation,
+}
+
+impl TransportClientRotation {
+    pub fn rotated(self) -> bool {
+        self.rotation.changed()
+    }
+
+    pub fn generations(self) -> Option<(u64, u64)> {
+        self.rotation.generations()
+    }
+}
+
 pub struct UpstreamTransportPool {
-    backend_kinds: HashMap<String, BackendTransportKind>,
+    backend_entries: HashMap<String, BackendTransportEntry>,
     h1_pool: H1Pool,
     h2_pool: H2Pool,
+    execution_timeout: Duration,
 }
 
 impl UpstreamTransportPool {
-    pub fn new<I>(
+    pub async fn send_backend_request(
+        &self,
+        backend: &str,
+        req: Request<BoxBody<Bytes, Infallible>>,
+    ) -> Result<hyper::Response<Incoming>, ProxyError> {
+        self.execute(backend, req).await
+    }
+
+    pub fn new_from_runtime_backends<I>(
         backends: I,
         backend_tls: HashMap<String, TlsClientConfig>,
-        max_inflight: usize,
-        max_idle_per_backend: usize,
-        pool_idle_timeout: Duration,
-        connect_timeout: Duration,
+        connection_policy: RuntimeBackendConnectionPolicy,
         dns_resolver: SharedDnsResolver,
     ) -> Result<Self, String>
     where
-        I: IntoIterator<Item = (String, BackendTransportKind)>,
+        I: IntoIterator<Item = (String, RuntimeBackendTransportKind)>,
     {
-        Self::new_with_observer(
+        Self::new_runtime_with_observer(
             backends,
             backend_tls,
-            max_inflight,
-            max_idle_per_backend,
-            pool_idle_timeout,
-            connect_timeout,
+            connection_policy.max_inflight,
+            connection_policy.max_idle_per_backend,
+            connection_policy.pool_idle_timeout,
+            connection_policy.connect_timeout,
+            connection_policy.execution_timeout,
             dns_resolver,
             None,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn new_with_observer<I>(
+    fn new_runtime_with_observer<I>(
         backends: I,
         backend_tls: HashMap<String, TlsClientConfig>,
         max_inflight: usize,
         max_idle_per_backend: usize,
         pool_idle_timeout: Duration,
         connect_timeout: Duration,
+        execution_timeout: Duration,
         dns_resolver: SharedDnsResolver,
         connect_observer: Option<ConnectObserver>,
     ) -> Result<Self, String>
     where
-        I: IntoIterator<Item = (String, BackendTransportKind)>,
+        I: IntoIterator<Item = (String, RuntimeBackendTransportKind)>,
     {
-        let mut backend_kinds = HashMap::new();
+        let mut backend_entries = HashMap::new();
         let mut h1_backends = Vec::new();
         let mut h2_backends = Vec::new();
 
-        for (backend, kind) in backends {
-            backend_kinds.insert(backend.clone(), kind);
-            match kind {
-                BackendTransportKind::Http1 => h1_backends.push(backend),
-                BackendTransportKind::H2 => h2_backends.push(backend),
+        for (backend, runtime_transport) in backends {
+            let entry = Self::resolve_runtime_transport(runtime_transport);
+            backend_entries.insert(backend.clone(), entry);
+            match entry {
+                BackendTransportEntry::Http1 => h1_backends.push(backend),
+                BackendTransportEntry::H2 => h2_backends.push(backend),
             }
         }
 
@@ -100,10 +123,18 @@ impl UpstreamTransportPool {
         )?;
 
         Ok(Self {
-            backend_kinds,
+            backend_entries,
             h1_pool,
             h2_pool,
+            execution_timeout,
         })
+    }
+
+    fn resolve_runtime_transport(transport: RuntimeBackendTransportKind) -> BackendTransportEntry {
+        match transport {
+            RuntimeBackendTransportKind::Http1 => BackendTransportEntry::Http1,
+            RuntimeBackendTransportKind::H2 => BackendTransportEntry::H2,
+        }
     }
 
     pub fn from_runtime_upstreams<'a, I>(
@@ -121,12 +152,11 @@ impl UpstreamTransportPool {
         for upstream in upstreams {
             for backend in &upstream.backends {
                 let backend_addr = backend.backend.address.clone();
-                let kind = match backend.endpoint.transport_kind {
-                    RuntimeBackendTransportKind::Http1 => BackendTransportKind::Http1,
-                    RuntimeBackendTransportKind::H2 => BackendTransportKind::H2,
-                };
-                backends.push((backend_addr.clone(), kind));
-                if matches!(kind, BackendTransportKind::H2) {
+                backends.push((backend_addr.clone(), backend.endpoint.transport_kind));
+                if matches!(
+                    backend.endpoint.transport_kind,
+                    RuntimeBackendTransportKind::H2
+                ) {
                     backend_tls.insert(
                         backend_addr,
                         TlsClientConfig::from(&upstream.policy_set.transport.tls),
@@ -135,38 +165,74 @@ impl UpstreamTransportPool {
             }
         }
 
-        Self::new_with_observer(
+        Self::new_runtime_with_observer(
             backends,
             backend_tls,
             connection_policy.max_inflight,
             connection_policy.max_idle_per_backend,
             connection_policy.pool_idle_timeout,
             connection_policy.connect_timeout,
+            connection_policy.execution_timeout,
             dns_resolver,
             connect_observer,
         )
     }
 
-    pub async fn send(
+    fn backend_entry(&self, backend: &str) -> Option<BackendTransportEntry> {
+        self.backend_entries.get(backend).copied()
+    }
+
+    async fn execute(
         &self,
         backend: &str,
         req: Request<BoxBody<Bytes, Infallible>>,
-    ) -> Result<hyper::Response<Incoming>, PoolError> {
-        match self.backend_kinds.get(backend).copied() {
-            Some(BackendTransportKind::Http1) => self.h1_pool.send(backend, req).await,
-            Some(BackendTransportKind::H2) => self.h2_pool.send(backend, req).await,
-            None => Err(PoolError::UnknownBackend(backend.to_string())),
+    ) -> Result<hyper::Response<Incoming>, ProxyError> {
+        match self.backend_entry(backend) {
+            Some(BackendTransportEntry::Http1) => {
+                self.execute_with_timeout(backend, self.h1_pool.send(backend, req))
+                    .await
+            }
+            Some(BackendTransportEntry::H2) => {
+                self.execute_with_timeout(backend, self.h2_pool.send(backend, req))
+                    .await
+            }
+            None => Err(ProxyError::Pool(PoolError::UnknownBackend(
+                backend.to_string(),
+            ))),
         }
     }
 
-    pub fn rotate_backend_client(&self, backend: &str) -> Result<bool, String> {
-        match self.backend_kinds.get(backend).copied() {
-            Some(BackendTransportKind::Http1) => self.h1_pool.rotate_backend_client(backend),
-            Some(BackendTransportKind::H2) => self
+    pub fn rotate_backend_client(&self, backend: &str) -> Result<TransportClientRotation, String> {
+        match self.backend_entry(backend) {
+            Some(BackendTransportEntry::Http1) => self
+                .h1_pool
+                .rotate_backend_client(backend)
+                .map(Self::transport_rotation),
+            Some(BackendTransportEntry::H2) => self
                 .h2_pool
                 .rotate_backend_client(backend)
-                .map(|rotation| rotation.is_some()),
-            None => Ok(false),
+                .map(Self::transport_rotation),
+            None => Ok(TransportClientRotation {
+                rotation: BackendClientRotation::missing_backend(),
+            }),
         }
+    }
+
+    fn transport_rotation(rotation: BackendClientRotation) -> TransportClientRotation {
+        TransportClientRotation { rotation }
+    }
+
+    async fn execute_with_timeout<F>(
+        &self,
+        _backend: &str,
+        send: F,
+    ) -> Result<hyper::Response<Incoming>, ProxyError>
+    where
+        F: std::future::Future<Output = Result<hyper::Response<Incoming>, PoolError>>,
+    {
+        tokio::time::timeout(self.execution_timeout, send)
+            .await
+            .map_err(|_| ProxyError::Timeout)?
+            .map_err(ProxyError::Pool)
     }
 }
