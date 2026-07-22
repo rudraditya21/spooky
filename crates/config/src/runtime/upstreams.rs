@@ -13,10 +13,6 @@ impl RuntimeUpstream {
             .tls
             .clone()
             .unwrap_or_else(|| config.upstream_tls.clone());
-        let upstream_transport = RuntimeUpstreamTransportPolicy::from_effective_tls(
-            &effective_tls,
-            &base_policies.transport,
-        );
         let load_balancing = RuntimeLoadBalancingPolicy::normalize(&upstream.load_balancing)?;
         let route = RuntimeRouteMatchPolicy::normalize(name, &upstream.route)?;
         let policy = RuntimeUpstreamPolicy {
@@ -25,30 +21,19 @@ impl RuntimeUpstream {
             forwarded_headers: RuntimeForwardedHeaderPolicy(upstream.forwarded_headers.clone()),
             protocol: base_policies.admission.protocol.clone(),
         };
-        let mut runtime_upstream = Self {
+        let runtime_upstream = Self {
             name: name.to_string(),
             load_balancing: load_balancing.clone(),
             route: route.clone(),
             policy,
-            policy_set: RuntimeUpstreamPolicySet {
-                timeouts: base_policies.timeouts.clone(),
-                auth: RuntimeAuthPolicy::default(),
-                rate_limits: base_policies.rate_limits.clone(),
-                load_balancing,
-                admission: base_policies.admission.clone(),
-                transport: upstream_transport,
-                host: RuntimeHostPolicy(upstream.host_policy.clone()),
-                forwarded_headers: RuntimeForwardedHeaderPolicy(upstream.forwarded_headers.clone()),
-                protocol: base_policies.admission.protocol.clone(),
-            },
             effective_tls: effective_tls.clone(),
+            backend_tls_policy: RuntimeBackendTlsPolicy::from_effective_tls(&effective_tls),
             backends: upstream
                 .backends
                 .iter()
                 .map(|backend| RuntimeBackend::normalize(name, backend))
                 .collect::<Result<Vec<_>, _>>()?,
         };
-        runtime_upstream.policy_set.auth = runtime_upstream.policy.upstream_auth.clone();
 
         Ok(runtime_upstream)
     }
@@ -140,7 +125,7 @@ pub(super) fn normalize_upstreams(
         if upstream_uses_https_backends {
             validate_runtime_upstream_tls(
                 upstream_name,
-                &runtime_upstream.policy_set.transport.tls.as_upstream_tls(),
+                &runtime_upstream.backend_tls_policy.as_upstream_tls(),
             )?;
         }
 

@@ -157,10 +157,8 @@ impl UpstreamTransportPool {
                     backend.endpoint.transport_kind,
                     RuntimeBackendTransportKind::H2
                 ) {
-                    backend_tls.insert(
-                        backend_addr,
-                        TlsClientConfig::from(&upstream.policy_set.transport.tls),
-                    );
+                    backend_tls
+                        .insert(backend_addr, TlsClientConfig::from(upstream.backend_tls_policy()));
                 }
             }
         }

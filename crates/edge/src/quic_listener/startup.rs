@@ -228,10 +228,10 @@ impl QUICListener {
                     "Configured upstream TLS policy backend={} upstream={} verify_certificates={} strict_sni={} ca_file={:?} ca_dir={:?} authority_kind={}",
                     backend.backend.address,
                     upstream_name,
-                    upstream.policy_set.transport.tls.verify_certificates,
-                    upstream.policy_set.transport.tls.strict_sni,
-                    upstream.policy_set.transport.tls.ca_file,
-                    upstream.policy_set.transport.tls.ca_dir,
+                    upstream.backend_tls_policy().verify_certificates,
+                    upstream.backend_tls_policy().strict_sni,
+                    upstream.backend_tls_policy().ca_file,
+                    upstream.backend_tls_policy().ca_dir,
                     authority_kind
                 );
                 backend_endpoints.insert(backend.backend.address.clone(), endpoint);

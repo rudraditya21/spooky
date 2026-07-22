@@ -1,3 +1,9 @@
+//! Runtime policy interpreter façade.
+//!
+//! This module re-exports the stable normalized policy types that downstream
+//! crates consume. Domain-local normalization helpers and intermediate policy
+//! set assembly stay crate-private to avoid leaking interpreter structure.
+
 mod admission;
 mod auth;
 mod backend;
@@ -30,11 +36,8 @@ pub use self::{
     watchdog::RuntimeWatchdogPolicy,
 };
 use super::{
-    Config, ListenerRuntimeConfig, RuntimeConfigError, RuntimeForwardedHeaderPolicy,
-    RuntimeHostPolicy, RuntimeListenerTls, RuntimeProtocolPolicy,
+    Config, ListenerRuntimeConfig, RuntimeConfigError, RuntimeListenerTls,
 };
-use crate::config::UpstreamTls;
-
 fn config_invalid(message: impl Into<String>) -> RuntimeConfigError {
     RuntimeConfigError::ConfigInvalid(message.into())
 }
@@ -149,26 +152,6 @@ pub enum RuntimeBackendTransportKind {
 }
 
 #[derive(Debug, Clone)]
-pub struct RuntimeUpstreamTransportPolicy {
-    pub tls: RuntimeBackendTlsPolicy,
-    pub connection: RuntimeBackendConnectionPolicy,
-    pub dns: RuntimeBackendDnsPolicy,
-}
-
-impl RuntimeUpstreamTransportPolicy {
-    pub(crate) fn from_effective_tls(
-        effective_tls: &UpstreamTls,
-        transport: &RuntimeTransportPolicy,
-    ) -> Self {
-        Self {
-            tls: RuntimeBackendTlsPolicy::from_effective_tls(effective_tls),
-            connection: transport.backend_connections.clone(),
-            dns: transport.backend_dns.clone(),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
 pub struct RuntimePolicySet {
     pub timeouts: RuntimeTimeoutPolicy,
     pub admission: RuntimeAdmissionPolicy,
@@ -208,17 +191,4 @@ impl RuntimeListenerPolicySet {
             tls: config.listen.tls.clone(),
         }
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct RuntimeUpstreamPolicySet {
-    pub timeouts: RuntimeTimeoutPolicy,
-    pub auth: RuntimeAuthPolicy,
-    pub rate_limits: RuntimeRateLimitPolicy,
-    pub load_balancing: RuntimeLoadBalancingPolicy,
-    pub admission: RuntimeAdmissionPolicy,
-    pub transport: RuntimeUpstreamTransportPolicy,
-    pub host: RuntimeHostPolicy,
-    pub forwarded_headers: RuntimeForwardedHeaderPolicy,
-    pub protocol: RuntimeProtocolPolicy,
 }
