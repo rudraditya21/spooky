@@ -5,6 +5,8 @@ use subtle::ConstantTimeEq;
 
 use super::{state::ControlApiState, *};
 
+type ControlApiGateError = Box<Response<Full<Bytes>>>;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ControlApiRoute {
     Health,
@@ -61,7 +63,7 @@ impl QUICListener {
         req: &Request<Incoming>,
         state: &ControlApiState,
         route: ControlApiRoute,
-    ) -> Result<(), Response<Full<Bytes>>> {
+    ) -> Result<(), ControlApiGateError> {
         if !route.requires_authorization() || Self::control_api_is_authorized(req, state) {
             return Ok(());
         }
@@ -80,15 +82,15 @@ impl QUICListener {
             }),
             ControlApiRoute::Health | ControlApiRoute::Ready => unreachable!(),
         };
-        Err(Self::json_response(StatusCode::UNAUTHORIZED, response))
+        Err(Box::new(Self::json_response(StatusCode::UNAUTHORIZED, response)))
     }
 
     pub(super) fn gate_control_api_request(
         req: &Request<Incoming>,
         state: &ControlApiState,
-    ) -> Result<ControlApiRoute, Response<Full<Bytes>>> {
+    ) -> Result<ControlApiRoute, ControlApiGateError> {
         let Some(route) = Self::control_api_request_route(req, state) else {
-            return Err(Self::control_api_not_found_response());
+            return Err(Box::new(Self::control_api_not_found_response()));
         };
         Self::authorize_control_api_request(req, state, route)?;
         Ok(route)

@@ -7,7 +7,7 @@ impl QUICListener {
     ) -> Response<http_body_util::Full<bytes::Bytes>> {
         let route = match Self::gate_control_api_request(&req, state) {
             Ok(route) => route,
-            Err(response) => return response,
+            Err(response) => return *response,
         };
         match route {
             super::auth::ControlApiRoute::Health => Self::render_control_api_health(state),
