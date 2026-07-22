@@ -11,6 +11,7 @@ use spooky_config::runtime::{
 pub use spooky_errors::PoolError;
 
 use crate::{
+    client_rotation::{BackendClientRotation, BackendClientRotationState},
     h1_pool::H1Pool,
     h2_client::{ConnectObserver, SharedDnsResolver, TlsClientConfig},
     h2_pool::H2Pool,
@@ -72,24 +73,14 @@ impl TransportExecutionResult {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TransportClientRotationState {
-    MissingBackend,
-    Recreated,
-    Rotated {
-        previous_generation: u64,
-        current_generation: u64,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransportClientRotation {
     transport: Option<ResolvedBackendTransport>,
-    state: TransportClientRotationState,
+    rotation: BackendClientRotation,
 }
 
 impl TransportClientRotation {
     pub fn rotated(self) -> bool {
-        !matches!(self.state, TransportClientRotationState::MissingBackend)
+        self.rotation.changed()
     }
 
     pub fn protocol_name(self) -> Option<&'static str> {
@@ -100,13 +91,7 @@ impl TransportClientRotation {
     }
 
     pub fn generations(self) -> Option<(u64, u64)> {
-        match self.state {
-            TransportClientRotationState::Rotated {
-                previous_generation,
-                current_generation,
-            } => Some((previous_generation, current_generation)),
-            _ => None,
-        }
+        self.rotation.generations()
     }
 }
 
@@ -277,39 +262,32 @@ impl UpstreamTransportPool {
             Some(BackendTransportEntry::Http1) => self
                 .h1_pool
                 .rotate_backend_client(target.backend())
-                .map(|rotated| {
-                    if rotated {
-                        TransportClientRotation {
-                            transport: Some(ResolvedBackendTransport::Http1),
-                            state: TransportClientRotationState::Recreated,
-                        }
-                    } else {
-                        TransportClientRotation {
-                            transport: None,
-                            state: TransportClientRotationState::MissingBackend,
-                        }
-                    }
-                }),
+                .map(|rotation| Self::transport_rotation(ResolvedBackendTransport::Http1, rotation)),
             Some(BackendTransportEntry::H2) => self
                 .h2_pool
                 .rotate_backend_client(target.backend())
-                .map(|rotation| match rotation {
-                    Some(rotation) => TransportClientRotation {
-                        transport: Some(ResolvedBackendTransport::H2),
-                        state: TransportClientRotationState::Rotated {
-                            previous_generation: rotation.previous_generation,
-                            current_generation: rotation.current_generation,
-                        },
-                    },
-                    None => TransportClientRotation {
-                        transport: None,
-                        state: TransportClientRotationState::MissingBackend,
-                    },
-                }),
+                .map(|rotation| Self::transport_rotation(ResolvedBackendTransport::H2, rotation)),
             None => Ok(TransportClientRotation {
                 transport: None,
-                state: TransportClientRotationState::MissingBackend,
+                rotation: BackendClientRotation::missing_backend(),
             }),
+        }
+    }
+
+    fn transport_rotation(
+        transport: ResolvedBackendTransport,
+        rotation: BackendClientRotation,
+    ) -> TransportClientRotation {
+        let transport = match rotation.state() {
+            BackendClientRotationState::MissingBackend => None,
+            BackendClientRotationState::Recreated | BackendClientRotationState::Rotated { .. } => {
+                Some(transport)
+            }
+        };
+
+        TransportClientRotation {
+            transport,
+            rotation,
         }
     }
 }

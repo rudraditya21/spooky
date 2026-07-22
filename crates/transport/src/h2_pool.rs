@@ -13,7 +13,10 @@ use hyper::{
 pub use spooky_errors::PoolError;
 use tokio::sync::{Semaphore, TryAcquireError};
 
-use crate::h2_client::{ConnectObserver, H2Client, SharedDnsResolver, TlsClientConfig};
+use crate::{
+    client_rotation::BackendClientRotation,
+    h2_client::{ConnectObserver, H2Client, SharedDnsResolver, TlsClientConfig},
+};
 
 struct BackendClientState {
     client: Arc<H2Client>,
@@ -37,12 +40,6 @@ pub struct H2Pool {
     connect_timeout: Duration,
     dns_resolver: SharedDnsResolver,
     connect_observer: Option<ConnectObserver>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BackendClientRotation {
-    pub previous_generation: u64,
-    pub current_generation: u64,
 }
 
 impl H2Pool {
@@ -126,9 +123,9 @@ impl H2Pool {
     pub fn rotate_backend_client(
         &self,
         backend: &str,
-    ) -> Result<Option<BackendClientRotation>, String> {
+    ) -> Result<BackendClientRotation, String> {
         let Some(handle) = self.backends.get(backend) else {
-            return Ok(None);
+            return Ok(BackendClientRotation::missing_backend());
         };
 
         let client = Arc::new(H2Client::new_with_observer(
@@ -147,10 +144,10 @@ impl H2Pool {
         let previous_generation = state.generation;
         state.client = client;
         state.generation = state.generation.saturating_add(1);
-        Ok(Some(BackendClientRotation {
+        Ok(BackendClientRotation::rotated(
             previous_generation,
-            current_generation: state.generation,
-        }))
+            state.generation,
+        ))
     }
 
     pub async fn send(

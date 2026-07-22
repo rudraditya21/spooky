@@ -14,6 +14,7 @@ pub use spooky_errors::PoolError;
 use tokio::sync::{Semaphore, TryAcquireError};
 
 use crate::{
+    client_rotation::BackendClientRotation,
     h1_client::H1Client,
     h2_client::{ConnectObserver, SharedDnsResolver},
 };
@@ -113,9 +114,9 @@ impl H1Pool {
         client.send(req).await.map_err(PoolError::Send)
     }
 
-    pub fn rotate_backend_client(&self, backend: &str) -> Result<bool, String> {
+    pub fn rotate_backend_client(&self, backend: &str) -> Result<BackendClientRotation, String> {
         let Some(handle) = self.backends.get(backend) else {
-            return Ok(false);
+            return Ok(BackendClientRotation::missing_backend());
         };
 
         let client = Arc::new(H1Client::new_with_observer(
@@ -131,7 +132,7 @@ impl H1Pool {
             .write()
             .map_err(|_| format!("backend client state poisoned for '{backend}'"))?;
         state.client = client;
-        Ok(true)
+        Ok(BackendClientRotation::recreated())
     }
 
     fn backend_handle(&self, backend: &str) -> Result<&BackendHandle, PoolError> {
