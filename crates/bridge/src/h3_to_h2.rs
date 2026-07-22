@@ -14,8 +14,7 @@ use crate::{
     websocket::{H3WebsocketRequestKind, h3_websocket_request_kind},
 };
 
-#[allow(clippy::too_many_arguments)]
-pub fn build_h2_request_for_target(
+pub(crate) fn build_h2_request_for_target(
     target: RequestBuildTarget<'_>,
     input: RequestBuildInput<'_, BoxBody<Bytes, Infallible>>,
 ) -> Result<Request<BoxBody<Bytes, Infallible>>, BridgeError> {

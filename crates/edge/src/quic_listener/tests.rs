@@ -854,9 +854,9 @@ fn resolve_backend_skips_unhealthy_backends() {
         test_routing_context("round-robin");
     {
         let mut guard = pool.write().expect("pool write");
-        guard.pool.mark_failure(0);
-        guard.pool.mark_failure(0);
-        guard.pool.mark_failure(0);
+        guard.mark_backend_failure_from_active_check(0);
+        guard.mark_backend_failure_from_active_check(0);
+        guard.mark_backend_failure_from_active_check(0);
     }
 
     let request =
@@ -881,8 +881,8 @@ fn resolve_backend_respects_least_connections_strategy() {
         test_routing_context("least-connections");
     {
         let guard = pool.read().expect("pool read");
-        guard.pool.begin_request(0);
-        guard.pool.begin_request(0);
+        guard.begin_request_for_accounting(0);
+        guard.begin_request_for_accounting(0);
     }
 
     let request =

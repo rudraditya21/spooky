@@ -598,10 +598,8 @@ mod tests {
         })
         .expect("runtime config");
 
-        let mut pool =
-            UpstreamPool::from_runtime_upstream(runtime.upstreams.get("api").expect("upstream"))
-                .expect("pool");
-        pool.pool.backends[0].health_check = Some(HealthCheck {
+        let mut runtime_upstream = runtime.upstreams.get("api").expect("upstream").clone();
+        runtime_upstream.backends[0].backend.health_check = Some(HealthCheck {
             path: "/health".to_string(),
             interval: 0,
             timeout_ms: 1000,
@@ -610,7 +608,9 @@ mod tests {
             cooldown_ms: 0,
         });
 
-        Arc::new(RwLock::new(pool))
+        Arc::new(RwLock::new(
+            UpstreamPool::from_runtime_upstream(&runtime_upstream).expect("pool"),
+        ))
     }
 
     fn upstream_request_count(
@@ -858,8 +858,9 @@ mod tests {
         });
         {
             let guard = pool.read().expect("read");
-            assert_eq!(guard.pool.backends[0].active_requests(), 0);
-            assert!(guard.pool.backends[0].ewma_latency_ms().is_some());
+            let state = guard.backend_runtime_state(0).expect("backend state");
+            assert_eq!(state.active_requests, 0);
+            assert!(state.ewma_latency_ms.is_some());
         }
 
         let unhealthy = observe_backend_response_status(BackendHealthObservationInput {

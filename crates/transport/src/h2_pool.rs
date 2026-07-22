@@ -10,7 +10,7 @@ use hyper::{
     Request,
     body::{Bytes, Incoming},
 };
-pub use spooky_errors::PoolError;
+use spooky_errors::PoolError;
 use tokio::sync::{Semaphore, TryAcquireError};
 
 use crate::{

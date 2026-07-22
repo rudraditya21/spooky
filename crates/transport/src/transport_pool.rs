@@ -1,3 +1,10 @@
+//! Canonical transport execution façade.
+//!
+//! This module owns runtime-selected backend protocol dispatch, transport-level
+//! timeout application, connection reuse, and backend client rotation. Callers
+//! should hand it a backend identity plus a canonical request and avoid
+//! reconstructing H1/H2 selection logic themselves.
+
 use std::{collections::HashMap, convert::Infallible, time::Duration};
 
 use http_body_util::combinators::BoxBody;
@@ -10,10 +17,12 @@ use spooky_config::runtime::{
 };
 use spooky_errors::{PoolError, ProxyError};
 
-pub use crate::h2_client::{
-    ConnectObservation, ConnectObserver, SharedDnsResolver, TlsClientConfig,
+use crate::{
+    client_rotation::BackendClientRotation,
+    h1_pool::H1Pool,
+    h2_client::{ConnectObserver, SharedDnsResolver, TlsClientConfig},
+    h2_pool::H2Pool,
 };
-use crate::{client_rotation::BackendClientRotation, h1_pool::H1Pool, h2_pool::H2Pool};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BackendTransportEntry {
@@ -27,15 +36,18 @@ pub struct TransportClientRotation {
 }
 
 impl TransportClientRotation {
+    /// Returns true when transport rotated or recreated the backend client.
     pub fn rotated(self) -> bool {
         self.rotation.changed()
     }
 
+    /// Returns generation movement for protocols that track reusable client generations.
     pub fn generations(self) -> Option<(u64, u64)> {
         self.rotation.generations()
     }
 }
 
+/// Canonical transport façade used by edge/runtime code for backend execution.
 pub struct UpstreamTransportPool {
     backend_entries: HashMap<String, BackendTransportEntry>,
     h1_pool: H1Pool,
@@ -44,6 +56,7 @@ pub struct UpstreamTransportPool {
 }
 
 impl UpstreamTransportPool {
+    /// Execute a canonical upstream request against the resolved backend target.
     pub async fn send_backend_request(
         &self,
         backend: &str,
@@ -52,6 +65,7 @@ impl UpstreamTransportPool {
         self.execute(backend, req).await
     }
 
+    /// Build a transport pool from already-interpreted backend transport entries.
     pub fn new_from_runtime_backends<I>(
         backends: I,
         backend_tls: HashMap<String, TlsClientConfig>,
@@ -137,6 +151,7 @@ impl UpstreamTransportPool {
         }
     }
 
+    /// Build the canonical transport façade directly from runtime upstream definitions.
     pub fn from_runtime_upstreams<'a, I>(
         upstreams: I,
         connection_policy: &RuntimeBackendConnectionPolicy,
@@ -159,7 +174,7 @@ impl UpstreamTransportPool {
                 ) {
                     backend_tls.insert(
                         backend_addr,
-                        TlsClientConfig::from(&upstream.policy_set.transport.tls),
+                        TlsClientConfig::from(upstream.backend_tls_policy()),
                     );
                 }
             }

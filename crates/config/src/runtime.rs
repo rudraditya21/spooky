@@ -1,3 +1,9 @@
+//! Canonical runtime-ready configuration for the rest of the system.
+//!
+//! `RuntimeConfig` and the types re-exported from this module are the validated,
+//! normalized outputs that downstream crates should consume. Interpreter-only
+//! shaping details stay internal to the runtime lowering modules.
+
 use std::{collections::HashMap, fmt, net::IpAddr};
 
 use crate::config::{
@@ -21,7 +27,7 @@ pub use self::policies::{
     RuntimePolicySet, RuntimeRateLimitPolicy, RuntimeRequestKeySpec, RuntimeRetryBudgetPolicy,
     RuntimeRouteHostPattern, RuntimeRouteMatchPolicy, RuntimeRouteQueuePolicy,
     RuntimeScopedRateLimitPolicy, RuntimeTimeoutPolicy, RuntimeTransportPolicy,
-    RuntimeUpstreamPolicySet, RuntimeUpstreamTransportPolicy, RuntimeWatchdogPolicy,
+    RuntimeWatchdogPolicy,
 };
 
 #[derive(Debug, Clone)]
@@ -82,14 +88,6 @@ impl RuntimeConfig {
 
     pub fn policies(&self) -> RuntimePolicySet {
         self.policies.clone()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn upstream_policy_sets(&self) -> HashMap<String, RuntimeUpstreamPolicySet> {
-        self.upstreams
-            .iter()
-            .map(|(name, upstream)| (name.clone(), upstream.policy_set.clone()))
-            .collect()
     }
 }
 
@@ -237,9 +235,15 @@ pub struct RuntimeUpstream {
     pub load_balancing: RuntimeLoadBalancingPolicy,
     pub route: RuntimeRouteMatchPolicy,
     pub policy: RuntimeUpstreamPolicy,
-    pub policy_set: RuntimeUpstreamPolicySet,
     pub effective_tls: UpstreamTls,
     pub backends: Vec<RuntimeBackend>,
+    pub(crate) backend_tls_policy: RuntimeBackendTlsPolicy,
+}
+
+impl RuntimeUpstream {
+    pub fn backend_tls_policy(&self) -> &RuntimeBackendTlsPolicy {
+        &self.backend_tls_policy
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -270,9 +274,8 @@ pub struct RuntimeUpstreamPolicy {
 // NOTE: Public-API `RuntimeConfig::from_config` contract tests live in the
 // regression suite at `crates/config/tests/regression/`. The tests kept here are
 // the ones that reach crate-internal items — the private `listeners` module's
-// `runtime_listeners`, and the `#[cfg(test)] pub(crate)` `upstreams_as_config` /
-// `upstream_policy_sets` helpers — which are not reachable from an external
-// integration-test crate.
+// `runtime_listeners` and the `#[cfg(test)] pub(crate)` `upstreams_as_config`
+// helper — which are not reachable from an external integration-test crate.
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -342,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_upstream_policy_set_carries_canonical_lb_auth_and_tls_shapes() {
+    fn runtime_upstream_carries_canonical_lb_auth_and_tls_shapes() {
         let mut config = sample_config();
         let upstream = config.upstream.get_mut("api").expect("api upstream");
         upstream.load_balancing = LoadBalancing {
@@ -370,10 +373,7 @@ mod tests {
         }];
 
         let runtime = RuntimeConfig::from_config(&config).expect("runtime config");
-        let upstream_policies = runtime.upstream_policy_sets();
-        let api = upstream_policies
-            .get("api")
-            .expect("api runtime policy set");
+        let api = runtime.upstreams.get("api").expect("api runtime upstream");
 
         assert_eq!(
             api.load_balancing.strategy,
@@ -381,27 +381,28 @@ mod tests {
         );
         assert_eq!(api.load_balancing.key.as_deref(), Some("header:x-user-id"));
         assert_eq!(
-            api.auth
+            api.policy
+                .upstream_auth
                 .api_key
                 .as_ref()
                 .map(|auth| auth.header_name.as_str()),
             Some("x-api-key")
         );
         assert_eq!(
-            api.transport.tls.ca_file.as_deref(),
+            api.backend_tls_policy().ca_file.as_deref(),
             Some("/tmp/upstream-ca.pem")
         );
         assert_eq!(
-            api.transport.connection.max_inflight,
+            runtime.policies.transport.backend_connections.max_inflight,
             runtime
                 .policies
                 .transport
                 .connection_limits
                 .backend_pool_max_inflight
         );
-        assert_eq!(api.rate_limits.scoped_limits.len(), 1);
+        assert_eq!(runtime.policies.rate_limits.scoped_limits.len(), 1);
         assert_eq!(
-            api.rate_limits.scoped_limits[0].idle_ttl,
+            runtime.policies.rate_limits.scoped_limits[0].idle_ttl,
             Duration::from_secs(30)
         );
     }

@@ -1,3 +1,9 @@
+//! Canonical downstream response normalization surface.
+//!
+//! This module owns header/trailer filtering, bodyless/no-content shaping, and
+//! response emission policy decisions shared across forwarding and bootstrap
+//! compatibility paths.
+
 use std::collections::HashSet;
 
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};

@@ -474,7 +474,7 @@ fn dns_refresh_rotation_works_through_unified_surface() {
         resolver.clone(),
     );
 
-    resolver.replace_host_addrs(
+    resolver.set_host_addrs(
         "api.example.com",
         [std::net::SocketAddr::from(([127, 0, 0, 10], 443))],
     );
@@ -484,7 +484,7 @@ fn dns_refresh_rotation_works_through_unified_surface() {
     assert!(first_rotation.rotated());
     assert_eq!(first_rotation.generations(), Some((0, 1)));
 
-    resolver.replace_host_addrs(
+    resolver.set_host_addrs(
         "api.example.com",
         [std::net::SocketAddr::from(([127, 0, 0, 11], 443))],
     );

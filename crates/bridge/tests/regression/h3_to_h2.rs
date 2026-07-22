@@ -8,7 +8,8 @@ use http_body_util::combinators::BoxBody;
 use hyper::ext::Protocol;
 use quiche::h3::Header;
 use spooky_bridge::{
-    BridgeError, h3_to_h1::build_h1_request, h3_to_h2::build_h2_request_for_target,
+    BridgeError,
+    request::{build_h1_request, build_h2_request_for_target},
 };
 use spooky_config::{
     backend_endpoint::BackendEndpoint,

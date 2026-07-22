@@ -45,7 +45,7 @@ fn runtime_upstream_applies_effective_tls_and_policy_wrappers() {
         RuntimeBackendTransportKind::H2
     );
     assert_eq!(
-        upstream.policy_set.transport.tls.ca_file.as_deref(),
+        upstream.backend_tls_policy().ca_file.as_deref(),
         Some("/tmp/roots/upstream.pem")
     );
     assert_eq!(upstream.policy.host.0.mode, UpstreamHostPolicyMode::Rewrite);

@@ -12,11 +12,9 @@ use hyper::body::Incoming;
 use log::warn;
 use spooky_bridge::{
     BridgeError,
-    h3_to_h1::build_h1_request,
-    h3_to_h2::build_h2_request_for_target,
     request::{
         RequestBuildInput, RequestBuildPolicies, RequestBuildTarget, RequestForwardedContext,
-        RequestTraceContext,
+        RequestTraceContext, build_h1_request, build_h2_request_for_target,
     },
 };
 use spooky_config::{

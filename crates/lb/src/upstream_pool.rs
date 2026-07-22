@@ -1,3 +1,9 @@
+//! Canonical upstream pool façade.
+//!
+//! [`UpstreamPool`] owns balancing primitives plus the narrow lifecycle-facing
+//! mutation surface that edge/runtime code is allowed to use. Strategy state is
+//! encapsulated here; callers should not reach into [`BackendPool`] directly.
+
 use std::time::Duration;
 
 use spooky_config::runtime::{
@@ -19,9 +25,16 @@ pub struct UpstreamPoolMembershipSummary {
     pub membership_epoch: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct UpstreamBackendRuntimeState {
+    pub healthy: bool,
+    pub active_requests: usize,
+    pub ewma_latency_ms: Option<f64>,
+}
+
 pub struct UpstreamPool {
-    pub pool: BackendPool,
-    pub load_balancer: LoadBalancing,
+    pool: BackendPool,
+    load_balancer: LoadBalancing,
     lb_policy: RuntimeLoadBalancingPolicy,
 }
 
@@ -95,8 +108,33 @@ impl UpstreamPool {
         self.pool.address(index)
     }
 
+    pub fn backend_count(&self) -> usize {
+        self.pool.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pool.is_empty()
+    }
+
     pub fn backend_indices(&self) -> Vec<usize> {
         self.pool.all_indices()
+    }
+
+    pub fn is_backend_healthy(&self, index: usize) -> bool {
+        self.pool.is_healthy_index(index)
+    }
+
+    pub fn begin_request_for_accounting(&self, index: usize) {
+        self.pool.begin_request(index);
+    }
+
+    pub fn backend_runtime_state(&self, index: usize) -> Option<UpstreamBackendRuntimeState> {
+        let backend = self.pool.backend(index)?;
+        Some(UpstreamBackendRuntimeState {
+            healthy: self.pool.is_healthy_index(index),
+            active_requests: backend.active_requests(),
+            ewma_latency_ms: backend.ewma_latency_ms(),
+        })
     }
 
     pub fn healthy_backend_indices_iter(&self) -> impl Iterator<Item = usize> + '_ {
@@ -117,6 +155,10 @@ impl UpstreamPool {
 
     pub fn lb_strategy(&self) -> RuntimeLoadBalancingStrategy {
         self.lb_policy.strategy
+    }
+
+    pub fn load_balancer_name(&self) -> &'static str {
+        self.load_balancer.name()
     }
 
     pub fn lb_key_spec(&self) -> Option<&RuntimeRequestKeySpec> {

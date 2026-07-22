@@ -173,7 +173,7 @@ impl BackendLifecycleCoordinator {
                 let Some(backend_addr) = guard.backend_address(backend_index) else {
                     continue;
                 };
-                let Some(backend) = guard.pool.backend(backend_index) else {
+                let Some(backend) = guard.backend_runtime_state(backend_index) else {
                     continue;
                 };
                 let entry = snapshots
@@ -195,9 +195,9 @@ impl BackendLifecycleCoordinator {
                 entry.placements.push(BackendPoolPlacementSnapshot {
                     upstream_name: upstream_name.clone(),
                     backend_index,
-                    healthy: guard.pool.is_healthy_index(backend_index),
-                    active_requests: backend.active_requests(),
-                    ewma_latency_ms: backend.ewma_latency_ms(),
+                    healthy: backend.healthy,
+                    active_requests: backend.active_requests,
+                    ewma_latency_ms: backend.ewma_latency_ms,
                     membership_epoch: membership_summary.membership_epoch,
                 });
             }
@@ -367,7 +367,7 @@ pub(crate) fn apply_backend_dns_refresh(
                 };
             };
 
-            let _ = backend_dns_resolver.replace_host_addrs(
+            backend_dns_resolver.set_host_addrs(
                 &backend.resolution.authority_host,
                 resolved
                     .into_iter()
@@ -851,8 +851,9 @@ mod tests {
         );
 
         let guard = pool.read().expect("read");
-        assert_eq!(guard.pool.backends[0].active_requests(), 0);
-        assert!(guard.pool.backends[0].ewma_latency_ms().is_some());
+        let state = guard.backend_runtime_state(0).expect("backend state");
+        assert_eq!(state.active_requests, 0);
+        assert!(state.ewma_latency_ms.is_some());
     }
 
     #[test]

@@ -1,3 +1,5 @@
+//! Canonical proxy and upstream error classification surface.
+
 use thiserror::Error;
 
 use crate::{

@@ -13,7 +13,7 @@ use spooky_errors::{
     HedgeOutcomeTelemetryReason, HedgeTriggerTelemetryReason, RetryAttemptTelemetryReason,
     RetryPolicyDenialReason,
 };
-pub use spooky_lb::health::HealthFailureReason;
+use spooky_lb::health::HealthFailureReason;
 
 pub struct Metrics {
     pub requests_total: AtomicU64,

@@ -10,12 +10,11 @@ use std::{
 use log::{error, info};
 use spooky_config::runtime::{ListenerRuntimeConfig, RuntimeConfig};
 use spooky_edge::{
-    quic_listener::{
-        ListenerWorkerGroupConfig, ListenerWorkerRuntimeState, spawn_listener_worker_group,
-    },
+    ListenerWorkerGroupConfig, ListenerWorkerRuntimeState,
     runtime::{
         bundle::RuntimeBundleHandle, listener::QUICListener, shared_state::SharedRuntimeState,
     },
+    spawn_listener_worker_group,
 };
 
 use crate::runtime_guard;
@@ -335,7 +334,7 @@ fn group_signature_worker_count(group: &ListenerGroupRuntime) -> usize {
 mod tests {
     use std::{net::SocketAddr, sync::atomic::AtomicUsize};
 
-    use spooky_edge::quic_listener::workers::{
+    use spooky_edge::{
         release_shard_queue_bytes, shard_index_for_peer, try_reserve_shard_queue_bytes,
     };
 
