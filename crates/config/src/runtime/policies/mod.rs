@@ -9,9 +9,8 @@ mod watchdog;
 
 use super::*;
 pub use self::admission::{
-    RuntimeAdmissionPolicy, RuntimeBrownoutPolicy, RuntimeCircuitBreakerPolicy,
-    RuntimeHedgingPolicy, RuntimeRateLimitPolicy, RuntimeRetryBudgetPolicy,
-    RuntimeRouteQueuePolicy, RuntimeScopedRateLimitPolicy, RuntimeWatchdogPolicy,
+    RuntimeAdmissionPolicy, RuntimeBrownoutPolicy, RuntimeRateLimitPolicy,
+    RuntimeRouteQueuePolicy, RuntimeScopedRateLimitPolicy,
 };
 pub use self::auth::{
     RuntimeApiKeyAuth, RuntimeAuthPolicy, RuntimeExternalAuth, RuntimeExternalAuthFailureMode,
@@ -25,10 +24,14 @@ pub use self::lb::{
     RuntimeAlternateBackendPolicy, RuntimeLoadBalancingPolicy, RuntimeLoadBalancingStrategy,
     RuntimeRequestKeySpec,
 };
+pub use self::resilience::{
+    RuntimeCircuitBreakerPolicy, RuntimeHedgingPolicy, RuntimeRetryBudgetPolicy,
+};
 pub use self::timeouts::RuntimeTimeoutPolicy;
 pub use self::transport::{
     RuntimeBackendConnectionPolicy, RuntimeConnectionLimits, RuntimeTransportPolicy,
 };
+pub use self::watchdog::RuntimeWatchdogPolicy;
 
 fn config_invalid(message: impl Into<String>) -> RuntimeConfigError {
     RuntimeConfigError::ConfigInvalid(message.into())

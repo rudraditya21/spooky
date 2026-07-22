@@ -3,11 +3,19 @@ use std::{collections::HashMap, time::Duration};
 use super::{
     config_invalid, is_valid_connect_authority, is_valid_http_token, is_valid_request_key_spec,
     normalize_nonempty_string_vec, normalize_optional_string, normalize_string_vec,
-    require_nonzero_u64, require_nonzero_usize, unsupported_policy,
+    require_nonzero_usize,
 };
 use crate::{
     config::Resilience,
     runtime::{RuntimeConfigError, RuntimeProtocolPolicy},
+};
+
+use super::{
+    resilience::{
+        normalize_circuit_breaker_policy, normalize_hedging_policy,
+        normalize_retry_budget_policy,
+    },
+    watchdog::normalize_watchdog_policy,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,48 +145,11 @@ impl RuntimeRouteQueuePolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeCircuitBreakerPolicy {
-    pub enabled: bool,
-    pub failure_threshold: u32,
-    pub open: Duration,
-    pub half_open_max_probes: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeHedgingPolicy {
-    pub enabled: bool,
-    pub delay: Duration,
-    pub safe_methods: Vec<String>,
-    pub route_allowlist: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeRetryBudgetPolicy {
-    pub enabled: bool,
-    pub ratio_percent: u8,
-    pub per_route_ratio_percent: HashMap<String, u8>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeBrownoutPolicy {
     pub enabled: bool,
     pub trigger_inflight_percent: u8,
     pub recover_inflight_percent: u8,
     pub core_routes: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeWatchdogPolicy {
-    pub enabled: bool,
-    pub check_interval: Duration,
-    pub poll_stall_timeout: Duration,
-    pub timeout_error_rate_percent: u8,
-    pub min_requests_per_window: u64,
-    pub overload_inflight_percent: u8,
-    pub unhealthy_consecutive_windows: u32,
-    pub drain_grace: Duration,
-    pub restart_cooldown: Duration,
-    pub restart_command: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -209,11 +180,11 @@ impl RuntimeRateLimitPolicy {
 pub struct RuntimeAdmissionPolicy {
     pub adaptive_admission: RuntimeAdaptiveAdmissionPolicy,
     pub route_queue: RuntimeRouteQueuePolicy,
-    pub circuit_breaker: RuntimeCircuitBreakerPolicy,
-    pub hedging: RuntimeHedgingPolicy,
-    pub retry_budget: RuntimeRetryBudgetPolicy,
+    pub circuit_breaker: super::RuntimeCircuitBreakerPolicy,
+    pub hedging: super::RuntimeHedgingPolicy,
+    pub retry_budget: super::RuntimeRetryBudgetPolicy,
     pub brownout: RuntimeBrownoutPolicy,
-    pub watchdog: RuntimeWatchdogPolicy,
+    pub watchdog: super::RuntimeWatchdogPolicy,
     pub protocol: RuntimeProtocolPolicy,
 }
 
@@ -339,44 +310,6 @@ impl RuntimeAdmissionPolicy {
             ));
         }
 
-        if resilience.circuit_breaker.failure_threshold == 0 {
-            return Err(config_invalid(
-                "resilience.circuit_breaker.failure_threshold must be greater than 0",
-            ));
-        }
-        if resilience.circuit_breaker.open_ms == 0 {
-            return Err(config_invalid(
-                "resilience.circuit_breaker.open_ms must be greater than 0",
-            ));
-        }
-        if resilience.circuit_breaker.half_open_max_probes == 0 {
-            return Err(config_invalid(
-                "resilience.circuit_breaker.half_open_max_probes must be greater than 0",
-            ));
-        }
-
-        if resilience.hedging.enabled && resilience.hedging.delay_ms == 0 {
-            return Err(config_invalid(
-                "resilience.hedging: delay_ms must be > 0 when hedging is enabled",
-            ));
-        }
-
-        if resilience.retry_budget.ratio_percent > 100 {
-            return Err(config_invalid(
-                "resilience.retry_budget.ratio_percent must be <= 100",
-            ));
-        }
-        if resilience
-            .retry_budget
-            .per_route_ratio_percent
-            .values()
-            .any(|ratio| *ratio > 100)
-        {
-            return Err(config_invalid(
-                "resilience.retry_budget.per_route_ratio_percent values must be <= 100",
-            ));
-        }
-
         if resilience.brownout.trigger_inflight_percent > 100
             || resilience.brownout.recover_inflight_percent > 100
         {
@@ -392,58 +325,12 @@ impl RuntimeAdmissionPolicy {
             ));
         }
 
-        require_nonzero_u64(
-            "resilience.watchdog.check_interval_ms",
-            resilience.watchdog.check_interval_ms,
-        )?;
-        require_nonzero_u64(
-            "resilience.watchdog.poll_stall_timeout_ms",
-            resilience.watchdog.poll_stall_timeout_ms,
-        )?;
-        if resilience.watchdog.timeout_error_rate_percent > 100 {
-            return Err(config_invalid(
-                "resilience.watchdog.timeout_error_rate_percent must be <= 100",
-            ));
-        }
-        require_nonzero_u64(
-            "resilience.watchdog.min_requests_per_window",
-            resilience.watchdog.min_requests_per_window,
-        )?;
-        if resilience.watchdog.overload_inflight_percent > 100 {
-            return Err(config_invalid(
-                "resilience.watchdog.overload_inflight_percent must be <= 100",
-            ));
-        }
-        if resilience.watchdog.unhealthy_consecutive_windows == 0 {
-            return Err(config_invalid(
-                "resilience.watchdog.unhealthy_consecutive_windows must be greater than 0",
-            ));
-        }
-        require_nonzero_u64(
-            "resilience.watchdog.drain_grace_ms",
-            resilience.watchdog.drain_grace_ms,
-        )?;
-        require_nonzero_u64(
-            "resilience.watchdog.restart_cooldown_ms",
-            resilience.watchdog.restart_cooldown_ms,
-        )?;
-        if !resilience.watchdog.restart_command.is_empty()
-            && resilience.watchdog.restart_command[0].trim().is_empty()
-        {
-            return Err(config_invalid(
-                "resilience.watchdog.restart_command[0] must be a non-empty executable path",
-            ));
-        }
-        if resilience.watchdog.restart_hook.is_some() {
-            return Err(unsupported_policy(
-                "resilience.watchdog.restart_hook is deprecated and unsupported; use restart_command instead",
-            ));
-        }
-
         let mut protocol = resilience.protocol.clone();
         protocol.early_data_safe_methods = early_data_safe_methods;
         protocol.allowed_methods = allowed_methods;
         protocol.denied_path_prefixes = denied_path_prefixes;
+        let hedging_safe_methods = normalize_string_vec(&resilience.hedging.safe_methods);
+        let hedging_route_allowlist = normalize_string_vec(&resilience.hedging.route_allowlist);
 
         Ok(Self {
             adaptive_admission: RuntimeAdaptiveAdmissionPolicy {
@@ -464,43 +351,20 @@ impl RuntimeAdmissionPolicy {
                 shed_retry_after_seconds: resilience.route_queue.shed_retry_after_seconds.max(1),
                 caps: resilience.route_queue.caps.clone(),
             },
-            circuit_breaker: RuntimeCircuitBreakerPolicy {
-                enabled: resilience.circuit_breaker.enabled,
-                failure_threshold: resilience.circuit_breaker.failure_threshold,
-                open: Duration::from_millis(resilience.circuit_breaker.open_ms.max(1)),
-                half_open_max_probes: resilience.circuit_breaker.half_open_max_probes,
-            },
-            hedging: RuntimeHedgingPolicy {
-                enabled: resilience.hedging.enabled,
-                delay: Duration::from_millis(resilience.hedging.delay_ms),
-                safe_methods: normalize_string_vec(&resilience.hedging.safe_methods),
-                route_allowlist: normalize_string_vec(&resilience.hedging.route_allowlist),
-            },
-            retry_budget: RuntimeRetryBudgetPolicy {
-                enabled: resilience.retry_budget.enabled,
-                ratio_percent: resilience.retry_budget.ratio_percent,
-                per_route_ratio_percent: resilience.retry_budget.per_route_ratio_percent.clone(),
-            },
+            circuit_breaker: normalize_circuit_breaker_policy(resilience)?,
+            hedging: normalize_hedging_policy(
+                resilience,
+                hedging_safe_methods,
+                hedging_route_allowlist,
+            )?,
+            retry_budget: normalize_retry_budget_policy(resilience)?,
             brownout: RuntimeBrownoutPolicy {
                 enabled: resilience.brownout.enabled,
                 trigger_inflight_percent: resilience.brownout.trigger_inflight_percent,
                 recover_inflight_percent: resilience.brownout.recover_inflight_percent,
                 core_routes: normalize_string_vec(&resilience.brownout.core_routes),
             },
-            watchdog: RuntimeWatchdogPolicy {
-                enabled: resilience.watchdog.enabled,
-                check_interval: Duration::from_millis(resilience.watchdog.check_interval_ms),
-                poll_stall_timeout: Duration::from_millis(
-                    resilience.watchdog.poll_stall_timeout_ms,
-                ),
-                timeout_error_rate_percent: resilience.watchdog.timeout_error_rate_percent,
-                min_requests_per_window: resilience.watchdog.min_requests_per_window,
-                overload_inflight_percent: resilience.watchdog.overload_inflight_percent,
-                unhealthy_consecutive_windows: resilience.watchdog.unhealthy_consecutive_windows,
-                drain_grace: Duration::from_millis(resilience.watchdog.drain_grace_ms),
-                restart_cooldown: Duration::from_millis(resilience.watchdog.restart_cooldown_ms),
-                restart_command: resilience.watchdog.restart_command.clone(),
-            },
+            watchdog: normalize_watchdog_policy(resilience)?,
             protocol: RuntimeProtocolPolicy(protocol),
         })
     }
