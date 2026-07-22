@@ -11,7 +11,7 @@ use crate::{
 
 #[path = "runtime/listeners.rs"]
 mod listeners;
-#[path = "runtime/policies.rs"]
+#[path = "runtime/policies/mod.rs"]
 mod policies;
 #[path = "runtime/upstreams.rs"]
 mod upstreams;
