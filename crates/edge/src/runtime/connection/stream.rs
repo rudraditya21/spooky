@@ -271,7 +271,6 @@ pub struct DispatchReadyState {
 }
 
 pub struct RequestBodyRuntime {
-    pub body_tx: Option<mpsc::Sender<Bytes>>,
     pub body_buf: VecDeque<Bytes>,
     pub body_buf_bytes: usize,
     pub body_bytes_received: usize,
@@ -302,6 +301,24 @@ impl BackendAccountingState {
 }
 
 #[allow(dead_code)]
+pub struct BackendDispatchState {
+    pub body_tx: Option<mpsc::Sender<Bytes>>,
+    pub(crate) upstream_result_rx: oneshot::Receiver<UpstreamResult>,
+    pub backend_accounting: BackendAccountingState,
+}
+
+#[allow(dead_code)]
+pub struct AdmittedState {
+    pub context: RequestContext,
+    pub routing: RoutingSnapshot,
+    pub request_mode: RequestMode,
+    pub request_body: RequestBodyState,
+    pub request_body_runtime: RequestBodyRuntime,
+    pub pending_forward: Arc<PendingForward>,
+    pub permits: AdmissionPermits,
+}
+
+#[allow(dead_code)]
 pub struct AwaitingUpstreamState {
     pub context: RequestContext,
     pub routing: RoutingSnapshot,
@@ -310,8 +327,7 @@ pub struct AwaitingUpstreamState {
     pub request_body_runtime: RequestBodyRuntime,
     pub pending_forward: Arc<PendingForward>,
     pub permits: AdmissionPermits,
-    pub(crate) upstream_result_rx: oneshot::Receiver<UpstreamResult>,
-    pub backend_accounting: BackendAccountingState,
+    pub dispatch: BackendDispatchState,
 }
 
 #[allow(dead_code)]
@@ -323,7 +339,7 @@ pub struct ResponseStreamingState {
     pub permits: AdmissionPermits,
     pub response_status: StatusCode,
     pub emission: ResponseEmissionState,
-    pub(crate) response_chunk_rx: mpsc::Receiver<ResponseChunk>,
+    pub(crate) response_chunk_rx: Option<mpsc::Receiver<ResponseChunk>>,
     pub(crate) pending_chunk: Option<ResponseChunk>,
     pub backend_accounting: BackendAccountingState,
 }
@@ -332,6 +348,7 @@ pub struct LegacyRequestLifecycle {
     pub phase: StreamPhase,
     pub admission_state: StreamAdmissionState,
     pub request_body_runtime: RequestBodyRuntime,
+    pub body_tx: Option<mpsc::Sender<Bytes>>,
     pub pending_forward: Option<Arc<PendingForward>>,
     pub backend_request_started: bool,
     pub backend_request_finished: bool,
@@ -437,6 +454,7 @@ pub enum RequestExecutionState {
     Intake(RequestIntakeState),
     AwaitingAuth(AwaitingAuthState),
     DispatchReady(DispatchReadyState),
+    Admitted(AdmittedState),
     AwaitingUpstream(AwaitingUpstreamState),
     StreamingResponse(ResponseStreamingState),
     /// Migration shim used while handlers are incrementally rewritten away
@@ -460,11 +478,14 @@ impl RequestExecutionState {
 
     pub fn should_finalize_backend_accounting(&self) -> bool {
         match self {
-            Self::AwaitingUpstream(state) => state.backend_accounting.should_finalize(),
+            Self::AwaitingUpstream(state) => state.dispatch.backend_accounting.should_finalize(),
             Self::StreamingResponse(state) => state.backend_accounting.should_finalize(),
             Self::Terminal(state) => state.should_finalize_backend_accounting(),
             Self::Legacy(state) => state.backend_request_started && !state.backend_request_finished,
-            Self::Intake(_) | Self::AwaitingAuth(_) | Self::DispatchReady(_) => false,
+            Self::Intake(_)
+            | Self::AwaitingAuth(_)
+            | Self::DispatchReady(_)
+            | Self::Admitted(_) => false,
         }
     }
 
@@ -473,6 +494,7 @@ impl RequestExecutionState {
             Self::Intake(state) => state.request_body.can_accept_downstream_body(),
             Self::AwaitingAuth(state) => state.request_body.can_accept_downstream_body(),
             Self::DispatchReady(state) => state.request_body.can_accept_downstream_body(),
+            Self::Admitted(state) => state.request_body.can_accept_downstream_body(),
             Self::AwaitingUpstream(state) => {
                 state.request_mode.is_tunnel() && state.request_body.can_accept_downstream_body()
             }
@@ -500,9 +522,10 @@ impl RequestExecutionState {
 
     pub fn phase(&self) -> StreamPhase {
         match self {
-            Self::Intake(_) | Self::AwaitingAuth(_) | Self::DispatchReady(_) => {
-                StreamPhase::ReceivingRequest
-            }
+            Self::Intake(_)
+            | Self::AwaitingAuth(_)
+            | Self::DispatchReady(_)
+            | Self::Admitted(_) => StreamPhase::ReceivingRequest,
             Self::AwaitingUpstream(_) => StreamPhase::AwaitingUpstream,
             Self::StreamingResponse(_) => StreamPhase::SendingResponse,
             Self::Legacy(state) => state.phase.clone(),
@@ -514,9 +537,10 @@ impl RequestExecutionState {
     pub fn admission_state(&self) -> StreamAdmissionState {
         match self {
             Self::AwaitingAuth(_) => StreamAdmissionState::WaitingForAuth,
-            Self::DispatchReady(_) | Self::AwaitingUpstream(_) | Self::StreamingResponse(_) => {
-                StreamAdmissionState::ReadyToForward
-            }
+            Self::DispatchReady(_)
+            | Self::Admitted(_)
+            | Self::AwaitingUpstream(_)
+            | Self::StreamingResponse(_) => StreamAdmissionState::ReadyToForward,
             Self::Terminal(TerminalState::Rejected(_)) => StreamAdmissionState::Denied,
             Self::Legacy(state) => state.admission_state.clone(),
             Self::Intake(_) | Self::Terminal(_) => StreamAdmissionState::ReadyToForward,
