@@ -22,7 +22,10 @@ use super::{
         finish_bootstrap_backend_request_accounting, observe_bootstrap_response_prebuffer_overflow,
         observe_bootstrap_response_status,
     },
-    request::BootstrapPreparedRoute,
+    request::{
+        BootstrapPreparedRoute, BootstrapRejectionReason, BootstrapRequestMode,
+        BootstrapTerminalOutcome,
+    },
     websocket::write_bootstrap_websocket_upgrade,
 };
 use crate::runtime::connection::guardrails::{
@@ -36,7 +39,40 @@ pub(in crate::quic_listener) struct BootstrapStreamingBody {
     bytes_seen: usize,
     prebuffered_bytes: usize,
     capped: bool,
+    terminal: Option<BootstrapStreamingTerminal>,
     backend_accounting: Option<BootstrapBackendAccounting>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::quic_listener) enum BootstrapResponseMode {
+    StandardResponse,
+    WebsocketUpgrade,
+}
+
+impl BootstrapResponseMode {
+    fn from_request_mode(request_mode: BootstrapRequestMode, status: StatusCode) -> Self {
+        match request_mode {
+            BootstrapRequestMode::WebsocketUpgrade if status == StatusCode::SWITCHING_PROTOCOLS => {
+                Self::WebsocketUpgrade
+            }
+            BootstrapRequestMode::WebsocketUpgrade | BootstrapRequestMode::Standard => {
+                Self::StandardResponse
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::quic_listener) enum BootstrapStreamingTerminal {
+    Completed,
+    CappedRejected,
+    UpstreamBodyFailed,
+}
+
+#[allow(dead_code)]
+pub(in crate::quic_listener) struct BootstrapWritebackOutcome {
+    pub(in crate::quic_listener) response: Response<BoxBody<Bytes, Infallible>>,
+    pub(in crate::quic_listener) terminal: BootstrapTerminalOutcome,
 }
 
 struct BootstrapBackendAccounting {
@@ -56,6 +92,7 @@ impl BootstrapStreamingBody {
             bytes_seen: 0,
             prebuffered_bytes: 0,
             capped: false,
+            terminal: None,
             backend_accounting: None,
         }
     }
@@ -82,6 +119,7 @@ impl BootstrapStreamingBody {
             bytes_seen: 0,
             prebuffered_bytes: 0,
             capped: false,
+            terminal: None,
             backend_accounting: Some(BootstrapBackendAccounting {
                 upstream_pool,
                 backend_index,
@@ -107,6 +145,14 @@ impl BootstrapStreamingBody {
             );
             accounting.finished = true;
         }
+    }
+
+    fn terminalize(&mut self, terminal: BootstrapStreamingTerminal) {
+        if self.terminal.is_some() {
+            return;
+        }
+        self.terminal = Some(terminal);
+        self.finish_backend_accounting();
     }
 }
 
@@ -146,18 +192,18 @@ impl Body for BootstrapStreamingBody {
                         self.prebuffered_bytes = next_state.next_state.prebuffered_bytes;
                     } else {
                         self.capped = true;
-                        self.finish_backend_accounting();
+                        self.terminalize(BootstrapStreamingTerminal::CappedRejected);
                         return Poll::Ready(None);
                     }
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
             Poll::Ready(Some(Err(_))) => {
-                self.finish_backend_accounting();
+                self.terminalize(BootstrapStreamingTerminal::UpstreamBodyFailed);
                 Poll::Ready(None)
             }
             Poll::Ready(None) => {
-                self.finish_backend_accounting();
+                self.terminalize(BootstrapStreamingTerminal::Completed);
                 Poll::Ready(None)
             }
             Poll::Pending => Poll::Pending,
@@ -167,7 +213,9 @@ impl Body for BootstrapStreamingBody {
 
 impl Drop for BootstrapStreamingBody {
     fn drop(&mut self) {
-        self.finish_backend_accounting();
+        if self.terminal.is_none() {
+            self.terminalize(BootstrapStreamingTerminal::UpstreamBodyFailed);
+        }
     }
 }
 
@@ -180,13 +228,15 @@ pub(in crate::quic_listener) struct BootstrapWritebackInput<'a> {
     pub(in crate::quic_listener) prepared_route: &'a BootstrapPreparedRoute,
     pub(in crate::quic_listener) dispatch_ctx: BootstrapDispatchCtx<'a>,
     pub(in crate::quic_listener) suppress_downstream_body: bool,
+    pub(in crate::quic_listener) request_mode: BootstrapRequestMode,
     pub(in crate::quic_listener) client_upgrade: Option<hyper::upgrade::OnUpgrade>,
 }
 
 pub(in crate::quic_listener) fn write_bootstrap_response(
     mut input: BootstrapWritebackInput<'_>,
-) -> Result<Response<BoxBody<Bytes, Infallible>>, hyper::Error> {
+) -> Result<BootstrapWritebackOutcome, hyper::Error> {
     let status = input.upstream_resp.status();
+    let response_mode = BootstrapResponseMode::from_request_mode(input.request_mode, status);
     let normalized_response = normalize_upstream_response(ResponseNormalizationInput {
         upstream: spooky_bridge::response::UpstreamResponseView {
             status,
@@ -202,8 +252,7 @@ pub(in crate::quic_listener) fn write_bootstrap_response(
             protocol: ResponseNormalizationProtocol::Http1,
             strip_connection_headers: true,
             allow_trailers: false,
-            preserve_upgrade: input.dispatch_ctx.is_websocket_upgrade
-                && status == StatusCode::SWITCHING_PROTOCOLS,
+            preserve_upgrade: matches!(response_mode, BootstrapResponseMode::WebsocketUpgrade),
         },
     });
     let upstream_content_length = input
@@ -243,8 +292,10 @@ pub(in crate::quic_listener) fn write_bootstrap_response(
                 normalized_response.emission.body,
                 ResponseBodyPolicy::Forward
             ),
-            exempt_from_body_size_cap: input.dispatch_ctx.is_websocket_upgrade
-                && status == StatusCode::SWITCHING_PROTOCOLS,
+            exempt_from_body_size_cap: matches!(
+                response_mode,
+                BootstrapResponseMode::WebsocketUpgrade
+            ),
         },
     );
     if matches!(
@@ -258,11 +309,14 @@ pub(in crate::quic_listener) fn write_bootstrap_response(
             input.prepared_route,
             input.dispatch_ctx.request.request_start,
         );
-        return Ok(Response::builder()
-            .status(StatusCode::SERVICE_UNAVAILABLE)
-            .header("alt-svc", &input.dispatch_ctx.request.runtime.alt_svc)
-            .body(boxed_full(Bytes::from_static(RESPONSE_BODY_TOO_LARGE_BODY)))
-            .unwrap_or_else(|_| Response::new(boxed_full(Bytes::from_static(b"error\n")))));
+        return Ok(BootstrapWritebackOutcome {
+            terminal: BootstrapTerminalOutcome::Rejected(BootstrapRejectionReason::Overloaded),
+            response: Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header("alt-svc", &input.dispatch_ctx.request.runtime.alt_svc)
+                .body(boxed_full(Bytes::from_static(RESPONSE_BODY_TOO_LARGE_BODY)))
+                .unwrap_or_else(|_| Response::new(boxed_full(Bytes::from_static(b"error\n")))),
+        });
     }
     observe_bootstrap_response_status(
         input.dispatch_ctx.request.runtime.metrics.as_ref(),
@@ -277,18 +331,19 @@ pub(in crate::quic_listener) fn write_bootstrap_response(
     }
     resp_builder = resp_builder.header("alt-svc", &input.dispatch_ctx.request.runtime.alt_svc);
 
-    if input.dispatch_ctx.is_websocket_upgrade
-        && input.upstream_resp.status() == StatusCode::SWITCHING_PROTOCOLS
-    {
-        return write_bootstrap_websocket_upgrade(
-            resp_builder,
-            &mut input.upstream_resp,
-            input.prepared_route,
-            input.dispatch_ctx.request.request_start,
-            &input.dispatch_ctx.request.runtime.alt_svc,
-            input.client_upgrade,
-            status,
-        );
+    if matches!(response_mode, BootstrapResponseMode::WebsocketUpgrade) {
+        return Ok(BootstrapWritebackOutcome {
+            terminal: BootstrapTerminalOutcome::AcceptedWebsocketUpgrade,
+            response: write_bootstrap_websocket_upgrade(
+                resp_builder,
+                &mut input.upstream_resp,
+                input.prepared_route,
+                input.dispatch_ctx.request.request_start,
+                &input.dispatch_ctx.request.runtime.alt_svc,
+                input.client_upgrade,
+                status,
+            )?,
+        });
     }
 
     let resp_body = if matches!(
@@ -320,7 +375,10 @@ pub(in crate::quic_listener) fn write_bootstrap_response(
         .boxed()
     };
 
-    Ok(resp_builder
-        .body(resp_body)
-        .unwrap_or_else(|_| Response::new(boxed_full(Bytes::new()))))
+    Ok(BootstrapWritebackOutcome {
+        terminal: BootstrapTerminalOutcome::AcceptedStandardResponse,
+        response: resp_builder
+            .body(resp_body)
+            .unwrap_or_else(|_| Response::new(boxed_full(Bytes::new()))),
+    })
 }
