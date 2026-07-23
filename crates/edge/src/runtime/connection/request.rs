@@ -21,11 +21,11 @@ use crate::{
         response::{ResponseChunk, UpstreamResult},
         stream::{
             AdmissionPermits, AdmittedState, AwaitingAuthState, AwaitingUpstreamState,
-            BackendAccountingState, BackendDispatchState, CancellationReason, CancelledState,
-            DispatchReadyState, LegacyRequestLifecycle, RequestBodyRuntime, RequestBodyState,
-            RequestContext, RequestExecutionState, RequestMode, ResponseEmissionState,
-            ResponseStreamingState, StreamAdmissionState, StreamPhase, TerminalSnapshot,
-            TerminalState, TunnelMode,
+            BackendAccountingState, BackendDispatchState, BackendFailureReason, CancellationReason,
+            CancelledState, CompletionReason, DispatchReadyState, LegacyRequestLifecycle,
+            RequestBodyRuntime, RequestBodyState, RequestContext, RequestExecutionState,
+            RequestMode, ResponseBackpressureState, ResponseEmissionState, ResponseStreamingState,
+            StreamAdmissionState, StreamPhase, TerminalSnapshot, TerminalState, TunnelMode,
         },
     },
 };
@@ -548,7 +548,7 @@ impl RequestEnvelope {
 
     pub(crate) fn response_chunk_rx_mut(&mut self) -> Option<&mut mpsc::Receiver<ResponseChunk>> {
         match &mut self.execution {
-            RequestExecutionState::StreamingResponse(state) => state.response_chunk_rx.as_mut(),
+            RequestExecutionState::StreamingResponse(state) => Some(&mut state.response_chunk_rx),
             RequestExecutionState::Legacy(state) => state.response_chunk_rx.as_mut(),
             _ => None,
         }
@@ -561,9 +561,6 @@ impl RequestEnvelope {
 
     pub fn clear_response_chunk_rx(&mut self) {
         match &mut self.execution {
-            RequestExecutionState::StreamingResponse(state) => {
-                state.response_chunk_rx = None;
-            }
             RequestExecutionState::Legacy(state) => {
                 state.response_chunk_rx = None;
             }
@@ -581,7 +578,7 @@ impl RequestEnvelope {
 
     pub fn has_response_chunk_rx(&self) -> bool {
         match &self.execution {
-            RequestExecutionState::StreamingResponse(state) => state.response_chunk_rx.is_some(),
+            RequestExecutionState::StreamingResponse(_) => true,
             RequestExecutionState::Legacy(state) => state.response_chunk_rx.is_some(),
             _ => false,
         }
@@ -616,7 +613,12 @@ impl RequestEnvelope {
     pub(crate) fn take_pending_chunk(&mut self) -> Option<ResponseChunk> {
         match &mut self.execution {
             RequestExecutionState::Legacy(state) => state.pending_chunk.take(),
-            RequestExecutionState::StreamingResponse(state) => state.pending_chunk.take(),
+            RequestExecutionState::StreamingResponse(state) => {
+                match std::mem::replace(&mut state.backpressure, ResponseBackpressureState::Ready) {
+                    ResponseBackpressureState::Ready => None,
+                    ResponseBackpressureState::Blocked(chunk) => Some(chunk),
+                }
+            }
             _ => None,
         }
     }
@@ -624,7 +626,12 @@ impl RequestEnvelope {
     pub(crate) fn set_pending_chunk(&mut self, chunk: Option<ResponseChunk>) {
         match &mut self.execution {
             RequestExecutionState::Legacy(state) => state.pending_chunk = chunk,
-            RequestExecutionState::StreamingResponse(state) => state.pending_chunk = chunk,
+            RequestExecutionState::StreamingResponse(state) => {
+                state.backpressure = match chunk {
+                    Some(chunk) => ResponseBackpressureState::Blocked(chunk),
+                    None => ResponseBackpressureState::Ready,
+                };
+            }
             _ => {}
         }
     }
@@ -632,8 +639,23 @@ impl RequestEnvelope {
     pub fn has_pending_chunk(&self) -> bool {
         match &self.execution {
             RequestExecutionState::Legacy(state) => state.pending_chunk.is_some(),
-            RequestExecutionState::StreamingResponse(state) => state.pending_chunk.is_some(),
+            RequestExecutionState::StreamingResponse(state) => {
+                matches!(state.backpressure, ResponseBackpressureState::Blocked(_))
+            }
             _ => false,
+        }
+    }
+
+    pub fn response_emission_state(&self) -> Option<ResponseEmissionState> {
+        match &self.execution {
+            RequestExecutionState::StreamingResponse(state) => Some(state.emission),
+            _ => None,
+        }
+    }
+
+    pub fn set_response_emission_state(&mut self, emission: ResponseEmissionState) {
+        if let RequestExecutionState::StreamingResponse(state) = &mut self.execution {
+            state.emission = emission;
         }
     }
 
@@ -825,9 +847,9 @@ impl RequestEnvelope {
 
     pub(crate) fn transition_to_streaming_response(
         &mut self,
-        response_chunk_rx: Option<mpsc::Receiver<ResponseChunk>>,
-        response_headers_sent: bool,
-        phase: StreamPhase,
+        response_chunk_rx: mpsc::Receiver<ResponseChunk>,
+        emission: ResponseEmissionState,
+        final_status: http::StatusCode,
     ) {
         let snapshot = self.terminal_snapshot();
         match std::mem::replace(
@@ -844,26 +866,18 @@ impl RequestEnvelope {
                     request_mode: state.request_mode,
                     request_body_runtime: state.request_body_runtime,
                     permits: state.permits,
-                    response_status: self
-                        .response_status
-                        .and_then(|status| http::StatusCode::from_u16(status).ok())
-                        .unwrap_or(http::StatusCode::OK),
-                    emission: if !response_headers_sent {
-                        ResponseEmissionState::DeferredHeaders
-                    } else if phase == StreamPhase::Completed {
-                        ResponseEmissionState::EndPending
-                    } else {
-                        ResponseEmissionState::HeadersSent
-                    },
+                    final_status,
+                    emission,
                     response_chunk_rx,
-                    pending_chunk: None,
+                    backpressure: ResponseBackpressureState::Ready,
                     backend_accounting: state.dispatch.backend_accounting,
                 });
             }
             RequestExecutionState::Legacy(mut legacy) => {
-                legacy.response_chunk_rx = response_chunk_rx;
-                legacy.response_headers_sent = response_headers_sent;
-                legacy.phase = phase;
+                legacy.response_chunk_rx = Some(response_chunk_rx);
+                legacy.response_headers_sent =
+                    !matches!(emission, ResponseEmissionState::DeferredHeaders);
+                legacy.phase = StreamPhase::SendingResponse;
                 self.execution = RequestExecutionState::Legacy(legacy);
             }
             other => {
@@ -871,6 +885,24 @@ impl RequestEnvelope {
                 panic!("streaming transition attempted from unsupported execution state");
             }
         }
+    }
+
+    pub(crate) fn transition_streaming_to_completed(&mut self, reason: CompletionReason) {
+        self.transition_to_terminal(TerminalState::Completed(
+            crate::runtime::connection::stream::CompletedState {
+                reason,
+                snapshot: self.terminal_snapshot(),
+            },
+        ));
+    }
+
+    pub(crate) fn transition_streaming_to_backend_failed(&mut self, reason: BackendFailureReason) {
+        self.transition_to_terminal(TerminalState::BackendFailed(
+            crate::runtime::connection::stream::BackendFailedState {
+                reason,
+                snapshot: self.terminal_snapshot(),
+            },
+        ));
     }
 
     pub fn transition_to_terminal(

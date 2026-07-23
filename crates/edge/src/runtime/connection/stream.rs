@@ -201,6 +201,13 @@ pub enum ResponseEmissionState {
 }
 
 #[allow(dead_code)]
+#[derive(Debug)]
+pub enum ResponseBackpressureState {
+    Ready,
+    Blocked(ResponseChunk),
+}
+
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionReason {
     ResponseStreamFinished,
@@ -395,10 +402,10 @@ pub struct ResponseStreamingState {
     pub request_mode: RequestMode,
     pub request_body_runtime: RequestBodyRuntime,
     pub permits: AdmissionPermits,
-    pub response_status: StatusCode,
+    pub final_status: StatusCode,
     pub emission: ResponseEmissionState,
-    pub(crate) response_chunk_rx: Option<mpsc::Receiver<ResponseChunk>>,
-    pub(crate) pending_chunk: Option<ResponseChunk>,
+    pub(crate) response_chunk_rx: mpsc::Receiver<ResponseChunk>,
+    pub(crate) backpressure: ResponseBackpressureState,
     pub backend_accounting: BackendAccountingState,
 }
 

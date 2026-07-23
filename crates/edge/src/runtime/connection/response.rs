@@ -7,10 +7,7 @@ use spooky_errors::{
 };
 use tokio::sync::mpsc;
 
-use crate::{
-    OverloadShedReason,
-    runtime::connection::{guardrails::ResponseBodyGuardrailConfig, stream::StreamPhase},
-};
+use crate::{OverloadShedReason, runtime::connection::guardrails::ResponseBodyGuardrailConfig};
 
 pub(crate) enum ForwardSuccess {
     Response {
@@ -85,10 +82,6 @@ pub(crate) struct ResponseStartMetadata {
 impl ResponseStartMetadata {
     pub(crate) fn response_headers_sent(&self) -> bool {
         !self.headers_deferred
-    }
-
-    pub(crate) fn streaming_phase(&self) -> StreamPhase {
-        StreamPhase::SendingResponse
     }
 }
 
