@@ -84,7 +84,7 @@ use crate::{
             quic::{QuicConnection, QuicConnectionErrorSnapshot},
             request::RequestEnvelope,
             response::{ForwardResult, ForwardSuccess, ResponseChunk, UpstreamResult},
-            stream::{StreamAdmissionState, StreamPhase, TunnelMode},
+            stream::{StreamPhase, TunnelMode},
         },
         health::{HealthClassification, outcome_from_status},
         listener::QUICListener,

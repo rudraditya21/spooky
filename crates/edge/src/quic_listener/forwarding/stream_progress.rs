@@ -8,6 +8,7 @@ use crate::runtime::connection::{
         evaluate_request_body_timeouts, response_body_limit_reason, response_chunk_ranges,
     },
     response::ForwardingPolicyTelemetry,
+    stream::RequestBodyState,
 };
 
 fn record_forwarding_policy_metrics(metrics: &Metrics, policy: &ForwardingPolicyTelemetry) {
@@ -96,6 +97,7 @@ impl QUICListener {
         };
         req.set_body_buf_bytes(next_state.buffered_bytes);
         req.body_buf_mut().push_back(chunk);
+        req.transition_request_body_buffered();
         Ok(())
     }
 
@@ -106,6 +108,10 @@ impl QUICListener {
         max_request_body_bytes: usize,
         request_buffer_global_cap_bytes: usize,
     ) -> Result<(), RequestBufferError> {
+        if !req.can_accept_request_body() {
+            return Ok(());
+        }
+
         if let Some(tx) = req.body_tx().cloned() {
             match tx.try_send(chunk) {
                 Ok(()) => Ok(()),
@@ -120,9 +126,9 @@ impl QUICListener {
                     if req.body_buf_bytes() > 0 {
                         metrics.release_request_buffer(req.body_buf_bytes());
                     }
-                    req.clear_body_tx();
                     req.body_buf_mut().clear();
                     req.set_body_buf_bytes(0);
+                    req.transition_request_body_forward_closed();
                     Ok(())
                 }
             }
@@ -140,9 +146,9 @@ impl QUICListener {
     pub(in crate::quic_listener) fn flush_request_buffer(
         req: &mut RequestEnvelope,
         metrics: &Metrics,
-    ) {
+    ) -> RequestBodyState {
         let Some(tx) = req.body_tx().cloned() else {
-            return;
+            return req.refresh_request_body_state();
         };
 
         loop {
@@ -165,11 +171,17 @@ impl QUICListener {
                     }
                     req.body_buf_mut().clear();
                     req.set_body_buf_bytes(0);
-                    req.clear_body_tx();
+                    req.transition_request_body_forward_closed();
                     break;
                 }
             }
         }
+
+        if req.should_close_request_body_forwarding() {
+            return req.transition_request_body_forward_closed();
+        }
+
+        req.refresh_request_body_state()
     }
 
     /// Advance all in-flight streams without blocking.
@@ -206,9 +218,7 @@ impl QUICListener {
         for stream_id in stream_ids {
             let now = Instant::now();
             if let Some(req) = streams.get(&stream_id)
-                && !req.request_fin_received()
-                && !req.bodyless_mode
-                && (req.phase() == StreamPhase::ReceivingRequest || req.body_tx().is_some())
+                && req.can_accept_request_body()
             {
                 let timeout_decision = evaluate_request_body_timeouts(
                     RequestBodyGuardrailConfig {
@@ -327,10 +337,7 @@ impl QUICListener {
             }
 
             if let Some(req) = streams.get_mut(&stream_id) {
-                Self::flush_request_buffer(req, metrics);
-                if req.request_fin_received() && req.body_buf().is_empty() {
-                    req.clear_body_tx();
-                }
+                let _ = Self::flush_request_buffer(req, metrics);
             }
 
             let auth_ready = streams

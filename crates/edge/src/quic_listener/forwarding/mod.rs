@@ -408,9 +408,10 @@ impl QUICListener {
             return Ok(false);
         };
 
+        let request_mode = req.request_mode();
         let websocket_h1_tunnel = req.tunnel_mode == TunnelMode::Websocket
             && backend_endpoint.scheme() == BackendScheme::Http;
-        let (body_tx, websocket_tunnel_body_rx, request_body) = if req.bodyless_mode {
+        let (body_tx, websocket_tunnel_body_rx, request_body) = if request_mode.bodyless_mode() {
             (None, None, Some(BoxBody::new(Full::new(Bytes::new()))))
         } else if websocket_h1_tunnel {
             let (tx, rx) = mpsc::channel::<Bytes>(REQUEST_CHUNK_CHANNEL_CAPACITY);
@@ -509,10 +510,7 @@ impl QUICListener {
             pool.begin_request_for_accounting(backend_index);
         }
         req.transition_admitted_to_awaiting_upstream(body_tx, result_rx);
-        Self::flush_request_buffer(req, metrics);
-        if req.request_fin_received() && req.body_buf().is_empty() {
-            req.clear_body_tx();
-        }
+        let _ = Self::flush_request_buffer(req, metrics);
         Ok(true)
     }
 
@@ -793,7 +791,7 @@ impl QUICListener {
                                 if read > 0 {
                                     req.set_last_body_activity(Instant::now());
                                 }
-                                if req.bodyless_mode && read > 0 {
+                                if req.request_mode().bodyless_mode() && read > 0 {
                                     reject_body_for_bodyless = Some((
                                         req.upstream_name
                                             .clone()
@@ -1031,13 +1029,8 @@ impl QUICListener {
                 },
                 Ok((stream_id, quiche::h3::Event::Finished)) => {
                     if let Some(req) = connection.streams.get_mut(&stream_id) {
-                        req.set_request_fin_received(true);
-
-                        Self::flush_request_buffer(req, &metrics);
-                        // If buffer is now empty, drop body_tx to signal end-of-body.
-                        if req.body_buf().is_empty() {
-                            req.clear_body_tx();
-                        }
+                        req.transition_request_body_finished();
+                        let _ = Self::flush_request_buffer(req, &metrics);
                         // Only move to AwaitingUpstream once auth has allowed the request
                         // and an upstream task/body channel actually exists.
                         if req.admission_state() == StreamAdmissionState::ReadyToForward {
