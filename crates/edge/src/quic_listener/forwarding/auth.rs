@@ -494,6 +494,7 @@ impl QUICListener {
                     req.response_status.unwrap_or(0)
                 );
                 Self::send_external_auth_decision_response(h3, quic, stream_id, &decision)?;
+                req.mark_terminal_outcome_recorded();
                 req.transition_to_terminal_with_cleanup(
                     TerminalReason::Rejected(RejectionReason::AuthDenied),
                     metrics,
@@ -530,6 +531,7 @@ impl QUICListener {
                     AdmissionOutcomeClass::Failed { timed_out: false },
                 );
                 Self::send_simple_response(h3, quic, stream_id, status, body)?;
+                req.mark_terminal_outcome_recorded();
                 req.transition_to_terminal_with_cleanup(
                     TerminalReason::Rejected(RejectionReason::AuthUnavailable),
                     metrics,
@@ -554,6 +556,7 @@ impl QUICListener {
                     AdmissionOutcomeClass::Failed { timed_out: true },
                 );
                 Self::send_simple_response(h3, quic, stream_id, status, body)?;
+                req.mark_terminal_outcome_recorded();
                 req.transition_to_terminal_with_cleanup(
                     TerminalReason::TimedOut(TimeoutReason::ExternalAuth),
                     metrics,

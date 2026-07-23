@@ -295,6 +295,7 @@ impl QUICListener {
                         .adaptive_admission
                         .observe(req.start.elapsed(), true);
                     if let Some(req) = streams.get_mut(&stream_id) {
+                        req.mark_terminal_outcome_recorded();
                         terminalize_stream(
                             req,
                             TerminalReason::TimedOut(TimeoutReason::RequestBodyIdle),

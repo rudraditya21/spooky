@@ -349,6 +349,8 @@ impl QUICListener {
                 resilience
                     .adaptive_admission
                     .observe(req.start.elapsed(), true);
+                req.set_terminal_overload_reason(Some(decision.reason.metrics_reason()));
+                req.mark_terminal_outcome_recorded();
                 terminalize_stream(
                     req,
                     TerminalReason::Rejected(RejectionReason::Overloaded),
@@ -388,6 +390,10 @@ impl QUICListener {
                         .adaptive_admission
                         .observe(req.start.elapsed(), true);
                 }
+                if let Some(reason) = decision.overload_reason {
+                    req.set_terminal_overload_reason(Some(reason.metrics_reason()));
+                }
+                req.mark_terminal_outcome_recorded();
                 terminalize_stream(
                     req,
                     TerminalReason::Rejected(rejection_reason_for_status(decision.status)),
@@ -1031,6 +1037,10 @@ impl QUICListener {
                                     .adaptive_admission
                                     .observe(req.start.elapsed(), true);
                                 if let Some(req) = connection.streams.get_mut(&stream_id) {
+                                    req.set_terminal_overload_reason(Some(
+                                        OverloadShedReason::RequestBufferCap,
+                                    ));
+                                    req.mark_terminal_outcome_recorded();
                                     terminalize_stream(
                                         req,
                                         TerminalReason::Rejected(RejectionReason::Overloaded),

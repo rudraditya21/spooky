@@ -954,6 +954,12 @@ impl QUICListener {
                 terminal,
                 observation,
             } => {
+                if let ResponseStartObservation::ProxyError {
+                    overload_reason, ..
+                } = &observation
+                {
+                    req.set_terminal_overload_reason(*overload_reason);
+                }
                 match terminal {
                     ImmediateResponseStart::NormalizedHeadersOnly => {
                         Self::send_response_start_headers(h3, quic, stream_id, &metadata, true)?;
@@ -969,6 +975,7 @@ impl QUICListener {
                     }
                 }
                 req.response_status = Some(metadata.status.as_u16());
+                req.mark_terminal_outcome_recorded();
                 req.transition_streaming_to_completed(CompletionReason::ImmediateResponse, metrics);
                 Self::observe_response_start_transition(req, &observation, shared_ctx);
                 Ok(true)
