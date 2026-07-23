@@ -416,7 +416,9 @@ impl QUICListener {
                         };
                         if immediate_terminal {
                             if let Some(req) = streams.get_mut(&stream_id) {
-                                abort_stream(req, metrics);
+                                if !req.execution.is_terminal() {
+                                    abort_stream(req, metrics);
+                                }
                             }
                             streams.remove(&stream_id);
                             continue;
@@ -458,7 +460,9 @@ impl QUICListener {
 
             if terminal {
                 if let Some(req) = streams.get_mut(&stream_id) {
-                    abort_stream(req, metrics);
+                    if !req.execution.is_terminal() {
+                        abort_stream(req, metrics);
+                    }
                 }
                 streams.remove(&stream_id);
             }

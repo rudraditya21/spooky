@@ -15,6 +15,7 @@ use crate::runtime::connection::{
         ImmediateResponseStart, ResponseBodyPumpPlan, ResponseStartDecision, ResponseStartMetadata,
         ResponseStartObservation,
     },
+    stream::{BackendFailureReason, CompletionReason, ResponseEmissionState},
 };
 
 fn response_body_guardrail_error(decision: ResponseBodyGuardrailDecision) -> Option<ProxyError> {
@@ -940,7 +941,7 @@ impl QUICListener {
                     }
                 }
                 req.response_status = Some(metadata.status.as_u16());
-                req.transition_to_streaming_response(None, true, StreamPhase::Completed);
+                req.transition_streaming_to_completed(CompletionReason::ImmediateResponse);
                 Self::observe_response_start_transition(req, &observation, shared_ctx);
                 Ok(true)
             }
@@ -952,9 +953,9 @@ impl QUICListener {
                 Self::send_response_start_headers(h3, quic, stream_id, &metadata, false)?;
                 req.response_status = Some(metadata.status.as_u16());
                 req.transition_to_streaming_response(
-                    Some(response_chunk_rx),
-                    true,
-                    metadata.streaming_phase(),
+                    response_chunk_rx,
+                    ResponseEmissionState::HeadersSent,
+                    metadata.status,
                 );
                 Self::observe_response_start_transition(req, &observation, shared_ctx);
                 Ok(false)
@@ -971,9 +972,13 @@ impl QUICListener {
                 let chunk_rx = Self::spawn_response_body_pump(req, response_body, &metadata, pump);
                 req.response_status = Some(metadata.status.as_u16());
                 req.transition_to_streaming_response(
-                    Some(chunk_rx),
-                    metadata.response_headers_sent(),
-                    metadata.streaming_phase(),
+                    chunk_rx,
+                    if metadata.response_headers_sent() {
+                        ResponseEmissionState::HeadersSent
+                    } else {
+                        ResponseEmissionState::DeferredHeaders
+                    },
+                    metadata.status,
                 );
                 Self::observe_response_start_transition(req, &observation, shared_ctx);
                 Ok(false)
@@ -1005,7 +1010,9 @@ impl QUICListener {
                         Ok(c) => c,
                         Err(TryRecvError::Empty) => break,
                         Err(TryRecvError::Disconnected) => {
-                            req.set_phase_legacy(StreamPhase::Failed);
+                            req.transition_streaming_to_backend_failed(
+                                BackendFailureReason::ResponseStreamAborted,
+                            );
                             terminal = true;
                             break;
                         }
@@ -1024,7 +1031,7 @@ impl QUICListener {
                     }
                     match h3.send_response(quic, stream_id, &h3_headers, false) {
                         Ok(_) => {
-                            req.set_response_headers_sent(true);
+                            req.set_response_emission_state(ResponseEmissionState::HeadersSent);
                         }
                         Err(quiche::h3::Error::StreamBlocked) => {
                             req.set_pending_chunk(Some(ResponseChunk::Start { status, headers }));
@@ -1047,13 +1054,18 @@ impl QUICListener {
                             resilience
                                 .adaptive_admission
                                 .observe(req.start.elapsed(), true);
+                            req.transition_streaming_to_backend_failed(
+                                BackendFailureReason::ResponseWriteFailed,
+                            );
                             terminal = true;
                             break;
                         }
                     }
                 }
                 ResponseChunk::Data(data) => match h3.send_body(quic, stream_id, &data, false) {
-                    Ok(_) => {}
+                    Ok(_) => {
+                        req.set_response_emission_state(ResponseEmissionState::StreamingBody);
+                    }
                     Err(quiche::h3::Error::StreamBlocked) => {
                         req.set_pending_chunk(Some(ResponseChunk::Data(data)));
                         break;
@@ -1077,6 +1089,9 @@ impl QUICListener {
                         resilience
                             .adaptive_admission
                             .observe(req.start.elapsed(), true);
+                        req.transition_streaming_to_backend_failed(
+                            BackendFailureReason::ResponseWriteFailed,
+                        );
                         terminal = true;
                         break;
                     }
@@ -1087,7 +1102,9 @@ impl QUICListener {
                         h3_headers.push(quiche::h3::Header::new(name, value));
                     }
                     match h3.send_additional_headers(quic, stream_id, &h3_headers, false, false) {
-                        Ok(_) => {}
+                        Ok(_) => {
+                            req.set_response_emission_state(ResponseEmissionState::TrailersPending);
+                        }
                         Err(quiche::h3::Error::StreamBlocked) => {
                             req.set_pending_chunk(Some(ResponseChunk::Trailers { headers }));
                             break;
@@ -1111,6 +1128,9 @@ impl QUICListener {
                             resilience
                                 .adaptive_admission
                                 .observe(req.start.elapsed(), true);
+                            req.transition_streaming_to_backend_failed(
+                                BackendFailureReason::ResponseWriteFailed,
+                            );
                             terminal = true;
                             break;
                         }
@@ -1118,7 +1138,10 @@ impl QUICListener {
                 }
                 ResponseChunk::End => match h3.send_body(quic, stream_id, b"", true) {
                     Ok(_) => {
-                        req.set_phase_legacy(StreamPhase::Completed);
+                        req.set_response_emission_state(ResponseEmissionState::EndPending);
+                        req.transition_streaming_to_completed(
+                            CompletionReason::ResponseStreamFinished,
+                        );
                         terminal = true;
                         break;
                     }
@@ -1145,6 +1168,9 @@ impl QUICListener {
                         resilience
                             .adaptive_admission
                             .observe(req.start.elapsed(), true);
+                        req.transition_streaming_to_backend_failed(
+                            BackendFailureReason::ResponseWriteFailed,
+                        );
                         terminal = true;
                         break;
                     }
@@ -1169,7 +1195,6 @@ impl QUICListener {
                     } else {
                         let _ = h3.send_body(quic, stream_id, b"", true);
                     }
-                    req.set_phase_legacy(StreamPhase::Failed);
                     let upstream_name = routing_index.lookup(&req.path, req.authority.as_deref());
                     let upstream_pool = upstream_name.and_then(|n| upstream_pools.get(n));
                     if let (Some(addr), Some(idx), Some(classified)) = (
@@ -1293,6 +1318,9 @@ impl QUICListener {
                             }
                         }
                     }
+                    req.transition_streaming_to_backend_failed(
+                        BackendFailureReason::ResponseStreamAborted,
+                    );
                     terminal = true;
                     break;
                 }
