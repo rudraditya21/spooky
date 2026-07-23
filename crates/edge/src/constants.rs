@@ -6,7 +6,7 @@ use std::time::Duration;
 //
 //   Request path
 //   ├─ body channel:    REQUEST_CHUNK_CHANNEL_CAPACITY * REQUEST_CHUNK_BYTES_LIMIT
-//   │                   = 8 * 16 KiB = 128 KiB
+//   │                   = 64 * 16 KiB = 1 MiB
 //   ├─ backpressure buf: REQUEST_BUFFERED_CHUNK_BYTES_LIMIT = 1 MiB (== MAX_REQUEST_BODY_BYTES)
 //   └─ hard request cap: MAX_REQUEST_BODY_BYTES = 1 MiB → 413 on breach
 //
@@ -20,7 +20,7 @@ use std::time::Duration;
 //
 // Per-connection worst-case:
 //   MAX_STREAMS_PER_CONNECTION (= QUIC_INITIAL_MAX_STREAMS_BIDI = 100) streams
-//   × per-stream worst case above → ~101 MiB request + ~100 MiB response ≈ 200 MiB
+//   × per-stream worst case above → ~200 MiB request + ~100 MiB response ≈ 300 MiB
 //   (all caps enforced; no path causes unbounded growth)
 //
 // ─────────────────────────────────────────────────────────────────────────────
@@ -60,7 +60,7 @@ pub const RESET_TOKEN_LEN_BYTES: usize = 16;
 pub const MIN_SCID_LEN_BYTES: usize = 8;
 
 // Queue/backpressure controls for streaming request/response bodies.
-pub const REQUEST_CHUNK_CHANNEL_CAPACITY: usize = 8;
+pub const REQUEST_CHUNK_CHANNEL_CAPACITY: usize = 64;
 pub const REQUEST_CHUNK_BYTES_LIMIT: usize = 16 * 1024;
 pub const REQUEST_BUFFERED_CHUNK_BYTES_LIMIT: usize = MAX_REQUEST_BODY_BYTES;
 pub const RESPONSE_CHUNK_CHANNEL_CAPACITY: usize = 16;
