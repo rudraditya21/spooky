@@ -15,9 +15,11 @@ use tokio::{
 use tracing::Span;
 
 use crate::{
+    Metrics,
     resilience::{adaptive_admission::AdaptivePermit, route_queue::RouteQueuePermit},
     runtime::connection::{
         auth::{ExternalAuthFailureDisposition, ExternalAuthResult, PendingHeaderMutation},
+        outcome::{BackendRequestFinishInput, finalize_backend_request_cleanup},
         response::{ResponseChunk, UpstreamResult},
         stream::{
             AdmissionPermits, AdmittedState, AwaitingAuthState, AwaitingUpstreamState,
@@ -25,7 +27,8 @@ use crate::{
             CancelledState, CompletionReason, DispatchReadyState, LegacyRequestLifecycle,
             RequestBodyRuntime, RequestBodyState, RequestContext, RequestExecutionState,
             RequestMode, ResponseBackpressureState, ResponseEmissionState, ResponseStreamingState,
-            StreamAdmissionState, StreamPhase, TerminalSnapshot, TerminalState, TunnelMode,
+            StreamAdmissionState, StreamPhase, TerminalReason, TerminalSnapshot, TerminalState,
+            TunnelMode,
         },
     },
 };
@@ -887,22 +890,20 @@ impl RequestEnvelope {
         }
     }
 
-    pub(crate) fn transition_streaming_to_completed(&mut self, reason: CompletionReason) {
-        self.transition_to_terminal(TerminalState::Completed(
-            crate::runtime::connection::stream::CompletedState {
-                reason,
-                snapshot: self.terminal_snapshot(),
-            },
-        ));
+    pub(crate) fn transition_streaming_to_completed(
+        &mut self,
+        reason: CompletionReason,
+        metrics: &Metrics,
+    ) {
+        self.transition_to_terminal_with_cleanup(TerminalReason::Completed(reason), metrics);
     }
 
-    pub(crate) fn transition_streaming_to_backend_failed(&mut self, reason: BackendFailureReason) {
-        self.transition_to_terminal(TerminalState::BackendFailed(
-            crate::runtime::connection::stream::BackendFailedState {
-                reason,
-                snapshot: self.terminal_snapshot(),
-            },
-        ));
+    pub(crate) fn transition_streaming_to_backend_failed(
+        &mut self,
+        reason: BackendFailureReason,
+        metrics: &Metrics,
+    ) {
+        self.transition_to_terminal_with_cleanup(TerminalReason::BackendFailed(reason), metrics);
     }
 
     pub fn transition_to_terminal(
@@ -998,18 +999,54 @@ impl RequestEnvelope {
         }
     }
 
-    pub(crate) fn discard_awaiting_auth_resources(&mut self) {
-        let Some(state) = self.take_awaiting_auth_state() else {
-            return;
-        };
-        self.execution = RequestExecutionState::DispatchReady(DispatchReadyState {
-            context: state.context,
-            routing: state.routing,
-            request_mode: state.request_mode,
-            request_body: state.request_body,
-            request_body_runtime: state.request_body_runtime,
-            pending_forward: state.pending_forward,
-        });
+    pub(crate) fn transition_to_terminal_with_cleanup(
+        &mut self,
+        reason: TerminalReason,
+        metrics: &Metrics,
+    ) -> StreamPhase {
+        let prior_phase = self.phase();
+        if self.execution.is_terminal() {
+            return prior_phase;
+        }
+
+        let snapshot = self.terminal_snapshot();
+        let should_finalize_backend = self.execution.should_finalize_backend_accounting();
+        let buffered_body_bytes = Self::buffered_request_body_bytes(&self.execution);
+        let finalize_status = reason
+            .terminal_status(&snapshot)
+            .or(snapshot.response_status)
+            .map(|status| status.as_u16())
+            .or(Some(503));
+
+        let placeholder =
+            RequestExecutionState::Terminal(TerminalState::Cancelled(CancelledState {
+                reason: CancellationReason::OperatorAbort,
+                snapshot: snapshot.clone(),
+            }));
+        let prior_execution = std::mem::replace(&mut self.execution, placeholder);
+
+        if let RequestExecutionState::AwaitingAuth(state) = &prior_execution {
+            state.auth_abort.abort();
+        }
+
+        if should_finalize_backend {
+            let _ = finalize_backend_request_cleanup(
+                BackendRequestFinishInput {
+                    upstream_pool: self.upstream_pool.as_ref(),
+                    backend_index: self.backend_index,
+                    elapsed: self.start.elapsed(),
+                    status: finalize_status,
+                },
+                true,
+            );
+        }
+
+        if buffered_body_bytes > 0 {
+            metrics.release_request_buffer(buffered_body_bytes);
+        }
+
+        self.execution = RequestExecutionState::Terminal(reason.into_terminal_state(snapshot));
+        prior_phase
     }
 
     fn legacy_mut(&mut self) -> &mut LegacyRequestLifecycle {
@@ -1047,6 +1084,24 @@ impl RequestEnvelope {
             RequestExecutionState::Intake(_) | RequestExecutionState::Terminal(_) => {
                 panic!("request body runtime mutation unavailable in current execution state")
             }
+        }
+    }
+
+    fn buffered_request_body_bytes(execution: &RequestExecutionState) -> usize {
+        match execution {
+            RequestExecutionState::AwaitingAuth(state) => state.request_body_runtime.body_buf_bytes,
+            RequestExecutionState::DispatchReady(state) => {
+                state.request_body_runtime.body_buf_bytes
+            }
+            RequestExecutionState::Admitted(state) => state.request_body_runtime.body_buf_bytes,
+            RequestExecutionState::AwaitingUpstream(state) => {
+                state.request_body_runtime.body_buf_bytes
+            }
+            RequestExecutionState::StreamingResponse(state) => {
+                state.request_body_runtime.body_buf_bytes
+            }
+            RequestExecutionState::Legacy(state) => state.request_body_runtime.body_buf_bytes,
+            RequestExecutionState::Intake(_) | RequestExecutionState::Terminal(_) => 0,
         }
     }
 

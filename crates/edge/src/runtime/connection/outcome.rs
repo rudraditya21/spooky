@@ -415,6 +415,18 @@ pub(crate) fn finish_backend_request_accounting(input: BackendRequestFinishInput
     apply_backend_request_accounting(upstream_pool, backend_index, elapsed, status);
 }
 
+pub(crate) fn finalize_backend_request_cleanup(
+    input: BackendRequestFinishInput<'_>,
+    should_finalize: bool,
+) -> bool {
+    if should_finalize {
+        finish_backend_request_accounting(input);
+        true
+    } else {
+        false
+    }
+}
+
 pub(crate) fn observe_backend_response_status(
     input: BackendHealthObservationInput<'_>,
 ) -> Option<HealthTransition> {

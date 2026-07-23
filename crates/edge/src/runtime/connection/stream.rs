@@ -468,6 +468,39 @@ pub struct BackendFailedState {
 }
 
 #[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalReason {
+    Completed(CompletionReason),
+    Cancelled(CancellationReason),
+    TimedOut(TimeoutReason),
+    Rejected(RejectionReason),
+    BackendFailed(BackendFailureReason),
+}
+
+#[allow(dead_code)]
+impl TerminalReason {
+    pub fn terminal_status(self, snapshot: &TerminalSnapshot) -> Option<StatusCode> {
+        snapshot.response_status
+    }
+
+    pub fn into_terminal_state(self, snapshot: TerminalSnapshot) -> TerminalState {
+        match self {
+            Self::Completed(reason) => {
+                TerminalState::Completed(CompletedState { reason, snapshot })
+            }
+            Self::Cancelled(reason) => {
+                TerminalState::Cancelled(CancelledState { reason, snapshot })
+            }
+            Self::TimedOut(reason) => TerminalState::TimedOut(TimedOutState { reason, snapshot }),
+            Self::Rejected(reason) => TerminalState::Rejected(RejectedState { reason, snapshot }),
+            Self::BackendFailed(reason) => {
+                TerminalState::BackendFailed(BackendFailedState { reason, snapshot })
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
 pub enum TerminalState {
     Completed(CompletedState),
     Cancelled(CancelledState),
