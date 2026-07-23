@@ -20,25 +20,13 @@ use crate::{
         auth::{ExternalAuthFailureDisposition, ExternalAuthResult, PendingHeaderMutation},
         response::{ResponseChunk, UpstreamResult},
         stream::{
-            LegacyRequestLifecycle, RequestBodyRuntime, RequestBodyState, RequestContext,
-            RequestExecutionState, RequestMode, RoutingSnapshot, StreamAdmissionState, StreamPhase,
+            AwaitingAuthState, CancellationReason, CancelledState, DispatchReadyState,
+            LegacyRequestLifecycle, RequestBodyRuntime, RequestContext, RequestExecutionState,
+            RequestMode, StreamAdmissionState, StreamPhase, TerminalSnapshot, TerminalState,
             TunnelMode,
         },
     },
 };
-
-pub(crate) enum IntakeExecutionSeed {
-    AwaitingAuth {
-        pending_forward: Arc<PendingForward>,
-        auth_result_rx: oneshot::Receiver<ExternalAuthResult>,
-        auth_abort: AbortHandle,
-        auth_disposition: ExternalAuthFailureDisposition,
-        auth_deadline: Instant,
-    },
-    ReadyForForwarding {
-        pending_forward: Arc<PendingForward>,
-    },
-}
 
 pub struct RequestEnvelope {
     pub request_id: u64,
@@ -107,10 +95,10 @@ impl RequestEnvelope {
         admission_state: StreamAdmissionState,
         request_fin_received: bool,
         pending_forward: Option<Arc<PendingForward>>,
-        auth_result_rx: Option<oneshot::Receiver<ExternalAuthResult>>,
-        auth_abort: Option<AbortHandle>,
-        auth_disposition: Option<ExternalAuthFailureDisposition>,
-        auth_deadline: Option<Instant>,
+        _auth_result_rx: Option<oneshot::Receiver<ExternalAuthResult>>,
+        _auth_abort: Option<AbortHandle>,
+        _auth_disposition: Option<ExternalAuthFailureDisposition>,
+        _auth_deadline: Option<Instant>,
     ) -> Self {
         Self {
             request_id,
@@ -150,10 +138,6 @@ impl RequestEnvelope {
                     request_fin_received,
                 },
                 pending_forward,
-                auth_result_rx,
-                auth_abort,
-                auth_disposition,
-                auth_deadline,
                 backend_request_started: false,
                 backend_request_finished: false,
                 global_inflight_permit: None,
@@ -168,66 +152,39 @@ impl RequestEnvelope {
         }
     }
 
-    pub(crate) fn from_intake_legacy(
-        context: RequestContext,
-        routing: RoutingSnapshot,
+    pub(crate) fn from_dispatch_ready_state(
+        state: DispatchReadyState,
         upstream_pool: Arc<RwLock<UpstreamPool>>,
-        request_mode: RequestMode,
-        request_body: RequestBodyState,
         routing_transparency_enabled: bool,
         routing_transparency_include_reason: bool,
         retry_count: u8,
         error_kind: Option<&'static str>,
-        execution: IntakeExecutionSeed,
     ) -> Self {
-        let (
-            admission_state,
-            pending_forward,
-            auth_result_rx,
-            auth_abort,
-            auth_disposition,
-            auth_deadline,
-        ) = match execution {
-            IntakeExecutionSeed::AwaitingAuth {
-                pending_forward,
-                auth_result_rx,
-                auth_abort,
-                auth_disposition,
-                auth_deadline,
-            } => (
-                StreamAdmissionState::WaitingForAuth,
-                Some(pending_forward),
-                Some(auth_result_rx),
-                Some(auth_abort),
-                Some(auth_disposition),
-                Some(auth_deadline),
-            ),
-            IntakeExecutionSeed::ReadyForForwarding { pending_forward } => (
-                StreamAdmissionState::ReadyToForward,
-                Some(pending_forward),
-                None,
-                None,
-                None,
-                None,
-            ),
-        };
+        let DispatchReadyState {
+            context,
+            routing,
+            request_mode,
+            request_body: _,
+            request_body_runtime: _,
+            pending_forward: _,
+        } = &state;
 
         Self {
             request_id: context.request_id,
-            trace_id: context.trace_id,
-            span_id: context.span_id,
-            traceparent: context.traceparent,
-            trace_span: context.trace_span,
-            method: context.method,
-            path: context.path,
-            authority: context.authority,
-            backend_addr: Some(routing.backend_addr),
+            trace_id: context.trace_id.clone(),
+            span_id: context.span_id.clone(),
+            traceparent: context.traceparent.clone(),
+            trace_span: context.trace_span.clone(),
+            method: context.method.clone(),
+            path: context.path.clone(),
+            authority: context.authority.clone(),
+            backend_addr: Some(routing.backend_addr.clone()),
             backend_index: Some(routing.backend_index),
-            upstream_name: Some(routing.upstream_name),
-            route_reason: Some(routing.route_reason),
+            upstream_name: Some(routing.upstream_name.clone()),
+            route_reason: Some(routing.route_reason.clone()),
             route_path_len: Some(routing.route_path_len),
             route_host_specific: Some(routing.route_host_specific),
-            backend_lb: routing.backend_lb,
+            backend_lb: routing.backend_lb.clone(),
             upstream_pool: Some(upstream_pool),
             routing_transparency_enabled,
             routing_transparency_include_reason,
@@ -238,33 +195,58 @@ impl RequestEnvelope {
             tunnel_mode: request_mode.tunnel_mode(),
             retry_count,
             error_kind,
-            execution: RequestExecutionState::Legacy(LegacyRequestLifecycle {
-                phase: StreamPhase::ReceivingRequest,
-                admission_state,
-                request_body_runtime: RequestBodyRuntime {
-                    body_tx: None,
-                    body_buf: VecDeque::new(),
-                    body_buf_bytes: 0,
-                    body_bytes_received: 0,
-                    last_body_activity: context.start,
-                    request_fin_received: request_body.request_fin_received(),
-                },
-                pending_forward,
-                auth_result_rx,
-                auth_abort,
-                auth_disposition,
-                auth_deadline,
-                backend_request_started: false,
-                backend_request_finished: false,
-                global_inflight_permit: None,
-                upstream_inflight_permit: None,
-                adaptive_admission_permit: None,
-                route_queue_permit: None,
-                upstream_result_rx: None,
-                response_chunk_rx: None,
-                response_headers_sent: false,
-                pending_chunk: None,
-            }),
+            execution: RequestExecutionState::DispatchReady(state),
+        }
+    }
+
+    pub(crate) fn from_awaiting_auth_state(
+        state: AwaitingAuthState,
+        upstream_pool: Arc<RwLock<UpstreamPool>>,
+        routing_transparency_enabled: bool,
+        routing_transparency_include_reason: bool,
+        retry_count: u8,
+        error_kind: Option<&'static str>,
+    ) -> Self {
+        let AwaitingAuthState {
+            context,
+            routing,
+            request_mode,
+            request_body: _,
+            request_body_runtime: _,
+            pending_forward: _,
+            auth_result_rx: _,
+            auth_abort: _,
+            auth_deadline: _,
+            auth_disposition: _,
+        } = &state;
+
+        Self {
+            request_id: context.request_id,
+            trace_id: context.trace_id.clone(),
+            span_id: context.span_id.clone(),
+            traceparent: context.traceparent.clone(),
+            trace_span: context.trace_span.clone(),
+            method: context.method.clone(),
+            path: context.path.clone(),
+            authority: context.authority.clone(),
+            backend_addr: Some(routing.backend_addr.clone()),
+            backend_index: Some(routing.backend_index),
+            upstream_name: Some(routing.upstream_name.clone()),
+            route_reason: Some(routing.route_reason.clone()),
+            route_path_len: Some(routing.route_path_len),
+            route_host_specific: Some(routing.route_host_specific),
+            backend_lb: routing.backend_lb.clone(),
+            upstream_pool: Some(upstream_pool),
+            routing_transparency_enabled,
+            routing_transparency_include_reason,
+            response_status: None,
+            start: context.start,
+            total_request_deadline: context.total_request_deadline,
+            bodyless_mode: request_mode.bodyless_mode(),
+            tunnel_mode: request_mode.tunnel_mode(),
+            retry_count,
+            error_kind,
+            execution: RequestExecutionState::AwaitingAuth(state),
         }
     }
 
@@ -277,130 +259,112 @@ impl RequestEnvelope {
     }
 
     pub fn request_fin_received(&self) -> bool {
-        self.legacy().request_body_runtime.request_fin_received
+        self.request_body_runtime().request_fin_received
     }
 
     pub fn set_request_fin_received(&mut self, value: bool) {
-        self.legacy_mut().request_body_runtime.request_fin_received = value;
+        self.request_body_runtime_mut().request_fin_received = value;
     }
 
     pub fn body_tx(&self) -> Option<&mpsc::Sender<Bytes>> {
-        self.legacy().request_body_runtime.body_tx.as_ref()
+        self.request_body_runtime().body_tx.as_ref()
     }
 
     pub fn body_tx_mut(&mut self) -> &mut Option<mpsc::Sender<Bytes>> {
-        &mut self.legacy_mut().request_body_runtime.body_tx
+        &mut self.request_body_runtime_mut().body_tx
     }
 
     pub fn clear_body_tx(&mut self) {
-        self.legacy_mut().request_body_runtime.body_tx = None;
+        self.request_body_runtime_mut().body_tx = None;
     }
 
     pub fn body_buf(&self) -> &VecDeque<Bytes> {
-        &self.legacy().request_body_runtime.body_buf
+        &self.request_body_runtime().body_buf
     }
 
     pub fn body_buf_mut(&mut self) -> &mut VecDeque<Bytes> {
-        &mut self.legacy_mut().request_body_runtime.body_buf
+        &mut self.request_body_runtime_mut().body_buf
     }
 
     pub fn body_buf_bytes(&self) -> usize {
-        self.legacy().request_body_runtime.body_buf_bytes
+        self.request_body_runtime().body_buf_bytes
     }
 
     pub fn set_body_buf_bytes(&mut self, value: usize) {
-        self.legacy_mut().request_body_runtime.body_buf_bytes = value;
+        self.request_body_runtime_mut().body_buf_bytes = value;
     }
 
     pub fn body_bytes_received(&self) -> usize {
-        self.legacy().request_body_runtime.body_bytes_received
+        self.request_body_runtime().body_bytes_received
     }
 
     pub fn set_body_bytes_received(&mut self, value: usize) {
-        self.legacy_mut().request_body_runtime.body_bytes_received = value;
+        self.request_body_runtime_mut().body_bytes_received = value;
     }
 
     pub fn last_body_activity(&self) -> Instant {
-        self.legacy().request_body_runtime.last_body_activity
+        self.request_body_runtime().last_body_activity
     }
 
     pub fn set_last_body_activity(&mut self, value: Instant) {
-        self.legacy_mut().request_body_runtime.last_body_activity = value;
+        self.request_body_runtime_mut().last_body_activity = value;
     }
 
     pub fn pending_forward(&self) -> Option<&Arc<PendingForward>> {
-        self.legacy().pending_forward.as_ref()
+        match &self.execution {
+            RequestExecutionState::AwaitingAuth(state) => Some(&state.pending_forward),
+            RequestExecutionState::DispatchReady(state) => Some(&state.pending_forward),
+            RequestExecutionState::AwaitingUpstream(state) => Some(&state.pending_forward),
+            RequestExecutionState::Legacy(state) => state.pending_forward.as_ref(),
+            RequestExecutionState::Intake(_)
+            | RequestExecutionState::StreamingResponse(_)
+            | RequestExecutionState::Terminal(_) => None,
+        }
     }
 
     pub fn pending_forward_mut(&mut self) -> Option<&mut Arc<PendingForward>> {
-        self.legacy_mut().pending_forward.as_mut()
+        match &mut self.execution {
+            RequestExecutionState::AwaitingAuth(state) => Some(&mut state.pending_forward),
+            RequestExecutionState::DispatchReady(state) => Some(&mut state.pending_forward),
+            RequestExecutionState::AwaitingUpstream(state) => Some(&mut state.pending_forward),
+            RequestExecutionState::Legacy(state) => state.pending_forward.as_mut(),
+            RequestExecutionState::Intake(_)
+            | RequestExecutionState::StreamingResponse(_)
+            | RequestExecutionState::Terminal(_) => None,
+        }
     }
 
     pub fn clear_pending_forward(&mut self) {
-        self.legacy_mut().pending_forward = None;
+        match &mut self.execution {
+            RequestExecutionState::AwaitingAuth(_)
+            | RequestExecutionState::DispatchReady(_)
+            | RequestExecutionState::AwaitingUpstream(_)
+            | RequestExecutionState::Legacy(_) => {
+                self.set_pending_forward(None);
+            }
+            RequestExecutionState::Intake(_)
+            | RequestExecutionState::StreamingResponse(_)
+            | RequestExecutionState::Terminal(_) => {}
+        }
     }
 
-    pub(crate) fn auth_result_rx_mut(
+    pub(crate) fn poll_awaiting_auth_non_blocking(
         &mut self,
-    ) -> Option<&mut oneshot::Receiver<ExternalAuthResult>> {
-        self.legacy_mut().auth_result_rx.as_mut()
-    }
-
-    pub fn clear_auth_result_rx(&mut self) {
-        self.legacy_mut().auth_result_rx = None;
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn set_auth_result_rx(&mut self, rx: Option<oneshot::Receiver<ExternalAuthResult>>) {
-        self.legacy_mut().auth_result_rx = rx;
-    }
-
-    pub fn has_auth_result_rx(&self) -> bool {
-        self.legacy().auth_result_rx.is_some()
-    }
-
-    pub fn take_auth_abort(&mut self) -> Option<AbortHandle> {
-        self.legacy_mut().auth_abort.take()
-    }
-
-    pub fn clear_auth_abort(&mut self) {
-        self.legacy_mut().auth_abort = None;
-    }
-
-    pub fn set_auth_abort(&mut self, abort: Option<AbortHandle>) {
-        self.legacy_mut().auth_abort = abort;
-    }
-
-    pub fn has_auth_abort(&self) -> bool {
-        self.legacy().auth_abort.is_some()
-    }
-
-    pub fn auth_fail_open(&self) -> bool {
-        self.legacy()
-            .auth_disposition
-            .is_some_and(ExternalAuthFailureDisposition::fail_open)
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn set_auth_disposition(
-        &mut self,
-        disposition: Option<ExternalAuthFailureDisposition>,
-    ) {
-        self.legacy_mut().auth_disposition = disposition;
-    }
-
-    pub fn auth_deadline(&self) -> Option<Instant> {
-        self.legacy().auth_deadline
-    }
-
-    pub fn set_auth_deadline(&mut self, deadline: Option<Instant>) {
-        self.legacy_mut().auth_deadline = deadline;
+        now: Instant,
+    ) -> Option<ExternalAuthResult> {
+        match &mut self.execution {
+            RequestExecutionState::AwaitingAuth(state) => state.poll_non_blocking(now),
+            _ => None,
+        }
     }
 
     pub(crate) fn upstream_result_rx_mut(
         &mut self,
     ) -> Option<&mut oneshot::Receiver<UpstreamResult>> {
-        self.legacy_mut().upstream_result_rx.as_mut()
+        match &mut self.execution {
+            RequestExecutionState::Legacy(state) => state.upstream_result_rx.as_mut(),
+            _ => None,
+        }
     }
 
     #[allow(dead_code)]
@@ -409,11 +373,16 @@ impl RequestEnvelope {
     }
 
     pub fn clear_upstream_result_rx(&mut self) {
-        self.legacy_mut().upstream_result_rx = None;
+        if let RequestExecutionState::Legacy(state) = &mut self.execution {
+            state.upstream_result_rx = None;
+        }
     }
 
     pub(crate) fn response_chunk_rx_mut(&mut self) -> Option<&mut mpsc::Receiver<ResponseChunk>> {
-        self.legacy_mut().response_chunk_rx.as_mut()
+        match &mut self.execution {
+            RequestExecutionState::Legacy(state) => state.response_chunk_rx.as_mut(),
+            _ => None,
+        }
     }
 
     #[allow(dead_code)]
@@ -422,49 +391,94 @@ impl RequestEnvelope {
     }
 
     pub fn clear_response_chunk_rx(&mut self) {
-        self.legacy_mut().response_chunk_rx = None;
+        if let RequestExecutionState::Legacy(state) = &mut self.execution {
+            state.response_chunk_rx = None;
+        }
     }
 
     pub fn has_upstream_result_rx(&self) -> bool {
-        self.legacy().upstream_result_rx.is_some()
+        match &self.execution {
+            RequestExecutionState::Legacy(state) => state.upstream_result_rx.is_some(),
+            _ => false,
+        }
     }
 
     pub fn has_response_chunk_rx(&self) -> bool {
-        self.legacy().response_chunk_rx.is_some()
+        match &self.execution {
+            RequestExecutionState::Legacy(state) => state.response_chunk_rx.is_some(),
+            _ => false,
+        }
     }
 
     pub fn response_headers_sent(&self) -> bool {
-        self.legacy().response_headers_sent
+        match &self.execution {
+            RequestExecutionState::Legacy(state) => state.response_headers_sent,
+            _ => false,
+        }
     }
 
     pub fn set_response_headers_sent(&mut self, sent: bool) {
-        self.legacy_mut().response_headers_sent = sent;
+        if let RequestExecutionState::Legacy(state) = &mut self.execution {
+            state.response_headers_sent = sent;
+        }
     }
 
     pub(crate) fn take_pending_chunk(&mut self) -> Option<ResponseChunk> {
-        self.legacy_mut().pending_chunk.take()
+        match &mut self.execution {
+            RequestExecutionState::Legacy(state) => state.pending_chunk.take(),
+            RequestExecutionState::StreamingResponse(state) => state.pending_chunk.take(),
+            _ => None,
+        }
     }
 
     pub(crate) fn set_pending_chunk(&mut self, chunk: Option<ResponseChunk>) {
-        self.legacy_mut().pending_chunk = chunk;
+        match &mut self.execution {
+            RequestExecutionState::Legacy(state) => state.pending_chunk = chunk,
+            RequestExecutionState::StreamingResponse(state) => state.pending_chunk = chunk,
+            _ => {}
+        }
     }
 
     pub fn has_pending_chunk(&self) -> bool {
-        self.legacy().pending_chunk.is_some()
+        match &self.execution {
+            RequestExecutionState::Legacy(state) => state.pending_chunk.is_some(),
+            RequestExecutionState::StreamingResponse(state) => state.pending_chunk.is_some(),
+            _ => false,
+        }
     }
 
     pub fn backend_request_started(&self) -> bool {
-        self.legacy().backend_request_started
+        match &self.execution {
+            RequestExecutionState::Legacy(state) => state.backend_request_started,
+            RequestExecutionState::AwaitingUpstream(_)
+            | RequestExecutionState::StreamingResponse(_) => true,
+            _ => false,
+        }
     }
 
     pub fn backend_request_finished(&self) -> bool {
-        self.legacy().backend_request_finished
+        match &self.execution {
+            RequestExecutionState::Legacy(state) => state.backend_request_finished,
+            RequestExecutionState::AwaitingUpstream(state) => state.backend_accounting.finalized,
+            RequestExecutionState::StreamingResponse(state) => state.backend_accounting.finalized,
+            _ => false,
+        }
     }
 
     pub fn set_backend_request_state(&mut self, started: bool, finished: bool) {
-        let legacy = self.legacy_mut();
-        legacy.backend_request_started = started;
-        legacy.backend_request_finished = finished;
+        match &mut self.execution {
+            RequestExecutionState::Legacy(state) => {
+                state.backend_request_started = started;
+                state.backend_request_finished = finished;
+            }
+            RequestExecutionState::AwaitingUpstream(state) => {
+                state.backend_accounting.finalized = started && finished;
+            }
+            RequestExecutionState::StreamingResponse(state) => {
+                state.backend_accounting.finalized = started && finished;
+            }
+            _ => {}
+        }
     }
 
     pub fn set_dispatch_permits(
@@ -482,46 +496,48 @@ impl RequestEnvelope {
     }
 
     pub fn clear_dispatch_permits(&mut self) {
-        let legacy = self.legacy_mut();
-        legacy.global_inflight_permit = None;
-        legacy.upstream_inflight_permit = None;
-        legacy.adaptive_admission_permit = None;
-        legacy.route_queue_permit = None;
+        if let RequestExecutionState::Legacy(state) = &mut self.execution {
+            state.global_inflight_permit = None;
+            state.upstream_inflight_permit = None;
+            state.adaptive_admission_permit = None;
+            state.route_queue_permit = None;
+        }
     }
 
     pub fn has_global_inflight_permit(&self) -> bool {
-        self.legacy().global_inflight_permit.is_some()
+        match &self.execution {
+            RequestExecutionState::Legacy(state) => state.global_inflight_permit.is_some(),
+            RequestExecutionState::AwaitingUpstream(_)
+            | RequestExecutionState::StreamingResponse(_) => true,
+            _ => false,
+        }
     }
 
     pub fn has_upstream_inflight_permit(&self) -> bool {
-        self.legacy().upstream_inflight_permit.is_some()
+        match &self.execution {
+            RequestExecutionState::Legacy(state) => state.upstream_inflight_permit.is_some(),
+            RequestExecutionState::AwaitingUpstream(_)
+            | RequestExecutionState::StreamingResponse(_) => true,
+            _ => false,
+        }
     }
 
     pub fn has_adaptive_admission_permit(&self) -> bool {
-        self.legacy().adaptive_admission_permit.is_some()
+        match &self.execution {
+            RequestExecutionState::Legacy(state) => state.adaptive_admission_permit.is_some(),
+            RequestExecutionState::AwaitingUpstream(_)
+            | RequestExecutionState::StreamingResponse(_) => true,
+            _ => false,
+        }
     }
 
     pub fn has_route_queue_permit(&self) -> bool {
-        self.legacy().route_queue_permit.is_some()
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn transition_to_awaiting_auth(
-        &mut self,
-        pending_forward: Arc<PendingForward>,
-        auth_result_rx: oneshot::Receiver<ExternalAuthResult>,
-        auth_abort: AbortHandle,
-        auth_disposition: ExternalAuthFailureDisposition,
-        auth_deadline: Instant,
-    ) {
-        let legacy = self.legacy_mut();
-        legacy.phase = StreamPhase::ReceivingRequest;
-        legacy.admission_state = StreamAdmissionState::WaitingForAuth;
-        legacy.pending_forward = Some(pending_forward);
-        legacy.auth_result_rx = Some(auth_result_rx);
-        legacy.auth_abort = Some(auth_abort);
-        legacy.auth_disposition = Some(auth_disposition);
-        legacy.auth_deadline = Some(auth_deadline);
+        match &self.execution {
+            RequestExecutionState::Legacy(state) => state.route_queue_permit.is_some(),
+            RequestExecutionState::AwaitingUpstream(_)
+            | RequestExecutionState::StreamingResponse(_) => true,
+            _ => false,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -535,27 +551,68 @@ impl RequestEnvelope {
         route_queue: RouteQueuePermit,
     ) {
         let should_await_upstream = self.request_fin_received() && self.body_buf().is_empty();
-        let legacy = self.legacy_mut();
-        legacy.backend_request_started = true;
-        legacy.backend_request_finished = false;
-        legacy.request_body_runtime.body_tx = body_tx;
-        legacy.upstream_result_rx = Some(upstream_result_rx);
-        legacy.global_inflight_permit = Some(global);
-        legacy.upstream_inflight_permit = Some(upstream);
-        legacy.adaptive_admission_permit = Some(adaptive);
-        legacy.route_queue_permit = Some(route_queue);
-        legacy.admission_state = StreamAdmissionState::ReadyToForward;
-        legacy.phase = if should_await_upstream {
-            StreamPhase::AwaitingUpstream
-        } else {
-            StreamPhase::ReceivingRequest
-        };
-        legacy.auth_abort = None;
-        legacy.auth_result_rx = None;
-        legacy.auth_disposition = None;
-        legacy.auth_deadline = None;
-        if should_await_upstream {
-            legacy.request_body_runtime.body_tx = None;
+        match &mut self.execution {
+            RequestExecutionState::Legacy(legacy) => {
+                legacy.backend_request_started = true;
+                legacy.backend_request_finished = false;
+                legacy.request_body_runtime.body_tx = body_tx;
+                legacy.upstream_result_rx = Some(upstream_result_rx);
+                legacy.global_inflight_permit = Some(global);
+                legacy.upstream_inflight_permit = Some(upstream);
+                legacy.adaptive_admission_permit = Some(adaptive);
+                legacy.route_queue_permit = Some(route_queue);
+                legacy.admission_state = StreamAdmissionState::ReadyToForward;
+                legacy.phase = if should_await_upstream {
+                    StreamPhase::AwaitingUpstream
+                } else {
+                    StreamPhase::ReceivingRequest
+                };
+                if should_await_upstream {
+                    legacy.request_body_runtime.body_tx = None;
+                }
+            }
+            RequestExecutionState::DispatchReady(state) => {
+                let mut request_body_runtime = std::mem::replace(
+                    &mut state.request_body_runtime,
+                    RequestBodyRuntime {
+                        body_tx: None,
+                        body_buf: VecDeque::new(),
+                        body_buf_bytes: 0,
+                        body_bytes_received: 0,
+                        last_body_activity: self.start,
+                        request_fin_received: true,
+                    },
+                );
+                request_body_runtime.body_tx = body_tx;
+                if should_await_upstream {
+                    request_body_runtime.body_tx = None;
+                }
+                let pending_forward = Some(Arc::clone(&state.pending_forward));
+                self.execution = RequestExecutionState::Legacy(LegacyRequestLifecycle {
+                    phase: if should_await_upstream {
+                        StreamPhase::AwaitingUpstream
+                    } else {
+                        StreamPhase::ReceivingRequest
+                    },
+                    admission_state: StreamAdmissionState::ReadyToForward,
+                    request_body_runtime,
+                    pending_forward,
+                    backend_request_started: true,
+                    backend_request_finished: false,
+                    global_inflight_permit: Some(global),
+                    upstream_inflight_permit: Some(upstream),
+                    adaptive_admission_permit: Some(adaptive),
+                    route_queue_permit: Some(route_queue),
+                    upstream_result_rx: Some(upstream_result_rx),
+                    response_chunk_rx: None,
+                    response_headers_sent: false,
+                    pending_chunk: None,
+                });
+            }
+            other => panic!(
+                "dispatch transition attempted from unsupported state {:?}",
+                std::mem::discriminant(other)
+            ),
         }
     }
 
@@ -587,17 +644,86 @@ impl RequestEnvelope {
     }
 
     pub fn set_pending_forward(&mut self, pending_forward: Option<Arc<PendingForward>>) {
-        self.legacy_mut().pending_forward = pending_forward;
+        match &mut self.execution {
+            RequestExecutionState::AwaitingAuth(state) => {
+                if let Some(pending_forward) = pending_forward {
+                    state.pending_forward = pending_forward;
+                }
+            }
+            RequestExecutionState::DispatchReady(state) => {
+                if let Some(pending_forward) = pending_forward {
+                    state.pending_forward = pending_forward;
+                }
+            }
+            RequestExecutionState::AwaitingUpstream(state) => {
+                if let Some(pending_forward) = pending_forward {
+                    state.pending_forward = pending_forward;
+                }
+            }
+            RequestExecutionState::Legacy(state) => {
+                state.pending_forward = pending_forward;
+            }
+            RequestExecutionState::Intake(_)
+            | RequestExecutionState::StreamingResponse(_)
+            | RequestExecutionState::Terminal(_) => {}
+        }
     }
 
-    fn legacy(&self) -> &LegacyRequestLifecycle {
-        match &self.execution {
-            RequestExecutionState::Legacy(state) => state,
-            other => panic!(
-                "legacy lifecycle access attempted after migration to {:?}",
-                std::mem::discriminant(other)
-            ),
+    pub(crate) fn transition_awaiting_auth_to_dispatch_ready<I>(&mut self, mutations: I)
+    where
+        I: IntoIterator<Item = PendingHeaderMutation>,
+    {
+        let state = match self.take_awaiting_auth_state() {
+            Some(state) => {
+                let mut state = state;
+                crate::runtime::connection::auth::merge_auth_request_mutations(
+                    &mut Arc::make_mut(&mut state.pending_forward).auth_header_mutations,
+                    mutations,
+                );
+                state
+            }
+            None => panic!("awaiting-auth transition attempted outside AwaitingAuth state"),
+        };
+        self.execution = RequestExecutionState::DispatchReady(DispatchReadyState {
+            context: state.context,
+            routing: state.routing,
+            request_mode: state.request_mode,
+            request_body: state.request_body,
+            request_body_runtime: state.request_body_runtime,
+            pending_forward: state.pending_forward,
+        });
+    }
+
+    pub(crate) fn take_awaiting_auth_state(&mut self) -> Option<AwaitingAuthState> {
+        let placeholder =
+            RequestExecutionState::Terminal(TerminalState::Cancelled(CancelledState {
+                reason: CancellationReason::OperatorAbort,
+                snapshot: self.terminal_snapshot(),
+            }));
+        match std::mem::replace(&mut self.execution, placeholder) {
+            RequestExecutionState::AwaitingAuth(state) => {
+                state.auth_abort.abort();
+                Some(state)
+            }
+            other => {
+                self.execution = other;
+                None
+            }
         }
+    }
+
+    pub(crate) fn discard_awaiting_auth_resources(&mut self) {
+        let Some(state) = self.take_awaiting_auth_state() else {
+            return;
+        };
+        self.execution = RequestExecutionState::DispatchReady(DispatchReadyState {
+            context: state.context,
+            routing: state.routing,
+            request_mode: state.request_mode,
+            request_body: state.request_body,
+            request_body_runtime: state.request_body_runtime,
+            pending_forward: state.pending_forward,
+        });
     }
 
     fn legacy_mut(&mut self) -> &mut LegacyRequestLifecycle {
@@ -607,6 +733,70 @@ impl RequestEnvelope {
                 "legacy lifecycle mutation attempted after migration to {:?}",
                 std::mem::discriminant(other)
             ),
+        }
+    }
+
+    fn request_body_runtime(&self) -> &RequestBodyRuntime {
+        match &self.execution {
+            RequestExecutionState::AwaitingAuth(state) => &state.request_body_runtime,
+            RequestExecutionState::DispatchReady(state) => &state.request_body_runtime,
+            RequestExecutionState::AwaitingUpstream(state) => &state.request_body_runtime,
+            RequestExecutionState::StreamingResponse(state) => &state.request_body_runtime,
+            RequestExecutionState::Legacy(state) => &state.request_body_runtime,
+            RequestExecutionState::Intake(_) | RequestExecutionState::Terminal(_) => {
+                panic!("request body runtime unavailable in current execution state")
+            }
+        }
+    }
+
+    fn request_body_runtime_mut(&mut self) -> &mut RequestBodyRuntime {
+        match &mut self.execution {
+            RequestExecutionState::AwaitingAuth(state) => &mut state.request_body_runtime,
+            RequestExecutionState::DispatchReady(state) => &mut state.request_body_runtime,
+            RequestExecutionState::AwaitingUpstream(state) => &mut state.request_body_runtime,
+            RequestExecutionState::StreamingResponse(state) => &mut state.request_body_runtime,
+            RequestExecutionState::Legacy(state) => &mut state.request_body_runtime,
+            RequestExecutionState::Intake(_) | RequestExecutionState::Terminal(_) => {
+                panic!("request body runtime mutation unavailable in current execution state")
+            }
+        }
+    }
+
+    fn terminal_snapshot(&self) -> TerminalSnapshot {
+        let routing = match &self.execution {
+            RequestExecutionState::AwaitingAuth(state) => Some(state.routing.clone()),
+            RequestExecutionState::DispatchReady(state) => Some(state.routing.clone()),
+            RequestExecutionState::AwaitingUpstream(state) => Some(state.routing.clone()),
+            RequestExecutionState::StreamingResponse(state) => Some(state.routing.clone()),
+            RequestExecutionState::Legacy(_) | RequestExecutionState::Intake(_) => None,
+            RequestExecutionState::Terminal(state) => match state {
+                TerminalState::Completed(state) => state.snapshot.routing.clone(),
+                TerminalState::Cancelled(state) => state.snapshot.routing.clone(),
+                TerminalState::TimedOut(state) => state.snapshot.routing.clone(),
+                TerminalState::Rejected(state) => state.snapshot.routing.clone(),
+                TerminalState::BackendFailed(state) => state.snapshot.routing.clone(),
+            },
+        };
+
+        TerminalSnapshot {
+            context: RequestContext {
+                request_id: self.request_id,
+                trace_id: self.trace_id.clone(),
+                span_id: self.span_id.clone(),
+                traceparent: self.traceparent.clone(),
+                trace_span: self.trace_span.clone(),
+                method: self.method.clone(),
+                path: self.path.clone(),
+                authority: self.authority.clone(),
+                start: self.start,
+                total_request_deadline: self.total_request_deadline,
+            },
+            routing,
+            request_mode: RequestMode::from_intake(self.tunnel_mode, &self.method, None),
+            response_status: self
+                .response_status
+                .and_then(|status| http::StatusCode::from_u16(status).ok()),
+            backend_accounting: None,
         }
     }
 }

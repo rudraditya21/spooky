@@ -2,6 +2,7 @@ use std::{collections::VecDeque, sync::Arc, time::Instant};
 
 use bytes::Bytes;
 use http::StatusCode;
+use spooky_errors::ProxyError;
 use tokio::{
     sync::{OwnedSemaphorePermit, mpsc, oneshot},
     task::AbortHandle,
@@ -230,16 +231,33 @@ pub struct RequestIntakeState {
 }
 
 #[allow(dead_code)]
-pub struct AuthWaitState {
+pub struct AwaitingAuthState {
     pub context: RequestContext,
     pub routing: RoutingSnapshot,
     pub request_mode: RequestMode,
     pub request_body: RequestBodyState,
+    pub request_body_runtime: RequestBodyRuntime,
     pub pending_forward: Arc<PendingForward>,
     pub(crate) auth_result_rx: oneshot::Receiver<ExternalAuthResult>,
     pub auth_abort: AbortHandle,
     pub auth_deadline: Instant,
     pub(crate) auth_disposition: ExternalAuthFailureDisposition,
+}
+
+impl AwaitingAuthState {
+    pub(crate) fn poll_non_blocking(&mut self, now: Instant) -> Option<ExternalAuthResult> {
+        if now >= self.auth_deadline {
+            return Some(Err(ProxyError::Timeout));
+        }
+
+        match self.auth_result_rx.try_recv() {
+            Ok(result) => Some(result),
+            Err(oneshot::error::TryRecvError::Empty) => None,
+            Err(oneshot::error::TryRecvError::Closed) => Some(Err(ProxyError::Transport(
+                "external auth task dropped sender".into(),
+            ))),
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -248,6 +266,7 @@ pub struct DispatchReadyState {
     pub routing: RoutingSnapshot,
     pub request_mode: RequestMode,
     pub request_body: RequestBodyState,
+    pub request_body_runtime: RequestBodyRuntime,
     pub pending_forward: Arc<PendingForward>,
 }
 
@@ -314,10 +333,6 @@ pub struct LegacyRequestLifecycle {
     pub admission_state: StreamAdmissionState,
     pub request_body_runtime: RequestBodyRuntime,
     pub pending_forward: Option<Arc<PendingForward>>,
-    pub(crate) auth_result_rx: Option<oneshot::Receiver<ExternalAuthResult>>,
-    pub auth_abort: Option<AbortHandle>,
-    pub(crate) auth_disposition: Option<ExternalAuthFailureDisposition>,
-    pub auth_deadline: Option<Instant>,
     pub backend_request_started: bool,
     pub backend_request_finished: bool,
     pub global_inflight_permit: Option<OwnedSemaphorePermit>,
@@ -420,7 +435,7 @@ impl TerminalState {
 #[allow(dead_code)]
 pub enum RequestExecutionState {
     Intake(RequestIntakeState),
-    AwaitingAuth(AuthWaitState),
+    AwaitingAuth(AwaitingAuthState),
     DispatchReady(DispatchReadyState),
     AwaitingUpstream(AwaitingUpstreamState),
     StreamingResponse(ResponseStreamingState),

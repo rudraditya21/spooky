@@ -18,14 +18,6 @@ impl ExternalAuthFailureDisposition {
         }
     }
 
-    pub(crate) fn from_fail_open(fail_open: bool) -> Self {
-        if fail_open {
-            Self::FailOpen
-        } else {
-            Self::FailClosed
-        }
-    }
-
     pub(crate) fn fail_open(self) -> bool {
         matches!(self, Self::FailOpen)
     }
@@ -181,6 +173,24 @@ pub(crate) enum ExternalAuthCompletion {
     },
 }
 
+pub(crate) enum ExternalAuthStateTransition {
+    Admitted {
+        request_header_mutations: Vec<PendingHeaderMutation>,
+    },
+    RejectedAuthDenied {
+        decision: ExternalAuthDecision,
+    },
+    RejectedAuthUnavailable {
+        status: http::StatusCode,
+        body: &'static [u8],
+        error: Option<ProxyError>,
+    },
+    TimedOutAuth {
+        status: http::StatusCode,
+        body: &'static [u8],
+    },
+}
+
 impl ExternalAuthDecisionOutcome {
     fn from_result(
         result: ExternalAuthResult,
@@ -294,6 +304,41 @@ pub(crate) fn evaluate_external_auth_completion(
                 error: Some(error),
             },
             None => unreachable!("error outcome must resolve"),
+        },
+    }
+}
+
+pub(crate) fn resolve_external_auth_state_transition(
+    result: ExternalAuthResult,
+    disposition: ExternalAuthFailureDisposition,
+) -> ExternalAuthStateTransition {
+    match evaluate_external_auth_completion(result, disposition) {
+        ExternalAuthCompletion::Allow {
+            request_header_mutations,
+        } => ExternalAuthStateTransition::Admitted {
+            request_header_mutations,
+        },
+        ExternalAuthCompletion::Respond(decision) => {
+            ExternalAuthStateTransition::RejectedAuthDenied { decision }
+        }
+        ExternalAuthCompletion::FailOpen { .. } => ExternalAuthStateTransition::Admitted {
+            request_header_mutations: Vec::new(),
+        },
+        ExternalAuthCompletion::Reject {
+            status,
+            body,
+            timed_out: true,
+            ..
+        } => ExternalAuthStateTransition::TimedOutAuth { status, body },
+        ExternalAuthCompletion::Reject {
+            status,
+            body,
+            timed_out: false,
+            error,
+        } => ExternalAuthStateTransition::RejectedAuthUnavailable {
+            status,
+            body,
+            error,
         },
     }
 }
