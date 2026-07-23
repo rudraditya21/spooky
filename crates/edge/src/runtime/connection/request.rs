@@ -9,16 +9,14 @@ use bytes::Bytes;
 use spooky_config::config::{ForwardedHeaderPolicy, UpstreamHostPolicy};
 use spooky_lb::upstream_pool::UpstreamPool;
 use tokio::{
-    sync::{OwnedSemaphorePermit, mpsc, oneshot},
-    task::AbortHandle,
+    sync::{mpsc, oneshot},
 };
 use tracing::Span;
 
 use crate::{
     Metrics, OverloadShedReason,
-    resilience::{adaptive_admission::AdaptivePermit, route_queue::RouteQueuePermit},
     runtime::connection::{
-        auth::{ExternalAuthFailureDisposition, ExternalAuthResult, PendingHeaderMutation},
+        auth::{ExternalAuthResult, PendingHeaderMutation},
         outcome::{
             BackendRequestFinishInput, finalize_backend_request_cleanup,
             observe_terminal_request_outcome,
@@ -27,9 +25,9 @@ use crate::{
         stream::{
             AdmissionPermits, AdmittedState, AwaitingAuthState, AwaitingUpstreamState,
             BackendAccountingState, BackendDispatchState, BackendFailureReason, CancellationReason,
-            CancelledState, CompletionReason, DispatchReadyState, LegacyRequestLifecycle,
-            RequestBodyRuntime, RequestBodyState, RequestContext, RequestExecutionState,
-            RequestMode, ResponseBackpressureState, ResponseEmissionState, ResponseStreamingState,
+            CancelledState, CompletionReason, DispatchReadyState, RequestBodyRuntime,
+            RequestBodyState, RequestContext, RequestExecutionState, RequestMode,
+            ResponseBackpressureState, ResponseEmissionState, ResponseStreamingState,
             StreamAdmissionState, StreamPhase, TerminalReason, TerminalSnapshot, TerminalState,
             TimeoutReason, TunnelMode,
         },
@@ -73,95 +71,6 @@ pub struct RequestEnvelope {
 impl RequestEnvelope {
     pub fn request_id(&self) -> u64 {
         self.request_id
-    }
-
-    #[allow(clippy::too_many_arguments, dead_code)]
-    pub(crate) fn new_legacy(
-        request_id: u64,
-        trace_id: Option<String>,
-        span_id: Option<String>,
-        traceparent: Option<String>,
-        trace_span: Option<Span>,
-        method: String,
-        path: String,
-        authority: Option<String>,
-        backend_addr: Option<String>,
-        backend_index: Option<usize>,
-        upstream_name: Option<String>,
-        route_reason: Option<String>,
-        route_path_len: Option<usize>,
-        route_host_specific: Option<bool>,
-        backend_lb: Option<String>,
-        upstream_pool: Option<Arc<RwLock<UpstreamPool>>>,
-        routing_transparency_enabled: bool,
-        routing_transparency_include_reason: bool,
-        start: Instant,
-        total_request_deadline: Instant,
-        bodyless_mode: bool,
-        tunnel_mode: TunnelMode,
-        retry_count: u8,
-        error_kind: Option<&'static str>,
-        phase: StreamPhase,
-        admission_state: StreamAdmissionState,
-        request_fin_received: bool,
-        pending_forward: Option<Arc<PendingForward>>,
-        _auth_result_rx: Option<oneshot::Receiver<ExternalAuthResult>>,
-        _auth_abort: Option<AbortHandle>,
-        _auth_disposition: Option<ExternalAuthFailureDisposition>,
-        _auth_deadline: Option<Instant>,
-    ) -> Self {
-        Self {
-            request_id,
-            trace_id,
-            span_id,
-            traceparent,
-            trace_span,
-            method,
-            path,
-            authority,
-            backend_addr,
-            backend_index,
-            upstream_name,
-            route_reason,
-            route_path_len,
-            route_host_specific,
-            backend_lb,
-            upstream_pool,
-            routing_transparency_enabled,
-            routing_transparency_include_reason,
-            response_status: None,
-            start,
-            total_request_deadline,
-            bodyless_mode,
-            tunnel_mode,
-            retry_count,
-            error_kind,
-            terminal_overload_reason: None,
-            terminal_outcome_recorded: false,
-            execution: RequestExecutionState::Legacy(LegacyRequestLifecycle {
-                phase,
-                admission_state,
-                request_body_runtime: RequestBodyRuntime {
-                    body_buf: VecDeque::new(),
-                    body_buf_bytes: 0,
-                    body_bytes_received: 0,
-                    last_body_activity: start,
-                    request_fin_received,
-                },
-                body_tx: None,
-                pending_forward,
-                backend_request_started: false,
-                backend_request_finished: false,
-                global_inflight_permit: None,
-                upstream_inflight_permit: None,
-                adaptive_admission_permit: None,
-                route_queue_permit: None,
-                upstream_result_rx: None,
-                response_chunk_rx: None,
-                response_headers_sent: false,
-                pending_chunk: None,
-            }),
-        }
     }
 
     pub fn set_terminal_overload_reason(&mut self, reason: Option<OverloadShedReason>) {
@@ -298,16 +207,7 @@ impl RequestEnvelope {
             RequestExecutionState::Admitted(state) => state.request_mode,
             RequestExecutionState::AwaitingUpstream(state) => state.request_mode,
             RequestExecutionState::StreamingResponse(state) => state.request_mode,
-            RequestExecutionState::Terminal(state) => match state {
-                TerminalState::Completed(state) => state.snapshot.request_mode,
-                TerminalState::Cancelled(state) => state.snapshot.request_mode,
-                TerminalState::TimedOut(state) => state.snapshot.request_mode,
-                TerminalState::Rejected(state) => state.snapshot.request_mode,
-                TerminalState::BackendFailed(state) => state.snapshot.request_mode,
-            },
-            RequestExecutionState::Legacy(_) => {
-                RequestMode::from_legacy_flags(self.tunnel_mode, &self.method, self.bodyless_mode)
-            }
+            RequestExecutionState::Terminal(state) => terminal_request_mode(state),
         }
     }
 
@@ -318,40 +218,16 @@ impl RequestEnvelope {
             RequestExecutionState::DispatchReady(state) => state.request_body,
             RequestExecutionState::Admitted(state) => state.request_body,
             RequestExecutionState::AwaitingUpstream(state) => state.request_body,
-            RequestExecutionState::StreamingResponse(_) | RequestExecutionState::Legacy(_) => {
+            RequestExecutionState::StreamingResponse(_) => {
                 RequestBodyState::from_runtime(
                     self.request_body_runtime().request_fin_received,
                     !self.request_body_runtime().body_buf.is_empty(),
                     self.body_tx().is_some(),
                 )
             }
-            RequestExecutionState::Terminal(state) => match state {
-                TerminalState::Completed(state) => state
-                    .snapshot
-                    .request_mode
-                    .initial_body_state()
-                    .on_forward_closed(),
-                TerminalState::Cancelled(state) => state
-                    .snapshot
-                    .request_mode
-                    .initial_body_state()
-                    .on_forward_closed(),
-                TerminalState::TimedOut(state) => state
-                    .snapshot
-                    .request_mode
-                    .initial_body_state()
-                    .on_forward_closed(),
-                TerminalState::Rejected(state) => state
-                    .snapshot
-                    .request_mode
-                    .initial_body_state()
-                    .on_forward_closed(),
-                TerminalState::BackendFailed(state) => state
-                    .snapshot
-                    .request_mode
-                    .initial_body_state()
-                    .on_forward_closed(),
-            },
+            RequestExecutionState::Terminal(state) => {
+                terminal_request_mode(state).initial_body_state().on_forward_closed()
+            }
         }
     }
 
@@ -364,7 +240,6 @@ impl RequestEnvelope {
             RequestExecutionState::Admitted(state) => state.request_body = next,
             RequestExecutionState::AwaitingUpstream(state) => state.request_body = next,
             RequestExecutionState::StreamingResponse(_)
-            | RequestExecutionState::Legacy(_)
             | RequestExecutionState::Terminal(_) => {}
         }
     }
@@ -403,63 +278,17 @@ impl RequestEnvelope {
     }
 
     pub fn can_accept_request_body(&self) -> bool {
-        match &self.execution {
-            RequestExecutionState::Legacy(state) => {
-                state.phase == StreamPhase::ReceivingRequest
-                    && self.request_body_state().can_accept_downstream_body()
-            }
-            _ => self.execution.can_accept_request_body(),
-        }
+        self.execution.can_accept_request_body()
     }
 
     pub fn can_poll_upstream(&self) -> bool {
-        match &self.execution {
-            RequestExecutionState::Legacy(state) => {
-                if state.admission_state != StreamAdmissionState::ReadyToForward {
-                    return false;
-                }
-
-                if self.request_mode().is_tunnel()
-                    && matches!(
-                        state.phase,
-                        StreamPhase::ReceivingRequest | StreamPhase::AwaitingUpstream
-                    )
-                {
-                    return true;
-                }
-
-                state.phase == StreamPhase::AwaitingUpstream
-                    && self.request_body_state().forwarding_complete()
-            }
-            _ => self.execution.can_poll_upstream(),
-        }
+        self.execution.can_poll_upstream()
     }
 
     pub fn can_poll_upstream_result(&self) -> bool {
         match &self.execution {
             RequestExecutionState::AwaitingUpstream(_) => {
                 self.has_upstream_result_rx() && self.execution.can_poll_upstream()
-            }
-            RequestExecutionState::Legacy(state) => {
-                if state.upstream_result_rx.is_none() {
-                    return false;
-                }
-
-                if state.admission_state != StreamAdmissionState::ReadyToForward {
-                    return false;
-                }
-
-                if self.request_mode().is_tunnel()
-                    && matches!(
-                        state.phase,
-                        StreamPhase::ReceivingRequest | StreamPhase::AwaitingUpstream
-                    )
-                {
-                    return true;
-                }
-
-                state.phase == StreamPhase::AwaitingUpstream
-                    && self.request_body_state().forwarding_complete()
             }
             _ => false,
         }
@@ -473,31 +302,6 @@ impl RequestEnvelope {
             | RequestExecutionState::DispatchReady(_)
             | RequestExecutionState::Admitted(_) => TimeoutReason::AwaitingUpstream,
             RequestExecutionState::Intake(_) => TimeoutReason::RequestBodyTotal,
-            RequestExecutionState::Legacy(state) => {
-                if state.admission_state == StreamAdmissionState::WaitingForAuth {
-                    return TimeoutReason::ExternalAuth;
-                }
-
-                if self.has_response_chunk_rx() || state.phase == StreamPhase::SendingResponse {
-                    return TimeoutReason::ResponseBodyTotal;
-                }
-
-                // Tunnel requests become await-upstream work as soon as admission is
-                // complete; they should not inherit normal request-body timeout labels.
-                if self.request_mode().is_tunnel() && self.can_poll_upstream_result() {
-                    return TimeoutReason::AwaitingUpstream;
-                }
-
-                if self.can_poll_upstream_result() {
-                    return TimeoutReason::AwaitingUpstream;
-                }
-
-                if self.can_accept_request_body() {
-                    return TimeoutReason::RequestBodyTotal;
-                }
-
-                TimeoutReason::TotalRequest
-            }
             RequestExecutionState::Terminal(state) => match state {
                 TerminalState::TimedOut(state) => state.reason,
                 _ => TimeoutReason::TotalRequest,
@@ -512,13 +316,6 @@ impl RequestEnvelope {
             | RequestExecutionState::DispatchReady(_)
             | RequestExecutionState::Admitted(_)
             | RequestExecutionState::AwaitingAuth(_) => TimeoutReason::AwaitingUpstream,
-            RequestExecutionState::Legacy(state) => {
-                if self.has_response_chunk_rx() || state.phase == StreamPhase::SendingResponse {
-                    TimeoutReason::ResponseBodyTotal
-                } else {
-                    TimeoutReason::AwaitingUpstream
-                }
-            }
             RequestExecutionState::Intake(_) | RequestExecutionState::Terminal(_) => {
                 TimeoutReason::AwaitingUpstream
             }
@@ -528,26 +325,13 @@ impl RequestEnvelope {
     pub fn body_tx(&self) -> Option<&mpsc::Sender<Bytes>> {
         match &self.execution {
             RequestExecutionState::AwaitingUpstream(state) => state.dispatch.body_tx.as_ref(),
-            RequestExecutionState::Legacy(state) => state.body_tx.as_ref(),
             _ => None,
         }
     }
 
-    pub fn body_tx_mut(&mut self) -> &mut Option<mpsc::Sender<Bytes>> {
-        match &mut self.execution {
-            RequestExecutionState::Legacy(state) => &mut state.body_tx,
-            other => panic!(
-                "dispatch body channel mutation attempted outside legacy state {:?}",
-                std::mem::discriminant(other)
-            ),
-        }
-    }
-
     pub fn clear_body_tx(&mut self) {
-        match &mut self.execution {
-            RequestExecutionState::AwaitingUpstream(state) => state.dispatch.body_tx = None,
-            RequestExecutionState::Legacy(state) => state.body_tx = None,
-            _ => {}
+        if let RequestExecutionState::AwaitingUpstream(state) = &mut self.execution {
+            state.dispatch.body_tx = None;
         }
         self.refresh_request_body_state();
     }
@@ -590,7 +374,6 @@ impl RequestEnvelope {
             RequestExecutionState::DispatchReady(state) => Some(&state.pending_forward),
             RequestExecutionState::Admitted(state) => Some(&state.pending_forward),
             RequestExecutionState::AwaitingUpstream(state) => Some(&state.pending_forward),
-            RequestExecutionState::Legacy(state) => state.pending_forward.as_ref(),
             RequestExecutionState::Intake(_)
             | RequestExecutionState::StreamingResponse(_)
             | RequestExecutionState::Terminal(_) => None,
@@ -603,25 +386,9 @@ impl RequestEnvelope {
             RequestExecutionState::DispatchReady(state) => Some(&mut state.pending_forward),
             RequestExecutionState::Admitted(state) => Some(&mut state.pending_forward),
             RequestExecutionState::AwaitingUpstream(state) => Some(&mut state.pending_forward),
-            RequestExecutionState::Legacy(state) => state.pending_forward.as_mut(),
             RequestExecutionState::Intake(_)
             | RequestExecutionState::StreamingResponse(_)
             | RequestExecutionState::Terminal(_) => None,
-        }
-    }
-
-    pub fn clear_pending_forward(&mut self) {
-        match &mut self.execution {
-            RequestExecutionState::AwaitingAuth(_)
-            | RequestExecutionState::DispatchReady(_)
-            | RequestExecutionState::Admitted(_)
-            | RequestExecutionState::AwaitingUpstream(_)
-            | RequestExecutionState::Legacy(_) => {
-                self.set_pending_forward(None);
-            }
-            RequestExecutionState::Intake(_)
-            | RequestExecutionState::StreamingResponse(_)
-            | RequestExecutionState::Terminal(_) => {}
         }
     }
 
@@ -642,58 +409,29 @@ impl RequestEnvelope {
             RequestExecutionState::AwaitingUpstream(state) => {
                 Some(&mut state.dispatch.upstream_result_rx)
             }
-            RequestExecutionState::Legacy(state) => state.upstream_result_rx.as_mut(),
             _ => None,
         }
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn set_upstream_result_rx(&mut self, rx: Option<oneshot::Receiver<UpstreamResult>>) {
-        self.legacy_mut().upstream_result_rx = rx;
-    }
-
     pub fn clear_upstream_result_rx(&mut self) {
-        if let RequestExecutionState::Legacy(state) = &mut self.execution {
-            state.upstream_result_rx = None;
-        }
     }
 
     pub(crate) fn response_chunk_rx_mut(&mut self) -> Option<&mut mpsc::Receiver<ResponseChunk>> {
         match &mut self.execution {
             RequestExecutionState::StreamingResponse(state) => Some(&mut state.response_chunk_rx),
-            RequestExecutionState::Legacy(state) => state.response_chunk_rx.as_mut(),
             _ => None,
         }
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn set_response_chunk_rx(&mut self, rx: Option<mpsc::Receiver<ResponseChunk>>) {
-        self.legacy_mut().response_chunk_rx = rx;
-    }
-
     pub fn clear_response_chunk_rx(&mut self) {
-        match &mut self.execution {
-            RequestExecutionState::Legacy(state) => {
-                state.response_chunk_rx = None;
-            }
-            _ => {}
-        }
     }
 
     pub fn has_upstream_result_rx(&self) -> bool {
-        match &self.execution {
-            RequestExecutionState::AwaitingUpstream(_) => true,
-            RequestExecutionState::Legacy(state) => state.upstream_result_rx.is_some(),
-            _ => false,
-        }
+        matches!(&self.execution, RequestExecutionState::AwaitingUpstream(_))
     }
 
     pub fn has_response_chunk_rx(&self) -> bool {
-        match &self.execution {
-            RequestExecutionState::StreamingResponse(_) => true,
-            RequestExecutionState::Legacy(state) => state.response_chunk_rx.is_some(),
-            _ => false,
-        }
+        matches!(&self.execution, RequestExecutionState::StreamingResponse(_))
     }
 
     pub fn response_headers_sent(&self) -> bool {
@@ -701,30 +439,22 @@ impl RequestEnvelope {
             RequestExecutionState::StreamingResponse(state) => {
                 !matches!(state.emission, ResponseEmissionState::DeferredHeaders)
             }
-            RequestExecutionState::Legacy(state) => state.response_headers_sent,
             _ => false,
         }
     }
 
     pub fn set_response_headers_sent(&mut self, sent: bool) {
-        match &mut self.execution {
-            RequestExecutionState::StreamingResponse(state) => {
-                state.emission = if sent {
-                    ResponseEmissionState::HeadersSent
-                } else {
-                    ResponseEmissionState::DeferredHeaders
-                };
-            }
-            RequestExecutionState::Legacy(state) => {
-                state.response_headers_sent = sent;
-            }
-            _ => {}
+        if let RequestExecutionState::StreamingResponse(state) = &mut self.execution {
+            state.emission = if sent {
+                ResponseEmissionState::HeadersSent
+            } else {
+                ResponseEmissionState::DeferredHeaders
+            };
         }
     }
 
     pub(crate) fn take_pending_chunk(&mut self) -> Option<ResponseChunk> {
         match &mut self.execution {
-            RequestExecutionState::Legacy(state) => state.pending_chunk.take(),
             RequestExecutionState::StreamingResponse(state) => {
                 match std::mem::replace(&mut state.backpressure, ResponseBackpressureState::Ready) {
                     ResponseBackpressureState::Ready => None,
@@ -736,21 +466,16 @@ impl RequestEnvelope {
     }
 
     pub(crate) fn set_pending_chunk(&mut self, chunk: Option<ResponseChunk>) {
-        match &mut self.execution {
-            RequestExecutionState::Legacy(state) => state.pending_chunk = chunk,
-            RequestExecutionState::StreamingResponse(state) => {
-                state.backpressure = match chunk {
-                    Some(chunk) => ResponseBackpressureState::Blocked(chunk),
-                    None => ResponseBackpressureState::Ready,
-                };
-            }
-            _ => {}
+        if let RequestExecutionState::StreamingResponse(state) = &mut self.execution {
+            state.backpressure = match chunk {
+                Some(chunk) => ResponseBackpressureState::Blocked(chunk),
+                None => ResponseBackpressureState::Ready,
+            };
         }
     }
 
     pub fn has_pending_chunk(&self) -> bool {
         match &self.execution {
-            RequestExecutionState::Legacy(state) => state.pending_chunk.is_some(),
             RequestExecutionState::StreamingResponse(state) => {
                 matches!(state.backpressure, ResponseBackpressureState::Blocked(_))
             }
@@ -773,7 +498,6 @@ impl RequestEnvelope {
 
     pub fn backend_request_started(&self) -> bool {
         match &self.execution {
-            RequestExecutionState::Legacy(state) => state.backend_request_started,
             RequestExecutionState::Admitted(_) => false,
             RequestExecutionState::AwaitingUpstream(_)
             | RequestExecutionState::StreamingResponse(_) => true,
@@ -783,7 +507,6 @@ impl RequestEnvelope {
 
     pub fn backend_request_finished(&self) -> bool {
         match &self.execution {
-            RequestExecutionState::Legacy(state) => state.backend_request_finished,
             RequestExecutionState::AwaitingUpstream(state) => {
                 state.dispatch.backend_accounting.finalized
             }
@@ -794,10 +517,6 @@ impl RequestEnvelope {
 
     pub fn set_backend_request_state(&mut self, started: bool, finished: bool) {
         match &mut self.execution {
-            RequestExecutionState::Legacy(state) => {
-                state.backend_request_started = started;
-                state.backend_request_finished = finished;
-            }
             RequestExecutionState::AwaitingUpstream(state) => {
                 state.dispatch.backend_accounting.finalized = started && finished;
             }
@@ -808,67 +527,40 @@ impl RequestEnvelope {
         }
     }
 
-    pub fn set_dispatch_permits(
-        &mut self,
-        global: Option<OwnedSemaphorePermit>,
-        upstream: Option<OwnedSemaphorePermit>,
-        adaptive: Option<AdaptivePermit>,
-        route_queue: Option<RouteQueuePermit>,
-    ) {
-        let legacy = self.legacy_mut();
-        legacy.global_inflight_permit = global;
-        legacy.upstream_inflight_permit = upstream;
-        legacy.adaptive_admission_permit = adaptive;
-        legacy.route_queue_permit = route_queue;
-    }
-
-    pub fn clear_dispatch_permits(&mut self) {
-        if let RequestExecutionState::Legacy(state) = &mut self.execution {
-            state.global_inflight_permit = None;
-            state.upstream_inflight_permit = None;
-            state.adaptive_admission_permit = None;
-            state.route_queue_permit = None;
-        }
-    }
-
     pub fn has_global_inflight_permit(&self) -> bool {
-        match &self.execution {
-            RequestExecutionState::Legacy(state) => state.global_inflight_permit.is_some(),
+        matches!(
+            &self.execution,
             RequestExecutionState::Admitted(_)
-            | RequestExecutionState::AwaitingUpstream(_)
-            | RequestExecutionState::StreamingResponse(_) => true,
-            _ => false,
-        }
+                | RequestExecutionState::AwaitingUpstream(_)
+                | RequestExecutionState::StreamingResponse(_)
+        )
     }
 
     pub fn has_upstream_inflight_permit(&self) -> bool {
-        match &self.execution {
-            RequestExecutionState::Legacy(state) => state.upstream_inflight_permit.is_some(),
+        matches!(
+            &self.execution,
             RequestExecutionState::Admitted(_)
-            | RequestExecutionState::AwaitingUpstream(_)
-            | RequestExecutionState::StreamingResponse(_) => true,
-            _ => false,
-        }
+                | RequestExecutionState::AwaitingUpstream(_)
+                | RequestExecutionState::StreamingResponse(_)
+        )
     }
 
     pub fn has_adaptive_admission_permit(&self) -> bool {
-        match &self.execution {
-            RequestExecutionState::Legacy(state) => state.adaptive_admission_permit.is_some(),
+        matches!(
+            &self.execution,
             RequestExecutionState::Admitted(_)
-            | RequestExecutionState::AwaitingUpstream(_)
-            | RequestExecutionState::StreamingResponse(_) => true,
-            _ => false,
-        }
+                | RequestExecutionState::AwaitingUpstream(_)
+                | RequestExecutionState::StreamingResponse(_)
+        )
     }
 
     pub fn has_route_queue_permit(&self) -> bool {
-        match &self.execution {
-            RequestExecutionState::Legacy(state) => state.route_queue_permit.is_some(),
+        matches!(
+            &self.execution,
             RequestExecutionState::Admitted(_)
-            | RequestExecutionState::AwaitingUpstream(_)
-            | RequestExecutionState::StreamingResponse(_) => true,
-            _ => false,
-        }
+                | RequestExecutionState::AwaitingUpstream(_)
+                | RequestExecutionState::StreamingResponse(_)
+        )
     }
 
     pub(crate) fn transition_to_admitted(&mut self, permits: AdmissionPermits) {
@@ -985,13 +677,6 @@ impl RequestEnvelope {
                     backend_accounting: state.dispatch.backend_accounting,
                 });
             }
-            RequestExecutionState::Legacy(mut legacy) => {
-                legacy.response_chunk_rx = Some(response_chunk_rx);
-                legacy.response_headers_sent =
-                    !matches!(emission, ResponseEmissionState::DeferredHeaders);
-                legacy.phase = StreamPhase::SendingResponse;
-                self.execution = RequestExecutionState::Legacy(legacy);
-            }
             other => {
                 self.execution = other;
                 panic!("streaming transition attempted from unsupported execution state");
@@ -1028,49 +713,6 @@ impl RequestEnvelope {
         terminal: crate::runtime::connection::stream::TerminalState,
     ) {
         self.execution = RequestExecutionState::Terminal(terminal);
-    }
-
-    pub fn set_phase_legacy(&mut self, phase: StreamPhase) {
-        if let RequestExecutionState::Legacy(state) = &mut self.execution {
-            state.phase = phase;
-        }
-    }
-
-    pub fn set_admission_state_legacy(&mut self, state: StreamAdmissionState) {
-        if let RequestExecutionState::Legacy(legacy) = &mut self.execution {
-            legacy.admission_state = state;
-        }
-    }
-
-    pub fn set_pending_forward(&mut self, pending_forward: Option<Arc<PendingForward>>) {
-        match &mut self.execution {
-            RequestExecutionState::AwaitingAuth(state) => {
-                if let Some(pending_forward) = pending_forward {
-                    state.pending_forward = pending_forward;
-                }
-            }
-            RequestExecutionState::DispatchReady(state) => {
-                if let Some(pending_forward) = pending_forward {
-                    state.pending_forward = pending_forward;
-                }
-            }
-            RequestExecutionState::Admitted(state) => {
-                if let Some(pending_forward) = pending_forward {
-                    state.pending_forward = pending_forward;
-                }
-            }
-            RequestExecutionState::AwaitingUpstream(state) => {
-                if let Some(pending_forward) = pending_forward {
-                    state.pending_forward = pending_forward;
-                }
-            }
-            RequestExecutionState::Legacy(state) => {
-                state.pending_forward = pending_forward;
-            }
-            RequestExecutionState::Intake(_)
-            | RequestExecutionState::StreamingResponse(_)
-            | RequestExecutionState::Terminal(_) => {}
-        }
     }
 
     pub(crate) fn transition_awaiting_auth_to_dispatch_ready<I>(&mut self, mutations: I)
@@ -1171,25 +813,17 @@ impl RequestEnvelope {
         prior_phase
     }
 
-    fn legacy_mut(&mut self) -> &mut LegacyRequestLifecycle {
-        match &mut self.execution {
-            RequestExecutionState::Legacy(state) => state,
-            other => panic!(
-                "legacy lifecycle mutation attempted after migration to {:?}",
-                std::mem::discriminant(other)
-            ),
-        }
-    }
-
     fn request_body_runtime(&self) -> &RequestBodyRuntime {
         match &self.execution {
+            RequestExecutionState::Intake(_) => {
+                panic!("request body runtime unavailable in intake state")
+            }
             RequestExecutionState::AwaitingAuth(state) => &state.request_body_runtime,
             RequestExecutionState::DispatchReady(state) => &state.request_body_runtime,
             RequestExecutionState::Admitted(state) => &state.request_body_runtime,
             RequestExecutionState::AwaitingUpstream(state) => &state.request_body_runtime,
             RequestExecutionState::StreamingResponse(state) => &state.request_body_runtime,
-            RequestExecutionState::Legacy(state) => &state.request_body_runtime,
-            RequestExecutionState::Intake(_) | RequestExecutionState::Terminal(_) => {
+            RequestExecutionState::Terminal(_) => {
                 panic!("request body runtime unavailable in current execution state")
             }
         }
@@ -1197,13 +831,15 @@ impl RequestEnvelope {
 
     fn request_body_runtime_mut(&mut self) -> &mut RequestBodyRuntime {
         match &mut self.execution {
+            RequestExecutionState::Intake(_) => {
+                panic!("request body runtime mutation unavailable in intake state")
+            }
             RequestExecutionState::AwaitingAuth(state) => &mut state.request_body_runtime,
             RequestExecutionState::DispatchReady(state) => &mut state.request_body_runtime,
             RequestExecutionState::Admitted(state) => &mut state.request_body_runtime,
             RequestExecutionState::AwaitingUpstream(state) => &mut state.request_body_runtime,
             RequestExecutionState::StreamingResponse(state) => &mut state.request_body_runtime,
-            RequestExecutionState::Legacy(state) => &mut state.request_body_runtime,
-            RequestExecutionState::Intake(_) | RequestExecutionState::Terminal(_) => {
+            RequestExecutionState::Terminal(_) => {
                 panic!("request body runtime mutation unavailable in current execution state")
             }
         }
@@ -1222,7 +858,6 @@ impl RequestEnvelope {
             RequestExecutionState::StreamingResponse(state) => {
                 state.request_body_runtime.body_buf_bytes
             }
-            RequestExecutionState::Legacy(state) => state.request_body_runtime.body_buf_bytes,
             RequestExecutionState::Intake(_) | RequestExecutionState::Terminal(_) => 0,
         }
     }
@@ -1234,7 +869,7 @@ impl RequestEnvelope {
             RequestExecutionState::Admitted(state) => Some(state.routing.clone()),
             RequestExecutionState::AwaitingUpstream(state) => Some(state.routing.clone()),
             RequestExecutionState::StreamingResponse(state) => Some(state.routing.clone()),
-            RequestExecutionState::Legacy(_) | RequestExecutionState::Intake(_) => None,
+            RequestExecutionState::Intake(_) => None,
             RequestExecutionState::Terminal(state) => match state {
                 TerminalState::Completed(state) => state.snapshot.routing.clone(),
                 TerminalState::Cancelled(state) => state.snapshot.routing.clone(),
@@ -1271,6 +906,16 @@ impl RequestEnvelope {
                 _ => None,
             },
         }
+    }
+}
+
+fn terminal_request_mode(state: &TerminalState) -> RequestMode {
+    match state {
+        TerminalState::Completed(state) => state.snapshot.request_mode,
+        TerminalState::Cancelled(state) => state.snapshot.request_mode,
+        TerminalState::TimedOut(state) => state.snapshot.request_mode,
+        TerminalState::Rejected(state) => state.snapshot.request_mode,
+        TerminalState::BackendFailed(state) => state.snapshot.request_mode,
     }
 }
 
