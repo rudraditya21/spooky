@@ -60,6 +60,15 @@ pub enum RequestMode {
 
 #[allow(dead_code)]
 impl RequestMode {
+    pub fn from_legacy_flags(tunnel_mode: TunnelMode, bodyless_mode: bool) -> Self {
+        match tunnel_mode {
+            TunnelMode::Connect => Self::ConnectTunnel,
+            TunnelMode::Websocket => Self::WebsocketTunnel,
+            TunnelMode::None if bodyless_mode => Self::HeadLike,
+            TunnelMode::None => Self::Normal,
+        }
+    }
+
     pub fn from_intake(
         tunnel_mode: TunnelMode,
         method: &str,
@@ -119,6 +128,46 @@ pub enum RequestBodyState {
 
 #[allow(dead_code)]
 impl RequestBodyState {
+    pub fn from_runtime(
+        request_fin_received: bool,
+        has_buffered_body: bool,
+        forward_open: bool,
+    ) -> Self {
+        if forward_open {
+            if has_buffered_body {
+                Self::Buffered
+            } else if request_fin_received {
+                Self::FinReceived
+            } else {
+                Self::Open
+            }
+        } else if request_fin_received {
+            Self::ClosedToUpstream
+        } else if has_buffered_body {
+            Self::Buffered
+        } else {
+            Self::Open
+        }
+    }
+
+    pub fn on_buffered(self) -> Self {
+        match self {
+            Self::ClosedToUpstream => Self::ClosedToUpstream,
+            _ => Self::Buffered,
+        }
+    }
+
+    pub fn on_downstream_finished(self) -> Self {
+        match self {
+            Self::ClosedToUpstream => Self::ClosedToUpstream,
+            _ => Self::FinReceived,
+        }
+    }
+
+    pub fn on_forward_closed(self) -> Self {
+        Self::ClosedToUpstream
+    }
+
     pub fn request_fin_received(self) -> bool {
         matches!(self, Self::FinReceived | Self::ClosedToUpstream)
     }
@@ -495,9 +544,7 @@ impl RequestExecutionState {
             Self::AwaitingAuth(state) => state.request_body.can_accept_downstream_body(),
             Self::DispatchReady(state) => state.request_body.can_accept_downstream_body(),
             Self::Admitted(state) => state.request_body.can_accept_downstream_body(),
-            Self::AwaitingUpstream(state) => {
-                state.request_mode.is_tunnel() && state.request_body.can_accept_downstream_body()
-            }
+            Self::AwaitingUpstream(state) => state.request_body.can_accept_downstream_body(),
             Self::Legacy(state) => {
                 state.phase == StreamPhase::ReceivingRequest
                     && !state.request_body_runtime.request_fin_received

@@ -22,9 +22,10 @@ use crate::{
         stream::{
             AdmissionPermits, AdmittedState, AwaitingAuthState, AwaitingUpstreamState,
             BackendAccountingState, BackendDispatchState, CancellationReason, CancelledState,
-            DispatchReadyState, LegacyRequestLifecycle, RequestBodyRuntime, RequestContext,
-            RequestExecutionState, RequestMode, ResponseEmissionState, ResponseStreamingState,
-            StreamAdmissionState, StreamPhase, TerminalSnapshot, TerminalState, TunnelMode,
+            DispatchReadyState, LegacyRequestLifecycle, RequestBodyRuntime, RequestBodyState,
+            RequestContext, RequestExecutionState, RequestMode, ResponseEmissionState,
+            ResponseStreamingState, StreamAdmissionState, StreamPhase, TerminalSnapshot,
+            TerminalState, TunnelMode,
         },
     },
 };
@@ -260,11 +261,156 @@ impl RequestEnvelope {
     }
 
     pub fn request_fin_received(&self) -> bool {
-        self.request_body_runtime().request_fin_received
+        self.request_body_state().request_fin_received()
     }
 
     pub fn set_request_fin_received(&mut self, value: bool) {
         self.request_body_runtime_mut().request_fin_received = value;
+    }
+
+    pub fn request_mode(&self) -> RequestMode {
+        match &self.execution {
+            RequestExecutionState::Intake(state) => state.request_mode,
+            RequestExecutionState::AwaitingAuth(state) => state.request_mode,
+            RequestExecutionState::DispatchReady(state) => state.request_mode,
+            RequestExecutionState::Admitted(state) => state.request_mode,
+            RequestExecutionState::AwaitingUpstream(state) => state.request_mode,
+            RequestExecutionState::StreamingResponse(state) => state.request_mode,
+            RequestExecutionState::Terminal(state) => match state {
+                TerminalState::Completed(state) => state.snapshot.request_mode,
+                TerminalState::Cancelled(state) => state.snapshot.request_mode,
+                TerminalState::TimedOut(state) => state.snapshot.request_mode,
+                TerminalState::Rejected(state) => state.snapshot.request_mode,
+                TerminalState::BackendFailed(state) => state.snapshot.request_mode,
+            },
+            RequestExecutionState::Legacy(_) => {
+                RequestMode::from_legacy_flags(self.tunnel_mode, self.bodyless_mode)
+            }
+        }
+    }
+
+    pub fn request_body_state(&self) -> RequestBodyState {
+        match &self.execution {
+            RequestExecutionState::Intake(state) => state.request_body,
+            RequestExecutionState::AwaitingAuth(state) => state.request_body,
+            RequestExecutionState::DispatchReady(state) => state.request_body,
+            RequestExecutionState::Admitted(state) => state.request_body,
+            RequestExecutionState::AwaitingUpstream(state) => state.request_body,
+            RequestExecutionState::StreamingResponse(_) | RequestExecutionState::Legacy(_) => {
+                RequestBodyState::from_runtime(
+                    self.request_body_runtime().request_fin_received,
+                    !self.request_body_runtime().body_buf.is_empty(),
+                    self.body_tx().is_some(),
+                )
+            }
+            RequestExecutionState::Terminal(state) => match state {
+                TerminalState::Completed(state) => state
+                    .snapshot
+                    .request_mode
+                    .initial_body_state()
+                    .on_forward_closed(),
+                TerminalState::Cancelled(state) => state
+                    .snapshot
+                    .request_mode
+                    .initial_body_state()
+                    .on_forward_closed(),
+                TerminalState::TimedOut(state) => state
+                    .snapshot
+                    .request_mode
+                    .initial_body_state()
+                    .on_forward_closed(),
+                TerminalState::Rejected(state) => state
+                    .snapshot
+                    .request_mode
+                    .initial_body_state()
+                    .on_forward_closed(),
+                TerminalState::BackendFailed(state) => state
+                    .snapshot
+                    .request_mode
+                    .initial_body_state()
+                    .on_forward_closed(),
+            },
+        }
+    }
+
+    pub fn set_request_body_state(&mut self, next: RequestBodyState) {
+        self.request_body_runtime_mut().request_fin_received = next.request_fin_received();
+        match &mut self.execution {
+            RequestExecutionState::Intake(state) => state.request_body = next,
+            RequestExecutionState::AwaitingAuth(state) => state.request_body = next,
+            RequestExecutionState::DispatchReady(state) => state.request_body = next,
+            RequestExecutionState::Admitted(state) => state.request_body = next,
+            RequestExecutionState::AwaitingUpstream(state) => state.request_body = next,
+            RequestExecutionState::StreamingResponse(_)
+            | RequestExecutionState::Legacy(_)
+            | RequestExecutionState::Terminal(_) => {}
+        }
+    }
+
+    pub fn refresh_request_body_state(&mut self) -> RequestBodyState {
+        let next = RequestBodyState::from_runtime(
+            self.request_body_runtime().request_fin_received,
+            !self.request_body_runtime().body_buf.is_empty(),
+            self.body_tx().is_some(),
+        );
+        self.set_request_body_state(next);
+        next
+    }
+
+    pub fn transition_request_body_buffered(&mut self) -> RequestBodyState {
+        let next = self.request_body_state().on_buffered();
+        self.set_request_body_state(next);
+        next
+    }
+
+    pub fn transition_request_body_finished(&mut self) -> RequestBodyState {
+        let next = self.request_body_state().on_downstream_finished();
+        self.set_request_body_state(next);
+        next
+    }
+
+    pub fn transition_request_body_forward_closed(&mut self) -> RequestBodyState {
+        self.clear_body_tx();
+        self.refresh_request_body_state()
+    }
+
+    pub fn should_close_request_body_forwarding(&self) -> bool {
+        matches!(self.request_body_state(), RequestBodyState::FinReceived)
+            && self.body_buf().is_empty()
+            && self.body_tx().is_some()
+    }
+
+    pub fn can_accept_request_body(&self) -> bool {
+        match &self.execution {
+            RequestExecutionState::Legacy(state) => {
+                state.phase == StreamPhase::ReceivingRequest
+                    && self.request_body_state().can_accept_downstream_body()
+            }
+            _ => self.execution.can_accept_request_body(),
+        }
+    }
+
+    pub fn can_poll_upstream(&self) -> bool {
+        match &self.execution {
+            RequestExecutionState::Legacy(state) => {
+                if state.admission_state != StreamAdmissionState::ReadyToForward {
+                    return false;
+                }
+
+                if self.request_mode().is_tunnel()
+                    && matches!(
+                        state.phase,
+                        StreamPhase::ReceivingRequest | StreamPhase::AwaitingUpstream
+                    )
+                {
+                    return true;
+                }
+
+                state.phase == StreamPhase::AwaitingUpstream
+                    && self.request_body_state().forwarding_complete()
+            }
+            _ => self.execution.can_poll_upstream(),
+        }
     }
 
     pub fn body_tx(&self) -> Option<&mpsc::Sender<Bytes>> {
@@ -291,6 +437,7 @@ impl RequestEnvelope {
             RequestExecutionState::Legacy(state) => state.body_tx = None,
             _ => {}
         }
+        self.refresh_request_body_state();
     }
 
     pub fn body_buf(&self) -> &VecDeque<Bytes> {
@@ -650,11 +797,16 @@ impl RequestEnvelope {
             context,
             routing,
             request_mode,
-            request_body,
+            request_body: _,
             request_body_runtime,
             pending_forward,
             permits,
         } = admitted;
+        let request_body = RequestBodyState::from_runtime(
+            request_body_runtime.request_fin_received,
+            !request_body_runtime.body_buf.is_empty(),
+            dispatch_body_tx.is_some(),
+        );
         self.execution = RequestExecutionState::AwaitingUpstream(AwaitingUpstreamState {
             context,
             routing,
