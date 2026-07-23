@@ -10,18 +10,17 @@ use tokio::task::AbortHandle;
 use super::*;
 use crate::runtime::connection::{
     auth::{
-        ExternalAuthCompletion, ExternalAuthDecision, ExternalAuthDenyResponse,
-        ExternalAuthExecutionPolicy, ExternalAuthFailureDisposition, ExternalAuthResponseMetadata,
-        ExternalAuthResult, ExternalAuthTaskConfig, OidcAuthorizationCheck,
-        evaluate_external_auth_completion, merge_auth_request_mutations, oidc_audience_matches,
+        ExternalAuthDecision, ExternalAuthDenyResponse, ExternalAuthExecutionPolicy,
+        ExternalAuthResponseMetadata, ExternalAuthResult, ExternalAuthStateTransition,
+        ExternalAuthTaskConfig, OidcAuthorizationCheck, oidc_audience_matches,
         oidc_authorization_check, oidc_discovery_target, oidc_scope_satisfied,
-        validate_oidc_provider_metadata,
+        resolve_external_auth_state_transition, validate_oidc_provider_metadata,
     },
     outcome::{
         AdmissionOutcomeClass, OutcomeBackendTarget, OutcomeRouteTarget, observe_admission_outcome,
     },
     request::PendingForward,
-    stream::StreamAdmissionState,
+    stream::RequestExecutionState,
 };
 
 const MAX_AUTH_BODY_BYTES: usize = 64 * 1024;
@@ -450,31 +449,29 @@ impl QUICListener {
         shared_ctx: &ForwardingSharedCtx<'_>,
     ) -> Result<bool, quiche::h3::Error> {
         let metrics = shared_ctx.metrics.as_ref();
-        req.clear_auth_result_rx();
-        if let Some(abort) = req.take_auth_abort() {
-            abort.abort();
-        }
-        req.set_auth_deadline(None);
-        let completion = evaluate_external_auth_completion(
-            result,
-            ExternalAuthFailureDisposition::from_fail_open(req.auth_fail_open()),
-        );
-        match completion {
-            ExternalAuthCompletion::Allow {
+        let RequestExecutionState::AwaitingAuth(awaiting_auth) = &req.execution else {
+            Self::send_simple_response(
+                h3,
+                quic,
+                stream_id,
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                b"missing awaiting auth state\n",
+            )?;
+            return Ok(false);
+        };
+        let transition =
+            resolve_external_auth_state_transition(result, awaiting_auth.auth_disposition);
+        match transition {
+            ExternalAuthStateTransition::Admitted {
                 request_header_mutations,
             } => {
                 metrics.inc_external_auth_allowed();
-                if let Some(pending_forward) = req.pending_forward_mut() {
-                    merge_auth_request_mutations(
-                        &mut Arc::make_mut(pending_forward).auth_header_mutations,
-                        request_header_mutations,
-                    );
-                }
+                req.transition_awaiting_auth_to_dispatch_ready(request_header_mutations);
                 Self::materialize_forward_after_auth(stream_id, req, h3, quic, exec_ctx, shared_ctx)
             }
-            ExternalAuthCompletion::Respond(decision) => {
-                req.set_admission_state_legacy(StreamAdmissionState::Denied);
+            ExternalAuthStateTransition::RejectedAuthDenied { decision } => {
                 req.response_status = Some(decision.status().as_u16());
+                req.discard_awaiting_auth_resources();
                 metrics.inc_policy_denied();
                 metrics.inc_external_auth_denied();
                 let _ = observe_admission_outcome(
@@ -500,48 +497,22 @@ impl QUICListener {
                 Self::send_external_auth_decision_response(h3, quic, stream_id, &decision)?;
                 Ok(false)
             }
-            ExternalAuthCompletion::FailOpen { timed_out, error } => {
-                if timed_out {
-                    metrics.inc_external_auth_timeout();
-                    warn!(
-                        "request_id={} route={} external auth failed open: timeout",
-                        req.request_id,
-                        req.upstream_name.as_deref().unwrap_or("unrouted"),
-                    );
-                } else {
-                    metrics.inc_external_auth_error();
-                    if let Some(error) = error {
-                        warn!(
-                            "request_id={} route={} external auth failed open: {:?}",
-                            req.request_id,
-                            req.upstream_name.as_deref().unwrap_or("unrouted"),
-                            error
-                        );
-                    }
-                }
-                Self::materialize_forward_after_auth(stream_id, req, h3, quic, exec_ctx, shared_ctx)
-            }
-            ExternalAuthCompletion::Reject {
+            ExternalAuthStateTransition::RejectedAuthUnavailable {
                 status,
                 body,
-                timed_out,
                 error,
             } => {
-                if timed_out {
-                    metrics.inc_external_auth_timeout();
-                } else {
-                    metrics.inc_external_auth_error();
-                    if let Some(error) = &error {
-                        debug!(
-                            "request_id={} route={} external auth rejected after error: {:?}",
-                            req.request_id,
-                            req.upstream_name.as_deref().unwrap_or("unrouted"),
-                            error
-                        );
-                    }
+                metrics.inc_external_auth_error();
+                if let Some(error) = &error {
+                    debug!(
+                        "request_id={} route={} external auth rejected after error: {:?}",
+                        req.request_id,
+                        req.upstream_name.as_deref().unwrap_or("unrouted"),
+                        error
+                    );
                 }
-                req.set_admission_state_legacy(StreamAdmissionState::Denied);
                 req.response_status = Some(status.as_u16());
+                req.discard_awaiting_auth_resources();
                 let _ = observe_admission_outcome(
                     metrics,
                     OutcomeRouteTarget {
@@ -554,7 +525,28 @@ impl QUICListener {
                     }),
                     req.start.elapsed(),
                     status,
-                    AdmissionOutcomeClass::Failed { timed_out },
+                    AdmissionOutcomeClass::Failed { timed_out: false },
+                );
+                Self::send_simple_response(h3, quic, stream_id, status, body)?;
+                Ok(false)
+            }
+            ExternalAuthStateTransition::TimedOutAuth { status, body } => {
+                metrics.inc_external_auth_timeout();
+                req.response_status = Some(status.as_u16());
+                req.discard_awaiting_auth_resources();
+                let _ = observe_admission_outcome(
+                    metrics,
+                    OutcomeRouteTarget {
+                        route: req.upstream_name.as_deref().unwrap_or("unrouted"),
+                    },
+                    Some(OutcomeBackendTarget {
+                        upstream: req.upstream_name.as_deref().unwrap_or("unrouted"),
+                        backend_addr: req.backend_addr.as_deref(),
+                        backend_index: req.backend_index,
+                    }),
+                    req.start.elapsed(),
+                    status,
+                    AdmissionOutcomeClass::Failed { timed_out: true },
                 );
                 Self::send_simple_response(h3, quic, stream_id, status, body)?;
                 Ok(false)

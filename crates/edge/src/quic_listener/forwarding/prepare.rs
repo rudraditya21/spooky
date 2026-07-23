@@ -1,7 +1,8 @@
-use std::convert::Infallible;
+use std::{collections::VecDeque, convert::Infallible};
 
 use http_body_util::Full;
 use spooky_config::runtime::RuntimeExternalAuth;
+use tokio::{sync::oneshot, task::AbortHandle};
 
 use super::{auth::start_external_auth_task, resolve::ForwardingResolvedTarget, *};
 use crate::{
@@ -10,6 +11,7 @@ use crate::{
         evaluate_forwarding_pre_admission_policy,
     },
     runtime::connection::{
+        auth::ExternalAuthResult,
         auth::{
             ExternalAuthCompletion, ExternalAuthFailureDisposition, ExternalAuthTaskConfig,
             apply_auth_request_mutations, evaluate_external_auth_completion,
@@ -18,9 +20,10 @@ use crate::{
             AdmissionOutcomeClass, OutcomeBackendTarget, OutcomeRouteTarget,
             observe_admission_outcome,
         },
-        request::{IntakeExecutionSeed, PendingForward, RequestEnvelope},
+        request::{PendingForward, RequestEnvelope},
         stream::{
-            DispatchReadyState, RequestContext, RequestIntakeState, RequestMode, RoutingSnapshot,
+            AwaitingAuthState, DispatchReadyState, RequestBodyRuntime, RequestContext,
+            RequestIntakeState, RequestMode, RoutingSnapshot,
         },
     },
 };
@@ -58,23 +61,57 @@ impl DispatchReadyCandidate {
         self.routing.backend_index
     }
 
-    fn into_envelope(
+    fn into_dispatch_ready_envelope(
         self,
         routing_transparency_enabled: bool,
         routing_transparency_include_reason: bool,
-        execution: IntakeExecutionSeed,
     ) -> RequestEnvelope {
-        RequestEnvelope::from_intake_legacy(
-            self.state.context,
-            self.routing,
+        RequestEnvelope::from_dispatch_ready_state(
+            self.state,
             self.upstream_pool,
-            self.state.request_mode,
-            self.state.request_body,
             routing_transparency_enabled,
             routing_transparency_include_reason,
             0,
             None,
-            execution,
+        )
+    }
+
+    fn into_awaiting_auth_envelope(
+        self,
+        routing_transparency_enabled: bool,
+        routing_transparency_include_reason: bool,
+        auth_result_rx: oneshot::Receiver<ExternalAuthResult>,
+        auth_abort: AbortHandle,
+        auth_disposition: ExternalAuthFailureDisposition,
+        auth_deadline: Instant,
+    ) -> RequestEnvelope {
+        let DispatchReadyState {
+            context,
+            routing,
+            request_mode,
+            request_body,
+            request_body_runtime,
+            pending_forward,
+        } = self.state;
+
+        RequestEnvelope::from_awaiting_auth_state(
+            AwaitingAuthState {
+                context,
+                routing,
+                request_mode,
+                request_body,
+                request_body_runtime,
+                pending_forward,
+                auth_result_rx,
+                auth_abort,
+                auth_deadline,
+                auth_disposition,
+            },
+            self.upstream_pool,
+            routing_transparency_enabled,
+            routing_transparency_include_reason,
+            0,
+            None,
         )
     }
 }
@@ -276,12 +313,21 @@ impl QUICListener {
             request_mode,
             request_body,
         } = intake.state;
+        let last_body_activity = context.start;
         DispatchReadyCandidate {
             state: DispatchReadyState {
                 context,
                 routing: routing.clone(),
                 request_mode,
                 request_body,
+                request_body_runtime: RequestBodyRuntime {
+                    body_tx: None,
+                    body_buf: VecDeque::new(),
+                    body_buf_bytes: 0,
+                    body_bytes_received: 0,
+                    last_body_activity,
+                    request_fin_received: request_body.request_fin_received(),
+                },
                 pending_forward,
             },
             routing,
@@ -612,12 +658,10 @@ impl QUICListener {
                 let mut request = request;
                 request.state.context.total_request_deadline =
                     request.state.context.start + backend_total_request_timeout;
-                let pending_forward = Arc::clone(&request.state.pending_forward);
                 Ok(Some(StartedRequestEnvelope {
-                    envelope: request.into_envelope(
+                    envelope: request.into_dispatch_ready_envelope(
                         routing_transparency_enabled,
                         routing_transparency_include_reason,
-                        IntakeExecutionSeed::ReadyForForwarding { pending_forward },
                     ),
                     should_materialize_forward: true,
                 }))
@@ -626,8 +670,8 @@ impl QUICListener {
                 let mut request = request;
                 request.request.state.context.total_request_deadline =
                     request.request.state.context.start + backend_total_request_timeout;
-                let pending_forward = Arc::clone(&request.request.state.pending_forward);
                 let auth_disposition = request.auth_disposition;
+                let pending_forward = Arc::clone(&request.request.state.pending_forward);
                 let auth_start = match start_external_auth_task(
                     pending_forward,
                     request.external_auth,
@@ -701,24 +745,19 @@ impl QUICListener {
                     }
                 };
                 let should_materialize_forward = auth_start.is_none();
-                let pending_forward = Arc::clone(&request.request.state.pending_forward);
                 let envelope = if let Some(start) = auth_start {
-                    request.request.into_envelope(
+                    request.request.into_awaiting_auth_envelope(
                         routing_transparency_enabled,
                         routing_transparency_include_reason,
-                        IntakeExecutionSeed::AwaitingAuth {
-                            pending_forward,
-                            auth_result_rx: start.rx,
-                            auth_abort: start.abort,
-                            auth_disposition,
-                            auth_deadline: start.deadline,
-                        },
+                        start.rx,
+                        start.abort,
+                        auth_disposition,
+                        start.deadline,
                     )
                 } else {
-                    request.request.into_envelope(
+                    request.request.into_dispatch_ready_envelope(
                         routing_transparency_enabled,
                         routing_transparency_include_reason,
-                        IntakeExecutionSeed::ReadyForForwarding { pending_forward },
                     )
                 };
                 Ok(Some(StartedRequestEnvelope {

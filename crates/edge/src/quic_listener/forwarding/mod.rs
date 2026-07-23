@@ -43,15 +43,11 @@ pub(super) fn abort_stream(req: &mut RequestEnvelope, metrics: &Metrics) -> Stre
     }
     req.body_buf_mut().clear();
     req.clear_body_tx();
-    req.clear_auth_result_rx();
-    if let Some(abort) = req.take_auth_abort() {
-        abort.abort();
-    }
+    req.discard_awaiting_auth_resources();
     req.clear_upstream_result_rx();
     req.clear_response_chunk_rx();
     req.set_pending_chunk(None);
     req.clear_pending_forward();
-    req.set_auth_deadline(None);
     req.clear_dispatch_permits();
     phase
 }

@@ -38,7 +38,10 @@ use crate::{
             BodyLimitKind, ResponseBodyGuardrailConfig, ResponseBodyGuardrailDecision,
             ResponseBodyGuardrailInput, checked_response_body_guardrails,
         },
-        stream::StreamAdmissionState,
+        stream::{
+            AwaitingAuthState, RequestBodyRuntime, RequestBodyState, RequestExecutionState,
+            RequestMode, RoutingSnapshot, StreamAdmissionState,
+        },
     },
 };
 type RoutingMaps = (
@@ -1997,12 +2000,42 @@ fn abort_stream_waiting_for_auth_clears_async_auth_state() {
     let metrics = crate::Metrics::default();
     let (auth_tx, auth_rx) =
         oneshot::channel::<crate::runtime::connection::auth::ExternalAuthResult>();
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let auth_task = runtime.spawn(async {});
     let mut req = make_envelope(StreamPhase::ReceivingRequest);
-    req.set_admission_state_legacy(StreamAdmissionState::WaitingForAuth);
-    req.set_auth_result_rx(Some(auth_rx));
-    req.set_auth_deadline(Some(Instant::now() + std::time::Duration::from_secs(1)));
-    req.set_pending_forward(Some(Arc::new(
-        crate::runtime::connection::request::PendingForward {
+    req.execution = RequestExecutionState::AwaitingAuth(AwaitingAuthState {
+        context: crate::runtime::connection::stream::RequestContext {
+            request_id: req.request_id,
+            trace_id: req.trace_id.clone(),
+            span_id: req.span_id.clone(),
+            traceparent: req.traceparent.clone(),
+            trace_span: req.trace_span.clone(),
+            method: req.method.clone(),
+            path: req.path.clone(),
+            authority: req.authority.clone(),
+            start: req.start,
+            total_request_deadline: req.total_request_deadline,
+        },
+        routing: RoutingSnapshot {
+            backend_addr: "http://127.0.0.1:8080".into(),
+            backend_index: 0,
+            upstream_name: "api".into(),
+            route_reason: "path_prefix".into(),
+            route_path_len: 7,
+            route_host_specific: false,
+            backend_lb: None,
+        },
+        request_mode: RequestMode::Normal,
+        request_body: RequestBodyState::Open,
+        request_body_runtime: RequestBodyRuntime {
+            body_tx: None,
+            body_buf: std::collections::VecDeque::new(),
+            body_buf_bytes: 0,
+            body_bytes_received: 0,
+            last_body_activity: req.start,
+            request_fin_received: false,
+        },
+        pending_forward: Arc::new(crate::runtime::connection::request::PendingForward {
             method: Arc::<str>::from("POST"),
             path: Arc::<str>::from("/upload"),
             authority: Some(Arc::<str>::from("example.com")),
@@ -2022,16 +2055,18 @@ fn abort_stream_waiting_for_auth_clears_async_auth_state() {
             host_policy: Default::default(),
             forwarded_header_policy: Default::default(),
             auth_header_mutations: Vec::new(),
-        },
-    )));
+        }),
+        auth_result_rx: auth_rx,
+        auth_abort: auth_task.abort_handle(),
+        auth_deadline: Instant::now() + std::time::Duration::from_secs(1),
+        auth_disposition:
+            crate::runtime::connection::auth::ExternalAuthFailureDisposition::FailClosed,
+    });
 
     let phase = abort_stream(&mut req, &metrics);
 
     assert_eq!(phase, StreamPhase::ReceivingRequest);
-    assert!(!req.has_auth_result_rx());
-    assert!(!req.has_auth_abort());
-    assert!(req.auth_deadline().is_none());
-    assert!(req.pending_forward().is_none());
+    assert_ne!(req.admission_state(), StreamAdmissionState::WaitingForAuth);
     assert!(
         auth_tx
             .send(Ok(

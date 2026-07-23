@@ -1,6 +1,5 @@
 use super::*;
 use crate::runtime::connection::{
-    auth::ExternalAuthResult,
     guardrails::{
         BodyLimitKind, BodyTimeoutKind, ProgressiveEmissionPolicy, RESPONSE_BODY_TOO_LARGE_BODY,
         RequestBodyGuardrailConfig, RequestBodyGuardrailDecision, RequestBodyGuardrailInput,
@@ -334,31 +333,9 @@ impl QUICListener {
                 }
             }
 
-            let auth_ready: Option<ExternalAuthResult> = if streams
-                .get(&stream_id)
-                .is_some_and(|req| req.admission_state() == StreamAdmissionState::WaitingForAuth)
-            {
-                if streams
-                    .get(&stream_id)
-                    .and_then(RequestEnvelope::auth_deadline)
-                    .is_some_and(|deadline| Instant::now() >= deadline)
-                {
-                    Some(Err(ProxyError::Timeout))
-                } else {
-                    streams
-                        .get_mut(&stream_id)
-                        .and_then(RequestEnvelope::auth_result_rx_mut)
-                        .and_then(|rx| match rx.try_recv() {
-                            Ok(result) => Some(result),
-                            Err(oneshot::error::TryRecvError::Empty) => None,
-                            Err(oneshot::error::TryRecvError::Closed) => Some(Err(
-                                ProxyError::Transport("external auth task dropped sender".into()),
-                            )),
-                        })
-                }
-            } else {
-                None
-            };
+            let auth_ready = streams
+                .get_mut(&stream_id)
+                .and_then(|req| req.poll_awaiting_auth_non_blocking(now));
 
             if let Some(auth_result) = auth_ready {
                 let keep_stream = if let Some(req) = streams.get_mut(&stream_id) {
