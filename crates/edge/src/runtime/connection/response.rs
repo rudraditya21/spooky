@@ -1,9 +1,16 @@
 use bytes::Bytes;
+use http::StatusCode;
+use hyper::body::Incoming;
 use spooky_errors::{
     HedgeOutcomeTelemetryReason, HedgeTriggerTelemetryReason, ProxyError,
     RetryAttemptTelemetryReason, RetryPolicyDenialReason,
 };
 use tokio::sync::mpsc;
+
+use crate::{
+    OverloadShedReason,
+    runtime::connection::{guardrails::ResponseBodyGuardrailConfig, stream::StreamPhase},
+};
 
 pub(crate) enum ForwardSuccess {
     Response {
@@ -66,6 +73,68 @@ pub(crate) enum ResponseChunk {
     },
     End,
     Error(ProxyError),
+}
+
+#[derive(Clone)]
+pub(crate) struct ResponseStartMetadata {
+    pub(crate) status: StatusCode,
+    pub(crate) headers: Vec<(Vec<u8>, Vec<u8>)>,
+    pub(crate) headers_deferred: bool,
+}
+
+impl ResponseStartMetadata {
+    pub(crate) fn response_headers_sent(&self) -> bool {
+        !self.headers_deferred
+    }
+
+    pub(crate) fn streaming_phase(&self) -> StreamPhase {
+        StreamPhase::SendingResponse
+    }
+}
+
+pub(crate) enum ImmediateResponseStart {
+    NormalizedHeadersOnly,
+    SyntheticBody(&'static [u8]),
+}
+
+pub(crate) struct ResponseBodyPumpPlan {
+    pub(crate) guardrails: ResponseBodyGuardrailConfig,
+    pub(crate) upstream_content_length: Option<usize>,
+    pub(crate) body_forwarding_enabled: bool,
+    pub(crate) progressive_emission_allowed: bool,
+    pub(crate) defer_headers_until_body_validated: bool,
+    pub(crate) tunnel_response: bool,
+}
+
+pub(crate) enum ResponseStartObservation {
+    Status {
+        status: StatusCode,
+    },
+    ProxyError {
+        status: StatusCode,
+        error: ProxyError,
+        overload_reason: Option<OverloadShedReason>,
+    },
+}
+
+pub(crate) enum ResponseStartDecision {
+    ImmediateTerminal {
+        metadata: ResponseStartMetadata,
+        terminal: ImmediateResponseStart,
+        observation: ResponseStartObservation,
+    },
+    StreamingPrebuilt {
+        metadata: ResponseStartMetadata,
+        response_chunk_rx: mpsc::Receiver<ResponseChunk>,
+        observation: ResponseStartObservation,
+    },
+    StreamingBodyPump {
+        metadata: ResponseStartMetadata,
+        response_body: Incoming,
+        pump: ResponseBodyPumpPlan,
+        observation: ResponseStartObservation,
+    },
+    BackendFailure(ProxyError),
 }
 
 #[derive(Debug, Clone, Copy, Default)]

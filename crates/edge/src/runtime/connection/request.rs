@@ -284,7 +284,7 @@ impl RequestEnvelope {
                 TerminalState::BackendFailed(state) => state.snapshot.request_mode,
             },
             RequestExecutionState::Legacy(_) => {
-                RequestMode::from_legacy_flags(self.tunnel_mode, self.bodyless_mode)
+                RequestMode::from_legacy_flags(self.tunnel_mode, &self.method, self.bodyless_mode)
             }
         }
     }

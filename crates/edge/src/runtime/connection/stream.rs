@@ -53,6 +53,7 @@ pub enum TunnelMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestMode {
     Normal,
+    Bodyless,
     HeadLike,
     ConnectTunnel,
     WebsocketTunnel,
@@ -60,11 +61,16 @@ pub enum RequestMode {
 
 #[allow(dead_code)]
 impl RequestMode {
-    pub fn from_legacy_flags(tunnel_mode: TunnelMode, bodyless_mode: bool) -> Self {
+    pub fn from_legacy_flags(tunnel_mode: TunnelMode, method: &str, bodyless_mode: bool) -> Self {
         match tunnel_mode {
             TunnelMode::Connect => Self::ConnectTunnel,
             TunnelMode::Websocket => Self::WebsocketTunnel,
-            TunnelMode::None if bodyless_mode => Self::HeadLike,
+            TunnelMode::None if bodyless_mode && method.eq_ignore_ascii_case("GET") => {
+                Self::Bodyless
+            }
+            TunnelMode::None if bodyless_mode && method.eq_ignore_ascii_case("HEAD") => {
+                Self::HeadLike
+            }
             TunnelMode::None => Self::Normal,
         }
     }
@@ -78,11 +84,14 @@ impl RequestMode {
             TunnelMode::Connect => Self::ConnectTunnel,
             TunnelMode::Websocket => Self::WebsocketTunnel,
             TunnelMode::None
-                if content_length.unwrap_or(0) == 0
-                    && (method.eq_ignore_ascii_case("GET")
-                        || method.eq_ignore_ascii_case("HEAD")) =>
+                if content_length.unwrap_or(0) == 0 && method.eq_ignore_ascii_case("HEAD") =>
             {
                 Self::HeadLike
+            }
+            TunnelMode::None
+                if content_length.unwrap_or(0) == 0 && method.eq_ignore_ascii_case("GET") =>
+            {
+                Self::Bodyless
             }
             TunnelMode::None => Self::Normal,
         }
@@ -97,12 +106,12 @@ impl RequestMode {
     }
 
     pub fn bodyless_mode(self) -> bool {
-        matches!(self, Self::HeadLike)
+        matches!(self, Self::Bodyless | Self::HeadLike)
     }
 
     pub fn tunnel_mode(self) -> TunnelMode {
         match self {
-            Self::Normal | Self::HeadLike => TunnelMode::None,
+            Self::Normal | Self::Bodyless | Self::HeadLike => TunnelMode::None,
             Self::ConnectTunnel => TunnelMode::Connect,
             Self::WebsocketTunnel => TunnelMode::Websocket,
         }
