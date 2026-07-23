@@ -10,6 +10,7 @@ use tokio::{
 use tracing::Span;
 
 use crate::{
+    OverloadShedReason,
     resilience::{adaptive_admission::AdaptivePermit, route_queue::RouteQueuePermit},
     runtime::connection::{
         auth::{ExternalAuthFailureDisposition, ExternalAuthResult},
@@ -434,6 +435,7 @@ pub struct TerminalSnapshot {
     pub routing: Option<RoutingSnapshot>,
     pub request_mode: RequestMode,
     pub response_status: Option<StatusCode>,
+    pub overload_reason: Option<OverloadShedReason>,
     pub backend_accounting: Option<BackendAccountingState>,
 }
 

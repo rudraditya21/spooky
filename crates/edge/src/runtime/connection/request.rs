@@ -15,11 +15,14 @@ use tokio::{
 use tracing::Span;
 
 use crate::{
-    Metrics,
+    Metrics, OverloadShedReason,
     resilience::{adaptive_admission::AdaptivePermit, route_queue::RouteQueuePermit},
     runtime::connection::{
         auth::{ExternalAuthFailureDisposition, ExternalAuthResult, PendingHeaderMutation},
-        outcome::{BackendRequestFinishInput, finalize_backend_request_cleanup},
+        outcome::{
+            BackendRequestFinishInput, finalize_backend_request_cleanup,
+            observe_terminal_request_outcome,
+        },
         response::{ResponseChunk, UpstreamResult},
         stream::{
             AdmissionPermits, AdmittedState, AwaitingAuthState, AwaitingUpstreamState,
@@ -62,6 +65,8 @@ pub struct RequestEnvelope {
 
     pub retry_count: u8,
     pub error_kind: Option<&'static str>,
+    pub terminal_overload_reason: Option<OverloadShedReason>,
+    pub terminal_outcome_recorded: bool,
     pub execution: RequestExecutionState,
 }
 
@@ -131,6 +136,8 @@ impl RequestEnvelope {
             tunnel_mode,
             retry_count,
             error_kind,
+            terminal_overload_reason: None,
+            terminal_outcome_recorded: false,
             execution: RequestExecutionState::Legacy(LegacyRequestLifecycle {
                 phase,
                 admission_state,
@@ -155,6 +162,10 @@ impl RequestEnvelope {
                 pending_chunk: None,
             }),
         }
+    }
+
+    pub fn set_terminal_overload_reason(&mut self, reason: Option<OverloadShedReason>) {
+        self.terminal_overload_reason = reason;
     }
 
     pub(crate) fn from_dispatch_ready_state(
@@ -200,6 +211,8 @@ impl RequestEnvelope {
             tunnel_mode: request_mode.tunnel_mode(),
             retry_count,
             error_kind,
+            terminal_overload_reason: None,
+            terminal_outcome_recorded: false,
             execution: RequestExecutionState::DispatchReady(state),
         }
     }
@@ -251,8 +264,14 @@ impl RequestEnvelope {
             tunnel_mode: request_mode.tunnel_mode(),
             retry_count,
             error_kind,
+            terminal_overload_reason: None,
+            terminal_outcome_recorded: false,
             execution: RequestExecutionState::AwaitingAuth(state),
         }
+    }
+
+    pub fn mark_terminal_outcome_recorded(&mut self) {
+        self.terminal_outcome_recorded = true;
     }
 
     pub fn phase(&self) -> StreamPhase {
@@ -1108,6 +1127,11 @@ impl RequestEnvelope {
         }
 
         let snapshot = self.terminal_snapshot();
+        let terminal_state = reason.into_terminal_state(snapshot.clone());
+        if !self.terminal_outcome_recorded {
+            let _ = observe_terminal_request_outcome(metrics, &terminal_state);
+            self.terminal_outcome_recorded = true;
+        }
         let should_finalize_backend = self.execution.should_finalize_backend_accounting();
         let buffered_body_bytes = Self::buffered_request_body_bytes(&self.execution);
         let finalize_status = reason
@@ -1143,7 +1167,7 @@ impl RequestEnvelope {
             metrics.release_request_buffer(buffered_body_bytes);
         }
 
-        self.execution = RequestExecutionState::Terminal(reason.into_terminal_state(snapshot));
+        self.execution = RequestExecutionState::Terminal(terminal_state);
         prior_phase
     }
 
@@ -1238,6 +1262,7 @@ impl RequestEnvelope {
             response_status: self
                 .response_status
                 .and_then(|status| http::StatusCode::from_u16(status).ok()),
+            overload_reason: self.terminal_overload_reason,
             backend_accounting: match &self.execution {
                 RequestExecutionState::AwaitingUpstream(state) => {
                     Some(state.dispatch.backend_accounting)
