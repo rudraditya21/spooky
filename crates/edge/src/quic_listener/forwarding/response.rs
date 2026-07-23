@@ -6,37 +6,60 @@ use super::*;
 use crate::runtime::connection::{
     auth::ExternalAuthDecision,
     guardrails::{
-        ProgressiveEmissionPolicy, RESPONSE_BODY_TOO_LARGE_BODY, ResponseBodyGuardrailConfig,
-        ResponseBodyGuardrailDecision, ResponseBodyGuardrailInput,
+        BodyTimeoutKind, ProgressiveEmissionPolicy, RESPONSE_BODY_TOO_LARGE_BODY,
+        ResponseBodyGuardrailConfig, ResponseBodyGuardrailDecision, ResponseBodyGuardrailInput,
         checked_response_body_guardrails, is_unknown_length_response_prebuffer_reason,
         response_body_limit_reason, response_chunk_ranges,
     },
     response::{
-        ImmediateResponseStart, ResponseBodyPumpPlan, ResponseStartDecision, ResponseStartMetadata,
-        ResponseStartObservation,
+        ImmediateResponseStart, ResponseBodyPumpPlan, ResponseChunk, ResponseStartDecision,
+        ResponseStartMetadata, ResponseStartObservation,
     },
-    stream::{BackendFailureReason, CompletionReason, ResponseEmissionState},
+    stream::{BackendFailureReason, CompletionReason, ResponseEmissionState, TimeoutReason},
 };
 
-fn response_body_guardrail_error(decision: ResponseBodyGuardrailDecision) -> Option<ProxyError> {
+fn response_body_guardrail_chunk(decision: ResponseBodyGuardrailDecision) -> Option<ResponseChunk> {
     match decision {
         ResponseBodyGuardrailDecision::Continue { .. } => None,
-        ResponseBodyGuardrailDecision::Timeout { .. } => Some(ProxyError::Timeout),
+        ResponseBodyGuardrailDecision::Timeout {
+            kind: BodyTimeoutKind::Idle,
+        } => Some(ResponseChunk::Timeout(TimeoutReason::ResponseBodyIdle)),
+        ResponseBodyGuardrailDecision::Timeout {
+            kind: BodyTimeoutKind::Total,
+        } => Some(ResponseChunk::Timeout(TimeoutReason::ResponseBodyTotal)),
         ResponseBodyGuardrailDecision::Reject {
             kind: BodyLimitKind::BodySize,
-        } => Some(ProxyError::Pool(PoolError::BackendOverloaded(
-            response_body_limit_reason(BodyLimitKind::BodySize).into(),
+        } => Some(ResponseChunk::Error(ProxyError::Pool(
+            PoolError::BackendOverloaded(
+                response_body_limit_reason(BodyLimitKind::BodySize).into(),
+            ),
         ))),
         ResponseBodyGuardrailDecision::Reject {
             kind: BodyLimitKind::UnknownLengthPrebuffer,
-        } => Some(ProxyError::Pool(PoolError::BackendOverloaded(
-            response_body_limit_reason(BodyLimitKind::UnknownLengthPrebuffer).into(),
+        } => Some(ResponseChunk::Error(ProxyError::Pool(
+            PoolError::BackendOverloaded(
+                response_body_limit_reason(BodyLimitKind::UnknownLengthPrebuffer).into(),
+            ),
         ))),
-        ResponseBodyGuardrailDecision::Reject { .. } => {
-            Some(ProxyError::Pool(PoolError::BackendOverloaded(
+        ResponseBodyGuardrailDecision::Reject { .. } => Some(ResponseChunk::Error(
+            ProxyError::Pool(PoolError::BackendOverloaded(
                 response_body_limit_reason(BodyLimitKind::BufferedBody).into(),
-            )))
-        }
+            )),
+        )),
+    }
+}
+
+fn response_body_wait_timeout_reason(
+    guardrails: ResponseBodyGuardrailConfig,
+    body_started_at: tokio::time::Instant,
+    last_body_progress_at: tokio::time::Instant,
+) -> TimeoutReason {
+    if body_started_at.elapsed() >= guardrails.total_timeout {
+        TimeoutReason::ResponseBodyTotal
+    } else if last_body_progress_at.elapsed() >= guardrails.idle_timeout {
+        TimeoutReason::ResponseBodyIdle
+    } else {
+        TimeoutReason::ResponseBodyIdle
     }
 }
 
@@ -720,9 +743,9 @@ impl QUICListener {
                     Ok(evaluated) => evaluated.streaming,
                     other => {
                         if let Err(other) = other
-                            && let Some(err) = response_body_guardrail_error(other)
+                            && let Some(chunk) = response_body_guardrail_chunk(other)
                         {
-                            let _ = chunk_tx.send(ResponseChunk::Error(err)).await;
+                            let _ = chunk_tx.send(chunk).await;
                         }
                         return;
                     }
@@ -732,7 +755,11 @@ impl QUICListener {
                 match result {
                     Err(_elapsed) => {
                         let _ = chunk_tx
-                            .send(ResponseChunk::Error(ProxyError::Timeout))
+                            .send(ResponseChunk::Timeout(response_body_wait_timeout_reason(
+                                pump.guardrails,
+                                body_started_at,
+                                last_body_progress_at,
+                            )))
                             .await;
                         return;
                     }
@@ -760,9 +787,9 @@ impl QUICListener {
                                 Ok(evaluated) => evaluated,
                                 other => {
                                     if let Err(other) = other
-                                        && let Some(err) = response_body_guardrail_error(other)
+                                        && let Some(chunk) = response_body_guardrail_chunk(other)
                                     {
-                                        let _ = chunk_tx.send(ResponseChunk::Error(err)).await;
+                                        let _ = chunk_tx.send(chunk).await;
                                     }
                                     return;
                                 }
@@ -1329,6 +1356,37 @@ impl QUICListener {
                         BackendFailureReason::ResponseStreamAborted,
                         metrics,
                     );
+                    terminal = true;
+                    break;
+                }
+                ResponseChunk::Timeout(reason) => {
+                    metrics.inc_timeout();
+                    let _ = crate::runtime::connection::outcome::observe_proxy_error_outcome(
+                        metrics,
+                        Self::request_outcome_route_target(req),
+                        Self::request_outcome_backend_target(req),
+                        req.start.elapsed(),
+                        req.response_status
+                            .and_then(|status| http::StatusCode::from_u16(status).ok())
+                            .or(Some(http::StatusCode::SERVICE_UNAVAILABLE)),
+                        &ProxyError::Timeout,
+                        None,
+                    );
+                    if !req.response_headers_sent() {
+                        let _ = Self::send_simple_response(
+                            h3,
+                            quic,
+                            stream_id,
+                            http::StatusCode::SERVICE_UNAVAILABLE,
+                            b"upstream timeout\n",
+                        );
+                    } else {
+                        let _ = h3.send_body(quic, stream_id, b"", true);
+                    }
+                    resilience
+                        .adaptive_admission
+                        .observe(req.start.elapsed(), true);
+                    req.transition_streaming_to_timed_out(reason, metrics);
                     terminal = true;
                     break;
                 }

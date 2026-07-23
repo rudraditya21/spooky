@@ -328,7 +328,7 @@ impl QUICListener {
                 if let Some(req) = streams.get_mut(&stream_id) {
                     terminalize_stream(
                         req,
-                        TerminalReason::TimedOut(TimeoutReason::TotalRequest),
+                        TerminalReason::TimedOut(req.total_request_timeout_reason()),
                         metrics,
                     );
                 }
@@ -462,7 +462,15 @@ impl QUICListener {
                         }
                     }
                     Err(err) => {
-                        let failure_reason = backend_failure_reason_for_proxy_error(&err);
+                        let terminal_reason = match &err {
+                            ProxyError::Timeout => streams.get(&stream_id).map_or(
+                                TerminalReason::TimedOut(TimeoutReason::AwaitingUpstream),
+                                |req| TerminalReason::TimedOut(req.upstream_timeout_reason()),
+                            ),
+                            other => TerminalReason::BackendFailed(
+                                backend_failure_reason_for_proxy_error(other),
+                            ),
+                        };
                         if let Some(req) = streams.get(&stream_id) {
                             if let Err(protocol_err) = Self::handle_forward_result(
                                 h3,
@@ -482,11 +490,7 @@ impl QUICListener {
                                 .observe(req.start.elapsed(), true);
                         }
                         if let Some(req) = streams.get_mut(&stream_id) {
-                            terminalize_stream(
-                                req,
-                                TerminalReason::BackendFailed(failure_reason),
-                                metrics,
-                            );
+                            terminalize_stream(req, terminal_reason, metrics);
                         }
                         streams.remove(&stream_id);
                         continue;

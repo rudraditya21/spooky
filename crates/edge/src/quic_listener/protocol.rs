@@ -146,7 +146,7 @@ pub(in crate::quic_listener) fn is_connect_tunnel_response(
 }
 
 pub(in crate::quic_listener) fn can_poll_upstream_result(req: &RequestEnvelope) -> bool {
-    req.can_poll_upstream()
+    req.can_poll_upstream_result()
 }
 
 fn header_has_token(value: &http::HeaderValue, token: &str) -> bool {

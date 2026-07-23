@@ -31,7 +31,7 @@ use super::{
 };
 use crate::quic_listener::forwarding::terminalize_stream;
 use crate::runtime::connection::stream::{
-    BackendFailureReason, CancellationReason, TerminalReason,
+    BackendFailureReason, CancellationReason, TerminalReason, TimeoutReason,
 };
 use crate::{
     REQUEST_ID_COUNTER,
@@ -1337,6 +1337,48 @@ fn non_connect_requires_request_completion_before_upstream_poll() {
 
     req.set_admission_state_legacy(StreamAdmissionState::WaitingForAuth);
     assert!(!can_poll_upstream_result(&req));
+}
+
+#[test]
+fn total_request_timeout_tracks_typed_execution_phase() {
+    let (_tx, rx) = oneshot::channel::<crate::runtime::connection::response::UpstreamResult>();
+    let mut req = make_envelope(StreamPhase::ReceivingRequest);
+    req.method = "GET".to_string();
+    req.set_request_fin_received(false);
+    assert_eq!(
+        req.total_request_timeout_reason(),
+        TimeoutReason::RequestBodyTotal
+    );
+
+    req.set_request_fin_received(true);
+    req.set_phase_legacy(StreamPhase::AwaitingUpstream);
+    req.set_upstream_result_rx(Some(rx));
+    assert_eq!(
+        req.total_request_timeout_reason(),
+        TimeoutReason::AwaitingUpstream
+    );
+
+    req.set_phase_legacy(StreamPhase::SendingResponse);
+    assert_eq!(
+        req.total_request_timeout_reason(),
+        TimeoutReason::ResponseBodyTotal
+    );
+}
+
+#[test]
+fn connect_total_request_timeout_prefers_awaiting_upstream_bucket() {
+    let (_tx, rx) = oneshot::channel::<crate::runtime::connection::response::UpstreamResult>();
+    let mut req = make_envelope(StreamPhase::ReceivingRequest);
+    req.method = "CONNECT".to_string();
+    req.tunnel_mode = crate::runtime::connection::stream::TunnelMode::Connect;
+    req.set_request_fin_received(false);
+    req.set_upstream_result_rx(Some(rx));
+
+    assert!(can_poll_upstream_result(&req));
+    assert_eq!(
+        req.total_request_timeout_reason(),
+        TimeoutReason::AwaitingUpstream
+    );
 }
 
 #[test]
