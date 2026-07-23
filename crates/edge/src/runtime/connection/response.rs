@@ -7,7 +7,10 @@ use spooky_errors::{
 };
 use tokio::sync::mpsc;
 
-use crate::{OverloadShedReason, runtime::connection::guardrails::ResponseBodyGuardrailConfig};
+use crate::{
+    OverloadShedReason,
+    runtime::connection::{guardrails::ResponseBodyGuardrailConfig, stream::TimeoutReason},
+};
 
 pub(crate) enum ForwardSuccess {
     Response {
@@ -70,6 +73,7 @@ pub(crate) enum ResponseChunk {
     },
     End,
     Error(ProxyError),
+    Timeout(TimeoutReason),
 }
 
 #[derive(Clone)]

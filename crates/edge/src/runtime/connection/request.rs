@@ -28,7 +28,7 @@ use crate::{
             RequestBodyRuntime, RequestBodyState, RequestContext, RequestExecutionState,
             RequestMode, ResponseBackpressureState, ResponseEmissionState, ResponseStreamingState,
             StreamAdmissionState, StreamPhase, TerminalReason, TerminalSnapshot, TerminalState,
-            TunnelMode,
+            TimeoutReason, TunnelMode,
         },
     },
 };
@@ -413,6 +413,96 @@ impl RequestEnvelope {
                     && self.request_body_state().forwarding_complete()
             }
             _ => self.execution.can_poll_upstream(),
+        }
+    }
+
+    pub fn can_poll_upstream_result(&self) -> bool {
+        match &self.execution {
+            RequestExecutionState::AwaitingUpstream(_) => {
+                self.has_upstream_result_rx() && self.execution.can_poll_upstream()
+            }
+            RequestExecutionState::Legacy(state) => {
+                if state.upstream_result_rx.is_none() {
+                    return false;
+                }
+
+                if state.admission_state != StreamAdmissionState::ReadyToForward {
+                    return false;
+                }
+
+                if self.request_mode().is_tunnel()
+                    && matches!(
+                        state.phase,
+                        StreamPhase::ReceivingRequest | StreamPhase::AwaitingUpstream
+                    )
+                {
+                    return true;
+                }
+
+                state.phase == StreamPhase::AwaitingUpstream
+                    && self.request_body_state().forwarding_complete()
+            }
+            _ => false,
+        }
+    }
+
+    pub fn total_request_timeout_reason(&self) -> TimeoutReason {
+        match &self.execution {
+            RequestExecutionState::AwaitingAuth(_) => TimeoutReason::ExternalAuth,
+            RequestExecutionState::StreamingResponse(_) => TimeoutReason::ResponseBodyTotal,
+            RequestExecutionState::AwaitingUpstream(_)
+            | RequestExecutionState::DispatchReady(_)
+            | RequestExecutionState::Admitted(_) => TimeoutReason::AwaitingUpstream,
+            RequestExecutionState::Intake(_) => TimeoutReason::RequestBodyTotal,
+            RequestExecutionState::Legacy(state) => {
+                if state.admission_state == StreamAdmissionState::WaitingForAuth {
+                    return TimeoutReason::ExternalAuth;
+                }
+
+                if self.has_response_chunk_rx() || state.phase == StreamPhase::SendingResponse {
+                    return TimeoutReason::ResponseBodyTotal;
+                }
+
+                // Tunnel requests become await-upstream work as soon as admission is
+                // complete; they should not inherit normal request-body timeout labels.
+                if self.request_mode().is_tunnel() && self.can_poll_upstream_result() {
+                    return TimeoutReason::AwaitingUpstream;
+                }
+
+                if self.can_poll_upstream_result() {
+                    return TimeoutReason::AwaitingUpstream;
+                }
+
+                if self.can_accept_request_body() {
+                    return TimeoutReason::RequestBodyTotal;
+                }
+
+                TimeoutReason::TotalRequest
+            }
+            RequestExecutionState::Terminal(state) => match state {
+                TerminalState::TimedOut(state) => state.reason,
+                _ => TimeoutReason::TotalRequest,
+            },
+        }
+    }
+
+    pub fn upstream_timeout_reason(&self) -> TimeoutReason {
+        match &self.execution {
+            RequestExecutionState::StreamingResponse(_) => TimeoutReason::ResponseBodyTotal,
+            RequestExecutionState::AwaitingUpstream(_)
+            | RequestExecutionState::DispatchReady(_)
+            | RequestExecutionState::Admitted(_)
+            | RequestExecutionState::AwaitingAuth(_) => TimeoutReason::AwaitingUpstream,
+            RequestExecutionState::Legacy(state) => {
+                if self.has_response_chunk_rx() || state.phase == StreamPhase::SendingResponse {
+                    TimeoutReason::ResponseBodyTotal
+                } else {
+                    TimeoutReason::AwaitingUpstream
+                }
+            }
+            RequestExecutionState::Intake(_) | RequestExecutionState::Terminal(_) => {
+                TimeoutReason::AwaitingUpstream
+            }
         }
     }
 
@@ -904,6 +994,14 @@ impl RequestEnvelope {
         metrics: &Metrics,
     ) {
         self.transition_to_terminal_with_cleanup(TerminalReason::BackendFailed(reason), metrics);
+    }
+
+    pub(crate) fn transition_streaming_to_timed_out(
+        &mut self,
+        reason: TimeoutReason,
+        metrics: &Metrics,
+    ) {
+        self.transition_to_terminal_with_cleanup(TerminalReason::TimedOut(reason), metrics);
     }
 
     pub fn transition_to_terminal(
