@@ -23,6 +23,9 @@ use crate::{
         },
         state::BackendIdentity,
     },
+    runtime::connection::stream::{
+        BackendFailureReason, RejectionReason, TerminalState, TimeoutReason,
+    },
 };
 
 fn emit_backend_health_transition(
@@ -378,6 +381,208 @@ pub(crate) fn observe_admission_outcome(
     )
 }
 
+fn terminal_route_target(state: &TerminalState) -> OutcomeRouteTarget<'_> {
+    let routing = match state {
+        TerminalState::Completed(state) => state.snapshot.routing.as_ref(),
+        TerminalState::Cancelled(state) => state.snapshot.routing.as_ref(),
+        TerminalState::TimedOut(state) => state.snapshot.routing.as_ref(),
+        TerminalState::Rejected(state) => state.snapshot.routing.as_ref(),
+        TerminalState::BackendFailed(state) => state.snapshot.routing.as_ref(),
+    };
+    routing.map_or(OutcomeRouteTarget::UNROUTED, |routing| OutcomeRouteTarget {
+        route: &routing.upstream_name,
+    })
+}
+
+fn terminal_backend_target(state: &TerminalState) -> Option<OutcomeBackendTarget<'_>> {
+    let routing = match state {
+        TerminalState::Completed(state) => state.snapshot.routing.as_ref(),
+        TerminalState::Cancelled(state) => state.snapshot.routing.as_ref(),
+        TerminalState::TimedOut(state) => state.snapshot.routing.as_ref(),
+        TerminalState::Rejected(state) => state.snapshot.routing.as_ref(),
+        TerminalState::BackendFailed(state) => state.snapshot.routing.as_ref(),
+    }?;
+    Some(OutcomeBackendTarget {
+        upstream: &routing.upstream_name,
+        backend_addr: Some(&routing.backend_addr),
+        backend_index: Some(routing.backend_index),
+    })
+}
+
+fn terminal_elapsed(state: &TerminalState) -> Duration {
+    match state {
+        TerminalState::Completed(state) => state.snapshot.context.start.elapsed(),
+        TerminalState::Cancelled(state) => state.snapshot.context.start.elapsed(),
+        TerminalState::TimedOut(state) => state.snapshot.context.start.elapsed(),
+        TerminalState::Rejected(state) => state.snapshot.context.start.elapsed(),
+        TerminalState::BackendFailed(state) => state.snapshot.context.start.elapsed(),
+    }
+}
+
+fn infer_terminal_status(state: &TerminalState) -> Option<StatusCode> {
+    match state {
+        TerminalState::Completed(state) => state.snapshot.response_status,
+        TerminalState::Cancelled(state) => state.snapshot.response_status,
+        TerminalState::TimedOut(state) => {
+            state.snapshot.response_status.or(Some(match state.reason {
+                TimeoutReason::RequestBodyIdle
+                | TimeoutReason::RequestBodyTotal
+                | TimeoutReason::TotalRequest => StatusCode::REQUEST_TIMEOUT,
+                TimeoutReason::ExternalAuth
+                | TimeoutReason::AwaitingUpstream
+                | TimeoutReason::ResponseBodyIdle
+                | TimeoutReason::ResponseBodyTotal => StatusCode::GATEWAY_TIMEOUT,
+            }))
+        }
+        TerminalState::Rejected(state) => {
+            state.snapshot.response_status.or(Some(match state.reason {
+                RejectionReason::AuthDenied => StatusCode::UNAUTHORIZED,
+                RejectionReason::AuthUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+                RejectionReason::ValidationFailed | RejectionReason::RequestBodyNotAllowed => {
+                    StatusCode::BAD_REQUEST
+                }
+                RejectionReason::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+                RejectionReason::Overloaded | RejectionReason::ResponsePrebufferCap => {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+                RejectionReason::RequestBodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            }))
+        }
+        TerminalState::BackendFailed(state) => {
+            state.snapshot.response_status.or(Some(match state.reason {
+                BackendFailureReason::UpstreamTimeout => StatusCode::GATEWAY_TIMEOUT,
+                BackendFailureReason::DispatchSpawnFailed
+                | BackendFailureReason::UpstreamResultChannelDropped
+                | BackendFailureReason::UpstreamTransport
+                | BackendFailureReason::UpstreamProtocol
+                | BackendFailureReason::UpstreamTls
+                | BackendFailureReason::UpstreamBridge
+                | BackendFailureReason::ResponseWriteFailed
+                | BackendFailureReason::ResponseStreamAborted => StatusCode::BAD_GATEWAY,
+            }))
+        }
+    }
+}
+
+pub(crate) fn classify_terminal_outcome(state: &TerminalState) -> RequestOutcomeDecision {
+    match state {
+        TerminalState::Completed(state) if state.snapshot.overload_reason.is_some() => {
+            classify_admission_outcome(AdmissionOutcomeClass::OverloadShed {
+                reason: state.snapshot.overload_reason,
+            })
+        }
+        TerminalState::Completed(_) => infer_terminal_status(state)
+            .map(classify_status_outcome)
+            .unwrap_or(RequestOutcomeDecision {
+                route_outcome: CanonicalRouteOutcome::Success,
+                backend_outcome: CanonicalBackendOutcome::Success,
+                overload_reason: None,
+                health_effect: HealthEffectHint::Success,
+            }),
+        TerminalState::Cancelled(_) => infer_terminal_status(state)
+            .map(classify_status_outcome)
+            .unwrap_or(RequestOutcomeDecision {
+                route_outcome: CanonicalRouteOutcome::UpstreamFailure,
+                backend_outcome: CanonicalBackendOutcome::UpstreamFailure,
+                overload_reason: None,
+                health_effect: HealthEffectHint::None,
+            }),
+        TerminalState::TimedOut(_) => classify_proxy_error_outcome(&ProxyError::Timeout, None),
+        TerminalState::Rejected(state) => match state.reason {
+            RejectionReason::AuthDenied => {
+                classify_admission_outcome(AdmissionOutcomeClass::AuthDenied)
+            }
+            RejectionReason::RateLimited => {
+                classify_admission_outcome(AdmissionOutcomeClass::RateLimited)
+            }
+            RejectionReason::Overloaded | RejectionReason::ResponsePrebufferCap => {
+                classify_admission_outcome(AdmissionOutcomeClass::OverloadShed {
+                    reason: state.snapshot.overload_reason.or(
+                        if matches!(state.reason, RejectionReason::ResponsePrebufferCap) {
+                            Some(OverloadShedReason::ResponsePrebufferCap)
+                        } else {
+                            None
+                        },
+                    ),
+                })
+            }
+            RejectionReason::AuthUnavailable
+            | RejectionReason::ValidationFailed
+            | RejectionReason::RequestBodyNotAllowed
+            | RejectionReason::RequestBodyTooLarge => infer_terminal_status(
+                &TerminalState::Rejected(crate::runtime::connection::stream::RejectedState {
+                    reason: state.reason,
+                    snapshot: state.snapshot.clone(),
+                }),
+            )
+            .map(classify_status_outcome)
+            .unwrap_or(RequestOutcomeDecision {
+                route_outcome: CanonicalRouteOutcome::UpstreamFailure,
+                backend_outcome: CanonicalBackendOutcome::UpstreamFailure,
+                overload_reason: None,
+                health_effect: HealthEffectHint::None,
+            }),
+        },
+        TerminalState::BackendFailed(state) => match state.reason {
+            BackendFailureReason::UpstreamTimeout => RequestOutcomeDecision {
+                route_outcome: CanonicalRouteOutcome::Timeout,
+                backend_outcome: CanonicalBackendOutcome::Timeout,
+                overload_reason: None,
+                health_effect: HealthEffectHint::Failure {
+                    reason: HealthFailureReason::Timeout,
+                },
+            },
+            BackendFailureReason::UpstreamTls => RequestOutcomeDecision {
+                route_outcome: CanonicalRouteOutcome::UpstreamFailure,
+                backend_outcome: CanonicalBackendOutcome::UpstreamFailure,
+                overload_reason: None,
+                health_effect: HealthEffectHint::None,
+            },
+            BackendFailureReason::UpstreamBridge => RequestOutcomeDecision {
+                route_outcome: CanonicalRouteOutcome::UpstreamFailure,
+                backend_outcome: CanonicalBackendOutcome::UpstreamFailure,
+                overload_reason: None,
+                health_effect: HealthEffectHint::None,
+            },
+            BackendFailureReason::UpstreamProtocol => RequestOutcomeDecision {
+                route_outcome: CanonicalRouteOutcome::UpstreamFailure,
+                backend_outcome: CanonicalBackendOutcome::UpstreamFailure,
+                overload_reason: None,
+                health_effect: HealthEffectHint::Failure {
+                    reason: HealthFailureReason::Transport,
+                },
+            },
+            BackendFailureReason::UpstreamTransport
+            | BackendFailureReason::DispatchSpawnFailed
+            | BackendFailureReason::UpstreamResultChannelDropped
+            | BackendFailureReason::ResponseWriteFailed
+            | BackendFailureReason::ResponseStreamAborted => RequestOutcomeDecision {
+                route_outcome: CanonicalRouteOutcome::UpstreamFailure,
+                backend_outcome: CanonicalBackendOutcome::UpstreamFailure,
+                overload_reason: None,
+                health_effect: HealthEffectHint::Failure {
+                    reason: HealthFailureReason::Transport,
+                },
+            },
+        },
+    }
+}
+
+pub(crate) fn observe_terminal_request_outcome(
+    metrics: &Metrics,
+    state: &TerminalState,
+) -> RequestOutcomeDecision {
+    let status = infer_terminal_status(state);
+    observe_request_outcome(
+        metrics,
+        terminal_route_target(state),
+        terminal_backend_target(state),
+        terminal_elapsed(state),
+        status,
+        classify_terminal_outcome(state),
+    )
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct BackendRequestFinishInput<'a> {
     pub(crate) upstream_pool: Option<&'a Arc<RwLock<UpstreamPool>>>,
@@ -413,6 +618,18 @@ pub(crate) fn finish_backend_request_accounting(input: BackendRequestFinishInput
     } = input;
 
     apply_backend_request_accounting(upstream_pool, backend_index, elapsed, status);
+}
+
+pub(crate) fn finalize_backend_request_cleanup(
+    input: BackendRequestFinishInput<'_>,
+    should_finalize: bool,
+) -> bool {
+    if should_finalize {
+        finish_backend_request_accounting(input);
+        true
+    } else {
+        false
+    }
 }
 
 pub(crate) fn observe_backend_response_status(

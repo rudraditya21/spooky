@@ -8,18 +8,27 @@ use std::{
 use bytes::Bytes;
 use spooky_config::config::{ForwardedHeaderPolicy, UpstreamHostPolicy};
 use spooky_lb::upstream_pool::UpstreamPool;
-use tokio::{
-    sync::{OwnedSemaphorePermit, mpsc, oneshot},
-    task::AbortHandle,
-};
+use tokio::sync::{mpsc, oneshot};
 use tracing::Span;
 
 use crate::{
-    resilience::{adaptive_admission::AdaptivePermit, route_queue::RouteQueuePermit},
+    Metrics, OverloadShedReason,
     runtime::connection::{
         auth::{ExternalAuthResult, PendingHeaderMutation},
+        outcome::{
+            BackendRequestFinishInput, finalize_backend_request_cleanup,
+            observe_terminal_request_outcome,
+        },
         response::{ResponseChunk, UpstreamResult},
-        stream::{StreamAdmissionState, StreamPhase, TunnelMode},
+        stream::{
+            AdmissionPermits, AdmittedState, AwaitingAuthState, AwaitingUpstreamState,
+            BackendAccountingState, BackendDispatchState, BackendFailureReason, CancellationReason,
+            CancelledState, CompletionReason, DispatchReadyState, RequestBodyRuntime,
+            RequestBodyState, RequestContext, RequestExecutionState, RequestMode,
+            ResponseBackpressureState, ResponseEmissionState, ResponseStreamingState,
+            StreamAdmissionState, StreamPhase, TerminalReason, TerminalSnapshot, TerminalState,
+            TimeoutReason, TunnelMode,
+        },
     },
 };
 
@@ -33,16 +42,6 @@ pub struct RequestEnvelope {
     pub method: String,
     pub path: String,
     pub authority: Option<String>,
-    /// Sender half of the body channel.  Dropping it signals end-of-body to hyper.
-    pub body_tx: Option<mpsc::Sender<Bytes>>,
-    /// Body chunks that arrived before the channel had capacity.
-    pub body_buf: VecDeque<Bytes>,
-    /// Current bytes held in `body_buf`.
-    pub body_buf_bytes: usize,
-    /// Total body bytes received on this stream (buffered + already forwarded).
-    pub body_bytes_received: usize,
-    /// Last observed request-body byte arrival time.
-    pub last_body_activity: Instant,
     /// Resolved backend address and index (for health marking on response).
     pub backend_addr: Option<String>,
     pub backend_index: Option<usize>,
@@ -55,12 +54,6 @@ pub struct RequestEnvelope {
     pub routing_transparency_enabled: bool,
     pub routing_transparency_include_reason: bool,
     pub response_status: Option<u16>,
-    pub backend_request_started: bool,
-    pub backend_request_finished: bool,
-    pub global_inflight_permit: Option<OwnedSemaphorePermit>,
-    pub upstream_inflight_permit: Option<OwnedSemaphorePermit>,
-    pub adaptive_admission_permit: Option<AdaptivePermit>,
-    pub route_queue_permit: Option<RouteQueuePermit>,
     pub start: Instant,
     pub total_request_deadline: Instant,
     pub bodyless_mode: bool,
@@ -68,36 +61,874 @@ pub struct RequestEnvelope {
 
     pub retry_count: u8,
     pub error_kind: Option<&'static str>,
-    /// Deferred request-building snapshot for async auth/admission handoff.
-    pub pending_forward: Option<Arc<PendingForward>>,
-    /// Receives the external auth decision once async auth completes.
-    pub(crate) auth_result_rx: Option<oneshot::Receiver<ExternalAuthResult>>,
-    /// Aborts the detached external auth task when the stream is cancelled.
-    pub auth_abort: Option<AbortHandle>,
-    /// Whether auth transport errors and timeouts should allow the request.
-    pub auth_fail_open: bool,
-    /// Deadline for the external auth decision, when auth is running asynchronously.
-    pub auth_deadline: Option<Instant>,
-
-    /// Current lifecycle phase of this stream.
-    pub phase: StreamPhase,
-    /// Current auth/admission state of this stream.
-    pub admission_state: StreamAdmissionState,
-    /// True once the client has sent FIN on the request stream.
-    pub request_fin_received: bool,
-    /// Receives the upstream H2 response (status, headers, body stream).
-    pub(crate) upstream_result_rx: Option<oneshot::Receiver<UpstreamResult>>,
-    /// Receives response body chunks to write back over QUIC.
-    pub(crate) response_chunk_rx: Option<mpsc::Receiver<ResponseChunk>>,
-    /// True once downstream response headers are emitted on this stream.
-    pub response_headers_sent: bool,
-    /// A chunk that could not be written due to QUIC send backpressure; retried next poll.
-    pub(crate) pending_chunk: Option<ResponseChunk>,
+    pub terminal_overload_reason: Option<OverloadShedReason>,
+    pub terminal_outcome_recorded: bool,
+    pub execution: RequestExecutionState,
 }
 
 impl RequestEnvelope {
     pub fn request_id(&self) -> u64 {
         self.request_id
+    }
+
+    pub fn set_terminal_overload_reason(&mut self, reason: Option<OverloadShedReason>) {
+        self.terminal_overload_reason = reason;
+    }
+
+    pub(crate) fn from_dispatch_ready_state(
+        state: DispatchReadyState,
+        upstream_pool: Arc<RwLock<UpstreamPool>>,
+        routing_transparency_enabled: bool,
+        routing_transparency_include_reason: bool,
+        retry_count: u8,
+        error_kind: Option<&'static str>,
+    ) -> Self {
+        let DispatchReadyState {
+            context,
+            routing,
+            request_mode,
+            request_body: _,
+            request_body_runtime: _,
+            pending_forward: _,
+        } = &state;
+
+        Self {
+            request_id: context.request_id,
+            trace_id: context.trace_id.clone(),
+            span_id: context.span_id.clone(),
+            traceparent: context.traceparent.clone(),
+            trace_span: context.trace_span.clone(),
+            method: context.method.clone(),
+            path: context.path.clone(),
+            authority: context.authority.clone(),
+            backend_addr: Some(routing.backend_addr.clone()),
+            backend_index: Some(routing.backend_index),
+            upstream_name: Some(routing.upstream_name.clone()),
+            route_reason: Some(routing.route_reason.clone()),
+            route_path_len: Some(routing.route_path_len),
+            route_host_specific: Some(routing.route_host_specific),
+            backend_lb: routing.backend_lb.clone(),
+            upstream_pool: Some(upstream_pool),
+            routing_transparency_enabled,
+            routing_transparency_include_reason,
+            response_status: None,
+            start: context.start,
+            total_request_deadline: context.total_request_deadline,
+            bodyless_mode: request_mode.bodyless_mode(),
+            tunnel_mode: request_mode.tunnel_mode(),
+            retry_count,
+            error_kind,
+            terminal_overload_reason: None,
+            terminal_outcome_recorded: false,
+            execution: RequestExecutionState::DispatchReady(state),
+        }
+    }
+
+    pub(crate) fn from_awaiting_auth_state(
+        state: AwaitingAuthState,
+        upstream_pool: Arc<RwLock<UpstreamPool>>,
+        routing_transparency_enabled: bool,
+        routing_transparency_include_reason: bool,
+        retry_count: u8,
+        error_kind: Option<&'static str>,
+    ) -> Self {
+        let AwaitingAuthState {
+            context,
+            routing,
+            request_mode,
+            request_body: _,
+            request_body_runtime: _,
+            pending_forward: _,
+            auth_result_rx: _,
+            auth_abort: _,
+            auth_deadline: _,
+            auth_disposition: _,
+        } = &state;
+
+        Self {
+            request_id: context.request_id,
+            trace_id: context.trace_id.clone(),
+            span_id: context.span_id.clone(),
+            traceparent: context.traceparent.clone(),
+            trace_span: context.trace_span.clone(),
+            method: context.method.clone(),
+            path: context.path.clone(),
+            authority: context.authority.clone(),
+            backend_addr: Some(routing.backend_addr.clone()),
+            backend_index: Some(routing.backend_index),
+            upstream_name: Some(routing.upstream_name.clone()),
+            route_reason: Some(routing.route_reason.clone()),
+            route_path_len: Some(routing.route_path_len),
+            route_host_specific: Some(routing.route_host_specific),
+            backend_lb: routing.backend_lb.clone(),
+            upstream_pool: Some(upstream_pool),
+            routing_transparency_enabled,
+            routing_transparency_include_reason,
+            response_status: None,
+            start: context.start,
+            total_request_deadline: context.total_request_deadline,
+            bodyless_mode: request_mode.bodyless_mode(),
+            tunnel_mode: request_mode.tunnel_mode(),
+            retry_count,
+            error_kind,
+            terminal_overload_reason: None,
+            terminal_outcome_recorded: false,
+            execution: RequestExecutionState::AwaitingAuth(state),
+        }
+    }
+
+    pub fn mark_terminal_outcome_recorded(&mut self) {
+        self.terminal_outcome_recorded = true;
+    }
+
+    pub fn phase(&self) -> StreamPhase {
+        self.execution.phase()
+    }
+
+    pub fn admission_state(&self) -> StreamAdmissionState {
+        self.execution.admission_state()
+    }
+
+    pub fn request_fin_received(&self) -> bool {
+        self.request_body_state().request_fin_received()
+    }
+
+    pub fn set_request_fin_received(&mut self, value: bool) {
+        self.request_body_runtime_mut().request_fin_received = value;
+    }
+
+    pub fn request_mode(&self) -> RequestMode {
+        match &self.execution {
+            RequestExecutionState::Intake(state) => state.request_mode,
+            RequestExecutionState::AwaitingAuth(state) => state.request_mode,
+            RequestExecutionState::DispatchReady(state) => state.request_mode,
+            RequestExecutionState::Admitted(state) => state.request_mode,
+            RequestExecutionState::AwaitingUpstream(state) => state.request_mode,
+            RequestExecutionState::StreamingResponse(state) => state.request_mode,
+            RequestExecutionState::Terminal(state) => terminal_request_mode(state),
+        }
+    }
+
+    pub fn request_body_state(&self) -> RequestBodyState {
+        match &self.execution {
+            RequestExecutionState::Intake(state) => state.request_body,
+            RequestExecutionState::AwaitingAuth(state) => state.request_body,
+            RequestExecutionState::DispatchReady(state) => state.request_body,
+            RequestExecutionState::Admitted(state) => state.request_body,
+            RequestExecutionState::AwaitingUpstream(state) => state.request_body,
+            RequestExecutionState::StreamingResponse(_) => RequestBodyState::from_runtime(
+                self.request_body_runtime().request_fin_received,
+                !self.request_body_runtime().body_buf.is_empty(),
+                self.body_tx().is_some(),
+            ),
+            RequestExecutionState::Terminal(state) => terminal_request_mode(state)
+                .initial_body_state()
+                .on_forward_closed(),
+        }
+    }
+
+    pub fn set_request_body_state(&mut self, next: RequestBodyState) {
+        self.request_body_runtime_mut().request_fin_received = next.request_fin_received();
+        match &mut self.execution {
+            RequestExecutionState::Intake(state) => state.request_body = next,
+            RequestExecutionState::AwaitingAuth(state) => state.request_body = next,
+            RequestExecutionState::DispatchReady(state) => state.request_body = next,
+            RequestExecutionState::Admitted(state) => state.request_body = next,
+            RequestExecutionState::AwaitingUpstream(state) => state.request_body = next,
+            RequestExecutionState::StreamingResponse(_) | RequestExecutionState::Terminal(_) => {}
+        }
+    }
+
+    pub fn refresh_request_body_state(&mut self) -> RequestBodyState {
+        let next = RequestBodyState::from_runtime(
+            self.request_body_runtime().request_fin_received,
+            !self.request_body_runtime().body_buf.is_empty(),
+            self.body_tx().is_some(),
+        );
+        self.set_request_body_state(next);
+        next
+    }
+
+    pub fn transition_request_body_buffered(&mut self) -> RequestBodyState {
+        let next = self.request_body_state().on_buffered();
+        self.set_request_body_state(next);
+        next
+    }
+
+    pub fn transition_request_body_finished(&mut self) -> RequestBodyState {
+        let next = self.request_body_state().on_downstream_finished();
+        self.set_request_body_state(next);
+        next
+    }
+
+    pub fn transition_request_body_forward_closed(&mut self) -> RequestBodyState {
+        self.clear_body_tx();
+        self.refresh_request_body_state()
+    }
+
+    pub fn should_close_request_body_forwarding(&self) -> bool {
+        matches!(self.request_body_state(), RequestBodyState::FinReceived)
+            && self.body_buf().is_empty()
+            && self.body_tx().is_some()
+    }
+
+    pub fn can_accept_request_body(&self) -> bool {
+        self.execution.can_accept_request_body()
+    }
+
+    pub fn can_poll_upstream(&self) -> bool {
+        self.execution.can_poll_upstream()
+    }
+
+    pub fn can_poll_upstream_result(&self) -> bool {
+        match &self.execution {
+            RequestExecutionState::AwaitingUpstream(_) => {
+                self.has_upstream_result_rx() && self.execution.can_poll_upstream()
+            }
+            _ => false,
+        }
+    }
+
+    pub fn total_request_timeout_reason(&self) -> TimeoutReason {
+        match &self.execution {
+            RequestExecutionState::AwaitingAuth(_) => TimeoutReason::ExternalAuth,
+            RequestExecutionState::StreamingResponse(_) => TimeoutReason::ResponseBodyTotal,
+            RequestExecutionState::AwaitingUpstream(state) => {
+                Self::pre_response_timeout_reason(state.request_mode, state.request_body)
+            }
+            RequestExecutionState::DispatchReady(state) => {
+                Self::pre_response_timeout_reason(state.request_mode, state.request_body)
+            }
+            RequestExecutionState::Admitted(state) => {
+                Self::pre_response_timeout_reason(state.request_mode, state.request_body)
+            }
+            RequestExecutionState::Intake(_) => TimeoutReason::RequestBodyTotal,
+            RequestExecutionState::Terminal(state) => match state {
+                TerminalState::TimedOut(state) => state.reason,
+                _ => TimeoutReason::TotalRequest,
+            },
+        }
+    }
+
+    /// For pre-response states, requests still reading the client body time out
+    /// under the request-body bucket; once intake is complete (or for tunnels)
+    /// they time out under the await-upstream bucket.
+    fn pre_response_timeout_reason(
+        request_mode: RequestMode,
+        request_body: RequestBodyState,
+    ) -> TimeoutReason {
+        if request_mode.is_tunnel() || request_body.request_fin_received() {
+            TimeoutReason::AwaitingUpstream
+        } else {
+            TimeoutReason::RequestBodyTotal
+        }
+    }
+
+    pub fn upstream_timeout_reason(&self) -> TimeoutReason {
+        match &self.execution {
+            RequestExecutionState::StreamingResponse(_) => TimeoutReason::ResponseBodyTotal,
+            RequestExecutionState::AwaitingUpstream(_)
+            | RequestExecutionState::DispatchReady(_)
+            | RequestExecutionState::Admitted(_)
+            | RequestExecutionState::AwaitingAuth(_) => TimeoutReason::AwaitingUpstream,
+            RequestExecutionState::Intake(_) | RequestExecutionState::Terminal(_) => {
+                TimeoutReason::AwaitingUpstream
+            }
+        }
+    }
+
+    pub fn body_tx(&self) -> Option<&mpsc::Sender<Bytes>> {
+        match &self.execution {
+            RequestExecutionState::AwaitingUpstream(state) => state.dispatch.body_tx.as_ref(),
+            _ => None,
+        }
+    }
+
+    pub fn clear_body_tx(&mut self) {
+        if let RequestExecutionState::AwaitingUpstream(state) = &mut self.execution {
+            state.dispatch.body_tx = None;
+        }
+        self.refresh_request_body_state();
+    }
+
+    pub fn body_buf(&self) -> &VecDeque<Bytes> {
+        &self.request_body_runtime().body_buf
+    }
+
+    pub fn body_buf_mut(&mut self) -> &mut VecDeque<Bytes> {
+        &mut self.request_body_runtime_mut().body_buf
+    }
+
+    pub fn body_buf_bytes(&self) -> usize {
+        self.request_body_runtime().body_buf_bytes
+    }
+
+    pub fn set_body_buf_bytes(&mut self, value: usize) {
+        self.request_body_runtime_mut().body_buf_bytes = value;
+    }
+
+    pub fn body_bytes_received(&self) -> usize {
+        self.request_body_runtime().body_bytes_received
+    }
+
+    pub fn set_body_bytes_received(&mut self, value: usize) {
+        self.request_body_runtime_mut().body_bytes_received = value;
+    }
+
+    pub fn last_body_activity(&self) -> Instant {
+        self.request_body_runtime().last_body_activity
+    }
+
+    pub fn set_last_body_activity(&mut self, value: Instant) {
+        self.request_body_runtime_mut().last_body_activity = value;
+    }
+
+    pub fn pending_forward(&self) -> Option<&Arc<PendingForward>> {
+        match &self.execution {
+            RequestExecutionState::AwaitingAuth(state) => Some(&state.pending_forward),
+            RequestExecutionState::DispatchReady(state) => Some(&state.pending_forward),
+            RequestExecutionState::Admitted(state) => Some(&state.pending_forward),
+            RequestExecutionState::AwaitingUpstream(state) => Some(&state.pending_forward),
+            RequestExecutionState::Intake(_)
+            | RequestExecutionState::StreamingResponse(_)
+            | RequestExecutionState::Terminal(_) => None,
+        }
+    }
+
+    pub fn pending_forward_mut(&mut self) -> Option<&mut Arc<PendingForward>> {
+        match &mut self.execution {
+            RequestExecutionState::AwaitingAuth(state) => Some(&mut state.pending_forward),
+            RequestExecutionState::DispatchReady(state) => Some(&mut state.pending_forward),
+            RequestExecutionState::Admitted(state) => Some(&mut state.pending_forward),
+            RequestExecutionState::AwaitingUpstream(state) => Some(&mut state.pending_forward),
+            RequestExecutionState::Intake(_)
+            | RequestExecutionState::StreamingResponse(_)
+            | RequestExecutionState::Terminal(_) => None,
+        }
+    }
+
+    pub(crate) fn poll_awaiting_auth_non_blocking(
+        &mut self,
+        now: Instant,
+    ) -> Option<ExternalAuthResult> {
+        match &mut self.execution {
+            RequestExecutionState::AwaitingAuth(state) => state.poll_non_blocking(now),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn upstream_result_rx_mut(
+        &mut self,
+    ) -> Option<&mut oneshot::Receiver<UpstreamResult>> {
+        match &mut self.execution {
+            RequestExecutionState::AwaitingUpstream(state) => {
+                Some(&mut state.dispatch.upstream_result_rx)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn clear_upstream_result_rx(&mut self) {}
+
+    pub(crate) fn response_chunk_rx_mut(&mut self) -> Option<&mut mpsc::Receiver<ResponseChunk>> {
+        match &mut self.execution {
+            RequestExecutionState::StreamingResponse(state) => Some(&mut state.response_chunk_rx),
+            _ => None,
+        }
+    }
+
+    pub fn clear_response_chunk_rx(&mut self) {}
+
+    pub fn has_upstream_result_rx(&self) -> bool {
+        matches!(&self.execution, RequestExecutionState::AwaitingUpstream(_))
+    }
+
+    pub fn has_response_chunk_rx(&self) -> bool {
+        matches!(&self.execution, RequestExecutionState::StreamingResponse(_))
+    }
+
+    pub fn response_headers_sent(&self) -> bool {
+        match &self.execution {
+            RequestExecutionState::StreamingResponse(state) => {
+                !matches!(state.emission, ResponseEmissionState::DeferredHeaders)
+            }
+            _ => false,
+        }
+    }
+
+    pub fn set_response_headers_sent(&mut self, sent: bool) {
+        if let RequestExecutionState::StreamingResponse(state) = &mut self.execution {
+            state.emission = if sent {
+                ResponseEmissionState::HeadersSent
+            } else {
+                ResponseEmissionState::DeferredHeaders
+            };
+        }
+    }
+
+    pub(crate) fn take_pending_chunk(&mut self) -> Option<ResponseChunk> {
+        match &mut self.execution {
+            RequestExecutionState::StreamingResponse(state) => {
+                match std::mem::replace(&mut state.backpressure, ResponseBackpressureState::Ready) {
+                    ResponseBackpressureState::Ready => None,
+                    ResponseBackpressureState::Blocked(chunk) => Some(chunk),
+                }
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn set_pending_chunk(&mut self, chunk: Option<ResponseChunk>) {
+        if let RequestExecutionState::StreamingResponse(state) = &mut self.execution {
+            state.backpressure = match chunk {
+                Some(chunk) => ResponseBackpressureState::Blocked(chunk),
+                None => ResponseBackpressureState::Ready,
+            };
+        }
+    }
+
+    pub fn has_pending_chunk(&self) -> bool {
+        match &self.execution {
+            RequestExecutionState::StreamingResponse(state) => {
+                matches!(state.backpressure, ResponseBackpressureState::Blocked(_))
+            }
+            _ => false,
+        }
+    }
+
+    pub fn response_emission_state(&self) -> Option<ResponseEmissionState> {
+        match &self.execution {
+            RequestExecutionState::StreamingResponse(state) => Some(state.emission),
+            _ => None,
+        }
+    }
+
+    pub fn set_response_emission_state(&mut self, emission: ResponseEmissionState) {
+        if let RequestExecutionState::StreamingResponse(state) = &mut self.execution {
+            state.emission = emission;
+        }
+    }
+
+    pub fn backend_request_started(&self) -> bool {
+        match &self.execution {
+            RequestExecutionState::Admitted(_) => false,
+            RequestExecutionState::AwaitingUpstream(_)
+            | RequestExecutionState::StreamingResponse(_) => true,
+            _ => false,
+        }
+    }
+
+    pub fn backend_request_finished(&self) -> bool {
+        match &self.execution {
+            RequestExecutionState::AwaitingUpstream(state) => {
+                state.dispatch.backend_accounting.finalized
+            }
+            RequestExecutionState::StreamingResponse(state) => state.backend_accounting.finalized,
+            _ => false,
+        }
+    }
+
+    pub fn set_backend_request_state(&mut self, started: bool, finished: bool) {
+        match &mut self.execution {
+            RequestExecutionState::AwaitingUpstream(state) => {
+                state.dispatch.backend_accounting.finalized = started && finished;
+            }
+            RequestExecutionState::StreamingResponse(state) => {
+                state.backend_accounting.finalized = started && finished;
+            }
+            _ => {}
+        }
+    }
+
+    pub fn has_global_inflight_permit(&self) -> bool {
+        matches!(
+            &self.execution,
+            RequestExecutionState::Admitted(_)
+                | RequestExecutionState::AwaitingUpstream(_)
+                | RequestExecutionState::StreamingResponse(_)
+        )
+    }
+
+    pub fn has_upstream_inflight_permit(&self) -> bool {
+        matches!(
+            &self.execution,
+            RequestExecutionState::Admitted(_)
+                | RequestExecutionState::AwaitingUpstream(_)
+                | RequestExecutionState::StreamingResponse(_)
+        )
+    }
+
+    pub fn has_adaptive_admission_permit(&self) -> bool {
+        matches!(
+            &self.execution,
+            RequestExecutionState::Admitted(_)
+                | RequestExecutionState::AwaitingUpstream(_)
+                | RequestExecutionState::StreamingResponse(_)
+        )
+    }
+
+    pub fn has_route_queue_permit(&self) -> bool {
+        matches!(
+            &self.execution,
+            RequestExecutionState::Admitted(_)
+                | RequestExecutionState::AwaitingUpstream(_)
+                | RequestExecutionState::StreamingResponse(_)
+        )
+    }
+
+    pub(crate) fn transition_to_admitted(&mut self, permits: AdmissionPermits) {
+        let snapshot = self.terminal_snapshot();
+        let state = match std::mem::replace(
+            &mut self.execution,
+            RequestExecutionState::Terminal(TerminalState::Cancelled(CancelledState {
+                reason: CancellationReason::OperatorAbort,
+                snapshot,
+            })),
+        ) {
+            RequestExecutionState::DispatchReady(state) => state,
+            other => {
+                self.execution = other;
+                panic!("admission transition attempted outside DispatchReady state");
+            }
+        };
+        self.execution = RequestExecutionState::Admitted(AdmittedState {
+            context: state.context,
+            routing: state.routing,
+            request_mode: state.request_mode,
+            request_body: state.request_body,
+            request_body_runtime: state.request_body_runtime,
+            pending_forward: state.pending_forward,
+            permits,
+        });
+    }
+
+    pub(crate) fn transition_admitted_to_awaiting_upstream(
+        &mut self,
+        body_tx: Option<mpsc::Sender<Bytes>>,
+        upstream_result_rx: oneshot::Receiver<UpstreamResult>,
+    ) {
+        let snapshot = self.terminal_snapshot();
+        let admitted = match std::mem::replace(
+            &mut self.execution,
+            RequestExecutionState::Terminal(TerminalState::Cancelled(CancelledState {
+                reason: CancellationReason::OperatorAbort,
+                snapshot,
+            })),
+        ) {
+            RequestExecutionState::Admitted(state) => state,
+            other => {
+                self.execution = other;
+                panic!("dispatch transition attempted outside Admitted state");
+            }
+        };
+        let dispatch_body_tx = if admitted.request_body_runtime.request_fin_received
+            && admitted.request_body_runtime.body_buf.is_empty()
+        {
+            None
+        } else {
+            body_tx
+        };
+        let backend_accounting = BackendAccountingState {
+            response_status: None,
+            finalized: false,
+        };
+        let AdmittedState {
+            context,
+            routing,
+            request_mode,
+            request_body: _,
+            request_body_runtime,
+            pending_forward,
+            permits,
+        } = admitted;
+        let request_body = RequestBodyState::from_runtime(
+            request_body_runtime.request_fin_received,
+            !request_body_runtime.body_buf.is_empty(),
+            dispatch_body_tx.is_some(),
+        );
+        self.execution = RequestExecutionState::AwaitingUpstream(AwaitingUpstreamState {
+            context,
+            routing,
+            request_mode,
+            request_body,
+            request_body_runtime,
+            pending_forward,
+            permits,
+            dispatch: BackendDispatchState {
+                body_tx: dispatch_body_tx,
+                upstream_result_rx,
+                backend_accounting,
+            },
+        });
+    }
+
+    pub(crate) fn transition_to_streaming_response(
+        &mut self,
+        response_chunk_rx: mpsc::Receiver<ResponseChunk>,
+        emission: ResponseEmissionState,
+        final_status: http::StatusCode,
+    ) {
+        let snapshot = self.terminal_snapshot();
+        match std::mem::replace(
+            &mut self.execution,
+            RequestExecutionState::Terminal(TerminalState::Cancelled(CancelledState {
+                reason: CancellationReason::OperatorAbort,
+                snapshot,
+            })),
+        ) {
+            RequestExecutionState::AwaitingUpstream(state) => {
+                self.execution = RequestExecutionState::StreamingResponse(ResponseStreamingState {
+                    context: state.context,
+                    routing: state.routing,
+                    request_mode: state.request_mode,
+                    request_body_runtime: state.request_body_runtime,
+                    permits: state.permits,
+                    final_status,
+                    emission,
+                    response_chunk_rx,
+                    backpressure: ResponseBackpressureState::Ready,
+                    backend_accounting: state.dispatch.backend_accounting,
+                });
+            }
+            other => {
+                self.execution = other;
+                panic!("streaming transition attempted from unsupported execution state");
+            }
+        }
+    }
+
+    pub(crate) fn transition_streaming_to_completed(
+        &mut self,
+        reason: CompletionReason,
+        metrics: &Metrics,
+    ) {
+        self.transition_to_terminal_with_cleanup(TerminalReason::Completed(reason), metrics);
+    }
+
+    pub(crate) fn transition_streaming_to_backend_failed(
+        &mut self,
+        reason: BackendFailureReason,
+        metrics: &Metrics,
+    ) {
+        self.transition_to_terminal_with_cleanup(TerminalReason::BackendFailed(reason), metrics);
+    }
+
+    pub(crate) fn transition_streaming_to_timed_out(
+        &mut self,
+        reason: TimeoutReason,
+        metrics: &Metrics,
+    ) {
+        self.transition_to_terminal_with_cleanup(TerminalReason::TimedOut(reason), metrics);
+    }
+
+    pub fn transition_to_terminal(
+        &mut self,
+        terminal: crate::runtime::connection::stream::TerminalState,
+    ) {
+        self.execution = RequestExecutionState::Terminal(terminal);
+    }
+
+    pub(crate) fn transition_awaiting_auth_to_dispatch_ready<I>(&mut self, mutations: I)
+    where
+        I: IntoIterator<Item = PendingHeaderMutation>,
+    {
+        let state = match self.take_awaiting_auth_state() {
+            Some(state) => {
+                let mut state = state;
+                crate::runtime::connection::auth::merge_auth_request_mutations(
+                    &mut Arc::make_mut(&mut state.pending_forward).auth_header_mutations,
+                    mutations,
+                );
+                state
+            }
+            None => panic!("awaiting-auth transition attempted outside AwaitingAuth state"),
+        };
+        self.execution = RequestExecutionState::DispatchReady(DispatchReadyState {
+            context: state.context,
+            routing: state.routing,
+            request_mode: state.request_mode,
+            request_body: state.request_body,
+            request_body_runtime: state.request_body_runtime,
+            pending_forward: state.pending_forward,
+        });
+    }
+
+    pub(crate) fn take_awaiting_auth_state(&mut self) -> Option<AwaitingAuthState> {
+        let placeholder =
+            RequestExecutionState::Terminal(TerminalState::Cancelled(CancelledState {
+                reason: CancellationReason::OperatorAbort,
+                snapshot: self.terminal_snapshot(),
+            }));
+        match std::mem::replace(&mut self.execution, placeholder) {
+            RequestExecutionState::AwaitingAuth(state) => {
+                state.auth_abort.abort();
+                Some(state)
+            }
+            other => {
+                self.execution = other;
+                None
+            }
+        }
+    }
+
+    pub(crate) fn transition_to_terminal_with_cleanup(
+        &mut self,
+        reason: TerminalReason,
+        metrics: &Metrics,
+    ) -> StreamPhase {
+        let prior_phase = self.phase();
+        if self.execution.is_terminal() {
+            return prior_phase;
+        }
+
+        let snapshot = self.terminal_snapshot();
+        let terminal_state = reason.into_terminal_state(snapshot.clone());
+        if !self.terminal_outcome_recorded {
+            let _ = observe_terminal_request_outcome(metrics, &terminal_state);
+            self.terminal_outcome_recorded = true;
+        }
+        let should_finalize_backend = self.execution.should_finalize_backend_accounting();
+        let buffered_body_bytes = Self::buffered_request_body_bytes(&self.execution);
+        let finalize_status = reason
+            .terminal_status(&snapshot)
+            .or(snapshot.response_status)
+            .map(|status| status.as_u16())
+            .or(Some(503));
+
+        let placeholder =
+            RequestExecutionState::Terminal(TerminalState::Cancelled(CancelledState {
+                reason: CancellationReason::OperatorAbort,
+                snapshot: snapshot.clone(),
+            }));
+        let prior_execution = std::mem::replace(&mut self.execution, placeholder);
+
+        if let RequestExecutionState::AwaitingAuth(state) = &prior_execution {
+            state.auth_abort.abort();
+        }
+
+        if should_finalize_backend {
+            let _ = finalize_backend_request_cleanup(
+                BackendRequestFinishInput {
+                    upstream_pool: self.upstream_pool.as_ref(),
+                    backend_index: self.backend_index,
+                    elapsed: self.start.elapsed(),
+                    status: finalize_status,
+                },
+                true,
+            );
+        }
+
+        if buffered_body_bytes > 0 {
+            metrics.release_request_buffer(buffered_body_bytes);
+        }
+
+        self.execution = RequestExecutionState::Terminal(terminal_state);
+        prior_phase
+    }
+
+    fn request_body_runtime(&self) -> &RequestBodyRuntime {
+        match &self.execution {
+            RequestExecutionState::Intake(_) => {
+                panic!("request body runtime unavailable in intake state")
+            }
+            RequestExecutionState::AwaitingAuth(state) => &state.request_body_runtime,
+            RequestExecutionState::DispatchReady(state) => &state.request_body_runtime,
+            RequestExecutionState::Admitted(state) => &state.request_body_runtime,
+            RequestExecutionState::AwaitingUpstream(state) => &state.request_body_runtime,
+            RequestExecutionState::StreamingResponse(state) => &state.request_body_runtime,
+            RequestExecutionState::Terminal(_) => {
+                panic!("request body runtime unavailable in current execution state")
+            }
+        }
+    }
+
+    fn request_body_runtime_mut(&mut self) -> &mut RequestBodyRuntime {
+        match &mut self.execution {
+            RequestExecutionState::Intake(_) => {
+                panic!("request body runtime mutation unavailable in intake state")
+            }
+            RequestExecutionState::AwaitingAuth(state) => &mut state.request_body_runtime,
+            RequestExecutionState::DispatchReady(state) => &mut state.request_body_runtime,
+            RequestExecutionState::Admitted(state) => &mut state.request_body_runtime,
+            RequestExecutionState::AwaitingUpstream(state) => &mut state.request_body_runtime,
+            RequestExecutionState::StreamingResponse(state) => &mut state.request_body_runtime,
+            RequestExecutionState::Terminal(_) => {
+                panic!("request body runtime mutation unavailable in current execution state")
+            }
+        }
+    }
+
+    fn buffered_request_body_bytes(execution: &RequestExecutionState) -> usize {
+        match execution {
+            RequestExecutionState::AwaitingAuth(state) => state.request_body_runtime.body_buf_bytes,
+            RequestExecutionState::DispatchReady(state) => {
+                state.request_body_runtime.body_buf_bytes
+            }
+            RequestExecutionState::Admitted(state) => state.request_body_runtime.body_buf_bytes,
+            RequestExecutionState::AwaitingUpstream(state) => {
+                state.request_body_runtime.body_buf_bytes
+            }
+            RequestExecutionState::StreamingResponse(state) => {
+                state.request_body_runtime.body_buf_bytes
+            }
+            RequestExecutionState::Intake(_) | RequestExecutionState::Terminal(_) => 0,
+        }
+    }
+
+    fn terminal_snapshot(&self) -> TerminalSnapshot {
+        let routing = match &self.execution {
+            RequestExecutionState::AwaitingAuth(state) => Some(state.routing.clone()),
+            RequestExecutionState::DispatchReady(state) => Some(state.routing.clone()),
+            RequestExecutionState::Admitted(state) => Some(state.routing.clone()),
+            RequestExecutionState::AwaitingUpstream(state) => Some(state.routing.clone()),
+            RequestExecutionState::StreamingResponse(state) => Some(state.routing.clone()),
+            RequestExecutionState::Intake(_) => None,
+            RequestExecutionState::Terminal(state) => match state {
+                TerminalState::Completed(state) => state.snapshot.routing.clone(),
+                TerminalState::Cancelled(state) => state.snapshot.routing.clone(),
+                TerminalState::TimedOut(state) => state.snapshot.routing.clone(),
+                TerminalState::Rejected(state) => state.snapshot.routing.clone(),
+                TerminalState::BackendFailed(state) => state.snapshot.routing.clone(),
+            },
+        };
+
+        TerminalSnapshot {
+            context: RequestContext {
+                request_id: self.request_id,
+                trace_id: self.trace_id.clone(),
+                span_id: self.span_id.clone(),
+                traceparent: self.traceparent.clone(),
+                trace_span: self.trace_span.clone(),
+                method: self.method.clone(),
+                path: self.path.clone(),
+                authority: self.authority.clone(),
+                start: self.start,
+                total_request_deadline: self.total_request_deadline,
+            },
+            routing,
+            request_mode: RequestMode::from_intake(self.tunnel_mode, &self.method, None),
+            response_status: self
+                .response_status
+                .and_then(|status| http::StatusCode::from_u16(status).ok()),
+            overload_reason: self.terminal_overload_reason,
+            backend_accounting: match &self.execution {
+                RequestExecutionState::AwaitingUpstream(state) => {
+                    Some(state.dispatch.backend_accounting)
+                }
+                RequestExecutionState::StreamingResponse(state) => Some(state.backend_accounting),
+                _ => None,
+            },
+        }
+    }
+}
+
+fn terminal_request_mode(state: &TerminalState) -> RequestMode {
+    match state {
+        TerminalState::Completed(state) => state.snapshot.request_mode,
+        TerminalState::Cancelled(state) => state.snapshot.request_mode,
+        TerminalState::TimedOut(state) => state.snapshot.request_mode,
+        TerminalState::Rejected(state) => state.snapshot.request_mode,
+        TerminalState::BackendFailed(state) => state.snapshot.request_mode,
     }
 }
 

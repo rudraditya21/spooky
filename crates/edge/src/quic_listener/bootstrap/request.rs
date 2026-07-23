@@ -40,6 +40,91 @@ use super::{
 };
 use crate::runtime::connection::outcome::AdmissionOutcomeClass;
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::quic_listener) enum BootstrapLifecycleStage {
+    Intake,
+    Validate,
+    ResolveRoute,
+    AdmitOrReject,
+    Dispatch,
+    WriteResponse,
+    Terminalize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::quic_listener) enum BootstrapRequestMode {
+    Standard,
+    WebsocketUpgrade,
+}
+
+impl BootstrapRequestMode {
+    pub(in crate::quic_listener) fn is_websocket_upgrade(self) -> bool {
+        matches!(self, Self::WebsocketUpgrade)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::quic_listener) enum BootstrapRejectionReason {
+    ValidationFailed,
+    AuthDenied,
+    RateLimited,
+    Overloaded,
+    RequestBodyTooLarge,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::quic_listener) enum BootstrapBackendFailureReason {
+    RouteResolutionFailed,
+    MissingEndpoint,
+    RequestBuildFailed,
+    DispatchFailed,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::quic_listener) enum BootstrapTimeoutReason {
+    Upstream,
+    ResponseBody,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::quic_listener) enum BootstrapTerminalOutcome {
+    AcceptedStandardResponse,
+    AcceptedWebsocketUpgrade,
+    Rejected(BootstrapRejectionReason),
+    BackendFailed(BootstrapBackendFailureReason),
+    TimedOut(BootstrapTimeoutReason),
+}
+
+#[allow(dead_code)]
+pub(in crate::quic_listener) struct BootstrapTerminalResponse {
+    pub(in crate::quic_listener) stage: BootstrapLifecycleStage,
+    pub(in crate::quic_listener) outcome: BootstrapTerminalOutcome,
+    pub(in crate::quic_listener) response: Response<BoxBody<Bytes, Infallible>>,
+}
+
+impl BootstrapTerminalResponse {
+    pub(in crate::quic_listener) fn new(
+        stage: BootstrapLifecycleStage,
+        outcome: BootstrapTerminalOutcome,
+        response: Response<BoxBody<Bytes, Infallible>>,
+    ) -> Box<Self> {
+        Box::new(Self {
+            stage,
+            outcome,
+            response,
+        })
+    }
+
+    pub(in crate::quic_listener) fn into_response(self) -> Response<BoxBody<Bytes, Infallible>> {
+        self.response
+    }
+}
+
+pub(in crate::quic_listener) type BootstrapTerminalResult<T> =
+    Result<T, Box<BootstrapTerminalResponse>>;
+
 pub(in crate::quic_listener) struct BootstrapPreparedRoute {
     pub(in crate::quic_listener) endpoint: BackendEndpoint,
     pub(in crate::quic_listener) backend_addr: String,
@@ -141,7 +226,7 @@ fn resolve_scoped_rate_limit_key_for_bootstrap(
 
 pub(in crate::quic_listener) fn evaluate_bootstrap_request_policy(
     input: BootstrapPolicyEvaluationInput<'_>,
-) -> Result<BootstrapPreparedRoute, Box<Response<BoxBody<Bytes, Infallible>>>> {
+) -> BootstrapTerminalResult<BootstrapPreparedRoute> {
     let lb_header_lookup = |name: &str| {
         input
             .headers
@@ -164,11 +249,13 @@ pub(in crate::quic_listener) fn evaluate_bootstrap_request_policy(
         Ok(value) => value,
         Err(err) => {
             let (status, body) = QUICListener::bootstrap_route_resolution_error_response(&err);
-            return Err(Box::new(bootstrap_error_response(
-                &input.request_ctx.runtime.alt_svc,
-                status,
-                body,
-            )));
+            return Err(BootstrapTerminalResponse::new(
+                BootstrapLifecycleStage::ResolveRoute,
+                BootstrapTerminalOutcome::BackendFailed(
+                    BootstrapBackendFailureReason::RouteResolutionFailed,
+                ),
+                bootstrap_error_response(&input.request_ctx.runtime.alt_svc, status, body),
+            ));
         }
     };
 
@@ -228,20 +315,26 @@ pub(in crate::quic_listener) fn evaluate_bootstrap_request_policy(
                     "Bootstrap request route={} missing admission rejection response for unauthorized decision",
                     resolved.upstream_name
                 );
-                return Err(Box::new(internal_proxy_error_response(
-                    &input.request_ctx.runtime.alt_svc,
-                )));
+                return Err(BootstrapTerminalResponse::new(
+                    BootstrapLifecycleStage::AdmitOrReject,
+                    BootstrapTerminalOutcome::Rejected(BootstrapRejectionReason::AuthDenied),
+                    internal_proxy_error_response(&input.request_ctx.runtime.alt_svc),
+                ));
             };
             let Some(challenge) = response.www_authenticate else {
                 warn!(
                     "Bootstrap request route={} missing auth challenge in admission rejection response",
                     resolved.upstream_name
                 );
-                return Err(Box::new(internal_proxy_error_response(
-                    &input.request_ctx.runtime.alt_svc,
-                )));
+                return Err(BootstrapTerminalResponse::new(
+                    BootstrapLifecycleStage::AdmitOrReject,
+                    BootstrapTerminalOutcome::Rejected(BootstrapRejectionReason::AuthDenied),
+                    internal_proxy_error_response(&input.request_ctx.runtime.alt_svc),
+                ));
             };
-            return Err(Box::new(
+            return Err(BootstrapTerminalResponse::new(
+                BootstrapLifecycleStage::AdmitOrReject,
+                BootstrapTerminalOutcome::Rejected(BootstrapRejectionReason::AuthDenied),
                 Response::builder()
                     .status(response.status)
                     .header("alt-svc", &input.request_ctx.runtime.alt_svc)
@@ -270,20 +363,26 @@ pub(in crate::quic_listener) fn evaluate_bootstrap_request_policy(
                     "Bootstrap request route={} missing admission rejection response for rate-limited decision",
                     resolved.upstream_name
                 );
-                return Err(Box::new(internal_proxy_error_response(
-                    &input.request_ctx.runtime.alt_svc,
-                )));
+                return Err(BootstrapTerminalResponse::new(
+                    BootstrapLifecycleStage::AdmitOrReject,
+                    BootstrapTerminalOutcome::Rejected(BootstrapRejectionReason::RateLimited),
+                    internal_proxy_error_response(&input.request_ctx.runtime.alt_svc),
+                ));
             };
             let Some(retry_after_seconds) = response.retry_after_seconds else {
                 warn!(
                     "Bootstrap request route={} missing retry-after in rate-limited admission rejection response",
                     resolved.upstream_name
                 );
-                return Err(Box::new(internal_proxy_error_response(
-                    &input.request_ctx.runtime.alt_svc,
-                )));
+                return Err(BootstrapTerminalResponse::new(
+                    BootstrapLifecycleStage::AdmitOrReject,
+                    BootstrapTerminalOutcome::Rejected(BootstrapRejectionReason::RateLimited),
+                    internal_proxy_error_response(&input.request_ctx.runtime.alt_svc),
+                ));
             };
-            return Err(Box::new(
+            return Err(BootstrapTerminalResponse::new(
+                BootstrapLifecycleStage::AdmitOrReject,
+                BootstrapTerminalOutcome::Rejected(BootstrapRejectionReason::RateLimited),
                 Response::builder()
                     .status(response.status)
                     .header("alt-svc", &input.request_ctx.runtime.alt_svc)
@@ -315,20 +414,26 @@ pub(in crate::quic_listener) fn evaluate_bootstrap_request_policy(
                     "Bootstrap request route={} missing admission rejection response for overload decision",
                     resolved.upstream_name
                 );
-                return Err(Box::new(internal_proxy_error_response(
-                    &input.request_ctx.runtime.alt_svc,
-                )));
+                return Err(BootstrapTerminalResponse::new(
+                    BootstrapLifecycleStage::AdmitOrReject,
+                    BootstrapTerminalOutcome::Rejected(BootstrapRejectionReason::Overloaded),
+                    internal_proxy_error_response(&input.request_ctx.runtime.alt_svc),
+                ));
             };
             let Some(retry_after_seconds) = response.retry_after_seconds else {
                 warn!(
                     "Bootstrap request route={} missing retry-after in overload admission rejection response",
                     resolved.upstream_name
                 );
-                return Err(Box::new(internal_proxy_error_response(
-                    &input.request_ctx.runtime.alt_svc,
-                )));
+                return Err(BootstrapTerminalResponse::new(
+                    BootstrapLifecycleStage::AdmitOrReject,
+                    BootstrapTerminalOutcome::Rejected(BootstrapRejectionReason::Overloaded),
+                    internal_proxy_error_response(&input.request_ctx.runtime.alt_svc),
+                ));
             };
-            return Err(Box::new(
+            return Err(BootstrapTerminalResponse::new(
+                BootstrapLifecycleStage::AdmitOrReject,
+                BootstrapTerminalOutcome::Rejected(BootstrapRejectionReason::Overloaded),
                 Response::builder()
                     .status(response.status)
                     .header("alt-svc", &input.request_ctx.runtime.alt_svc)
@@ -356,11 +461,17 @@ pub(in crate::quic_listener) fn evaluate_bootstrap_request_policy(
                 StatusCode::BAD_GATEWAY,
                 &ProxyError::Transport("no endpoint".into()),
             );
-            return Err(Box::new(bootstrap_error_response(
-                &input.request_ctx.runtime.alt_svc,
-                StatusCode::BAD_GATEWAY,
-                b"no endpoint\n",
-            )));
+            return Err(BootstrapTerminalResponse::new(
+                BootstrapLifecycleStage::ResolveRoute,
+                BootstrapTerminalOutcome::BackendFailed(
+                    BootstrapBackendFailureReason::MissingEndpoint,
+                ),
+                bootstrap_error_response(
+                    &input.request_ctx.runtime.alt_svc,
+                    StatusCode::BAD_GATEWAY,
+                    b"no endpoint\n",
+                ),
+            ));
         }
     };
 
@@ -383,7 +494,7 @@ pub(in crate::quic_listener) fn build_bootstrap_upstream_request(
         &input.prepared_route.upstream_policy,
     );
 
-    if input.intake.is_websocket_upgrade {
+    if input.intake.request_mode.is_websocket_upgrade() {
         return build_h1_request(
             request_target,
             bootstrap_request_build_input(

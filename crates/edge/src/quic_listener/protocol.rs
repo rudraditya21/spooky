@@ -117,6 +117,7 @@ pub(in crate::quic_listener) fn is_head_method(method: &str) -> bool {
     method.eq_ignore_ascii_case("HEAD")
 }
 
+#[cfg(test)]
 pub(in crate::quic_listener) fn is_bodyless_request_mode(
     method: &str,
     content_length: Option<usize>,
@@ -145,21 +146,7 @@ pub(in crate::quic_listener) fn is_connect_tunnel_response(
 }
 
 pub(in crate::quic_listener) fn can_poll_upstream_result(req: &RequestEnvelope) -> bool {
-    if req.admission_state != StreamAdmissionState::ReadyToForward {
-        return false;
-    }
-
-    if is_tunnel_mode(req.tunnel_mode)
-        && (req.phase == StreamPhase::ReceivingRequest
-            || req.phase == StreamPhase::AwaitingUpstream)
-    {
-        return true;
-    }
-
-    req.phase == StreamPhase::AwaitingUpstream
-        && req.request_fin_received
-        && req.body_tx.is_none()
-        && req.body_buf.is_empty()
+    req.can_poll_upstream_result()
 }
 
 fn header_has_token(value: &http::HeaderValue, token: &str) -> bool {

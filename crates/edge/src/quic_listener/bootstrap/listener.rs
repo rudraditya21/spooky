@@ -25,8 +25,9 @@ use super::{
     intake::{BootstrapRequestIntake, prepare_bootstrap_request_intake},
     outcome::observe_bootstrap_request_proxy_error,
     request::{
-        BootstrapBuildRequestInput, BootstrapPolicyEvaluationInput,
-        build_bootstrap_upstream_request, evaluate_bootstrap_request_policy,
+        BootstrapBuildRequestInput, BootstrapPolicyEvaluationInput, BootstrapRequestMode,
+        BootstrapTerminalOutcome, build_bootstrap_upstream_request,
+        evaluate_bootstrap_request_policy,
     },
     response::{BootstrapWritebackInput, boxed_full, write_bootstrap_response},
     startup::{
@@ -237,7 +238,7 @@ pub(in crate::quic_listener) fn spawn_bootstrap_tls_listener(
                                 authority,
                                 content_length,
                                 suppress_downstream_body,
-                                is_websocket_upgrade,
+                                request_mode,
                                 client_upgrade,
                             } = match prepare_bootstrap_request_intake(
                                 &mut req,
@@ -257,7 +258,7 @@ pub(in crate::quic_listener) fn spawn_bootstrap_tls_listener(
                                 authority: authority.clone(),
                                 content_length,
                                 suppress_downstream_body,
-                                is_websocket_upgrade,
+                                request_mode,
                                 client_upgrade: None,
                             };
                             let prepared_route = match evaluate_bootstrap_request_policy(
@@ -268,7 +269,7 @@ pub(in crate::quic_listener) fn spawn_bootstrap_tls_listener(
                                 },
                             ) {
                                 Ok(prepared) => prepared,
-                                Err(response) => return Ok(*response),
+                                Err(terminal) => return Ok(terminal.into_response()),
                             };
 
                             let request_path = if path.is_empty() { "/" } else { &path };
@@ -286,7 +287,7 @@ pub(in crate::quic_listener) fn spawn_bootstrap_tls_listener(
                                     buffered_bytes: 0,
                                     next_chunk_bytes: 0,
                                     declared_content_length: content_length,
-                                    exempt_from_body_size_cap: is_websocket_upgrade,
+                                    exempt_from_body_size_cap: request_mode.is_websocket_upgrade(),
                                 },
                             );
                             if matches!(
@@ -304,15 +305,26 @@ pub(in crate::quic_listener) fn spawn_bootstrap_tls_listener(
                                     StatusCode::PAYLOAD_TOO_LARGE,
                                     &ProxyError::Transport("request body too large".into()),
                                 );
-                                return Ok(Response::builder()
-                                    .status(StatusCode::PAYLOAD_TOO_LARGE)
-                                    .header("alt-svc", &runtime_ctx.alt_svc)
-                                    .body(boxed_full(Bytes::from_static(
-                                        REQUEST_BODY_TOO_LARGE_BODY,
-                                    )))
-                                    .unwrap_or_else(|_| {
-                                        Response::new(boxed_full(Bytes::from_static(b"error\n")))
-                                    }));
+                                return Ok(
+                                    super::request::BootstrapTerminalResponse::new(
+                                        super::request::BootstrapLifecycleStage::Validate,
+                                        BootstrapTerminalOutcome::Rejected(
+                                            super::request::BootstrapRejectionReason::RequestBodyTooLarge,
+                                        ),
+                                        Response::builder()
+                                            .status(StatusCode::PAYLOAD_TOO_LARGE)
+                                            .header("alt-svc", &runtime_ctx.alt_svc)
+                                            .body(boxed_full(Bytes::from_static(
+                                                REQUEST_BODY_TOO_LARGE_BODY,
+                                            )))
+                                            .unwrap_or_else(|_| {
+                                                Response::new(boxed_full(Bytes::from_static(
+                                                    b"error\n",
+                                                )))
+                                            }),
+                                    )
+                                    .into_response(),
+                                );
                             }
 
                             let request_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -327,60 +339,68 @@ pub(in crate::quic_listener) fn spawn_bootstrap_tls_listener(
                                 authority: authority.clone(),
                                 content_length,
                                 suppress_downstream_body,
-                                is_websocket_upgrade,
+                                request_mode,
                                 client_upgrade: None,
                             };
-                            let upstream_req =
-                                match build_bootstrap_upstream_request(BootstrapBuildRequestInput {
+                            let upstream_req = match build_bootstrap_upstream_request(
+                                BootstrapBuildRequestInput {
                                     request: req,
                                     intake: &intake_for_build,
                                     prepared_route: &prepared_route,
                                     request_ctx,
                                     request_id,
                                     traceparent: traceparent.as_deref(),
-                                }) {
-                                    Ok(request) => request,
-                                    Err(err) => {
-                                        warn!("Bootstrap request build failed: {}", err);
-                                        let (status, body) = if is_websocket_upgrade
-                                            && matches!(err, spooky_bridge::BridgeError::Build(_))
-                                        {
-                                            (
-                                                StatusCode::BAD_GATEWAY,
-                                                b"request build error\n".as_slice(),
+                                },
+                            ) {
+                                Ok(request) => request,
+                                Err(err) => {
+                                    warn!("Bootstrap request build failed: {}", err);
+                                    let (status, body) = if request_mode
+                                        == BootstrapRequestMode::WebsocketUpgrade
+                                        && matches!(err, spooky_bridge::BridgeError::Build(_))
+                                    {
+                                        (
+                                            StatusCode::BAD_GATEWAY,
+                                            b"request build error\n".as_slice(),
+                                        )
+                                    } else {
+                                        (StatusCode::BAD_REQUEST, b"invalid request\n".as_slice())
+                                    };
+                                    let proxy_err = ProxyError::from(err);
+                                    observe_bootstrap_request_proxy_error(
+                                        runtime_ctx.metrics.as_ref(),
+                                        &prepared_route.upstream_name,
+                                        &prepared_route.backend_addr,
+                                        prepared_route.backend_index,
+                                        request_start,
+                                        status,
+                                        &proxy_err,
+                                    );
+                                    return Ok(
+                                            super::request::BootstrapTerminalResponse::new(
+                                                super::request::BootstrapLifecycleStage::Dispatch,
+                                                BootstrapTerminalOutcome::BackendFailed(
+                                                    super::request::BootstrapBackendFailureReason::RequestBuildFailed,
+                                                ),
+                                                Response::builder()
+                                                    .status(status)
+                                                    .header("alt-svc", &runtime_ctx.alt_svc)
+                                                    .body(boxed_full(Bytes::copy_from_slice(body)))
+                                                    .unwrap_or_else(|_| {
+                                                        Response::new(boxed_full(
+                                                            Bytes::from_static(b"error\n"),
+                                                        ))
+                                                    }),
                                             )
-                                        } else {
-                                            (
-                                                StatusCode::BAD_REQUEST,
-                                                b"invalid request\n".as_slice(),
-                                            )
-                                        };
-                                        let proxy_err = ProxyError::from(err);
-                                        observe_bootstrap_request_proxy_error(
-                                            runtime_ctx.metrics.as_ref(),
-                                            &prepared_route.upstream_name,
-                                            &prepared_route.backend_addr,
-                                            prepared_route.backend_index,
-                                            request_start,
-                                            status,
-                                            &proxy_err,
+                                            .into_response(),
                                         );
-                                        return Ok(Response::builder()
-                                            .status(status)
-                                            .header("alt-svc", &runtime_ctx.alt_svc)
-                                            .body(boxed_full(Bytes::copy_from_slice(body)))
-                                            .unwrap_or_else(|_| {
-                                                Response::new(boxed_full(Bytes::from_static(
-                                                    b"error\n",
-                                                )))
-                                            }));
-                                    }
-                                };
+                                }
+                            };
                             let dispatch_ctx = BootstrapDispatchCtx {
                                 request: request_ctx,
                                 request_id,
                                 request_path,
-                                is_websocket_upgrade,
+                                is_websocket_upgrade: request_mode.is_websocket_upgrade(),
                             };
                             let upstream_resp =
                                 match dispatch_bootstrap_upstream(BootstrapDispatchInput {
@@ -391,16 +411,18 @@ pub(in crate::quic_listener) fn spawn_bootstrap_tls_listener(
                                 .await
                                 {
                                     Ok(resp) => resp,
-                                    Err(response) => return Ok(response),
+                                    Err(terminal) => return Ok(terminal.into_response()),
                                 };
 
-                            write_bootstrap_response(BootstrapWritebackInput {
+                            let writeback = write_bootstrap_response(BootstrapWritebackInput {
                                 upstream_resp,
                                 prepared_route: &prepared_route,
                                 dispatch_ctx,
                                 suppress_downstream_body,
+                                request_mode,
                                 client_upgrade,
-                            })
+                            })?;
+                            Ok(writeback.response)
                         })
                     },
                 );

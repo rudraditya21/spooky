@@ -84,7 +84,7 @@ use crate::{
             quic::{QuicConnection, QuicConnectionErrorSnapshot},
             request::RequestEnvelope,
             response::{ForwardResult, ForwardSuccess, ResponseChunk, UpstreamResult},
-            stream::{StreamAdmissionState, StreamPhase, TunnelMode},
+            stream::{CancellationReason, TerminalReason, TunnelMode},
         },
         health::{HealthClassification, outcome_from_status},
         listener::QUICListener,
@@ -133,17 +133,17 @@ pub(crate) use connection::purge_connection_routes;
 #[cfg(test)]
 use connection::resolve_primary_from_radix_prefix;
 pub(crate) use connection::{ConnectionRoutes, sweep_closed_connections};
-use forwarding::{ForwardingExecutionCtx, ForwardingSharedCtx, StreamProgressConfig, abort_stream};
+use forwarding::{ForwardingExecutionCtx, ForwardingSharedCtx, StreamProgressConfig};
 #[cfg(test)]
 use health_check::classify_active_health_check_response;
 pub(in crate::quic_listener) use protocol::{
-    can_poll_upstream_result, collect_h3_trailers, is_bodyless_request_mode, is_connect_method,
-    is_head_method, is_tunnel_mode, is_tunnel_response,
+    can_poll_upstream_result, collect_h3_trailers, is_connect_method, is_tunnel_response,
 };
 #[cfg(test)]
 pub(in crate::quic_listener) use protocol::{
-    connection_header_tokens, is_connect_tunnel_response, should_strip_bootstrap_request_header,
-    should_strip_bootstrap_response_header, should_strip_h3_response_header,
+    connection_header_tokens, is_bodyless_request_mode, is_connect_tunnel_response,
+    should_strip_bootstrap_request_header, should_strip_bootstrap_response_header,
+    should_strip_h3_response_header,
 };
 pub use runtime_state::ListenerWorkerRuntimeState;
 pub(crate) use token_bucket::TokenBucket;
@@ -604,7 +604,11 @@ impl QUICListener {
 
     fn release_connection_streams(connection: &mut QuicConnection, metrics: &Metrics) {
         for req in connection.streams.values_mut() {
-            abort_stream(req, metrics);
+            forwarding::terminalize_stream(
+                req,
+                TerminalReason::Cancelled(CancellationReason::ConnectionClosed),
+                metrics,
+            );
         }
         connection.streams.clear();
     }

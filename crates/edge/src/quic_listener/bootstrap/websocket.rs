@@ -13,7 +13,11 @@ use super::{
     dispatch::BootstrapDispatchInput,
     intake::bootstrap_error_response,
     outcome::{finish_bootstrap_backend_request_accounting, observe_bootstrap_dispatch_failure},
-    request::BootstrapPreparedRoute,
+    request::{
+        BootstrapBackendFailureReason, BootstrapLifecycleStage, BootstrapPreparedRoute,
+        BootstrapTerminalOutcome, BootstrapTerminalResponse, BootstrapTerminalResult,
+        BootstrapTimeoutReason,
+    },
 };
 use crate::quic_listener::protocol::is_websocket_upgrade_request;
 
@@ -45,12 +49,16 @@ pub(in crate::quic_listener) fn capture_bootstrap_websocket_flow(
 
 pub(in crate::quic_listener) async fn dispatch_bootstrap_websocket(
     input: BootstrapDispatchInput<'_>,
-) -> Result<Response<Incoming>, Response<BoxBody<Bytes, Infallible>>> {
+) -> BootstrapTerminalResult<Response<Incoming>> {
     if input.prepared_route.endpoint.scheme() != BackendScheme::Http {
-        return Err(bootstrap_error_response(
-            &input.dispatch_ctx.request.runtime.alt_svc,
-            StatusCode::BAD_GATEWAY,
-            b"websocket bootstrap requires http upstream\n",
+        return Err(BootstrapTerminalResponse::new(
+            BootstrapLifecycleStage::Dispatch,
+            BootstrapTerminalOutcome::BackendFailed(BootstrapBackendFailureReason::DispatchFailed),
+            bootstrap_error_response(
+                &input.dispatch_ctx.request.runtime.alt_svc,
+                StatusCode::BAD_GATEWAY,
+                b"websocket bootstrap requires http upstream\n",
+            ),
         ));
     }
 
@@ -58,10 +66,16 @@ pub(in crate::quic_listener) async fn dispatch_bootstrap_websocket(
     let upstream_path_uri = match Uri::try_from(input.dispatch_ctx.request_path) {
         Ok(uri) => uri,
         Err(_) => {
-            return Err(bootstrap_error_response(
-                &input.dispatch_ctx.request.runtime.alt_svc,
-                StatusCode::BAD_GATEWAY,
-                b"bad uri\n",
+            return Err(BootstrapTerminalResponse::new(
+                BootstrapLifecycleStage::Dispatch,
+                BootstrapTerminalOutcome::BackendFailed(
+                    BootstrapBackendFailureReason::RequestBuildFailed,
+                ),
+                bootstrap_error_response(
+                    &input.dispatch_ctx.request.runtime.alt_svc,
+                    StatusCode::BAD_GATEWAY,
+                    b"bad uri\n",
+                ),
             ));
         }
     };
@@ -92,17 +106,27 @@ pub(in crate::quic_listener) async fn dispatch_bootstrap_websocket(
         }
         Ok(Err(err)) => {
             warn!("Bootstrap WebSocket connect error: {}", err);
-            return Err(bootstrap_error_response(
-                &input.dispatch_ctx.request.runtime.alt_svc,
-                StatusCode::BAD_GATEWAY,
-                b"upstream error\n",
+            return Err(BootstrapTerminalResponse::new(
+                BootstrapLifecycleStage::Dispatch,
+                BootstrapTerminalOutcome::BackendFailed(
+                    BootstrapBackendFailureReason::DispatchFailed,
+                ),
+                bootstrap_error_response(
+                    &input.dispatch_ctx.request.runtime.alt_svc,
+                    StatusCode::BAD_GATEWAY,
+                    b"upstream error\n",
+                ),
             ));
         }
         Err(_) => {
-            return Err(bootstrap_error_response(
-                &input.dispatch_ctx.request.runtime.alt_svc,
-                StatusCode::GATEWAY_TIMEOUT,
-                b"upstream timeout\n",
+            return Err(BootstrapTerminalResponse::new(
+                BootstrapLifecycleStage::Dispatch,
+                BootstrapTerminalOutcome::TimedOut(BootstrapTimeoutReason::Upstream),
+                bootstrap_error_response(
+                    &input.dispatch_ctx.request.runtime.alt_svc,
+                    StatusCode::GATEWAY_TIMEOUT,
+                    b"upstream timeout\n",
+                ),
             ));
         }
     };
@@ -112,10 +136,16 @@ pub(in crate::quic_listener) async fn dispatch_bootstrap_websocket(
         Ok(v) => v,
         Err(err) => {
             warn!("Bootstrap WebSocket handshake setup failed: {}", err);
-            return Err(bootstrap_error_response(
-                &input.dispatch_ctx.request.runtime.alt_svc,
-                StatusCode::BAD_GATEWAY,
-                b"upstream error\n",
+            return Err(BootstrapTerminalResponse::new(
+                BootstrapLifecycleStage::Dispatch,
+                BootstrapTerminalOutcome::BackendFailed(
+                    BootstrapBackendFailureReason::DispatchFailed,
+                ),
+                bootstrap_error_response(
+                    &input.dispatch_ctx.request.runtime.alt_svc,
+                    StatusCode::BAD_GATEWAY,
+                    b"upstream error\n",
+                ),
             ));
         }
     };
@@ -140,10 +170,16 @@ pub(in crate::quic_listener) async fn dispatch_bootstrap_websocket(
                 StatusCode::BAD_GATEWAY,
                 &proxy_err,
             );
-            Err(bootstrap_error_response(
-                &input.dispatch_ctx.request.runtime.alt_svc,
-                StatusCode::BAD_GATEWAY,
-                b"upstream error\n",
+            Err(BootstrapTerminalResponse::new(
+                BootstrapLifecycleStage::Dispatch,
+                BootstrapTerminalOutcome::BackendFailed(
+                    BootstrapBackendFailureReason::DispatchFailed,
+                ),
+                bootstrap_error_response(
+                    &input.dispatch_ctx.request.runtime.alt_svc,
+                    StatusCode::BAD_GATEWAY,
+                    b"upstream error\n",
+                ),
             ))
         }
         Err(_) => {
@@ -155,10 +191,14 @@ pub(in crate::quic_listener) async fn dispatch_bootstrap_websocket(
                 StatusCode::GATEWAY_TIMEOUT,
                 &ProxyError::Timeout,
             );
-            Err(bootstrap_error_response(
-                &input.dispatch_ctx.request.runtime.alt_svc,
-                StatusCode::GATEWAY_TIMEOUT,
-                b"upstream timeout\n",
+            Err(BootstrapTerminalResponse::new(
+                BootstrapLifecycleStage::Dispatch,
+                BootstrapTerminalOutcome::TimedOut(BootstrapTimeoutReason::Upstream),
+                bootstrap_error_response(
+                    &input.dispatch_ctx.request.runtime.alt_svc,
+                    StatusCode::GATEWAY_TIMEOUT,
+                    b"upstream timeout\n",
+                ),
             ))
         }
     }
