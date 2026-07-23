@@ -109,12 +109,12 @@ impl BootstrapTerminalResponse {
         stage: BootstrapLifecycleStage,
         outcome: BootstrapTerminalOutcome,
         response: Response<BoxBody<Bytes, Infallible>>,
-    ) -> Self {
-        Self {
+    ) -> Box<Self> {
+        Box::new(Self {
             stage,
             outcome,
             response,
-        }
+        })
     }
 
     pub(in crate::quic_listener) fn into_response(self) -> Response<BoxBody<Bytes, Infallible>> {
@@ -122,7 +122,8 @@ impl BootstrapTerminalResponse {
     }
 }
 
-pub(in crate::quic_listener) type BootstrapTerminalResult<T> = Result<T, BootstrapTerminalResponse>;
+pub(in crate::quic_listener) type BootstrapTerminalResult<T> =
+    Result<T, Box<BootstrapTerminalResponse>>;
 
 pub(in crate::quic_listener) struct BootstrapPreparedRoute {
     pub(in crate::quic_listener) endpoint: BackendEndpoint,

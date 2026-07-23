@@ -12,7 +12,7 @@ use http_body_util::Full;
 use spooky_config::config::ScopedRateLimitScope;
 use spooky_errors::ClassifiedUpstreamProxyError;
 
-use self::prepare::StartedRequestEnvelope;
+use self::prepare::{RequestFinalizationConfig, StartedRequestEnvelope};
 pub(in crate::quic_listener) use self::resolve::BootstrapResolutionInput;
 #[cfg(test)]
 pub(in crate::quic_listener) use self::resolve::RouteResolutionRequest as TestRouteResolutionRequest;
@@ -785,9 +785,11 @@ impl QUICListener {
                         request_start,
                         &metrics,
                         pre_auth,
-                        routing_transparency_enabled,
-                        routing_transparency_include_reason,
-                        backend_total_request_timeout,
+                        RequestFinalizationConfig {
+                            routing_transparency_enabled,
+                            routing_transparency_include_reason,
+                            backend_total_request_timeout,
+                        },
                     )? {
                         Some(started_auth) => started_auth,
                         None => continue,

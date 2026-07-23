@@ -128,13 +128,33 @@ pub(super) struct LocalRejectionCandidate {
 
 pub(super) enum PreAdmissionNextState {
     LocallyRejected(LocalRejectionCandidate),
-    RequiresExternalAuth(ExternalAuthCandidate),
-    ReadyForPostAuthAdmission(DispatchReadyCandidate),
+    RequiresExternalAuth(Box<ExternalAuthCandidate>),
+    ReadyForPostAuthAdmission(Box<DispatchReadyCandidate>),
 }
 
 pub(super) struct StartedRequestEnvelope {
     pub(super) envelope: RequestEnvelope,
     pub(super) should_materialize_forward: bool,
+}
+
+/// The parsed HTTP request-line/header inputs needed to build a request intake.
+pub(super) struct IntakeRequestDescriptor<'a> {
+    pub(super) quic_trace_id: &'a str,
+    pub(super) request_start: Instant,
+    pub(super) method: &'a str,
+    pub(super) path: &'a str,
+    pub(super) authority: Option<&'a str>,
+    pub(super) headers: &'a [quiche::h3::Header],
+    pub(super) content_length: Option<usize>,
+    pub(super) tunnel_mode: TunnelMode,
+    pub(super) tracing_enabled: bool,
+}
+
+/// Request-scoped configuration applied when finalizing the request envelope.
+pub(super) struct RequestFinalizationConfig {
+    pub(super) routing_transparency_enabled: bool,
+    pub(super) routing_transparency_include_reason: bool,
+    pub(super) backend_total_request_timeout: Duration,
 }
 
 impl PendingForward {
@@ -244,17 +264,18 @@ impl PendingForward {
 }
 
 impl QUICListener {
-    fn build_request_intake(
-        quic_trace_id: &str,
-        request_start: Instant,
-        method: &str,
-        path: &str,
-        authority: Option<&str>,
-        headers: &[quiche::h3::Header],
-        content_length: Option<usize>,
-        tunnel_mode: TunnelMode,
-        tracing_enabled: bool,
-    ) -> IntakeRequestCandidate {
+    fn build_request_intake(descriptor: IntakeRequestDescriptor<'_>) -> IntakeRequestCandidate {
+        let IntakeRequestDescriptor {
+            quic_trace_id,
+            request_start,
+            method,
+            path,
+            authority,
+            headers,
+            content_length,
+            tunnel_mode,
+            tracing_enabled,
+        } = descriptor;
         let request_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
         let request_mode = RequestMode::from_intake(tunnel_mode, method, content_length);
         let incoming_traceparent =
@@ -356,7 +377,7 @@ impl QUICListener {
         metrics: &Metrics,
         resilience: &RuntimeResilience,
     ) -> Result<Option<PreAdmissionNextState>, quiche::h3::Error> {
-        let intake = Self::build_request_intake(
+        let intake = Self::build_request_intake(IntakeRequestDescriptor {
             quic_trace_id,
             request_start,
             method,
@@ -366,7 +387,7 @@ impl QUICListener {
             content_length,
             tunnel_mode,
             tracing_enabled,
-        );
+        });
         let lb_header_lookup = |name: &str| {
             headers
                 .iter()
@@ -605,13 +626,15 @@ impl QUICListener {
 
                 Some(match (external_auth, auth_disposition) {
                     (Some(external_auth), Some(auth_disposition)) => {
-                        PreAdmissionNextState::RequiresExternalAuth(ExternalAuthCandidate {
-                            request: dispatch_ready,
-                            external_auth,
-                            auth_disposition,
-                        })
+                        PreAdmissionNextState::RequiresExternalAuth(Box::new(
+                            ExternalAuthCandidate {
+                                request: dispatch_ready,
+                                external_auth,
+                                auth_disposition,
+                            },
+                        ))
                     }
-                    _ => PreAdmissionNextState::ReadyForPostAuthAdmission(dispatch_ready),
+                    _ => PreAdmissionNextState::ReadyForPostAuthAdmission(Box::new(dispatch_ready)),
                 })
             }
             Err(err) => {
@@ -644,17 +667,20 @@ impl QUICListener {
         request_start: Instant,
         metrics: &Metrics,
         pre_auth: PreAdmissionNextState,
-        routing_transparency_enabled: bool,
-        routing_transparency_include_reason: bool,
-        backend_total_request_timeout: Duration,
+        finalization: RequestFinalizationConfig,
     ) -> Result<Option<StartedRequestEnvelope>, quiche::h3::Error> {
+        let RequestFinalizationConfig {
+            routing_transparency_enabled,
+            routing_transparency_include_reason,
+            backend_total_request_timeout,
+        } = finalization;
         match pre_auth {
             PreAdmissionNextState::LocallyRejected(rejection) => {
                 Self::send_admission_rejection_response(h3, quic, stream_id, &rejection.response)?;
                 Ok(None)
             }
             PreAdmissionNextState::ReadyForPostAuthAdmission(request) => {
-                let mut request = request;
+                let mut request = *request;
                 request.state.context.total_request_deadline =
                     request.state.context.start + backend_total_request_timeout;
                 Ok(Some(StartedRequestEnvelope {
@@ -666,7 +692,7 @@ impl QUICListener {
                 }))
             }
             PreAdmissionNextState::RequiresExternalAuth(request) => {
-                let mut request = request;
+                let mut request = *request;
                 request.request.state.context.total_request_deadline =
                     request.request.state.context.start + backend_total_request_timeout;
                 let auth_disposition = request.auth_disposition;
