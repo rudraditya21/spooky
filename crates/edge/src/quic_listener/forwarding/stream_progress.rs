@@ -360,14 +360,14 @@ impl QUICListener {
                     false
                 };
                 if !keep_stream {
-                    if let Some(req) = streams.get_mut(&stream_id) {
-                        if !req.execution.is_terminal() {
-                            terminalize_stream(
-                                req,
-                                TerminalReason::Cancelled(CancellationReason::OperatorAbort),
-                                metrics,
-                            );
-                        }
+                    if let Some(req) = streams.get_mut(&stream_id)
+                        && !req.execution.is_terminal()
+                    {
+                        terminalize_stream(
+                            req,
+                            TerminalReason::Cancelled(CancellationReason::OperatorAbort),
+                            metrics,
+                        );
                     }
                     streams.remove(&stream_id);
                     continue;
@@ -447,16 +447,16 @@ impl QUICListener {
                             false
                         };
                         if immediate_terminal {
-                            if let Some(req) = streams.get_mut(&stream_id) {
-                                if !req.execution.is_terminal() {
-                                    terminalize_stream(
-                                        req,
-                                        TerminalReason::Completed(
-                                            CompletionReason::ImmediateResponse,
-                                        ),
-                                        metrics,
-                                    );
-                                }
+                            if let Some(req) = streams.get_mut(&stream_id)
+                                && !req.execution.is_terminal()
+                            {
+                                terminalize_stream(
+                                    req,
+                                    TerminalReason::Completed(
+                                        CompletionReason::ImmediateResponse,
+                                    ),
+                                    metrics,
+                                );
                             }
                             streams.remove(&stream_id);
                             continue;
@@ -506,14 +506,14 @@ impl QUICListener {
             };
 
             if terminal {
-                if let Some(req) = streams.get_mut(&stream_id) {
-                    if !req.execution.is_terminal() {
-                        terminalize_stream(
-                            req,
-                            TerminalReason::Cancelled(CancellationReason::OperatorAbort),
-                            metrics,
-                        );
-                    }
+                if let Some(req) = streams.get_mut(&stream_id)
+                    && !req.execution.is_terminal()
+                {
+                    terminalize_stream(
+                        req,
+                        TerminalReason::Cancelled(CancellationReason::OperatorAbort),
+                        metrics,
+                    );
                 }
                 streams.remove(&stream_id);
             }

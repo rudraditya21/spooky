@@ -52,12 +52,10 @@ fn response_body_guardrail_chunk(decision: ResponseBodyGuardrailDecision) -> Opt
 fn response_body_wait_timeout_reason(
     guardrails: ResponseBodyGuardrailConfig,
     body_started_at: tokio::time::Instant,
-    last_body_progress_at: tokio::time::Instant,
+    _last_body_progress_at: tokio::time::Instant,
 ) -> TimeoutReason {
     if body_started_at.elapsed() >= guardrails.total_timeout {
         TimeoutReason::ResponseBodyTotal
-    } else if last_body_progress_at.elapsed() >= guardrails.idle_timeout {
-        TimeoutReason::ResponseBodyIdle
     } else {
         TimeoutReason::ResponseBodyIdle
     }
@@ -1078,7 +1076,6 @@ impl QUICListener {
                                 "HTTP/3 send_response protocol error on stream {}: {:?}",
                                 stream_id, err
                             );
-                            req.set_phase_legacy(StreamPhase::Failed);
                             metrics.inc_backend_error();
                             let _ = crate::runtime::connection::outcome::observe_status_outcome(
                                 metrics,
@@ -1112,7 +1109,6 @@ impl QUICListener {
                             "HTTP/3 send_body data protocol error on stream {}: {:?}",
                             stream_id, err
                         );
-                        req.set_phase_legacy(StreamPhase::Failed);
                         metrics.inc_backend_error();
                         let _ = crate::runtime::connection::outcome::observe_status_outcome(
                             metrics,
@@ -1152,7 +1148,6 @@ impl QUICListener {
                                 "HTTP/3 send_additional_headers protocol error on stream {}: {:?}",
                                 stream_id, err
                             );
-                            req.set_phase_legacy(StreamPhase::Failed);
                             metrics.inc_backend_error();
                             let _ = crate::runtime::connection::outcome::observe_status_outcome(
                                 metrics,
@@ -1194,7 +1189,6 @@ impl QUICListener {
                             "HTTP/3 send_body end protocol error on stream {}: {:?}",
                             stream_id, err
                         );
-                        req.set_phase_legacy(StreamPhase::Failed);
                         metrics.inc_backend_error();
                         let _ = crate::runtime::connection::outcome::observe_status_outcome(
                             metrics,

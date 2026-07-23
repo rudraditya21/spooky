@@ -41,9 +41,12 @@ use crate::{
             BodyLimitKind, ResponseBodyGuardrailConfig, ResponseBodyGuardrailDecision,
             ResponseBodyGuardrailInput, checked_response_body_guardrails,
         },
+        request::{PendingForward, RequestEnvelope},
         stream::{
-            AwaitingAuthState, RequestBodyRuntime, RequestBodyState, RequestExecutionState,
-            RequestMode, RoutingSnapshot, StreamAdmissionState,
+            AdmissionPermits, AwaitingAuthState, DispatchReadyState, RequestBodyRuntime,
+            RequestBodyState, RequestContext, RequestExecutionState, RequestMode,
+            ResponseEmissionState, RoutingSnapshot, StreamAdmissionState, StreamPhase,
+            TunnelMode,
         },
     },
 };
@@ -1314,35 +1317,57 @@ fn bodyless_request_mode_only_applies_to_empty_get_and_head() {
 
 #[test]
 fn connect_can_poll_upstream_before_request_fin() {
-    let (_tx, rx) = oneshot::channel::<crate::runtime::connection::response::UpstreamResult>();
-    let mut req = make_envelope(StreamPhase::ReceivingRequest);
+    let mut req = make_awaiting_upstream_envelope(Instant::now(), "CONNECT", false);
     req.method = "CONNECT".to_string();
-    req.tunnel_mode = crate::runtime::connection::stream::TunnelMode::Connect;
+    req.tunnel_mode = TunnelMode::Connect;
     req.set_request_fin_received(false);
-    req.set_upstream_result_rx(Some(rx));
+    if let RequestExecutionState::AwaitingUpstream(state) = &mut req.execution {
+        state.request_mode = RequestMode::ConnectTunnel;
+    }
     assert!(can_poll_upstream_result(&req));
 }
 
 #[test]
 fn non_connect_requires_request_completion_before_upstream_poll() {
-    let (_tx, rx) = oneshot::channel::<crate::runtime::connection::response::UpstreamResult>();
-    let mut req = make_envelope(StreamPhase::AwaitingUpstream);
+    let mut req = make_awaiting_upstream_envelope(Instant::now(), "GET", false);
     req.method = "GET".to_string();
     req.set_request_fin_received(false);
-    req.set_upstream_result_rx(Some(rx));
     assert!(!can_poll_upstream_result(&req));
 
     req.set_request_fin_received(true);
+    if let RequestExecutionState::AwaitingUpstream(state) = &mut req.execution {
+        state.request_body = RequestBodyState::FinReceived;
+        state.dispatch.body_tx = None;
+    }
     assert!(can_poll_upstream_result(&req));
 
-    req.set_admission_state_legacy(StreamAdmissionState::WaitingForAuth);
+    let start = req.start;
+    req.execution = RequestExecutionState::AwaitingAuth(AwaitingAuthState {
+        context: make_request_context(start, "GET"),
+        routing: make_routing_snapshot(),
+        request_mode: RequestMode::Normal,
+        request_body: RequestBodyState::FinReceived,
+        request_body_runtime: make_body_runtime(start, true),
+        pending_forward: make_pending_forward("GET"),
+        auth_result_rx: oneshot::channel::<
+            crate::runtime::connection::auth::ExternalAuthResult,
+        >()
+        .1,
+        auth_abort: tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .spawn(async {})
+            .abort_handle(),
+        auth_deadline: start + Duration::from_secs(1),
+        auth_disposition:
+            crate::runtime::connection::auth::ExternalAuthFailureDisposition::FailClosed,
+    });
     assert!(!can_poll_upstream_result(&req));
 }
 
 #[test]
 fn total_request_timeout_tracks_typed_execution_phase() {
-    let (_tx, rx) = oneshot::channel::<crate::runtime::connection::response::UpstreamResult>();
-    let mut req = make_envelope(StreamPhase::ReceivingRequest);
+    let start = Instant::now();
+    let mut req = make_dispatch_ready_envelope(start, "GET", false);
     req.method = "GET".to_string();
     req.set_request_fin_received(false);
     assert_eq!(
@@ -1350,15 +1375,13 @@ fn total_request_timeout_tracks_typed_execution_phase() {
         TimeoutReason::RequestBodyTotal
     );
 
-    req.set_request_fin_received(true);
-    req.set_phase_legacy(StreamPhase::AwaitingUpstream);
-    req.set_upstream_result_rx(Some(rx));
+    req = make_awaiting_upstream_envelope(start, "GET", true);
     assert_eq!(
         req.total_request_timeout_reason(),
         TimeoutReason::AwaitingUpstream
     );
 
-    req.set_phase_legacy(StreamPhase::SendingResponse);
+    req = make_streaming_envelope(start, StatusCode::OK, None);
     assert_eq!(
         req.total_request_timeout_reason(),
         TimeoutReason::ResponseBodyTotal
@@ -1367,12 +1390,13 @@ fn total_request_timeout_tracks_typed_execution_phase() {
 
 #[test]
 fn connect_total_request_timeout_prefers_awaiting_upstream_bucket() {
-    let (_tx, rx) = oneshot::channel::<crate::runtime::connection::response::UpstreamResult>();
-    let mut req = make_envelope(StreamPhase::ReceivingRequest);
+    let mut req = make_awaiting_upstream_envelope(Instant::now(), "CONNECT", false);
     req.method = "CONNECT".to_string();
-    req.tunnel_mode = crate::runtime::connection::stream::TunnelMode::Connect;
+    req.tunnel_mode = TunnelMode::Connect;
     req.set_request_fin_received(false);
-    req.set_upstream_result_rx(Some(rx));
+    if let RequestExecutionState::AwaitingUpstream(state) = &mut req.execution {
+        state.request_mode = RequestMode::ConnectTunnel;
+    }
 
     assert!(can_poll_upstream_result(&req));
     assert_eq!(
@@ -1944,47 +1968,193 @@ use std::time::Instant;
 
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
-use crate::{
-    resilience::{adaptive_admission::AdaptiveAdmission, route_queue::RouteQueueLimiter},
-    runtime::connection::{request::RequestEnvelope, stream::StreamPhase},
-};
+use crate::resilience::{adaptive_admission::AdaptiveAdmission, route_queue::RouteQueueLimiter};
 
 fn make_envelope(phase: StreamPhase) -> RequestEnvelope {
     let start = Instant::now();
-    RequestEnvelope::new_legacy(
-        REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
-        None,
-        None,
-        None,
-        None,
-        "GET".into(),
-        "/".into(),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        false,
-        false,
+    match phase {
+        StreamPhase::ReceivingRequest => make_dispatch_ready_envelope(start, "GET", false),
+        StreamPhase::AwaitingUpstream => make_awaiting_upstream_envelope(start, "GET", false),
+        StreamPhase::SendingResponse => make_streaming_envelope(start, StatusCode::OK, None),
+        StreamPhase::Completed | StreamPhase::Terminal => {
+            panic!("make_envelope is only defined for active execution phases")
+        }
+    }
+}
+
+fn make_request_context(start: Instant, method: &str) -> RequestContext {
+    RequestContext {
+        request_id: REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
+        trace_id: None,
+        span_id: None,
+        traceparent: None,
+        trace_span: None,
+        method: method.into(),
+        path: "/".into(),
+        authority: None,
         start,
-        start + std::time::Duration::from_secs(30),
-        false,
-        crate::runtime::connection::stream::TunnelMode::None,
-        0,
-        None,
-        phase,
-        StreamAdmissionState::ReadyToForward,
-        false,
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
+        total_request_deadline: start + std::time::Duration::from_secs(30),
+    }
+}
+
+fn make_routing_snapshot() -> RoutingSnapshot {
+    RoutingSnapshot {
+        backend_addr: "http://127.0.0.1:8080".into(),
+        backend_index: 0,
+        upstream_name: "api".into(),
+        route_reason: "path_prefix".into(),
+        route_path_len: 1,
+        route_host_specific: false,
+        backend_lb: None,
+    }
+}
+
+fn make_pending_forward(method: &str) -> Arc<PendingForward> {
+    Arc::new(PendingForward {
+        method: Arc::<str>::from(method),
+        path: Arc::<str>::from("/"),
+        authority: None,
+        headers: Arc::new(vec![quiche::h3::Header::new(b":method", method.as_bytes())]),
+        upstream_name: Arc::<str>::from("api"),
+        route_reason: Arc::<str>::from("path_prefix"),
+        route_path_len: 1,
+        route_host_specific: false,
+        backend_addr: Arc::<str>::from("http://127.0.0.1:8080"),
+        backend_index: 0,
+        backend_lb: None,
+        client_addr: "127.0.0.1:443".parse().expect("client addr"),
+        request_id: 42,
+        trace_id: None,
+        span_id: None,
+        traceparent: None,
+        host_policy: Default::default(),
+        forwarded_header_policy: Default::default(),
+        auth_header_mutations: Vec::new(),
+    })
+}
+
+fn make_body_runtime(start: Instant, request_fin_received: bool) -> RequestBodyRuntime {
+    RequestBodyRuntime {
+        body_buf: std::collections::VecDeque::new(),
+        body_buf_bytes: 0,
+        body_bytes_received: 0,
+        last_body_activity: start,
+        request_fin_received,
+    }
+}
+
+fn make_test_permits() -> AdmissionPermits {
+    let global = Arc::new(Semaphore::new(1))
+        .try_acquire_owned()
+        .expect("global permit");
+    let upstream = Arc::new(Semaphore::new(1))
+        .try_acquire_owned()
+        .expect("upstream permit");
+    let adaptive = Arc::new(AdaptiveAdmission::new(false, 1, 100, 1, 1, 1000))
+        .try_acquire()
+        .expect("adaptive permit");
+    let route_queue = Arc::new(RouteQueueLimiter::new(100, 1000, Default::default()))
+        .try_acquire("test")
+        .expect("route permit");
+    AdmissionPermits {
+        global,
+        upstream,
+        adaptive,
+        route_queue,
+    }
+}
+
+fn make_dispatch_ready_envelope(
+    start: Instant,
+    method: &str,
+    request_fin_received: bool,
+) -> RequestEnvelope {
+    let context = make_request_context(start, method);
+    let routing = make_routing_snapshot();
+    RequestEnvelope {
+        request_id: context.request_id,
+        trace_id: context.trace_id.clone(),
+        span_id: context.span_id.clone(),
+        traceparent: context.traceparent.clone(),
+        trace_span: context.trace_span.clone(),
+        method: context.method.clone(),
+        path: context.path.clone(),
+        authority: context.authority.clone(),
+        backend_addr: Some(routing.backend_addr.clone()),
+        backend_index: Some(routing.backend_index),
+        upstream_name: Some(routing.upstream_name.clone()),
+        route_reason: Some(routing.route_reason.clone()),
+        route_path_len: Some(routing.route_path_len),
+        route_host_specific: Some(routing.route_host_specific),
+        backend_lb: routing.backend_lb.clone(),
+        upstream_pool: None,
+        routing_transparency_enabled: false,
+        routing_transparency_include_reason: false,
+        response_status: None,
+        start: context.start,
+        total_request_deadline: context.total_request_deadline,
+        bodyless_mode: false,
+        tunnel_mode: TunnelMode::None,
+        retry_count: 0,
+        error_kind: None,
+        terminal_overload_reason: None,
+        terminal_outcome_recorded: false,
+        execution: RequestExecutionState::DispatchReady(DispatchReadyState {
+            context,
+            routing,
+            request_mode: RequestMode::Normal,
+            request_body: if request_fin_received {
+                RequestBodyState::FinReceived
+            } else {
+                RequestBodyState::Open
+            },
+            request_body_runtime: make_body_runtime(start, request_fin_received),
+            pending_forward: make_pending_forward(method),
+        }),
+    }
+}
+
+fn make_admitted_envelope(start: Instant, permits: AdmissionPermits) -> RequestEnvelope {
+    let mut req = make_dispatch_ready_envelope(start, "GET", false);
+    req.transition_to_admitted(permits);
+    req
+}
+
+fn make_awaiting_upstream_envelope(
+    start: Instant,
+    method: &str,
+    request_fin_received: bool,
+) -> RequestEnvelope {
+    let mut req = make_admitted_envelope(start, make_test_permits());
+    req.method = method.into();
+    if let RequestExecutionState::Admitted(state) = &mut req.execution {
+        state.context.method = method.into();
+        state.request_mode = RequestMode::from_intake(TunnelMode::None, method, None);
+        state.pending_forward = make_pending_forward(method);
+        state.request_body = if request_fin_received {
+            RequestBodyState::FinReceived
+        } else {
+            RequestBodyState::Open
+        };
+        state.request_body_runtime.request_fin_received = request_fin_received;
+    }
+    let (_tx, rx) = oneshot::channel::<crate::runtime::connection::response::UpstreamResult>();
+    req.transition_admitted_to_awaiting_upstream(None, rx);
+    req
+}
+
+fn make_streaming_envelope(
+    start: Instant,
+    status: StatusCode,
+    pending_chunk: Option<crate::runtime::connection::response::ResponseChunk>,
+) -> RequestEnvelope {
+    let mut req = make_awaiting_upstream_envelope(start, "GET", true);
+    let (_tx, rx) = mpsc::channel::<crate::runtime::connection::response::ResponseChunk>(4);
+    req.transition_to_streaming_response(rx, ResponseEmissionState::HeadersSent, status);
+    if let Some(chunk) = pending_chunk {
+        req.set_pending_chunk(Some(chunk));
+    }
+    req
 }
 
 /// Path A: client reset before upstream response (ReceivingRequest phase).
@@ -2002,16 +2172,15 @@ fn abort_stream_receiving_request_releases_permits() {
     let adaptive_permit = adaptive.try_acquire().unwrap();
     let route_permit = route_limiter.try_acquire("test").unwrap();
 
-    let (body_tx, body_rx) = mpsc::channel::<bytes::Bytes>(4);
-
-    let mut req = make_envelope(StreamPhase::ReceivingRequest);
-    req.set_dispatch_permits(
-        Some(global_permit),
-        Some(upstream_permit),
-        Some(adaptive_permit),
-        Some(route_permit),
+    let mut req = make_admitted_envelope(
+        Instant::now(),
+        AdmissionPermits {
+            global: global_permit,
+            upstream: upstream_permit,
+            adaptive: adaptive_permit,
+            route_queue: route_permit,
+        },
     );
-    *req.body_tx_mut() = Some(body_tx);
 
     let phase = terminalize_stream(
         &mut req,
@@ -2033,15 +2202,11 @@ fn abort_stream_receiving_request_releases_permits() {
         "upstream semaphore must be freed"
     );
 
-    // body_tx dropped: body_rx should see the channel as disconnected.
-    drop(body_rx); // safe to drop receiver — just checking channel is closed
-
-    // All option fields cleared.
+    // All permit ownership should be released.
     assert!(!req.has_global_inflight_permit());
     assert!(!req.has_upstream_inflight_permit());
     assert!(!req.has_adaptive_admission_permit());
     assert!(!req.has_route_queue_permit());
-    assert!(req.body_tx().is_none());
 }
 
 #[test]
@@ -2138,8 +2303,9 @@ fn abort_stream_awaiting_upstream_cancels_oneshot() {
     let (result_tx, result_rx) =
         oneshot::channel::<crate::runtime::connection::response::UpstreamResult>();
 
-    let mut req = make_envelope(StreamPhase::AwaitingUpstream);
-    req.set_upstream_result_rx(Some(result_rx));
+    let start = Instant::now();
+    let mut req = make_admitted_envelope(start, make_test_permits());
+    req.transition_admitted_to_awaiting_upstream(None, result_rx);
 
     let phase = terminalize_stream(
         &mut req,
@@ -2173,8 +2339,9 @@ fn abort_stream_sending_response_closes_chunk_channel() {
     let (chunk_tx, chunk_rx) =
         mpsc::channel::<crate::runtime::connection::response::ResponseChunk>(4);
 
-    let mut req = make_envelope(StreamPhase::SendingResponse);
-    req.set_response_chunk_rx(Some(chunk_rx));
+    let start = Instant::now();
+    let mut req = make_awaiting_upstream_envelope(start, "GET", true);
+    req.transition_to_streaming_response(chunk_rx, ResponseEmissionState::HeadersSent, StatusCode::OK);
     req.set_pending_chunk(Some(
         crate::runtime::connection::response::ResponseChunk::End,
     ));
@@ -2211,18 +2378,23 @@ fn abort_stream_upstream_error_releases_all_resources() {
     let global_permit = global_sem.clone().try_acquire_owned().unwrap();
     let upstream_permit = upstream_sem.clone().try_acquire_owned().unwrap();
 
-    let (_result_tx, result_rx) =
-        oneshot::channel::<crate::runtime::connection::response::UpstreamResult>();
     let (chunk_tx, chunk_rx) =
         mpsc::channel::<crate::runtime::connection::response::ResponseChunk>(4);
 
-    let mut req = make_envelope(StreamPhase::SendingResponse);
-    req.set_dispatch_permits(Some(global_permit), Some(upstream_permit), None, None);
-    req.set_upstream_result_rx(Some(result_rx));
-    req.set_response_chunk_rx(Some(chunk_rx));
-    req.set_pending_chunk(Some(
-        crate::runtime::connection::response::ResponseChunk::End,
-    ));
+    let adaptive = Arc::new(AdaptiveAdmission::new(false, 1, 100, 1, 1, 1000));
+    let route_limiter = Arc::new(RouteQueueLimiter::new(100, 1000, Default::default()));
+    let mut req = make_admitted_envelope(
+        Instant::now(),
+        AdmissionPermits {
+            global: global_permit,
+            upstream: upstream_permit,
+            adaptive: adaptive.try_acquire().unwrap(),
+            route_queue: route_limiter.try_acquire("test").unwrap(),
+        },
+    );
+    req.transition_admitted_to_awaiting_upstream(None, oneshot::channel().1);
+    req.transition_to_streaming_response(chunk_rx, ResponseEmissionState::HeadersSent, StatusCode::OK);
+    req.set_pending_chunk(Some(crate::runtime::connection::response::ResponseChunk::End));
 
     let phase = terminalize_stream(
         &mut req,
@@ -2241,7 +2413,6 @@ fn abort_stream_upstream_error_releases_all_resources() {
         2,
         "upstream semaphore must be fully freed"
     );
-    assert!(!req.has_upstream_result_rx());
     assert!(!req.has_response_chunk_rx());
     assert!(!req.has_pending_chunk());
 
@@ -2260,9 +2431,18 @@ fn abort_stream_is_idempotent() {
     let metrics = crate::Metrics::default();
     let global_sem = Arc::new(Semaphore::new(1));
     let permit = global_sem.clone().try_acquire_owned().unwrap();
-
-    let mut req = make_envelope(StreamPhase::ReceivingRequest);
-    req.set_dispatch_permits(Some(permit), None, None, None);
+    let upstream_sem = Arc::new(Semaphore::new(1));
+    let adaptive = Arc::new(AdaptiveAdmission::new(false, 1, 100, 1, 1, 1000));
+    let route_limiter = Arc::new(RouteQueueLimiter::new(100, 1000, Default::default()));
+    let mut req = make_admitted_envelope(
+        Instant::now(),
+        AdmissionPermits {
+            global: permit,
+            upstream: upstream_sem.try_acquire_owned().unwrap(),
+            adaptive: adaptive.try_acquire().unwrap(),
+            route_queue: route_limiter.try_acquire("test").unwrap(),
+        },
+    );
 
     terminalize_stream(
         &mut req,

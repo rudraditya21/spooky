@@ -24,7 +24,7 @@ use crate::runtime::connection::{
     },
     request::PendingForward,
     stream::{
-        AdmissionPermits, BackendFailureReason, RejectionReason, StreamAdmissionState, StreamPhase,
+        AdmissionPermits, BackendFailureReason, RejectionReason, StreamPhase,
         TerminalReason,
     },
 };
@@ -813,16 +813,14 @@ impl QUICListener {
                             false
                         };
                         if !keep_stream {
-                            if let Some(req) = connection.streams.get_mut(&stream_id) {
-                                if !req.execution.is_terminal() {
-                                    terminalize_stream(
-                                        req,
-                                        TerminalReason::Cancelled(
-                                            CancellationReason::OperatorAbort,
-                                        ),
-                                        &metrics,
-                                    );
-                                }
+                            if let Some(req) = connection.streams.get_mut(&stream_id)
+                                && !req.execution.is_terminal()
+                            {
+                                terminalize_stream(
+                                    req,
+                                    TerminalReason::Cancelled(CancellationReason::OperatorAbort),
+                                    &metrics,
+                                );
                             }
                             connection.streams.remove(&stream_id);
                             continue;
@@ -1109,11 +1107,6 @@ impl QUICListener {
                     if let Some(req) = connection.streams.get_mut(&stream_id) {
                         req.transition_request_body_finished();
                         let _ = Self::flush_request_buffer(req, &metrics);
-                        // Only move to AwaitingUpstream once auth has allowed the request
-                        // and an upstream task/body channel actually exists.
-                        if req.admission_state() == StreamAdmissionState::ReadyToForward {
-                            req.set_phase_legacy(StreamPhase::AwaitingUpstream);
-                        }
                         // Upstream polling and response dispatch are handled entirely
                         // by advance_streams_non_blocking, called unconditionally below.
                     }
