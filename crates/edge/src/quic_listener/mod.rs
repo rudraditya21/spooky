@@ -137,8 +137,7 @@ use forwarding::{ForwardingExecutionCtx, ForwardingSharedCtx, StreamProgressConf
 #[cfg(test)]
 use health_check::classify_active_health_check_response;
 pub(in crate::quic_listener) use protocol::{
-    can_poll_upstream_result, collect_h3_trailers, is_connect_method, is_head_method,
-    is_tunnel_response,
+    can_poll_upstream_result, collect_h3_trailers, is_connect_method, is_tunnel_response,
 };
 #[cfg(test)]
 pub(in crate::quic_listener) use protocol::{

@@ -1,12 +1,217 @@
+use bytes::Bytes;
 use spooky_errors::{UpstreamProxyErrorKind, classify_upstream_proxy_error};
 use tokio::sync::mpsc::error::TryRecvError;
 
 use super::*;
 use crate::runtime::connection::{
-    auth::ExternalAuthDecision, guardrails::is_unknown_length_response_prebuffer_reason,
+    auth::ExternalAuthDecision,
+    guardrails::{
+        ProgressiveEmissionPolicy, RESPONSE_BODY_TOO_LARGE_BODY, ResponseBodyGuardrailConfig,
+        ResponseBodyGuardrailDecision, ResponseBodyGuardrailInput,
+        checked_response_body_guardrails, is_unknown_length_response_prebuffer_reason,
+        response_body_limit_reason, response_chunk_ranges,
+    },
+    response::{
+        ImmediateResponseStart, ResponseBodyPumpPlan, ResponseStartDecision, ResponseStartMetadata,
+        ResponseStartObservation,
+    },
 };
 
+fn response_body_guardrail_error(decision: ResponseBodyGuardrailDecision) -> Option<ProxyError> {
+    match decision {
+        ResponseBodyGuardrailDecision::Continue { .. } => None,
+        ResponseBodyGuardrailDecision::Timeout { .. } => Some(ProxyError::Timeout),
+        ResponseBodyGuardrailDecision::Reject {
+            kind: BodyLimitKind::BodySize,
+        } => Some(ProxyError::Pool(PoolError::BackendOverloaded(
+            response_body_limit_reason(BodyLimitKind::BodySize).into(),
+        ))),
+        ResponseBodyGuardrailDecision::Reject {
+            kind: BodyLimitKind::UnknownLengthPrebuffer,
+        } => Some(ProxyError::Pool(PoolError::BackendOverloaded(
+            response_body_limit_reason(BodyLimitKind::UnknownLengthPrebuffer).into(),
+        ))),
+        ResponseBodyGuardrailDecision::Reject { .. } => {
+            Some(ProxyError::Pool(PoolError::BackendOverloaded(
+                response_body_limit_reason(BodyLimitKind::BufferedBody).into(),
+            )))
+        }
+    }
+}
+
 impl QUICListener {
+    pub(super) fn prepare_response_start_decision(
+        req: &RequestEnvelope,
+        success: ForwardSuccess,
+        progress_config: &StreamProgressConfig,
+    ) -> ResponseStartDecision {
+        let (status, resp_headers, response_body, prebuilt_response_chunk_rx) = match success {
+            ForwardSuccess::Response {
+                status,
+                headers,
+                body,
+            } => (status, headers, Some(body), None),
+            ForwardSuccess::Tunnel {
+                status,
+                headers,
+                response_chunk_rx,
+            } => (status, headers, None, Some(response_chunk_rx)),
+        };
+        let request_mode = req.request_mode();
+        let tunnel_response = is_tunnel_response(req.tunnel_mode, status);
+        let response_body_mode = if tunnel_response {
+            ResponseBodyMode::TunnelSuccess
+        } else if request_mode.suppresses_response_body() {
+            ResponseBodyMode::HeadRequest
+        } else {
+            ResponseBodyMode::Normal
+        };
+        let upstream_content_length = resp_headers
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<usize>().ok());
+        let normalized_response = normalize_upstream_response(ResponseNormalizationInput {
+            upstream: spooky_bridge::response::UpstreamResponseView {
+                status,
+                headers: &resp_headers,
+                trailers: None,
+            },
+            body_mode: response_body_mode,
+            constraints: ResponseProtocolConstraints {
+                protocol: ResponseNormalizationProtocol::Http3,
+                strip_connection_headers: true,
+                allow_trailers: true,
+                preserve_upgrade: false,
+            },
+        });
+        let body_forwarding_enabled = matches!(
+            normalized_response.emission.body,
+            ResponseBodyPolicy::Forward
+        );
+        let progressive_body_emission_allowed =
+            !normalized_response.emission.emit_end_stream_on_headers;
+        let response_guardrails = ResponseBodyGuardrailConfig {
+            idle_timeout: progress_config.backend_body_idle_timeout,
+            total_timeout: progress_config.backend_body_total_timeout,
+            max_body_bytes: progress_config.max_response_body_bytes,
+            unknown_length_prebuffer_bytes: progress_config.unknown_length_response_prebuffer_bytes,
+            chunk_bytes: RESPONSE_CHUNK_BYTES_LIMIT,
+        };
+        let preflight_guardrail = checked_response_body_guardrails(
+            response_guardrails,
+            ResponseBodyGuardrailInput {
+                elapsed: Duration::ZERO,
+                idle_for: Duration::ZERO,
+                bytes_received: 0,
+                prebuffered_bytes: 0,
+                next_chunk_bytes: 0,
+                declared_content_length: upstream_content_length,
+                headers_emitted: false,
+                progressive_emission_allowed: progressive_body_emission_allowed,
+                body_forwarding_enabled,
+                exempt_from_body_size_cap: tunnel_response,
+            },
+        );
+        if matches!(
+            preflight_guardrail,
+            Err(ResponseBodyGuardrailDecision::Reject {
+                kind: BodyLimitKind::BodySize,
+            })
+        ) {
+            return ResponseStartDecision::ImmediateTerminal {
+                metadata: ResponseStartMetadata {
+                    status: http::StatusCode::SERVICE_UNAVAILABLE,
+                    headers: Vec::new(),
+                    headers_deferred: false,
+                },
+                terminal: ImmediateResponseStart::SyntheticBody(RESPONSE_BODY_TOO_LARGE_BODY),
+                observation: ResponseStartObservation::ProxyError {
+                    status: http::StatusCode::SERVICE_UNAVAILABLE,
+                    error: ProxyError::Pool(PoolError::BackendOverloaded(
+                        "response prebuffer cap".into(),
+                    )),
+                    overload_reason: Some(OverloadShedReason::ResponsePrebufferCap),
+                },
+            };
+        }
+
+        let mut headers: Vec<(Vec<u8>, Vec<u8>)> = normalized_response
+            .head
+            .headers
+            .iter()
+            .map(|header| {
+                (
+                    header.name.as_str().as_bytes().to_vec(),
+                    header.value.as_bytes().to_vec(),
+                )
+            })
+            .collect();
+        headers.push((
+            b"alt-svc".to_vec(),
+            format!("h3=\":{}\"; ma=86400", progress_config.listen_port).into_bytes(),
+        ));
+
+        let defer_headers_until_body_validated = matches!(
+            preflight_guardrail,
+            Ok(crate::runtime::connection::guardrails::EvaluatedResponseBodyGuardrail {
+                streaming,
+                ..
+            }) if matches!(
+                streaming.emission,
+                ProgressiveEmissionPolicy::PrebufferUntilValidated
+            )
+        );
+        let observation = ResponseStartObservation::Status { status };
+
+        if normalized_response.emission.emit_end_stream_on_headers {
+            return ResponseStartDecision::ImmediateTerminal {
+                metadata: ResponseStartMetadata {
+                    status,
+                    headers,
+                    headers_deferred: false,
+                },
+                terminal: ImmediateResponseStart::NormalizedHeadersOnly,
+                observation,
+            };
+        }
+
+        if let Some(response_chunk_rx) = prebuilt_response_chunk_rx {
+            return ResponseStartDecision::StreamingPrebuilt {
+                metadata: ResponseStartMetadata {
+                    status,
+                    headers,
+                    headers_deferred: false,
+                },
+                response_chunk_rx,
+                observation,
+            };
+        }
+
+        let Some(response_body) = response_body else {
+            return ResponseStartDecision::BackendFailure(ProxyError::Transport(
+                "non-tunnel responses must carry an HTTP body stream".into(),
+            ));
+        };
+
+        ResponseStartDecision::StreamingBodyPump {
+            metadata: ResponseStartMetadata {
+                status,
+                headers,
+                headers_deferred: defer_headers_until_body_validated,
+            },
+            response_body,
+            pump: ResponseBodyPumpPlan {
+                guardrails: response_guardrails,
+                upstream_content_length,
+                body_forwarding_enabled,
+                progressive_emission_allowed: progressive_body_emission_allowed,
+                defer_headers_until_body_validated,
+                tunnel_response,
+            },
+            observation,
+        }
+    }
+
     /// Handle an already-resolved `ForwardResult`, applying health transitions
     /// and sending the H3 response.
     pub(super) fn handle_forward_result(
@@ -450,6 +655,330 @@ impl QUICListener {
                     &headers,
                 )
             }
+        }
+    }
+
+    fn send_response_start_headers(
+        h3: &mut quiche::h3::Connection,
+        quic: &mut quiche::Connection,
+        stream_id: u64,
+        metadata: &ResponseStartMetadata,
+        end_stream: bool,
+    ) -> Result<(), ProxyError> {
+        let mut h3_headers = Vec::with_capacity(metadata.headers.len() + 1);
+        h3_headers.push(quiche::h3::Header::new(
+            b":status",
+            metadata.status.as_str().as_bytes(),
+        ));
+        for (name, value) in &metadata.headers {
+            h3_headers.push(quiche::h3::Header::new(name, value));
+        }
+        h3.send_response(quic, stream_id, &h3_headers, end_stream)
+            .map_err(|err| {
+                ProxyError::Protocol(format!("failed to send HTTP/3 response headers: {:?}", err))
+            })
+    }
+
+    fn spawn_response_body_pump(
+        req: &RequestEnvelope,
+        response_body: hyper::body::Incoming,
+        metadata: &ResponseStartMetadata,
+        pump: ResponseBodyPumpPlan,
+    ) -> mpsc::Receiver<ResponseChunk> {
+        let (chunk_tx, chunk_rx) = mpsc::channel::<ResponseChunk>(RESPONSE_CHUNK_CHANNEL_CAPACITY);
+        let fail_tx = chunk_tx.clone();
+        let deferred_status = metadata.status;
+        let deferred_headers = metadata.headers.clone();
+        let fut = async move {
+            use http_body_util::BodyExt;
+
+            let mut body = response_body;
+            let body_started_at = tokio::time::Instant::now();
+            let mut last_body_progress_at = body_started_at;
+            let mut response_bytes_received: usize = 0;
+            let mut prebuffered_bytes: usize = 0;
+            let mut buffered_chunks: Vec<Bytes> = Vec::new();
+            let mut buffered_trailers: Option<Vec<(Vec<u8>, Vec<u8>)>> = None;
+            loop {
+                let wait_decision = checked_response_body_guardrails(
+                    pump.guardrails,
+                    ResponseBodyGuardrailInput {
+                        elapsed: body_started_at.elapsed(),
+                        idle_for: last_body_progress_at.elapsed(),
+                        bytes_received: response_bytes_received,
+                        prebuffered_bytes,
+                        next_chunk_bytes: 0,
+                        declared_content_length: pump.upstream_content_length,
+                        headers_emitted: !pump.defer_headers_until_body_validated,
+                        progressive_emission_allowed: pump.progressive_emission_allowed,
+                        body_forwarding_enabled: pump.body_forwarding_enabled,
+                        exempt_from_body_size_cap: pump.tunnel_response,
+                    },
+                );
+                let streaming = match wait_decision {
+                    Ok(evaluated) => evaluated.streaming,
+                    other => {
+                        if let Err(other) = other
+                            && let Some(err) = response_body_guardrail_error(other)
+                        {
+                            let _ = chunk_tx.send(ResponseChunk::Error(err)).await;
+                        }
+                        return;
+                    }
+                };
+                let frame_fut = BodyExt::frame(&mut body);
+                let result = tokio::time::timeout(streaming.wait_timeout, frame_fut).await;
+                match result {
+                    Err(_elapsed) => {
+                        let _ = chunk_tx
+                            .send(ResponseChunk::Error(ProxyError::Timeout))
+                            .await;
+                        return;
+                    }
+                    Ok(Some(Ok(f))) => match f.into_data() {
+                        Ok(data) => {
+                            if !data.is_empty() {
+                                last_body_progress_at = tokio::time::Instant::now();
+                            }
+                            let data_decision = checked_response_body_guardrails(
+                                pump.guardrails,
+                                ResponseBodyGuardrailInput {
+                                    elapsed: body_started_at.elapsed(),
+                                    idle_for: last_body_progress_at.elapsed(),
+                                    bytes_received: response_bytes_received,
+                                    prebuffered_bytes,
+                                    next_chunk_bytes: data.len(),
+                                    declared_content_length: pump.upstream_content_length,
+                                    headers_emitted: !pump.defer_headers_until_body_validated,
+                                    progressive_emission_allowed: pump.progressive_emission_allowed,
+                                    body_forwarding_enabled: pump.body_forwarding_enabled,
+                                    exempt_from_body_size_cap: pump.tunnel_response,
+                                },
+                            );
+                            let evaluated = match data_decision {
+                                Ok(evaluated) => evaluated,
+                                other => {
+                                    if let Err(other) = other
+                                        && let Some(err) = response_body_guardrail_error(other)
+                                    {
+                                        let _ = chunk_tx.send(ResponseChunk::Error(err)).await;
+                                    }
+                                    return;
+                                }
+                            };
+                            let streaming = evaluated.streaming;
+                            response_bytes_received = evaluated.next_state.bytes_received;
+                            prebuffered_bytes = evaluated.next_state.prebuffered_bytes;
+                            for (start, end) in
+                                response_chunk_ranges(data.len(), streaming.chunk_emission)
+                            {
+                                let chunk = data.slice(start..end);
+                                match streaming.emission {
+                                    ProgressiveEmissionPolicy::PrebufferUntilValidated => {
+                                        buffered_chunks.push(chunk);
+                                    }
+                                    ProgressiveEmissionPolicy::StreamProgressively => {
+                                        if chunk_tx.send(ResponseChunk::Data(chunk)).await.is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
+                                    ProgressiveEmissionPolicy::SuppressBody => {}
+                                }
+                            }
+                        }
+                        Err(frame) => {
+                            if let Ok(trailers) = frame.into_trailers() {
+                                let trailer_headers = collect_h3_trailers(&trailers);
+                                if !trailer_headers.is_empty() {
+                                    if pump.defer_headers_until_body_validated {
+                                        buffered_trailers = Some(trailer_headers);
+                                    } else if chunk_tx
+                                        .send(ResponseChunk::Trailers {
+                                            headers: trailer_headers,
+                                        })
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    Ok(Some(Err(_))) => {
+                        let _ = chunk_tx
+                            .send(ResponseChunk::Error(ProxyError::Transport(
+                                "upstream body error".into(),
+                            )))
+                            .await;
+                        return;
+                    }
+                    Ok(None) => {
+                        if pump.defer_headers_until_body_validated {
+                            if chunk_tx
+                                .send(ResponseChunk::Start {
+                                    status: deferred_status,
+                                    headers: deferred_headers,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            for chunk in buffered_chunks {
+                                if chunk_tx.send(ResponseChunk::Data(chunk)).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        if let Some(headers) = buffered_trailers
+                            && chunk_tx
+                                .send(ResponseChunk::Trailers { headers })
+                                .await
+                                .is_err()
+                        {
+                            return;
+                        }
+                        let _ = chunk_tx.send(ResponseChunk::End).await;
+                        return;
+                    }
+                }
+            }
+        };
+        let spawned = match req.trace_span.clone() {
+            Some(span) => spawn_async_task(fut.instrument(span), "body-pump"),
+            None => spawn_async_task(fut, "body-pump"),
+        };
+        if !spawned {
+            let _ = fail_tx.try_send(ResponseChunk::Error(ProxyError::Transport(
+                "runtime unavailable".into(),
+            )));
+        }
+        chunk_rx
+    }
+
+    fn observe_response_start_transition(
+        req: &RequestEnvelope,
+        observation: &ResponseStartObservation,
+        shared_ctx: &ForwardingSharedCtx<'_>,
+    ) {
+        let metrics = shared_ctx.metrics.as_ref();
+        let resilience = shared_ctx.resilience;
+        match observation {
+            ResponseStartObservation::Status { status } => {
+                if let (Some(addr), Some(idx)) = (&req.backend_addr, req.backend_index) {
+                    let _ = crate::runtime::connection::outcome::observe_backend_response_status_and_log(
+                        crate::runtime::connection::outcome::BackendHealthObservationInput {
+                            backend_addr: addr,
+                            backend_index: idx,
+                            upstream_pool: req.upstream_pool.as_ref(),
+                            status: *status,
+                        },
+                    );
+                }
+                let _ = crate::runtime::connection::outcome::observe_status_outcome(
+                    metrics,
+                    Self::request_outcome_route_target(req),
+                    Self::request_outcome_backend_target(req),
+                    req.start.elapsed(),
+                    *status,
+                );
+                resilience
+                    .adaptive_admission
+                    .observe(req.start.elapsed(), false);
+                Self::log_access(req, status.as_u16());
+            }
+            ResponseStartObservation::ProxyError {
+                status,
+                error,
+                overload_reason,
+            } => {
+                let _ = crate::runtime::connection::outcome::observe_proxy_error_outcome(
+                    metrics,
+                    Self::request_outcome_route_target(req),
+                    Self::request_outcome_backend_target(req),
+                    req.start.elapsed(),
+                    Some(*status),
+                    error,
+                    *overload_reason,
+                );
+                resilience
+                    .adaptive_admission
+                    .observe(req.start.elapsed(), true);
+                Self::log_access(req, status.as_u16());
+            }
+        }
+    }
+
+    pub(super) fn apply_response_start_decision(
+        stream_id: u64,
+        req: &mut RequestEnvelope,
+        decision: ResponseStartDecision,
+        quic: &mut quiche::Connection,
+        h3: &mut quiche::h3::Connection,
+        shared_ctx: &ForwardingSharedCtx<'_>,
+    ) -> Result<bool, ProxyError> {
+        match decision {
+            ResponseStartDecision::ImmediateTerminal {
+                metadata,
+                terminal,
+                observation,
+            } => {
+                match terminal {
+                    ImmediateResponseStart::NormalizedHeadersOnly => {
+                        Self::send_response_start_headers(h3, quic, stream_id, &metadata, true)?;
+                    }
+                    ImmediateResponseStart::SyntheticBody(body) => {
+                        Self::send_simple_response(h3, quic, stream_id, metadata.status, body)
+                            .map_err(|err| {
+                                ProxyError::Protocol(format!(
+                                    "failed to send terminal response: {:?}",
+                                    err
+                                ))
+                            })?;
+                    }
+                }
+                req.response_status = Some(metadata.status.as_u16());
+                req.transition_to_streaming_response(None, true, StreamPhase::Completed);
+                Self::observe_response_start_transition(req, &observation, shared_ctx);
+                Ok(true)
+            }
+            ResponseStartDecision::StreamingPrebuilt {
+                metadata,
+                response_chunk_rx,
+                observation,
+            } => {
+                Self::send_response_start_headers(h3, quic, stream_id, &metadata, false)?;
+                req.response_status = Some(metadata.status.as_u16());
+                req.transition_to_streaming_response(
+                    Some(response_chunk_rx),
+                    true,
+                    metadata.streaming_phase(),
+                );
+                Self::observe_response_start_transition(req, &observation, shared_ctx);
+                Ok(false)
+            }
+            ResponseStartDecision::StreamingBodyPump {
+                metadata,
+                response_body,
+                pump,
+                observation,
+            } => {
+                if !metadata.headers_deferred {
+                    Self::send_response_start_headers(h3, quic, stream_id, &metadata, false)?;
+                }
+                let chunk_rx = Self::spawn_response_body_pump(req, response_body, &metadata, pump);
+                req.response_status = Some(metadata.status.as_u16());
+                req.transition_to_streaming_response(
+                    Some(chunk_rx),
+                    metadata.response_headers_sent(),
+                    metadata.streaming_phase(),
+                );
+                Self::observe_response_start_transition(req, &observation, shared_ctx);
+                Ok(false)
+            }
+            ResponseStartDecision::BackendFailure(err) => Err(err),
         }
     }
 
