@@ -7,8 +7,14 @@ use hyper::body::Incoming;
 use spooky_errors::ProxyError;
 
 use super::{
-    context::BootstrapDispatchCtx, intake::bootstrap_error_response,
-    outcome::observe_bootstrap_dispatch_failure, request::BootstrapPreparedRoute,
+    context::BootstrapDispatchCtx,
+    intake::bootstrap_error_response,
+    outcome::observe_bootstrap_dispatch_failure,
+    request::BootstrapPreparedRoute,
+    request::{
+        BootstrapBackendFailureReason, BootstrapLifecycleStage, BootstrapTerminalOutcome,
+        BootstrapTerminalResponse, BootstrapTerminalResult, BootstrapTimeoutReason,
+    },
     websocket::dispatch_bootstrap_websocket,
 };
 
@@ -20,7 +26,7 @@ pub(in crate::quic_listener) struct BootstrapDispatchInput<'a> {
 
 async fn dispatch_bootstrap_http(
     input: BootstrapDispatchInput<'_>,
-) -> Result<Response<Incoming>, Response<BoxBody<Bytes, Infallible>>> {
+) -> BootstrapTerminalResult<Response<Incoming>> {
     match input
         .dispatch_ctx
         .request
@@ -43,14 +49,24 @@ async fn dispatch_bootstrap_http(
                 status,
                 &proxy_err,
             );
-            Err(bootstrap_error_response(
-                &input.dispatch_ctx.request.runtime.alt_svc,
-                status,
+            Err(BootstrapTerminalResponse::new(
+                BootstrapLifecycleStage::Dispatch,
                 if matches!(proxy_err, ProxyError::Timeout) {
-                    b"upstream timeout\n"
+                    BootstrapTerminalOutcome::TimedOut(BootstrapTimeoutReason::Upstream)
                 } else {
-                    b"upstream error\n"
+                    BootstrapTerminalOutcome::BackendFailed(
+                        BootstrapBackendFailureReason::DispatchFailed,
+                    )
                 },
+                bootstrap_error_response(
+                    &input.dispatch_ctx.request.runtime.alt_svc,
+                    status,
+                    if matches!(proxy_err, ProxyError::Timeout) {
+                        b"upstream timeout\n"
+                    } else {
+                        b"upstream error\n"
+                    },
+                ),
             ))
         }
     }
@@ -58,7 +74,7 @@ async fn dispatch_bootstrap_http(
 
 pub(in crate::quic_listener) async fn dispatch_bootstrap_upstream(
     input: BootstrapDispatchInput<'_>,
-) -> Result<Response<Incoming>, Response<BoxBody<Bytes, Infallible>>> {
+) -> BootstrapTerminalResult<Response<Incoming>> {
     if input.dispatch_ctx.is_websocket_upgrade {
         dispatch_bootstrap_websocket(input).await
     } else {

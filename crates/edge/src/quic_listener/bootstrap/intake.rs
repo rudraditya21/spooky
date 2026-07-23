@@ -8,6 +8,10 @@ use spooky_errors::{BridgeError, ProxyError};
 
 use super::{
     super::{protocol::is_head_method, validation::validate_http_request},
+    request::{
+        BootstrapLifecycleStage, BootstrapRejectionReason, BootstrapRequestMode,
+        BootstrapTerminalOutcome, BootstrapTerminalResponse,
+    },
     response::boxed_full,
     websocket::capture_bootstrap_websocket_flow,
 };
@@ -23,7 +27,7 @@ pub(in crate::quic_listener) struct BootstrapRequestIntake {
     pub(in crate::quic_listener) authority: Option<String>,
     pub(in crate::quic_listener) content_length: Option<usize>,
     pub(in crate::quic_listener) suppress_downstream_body: bool,
-    pub(in crate::quic_listener) is_websocket_upgrade: bool,
+    pub(in crate::quic_listener) request_mode: BootstrapRequestMode,
     pub(in crate::quic_listener) client_upgrade: Option<OnUpgrade>,
 }
 
@@ -65,7 +69,14 @@ pub(in crate::quic_listener) fn prepare_bootstrap_request_intake(
                 &ProxyError::Bridge(BridgeError::InvalidHeader),
                 None,
             );
-            return Err(Box::new(bootstrap_error_response(alt_svc, status, body)));
+            return Err(Box::new(
+                BootstrapTerminalResponse::new(
+                    BootstrapLifecycleStage::Validate,
+                    BootstrapTerminalOutcome::Rejected(BootstrapRejectionReason::ValidationFailed),
+                    bootstrap_error_response(alt_svc, status, body),
+                )
+                .into_response(),
+            ));
         }
     };
 
@@ -75,7 +86,11 @@ pub(in crate::quic_listener) fn prepare_bootstrap_request_intake(
         path: request.path,
         authority: request.authority,
         content_length: request.content_length,
-        is_websocket_upgrade: websocket_flow.is_websocket_upgrade,
+        request_mode: if websocket_flow.is_websocket_upgrade {
+            BootstrapRequestMode::WebsocketUpgrade
+        } else {
+            BootstrapRequestMode::Standard
+        },
         client_upgrade: websocket_flow.client_upgrade,
     })
 }
