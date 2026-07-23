@@ -2028,7 +2028,6 @@ fn abort_stream_waiting_for_auth_clears_async_auth_state() {
         request_mode: RequestMode::Normal,
         request_body: RequestBodyState::Open,
         request_body_runtime: RequestBodyRuntime {
-            body_tx: None,
             body_buf: std::collections::VecDeque::new(),
             body_buf_bytes: 0,
             body_bytes_received: 0,

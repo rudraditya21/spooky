@@ -367,11 +367,11 @@ pub(super) fn execute_forwarding_post_auth_admission(
         ));
     };
 
-    let request_started = upstream_pool
+    let backend_healthy = upstream_pool
         .read()
         .ok()
-        .is_some_and(|pool| pool.begin_request_if_healthy(backend_index));
-    if !request_started {
+        .is_some_and(|pool| pool.is_backend_healthy(backend_index));
+    if !backend_healthy {
         return PostAuthAdmissionExecution::Rejected(PostAuthAdmissionRejection::Failed(
             PostAuthAdmissionFailure {
                 status: StatusCode::SERVICE_UNAVAILABLE,

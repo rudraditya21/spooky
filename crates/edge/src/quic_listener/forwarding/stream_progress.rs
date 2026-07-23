@@ -206,9 +206,9 @@ impl QUICListener {
         for stream_id in stream_ids {
             let now = Instant::now();
             if let Some(req) = streams.get(&stream_id)
-                && req.phase() == StreamPhase::ReceivingRequest
                 && !req.request_fin_received()
                 && !req.bodyless_mode
+                && (req.phase() == StreamPhase::ReceivingRequest || req.body_tx().is_some())
             {
                 let timeout_decision = evaluate_request_body_timeouts(
                     RequestBodyGuardrailConfig {

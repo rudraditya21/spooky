@@ -321,7 +321,6 @@ impl QUICListener {
                 request_mode,
                 request_body,
                 request_body_runtime: RequestBodyRuntime {
-                    body_tx: None,
                     body_buf: VecDeque::new(),
                     body_buf_bytes: 0,
                     body_bytes_received: 0,

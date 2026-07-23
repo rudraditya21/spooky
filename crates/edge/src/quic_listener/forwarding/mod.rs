@@ -23,7 +23,7 @@ use crate::runtime::connection::{
         finish_backend_request_accounting, observe_admission_outcome, observe_proxy_error_outcome,
     },
     request::PendingForward,
-    stream::StreamAdmissionState,
+    stream::{AdmissionPermits, StreamAdmissionState},
 };
 
 pub(super) fn abort_stream(req: &mut RequestEnvelope, metrics: &Metrics) -> StreamPhase {
@@ -371,18 +371,18 @@ impl QUICListener {
                 return Ok(false);
             }
         };
+        req.transition_to_admitted(AdmissionPermits {
+            global: global_permit,
+            upstream: upstream_permit,
+            adaptive: adaptive_permit,
+            route_queue: route_queue_permit,
+        });
 
         let Some(backend_endpoint) = exec_ctx
             .backend_endpoints
             .get(pending_forward.backend_addr.as_ref())
             .cloned()
         else {
-            finish_backend_request_accounting(BackendRequestFinishInput {
-                upstream_pool: Some(&upstream_pool),
-                backend_index: Some(backend_index),
-                elapsed: req.start.elapsed(),
-                status: Some(503),
-            });
             let _ = observe_proxy_error_outcome(
                 metrics,
                 OutcomeRouteTarget {
@@ -433,12 +433,6 @@ impl QUICListener {
                 Ok(request) => Some(request),
                 Err(err) => {
                     let err_text = err.to_string();
-                    finish_backend_request_accounting(BackendRequestFinishInput {
-                        upstream_pool: Some(&upstream_pool),
-                        backend_index: Some(backend_index),
-                        elapsed: req.start.elapsed(),
-                        status: Some(503),
-                    });
                     let _ = observe_proxy_error_outcome(
                         metrics,
                         OutcomeRouteTarget {
@@ -481,12 +475,6 @@ impl QUICListener {
         ) {
             Ok(result_rx) => result_rx,
             Err(err) => {
-                finish_backend_request_accounting(BackendRequestFinishInput {
-                    upstream_pool: Some(&upstream_pool),
-                    backend_index: Some(backend_index),
-                    elapsed: req.start.elapsed(),
-                    status: Some(503),
-                });
                 let _ = observe_proxy_error_outcome(
                     metrics,
                     OutcomeRouteTarget {
@@ -517,19 +505,13 @@ impl QUICListener {
                 return Ok(false);
             }
         };
-
-        req.transition_to_dispatching(
-            body_tx,
-            result_rx,
-            global_permit,
-            upstream_permit,
-            adaptive_permit,
-            route_queue_permit,
-        );
+        if let Ok(pool) = upstream_pool.write() {
+            pool.begin_request_for_accounting(backend_index);
+        }
+        req.transition_admitted_to_awaiting_upstream(body_tx, result_rx);
         Self::flush_request_buffer(req, metrics);
         if req.request_fin_received() && req.body_buf().is_empty() {
             req.clear_body_tx();
-            req.set_phase_legacy(StreamPhase::AwaitingUpstream);
         }
         Ok(true)
     }
