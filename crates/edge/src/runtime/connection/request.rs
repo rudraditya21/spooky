@@ -293,14 +293,34 @@ impl RequestEnvelope {
         match &self.execution {
             RequestExecutionState::AwaitingAuth(_) => TimeoutReason::ExternalAuth,
             RequestExecutionState::StreamingResponse(_) => TimeoutReason::ResponseBodyTotal,
-            RequestExecutionState::AwaitingUpstream(_)
-            | RequestExecutionState::DispatchReady(_)
-            | RequestExecutionState::Admitted(_) => TimeoutReason::AwaitingUpstream,
+            RequestExecutionState::AwaitingUpstream(state) => {
+                Self::pre_response_timeout_reason(state.request_mode, state.request_body)
+            }
+            RequestExecutionState::DispatchReady(state) => {
+                Self::pre_response_timeout_reason(state.request_mode, state.request_body)
+            }
+            RequestExecutionState::Admitted(state) => {
+                Self::pre_response_timeout_reason(state.request_mode, state.request_body)
+            }
             RequestExecutionState::Intake(_) => TimeoutReason::RequestBodyTotal,
             RequestExecutionState::Terminal(state) => match state {
                 TerminalState::TimedOut(state) => state.reason,
                 _ => TimeoutReason::TotalRequest,
             },
+        }
+    }
+
+    /// For pre-response states, requests still reading the client body time out
+    /// under the request-body bucket; once intake is complete (or for tunnels)
+    /// they time out under the await-upstream bucket.
+    fn pre_response_timeout_reason(
+        request_mode: RequestMode,
+        request_body: RequestBodyState,
+    ) -> TimeoutReason {
+        if request_mode.is_tunnel() || request_body.request_fin_received() {
+            TimeoutReason::AwaitingUpstream
+        } else {
+            TimeoutReason::RequestBodyTotal
         }
     }
 

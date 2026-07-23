@@ -1335,8 +1335,11 @@ fn non_connect_requires_request_completion_before_upstream_poll() {
 
     req.set_request_fin_received(true);
     if let RequestExecutionState::AwaitingUpstream(state) = &mut req.execution {
-        state.request_body = RequestBodyState::FinReceived;
         state.dispatch.body_tx = None;
+        // Request body forwarding is complete once FIN is received and the
+        // upstream body channel is closed; production reaches this via
+        // `from_runtime(fin, empty, no_tx)` == ClosedToUpstream.
+        state.request_body = RequestBodyState::ClosedToUpstream;
     }
     assert!(can_poll_upstream_result(&req));
 
