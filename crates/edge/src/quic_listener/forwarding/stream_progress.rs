@@ -452,9 +452,7 @@ impl QUICListener {
                             {
                                 terminalize_stream(
                                     req,
-                                    TerminalReason::Completed(
-                                        CompletionReason::ImmediateResponse,
-                                    ),
+                                    TerminalReason::Completed(CompletionReason::ImmediateResponse),
                                     metrics,
                                 );
                             }

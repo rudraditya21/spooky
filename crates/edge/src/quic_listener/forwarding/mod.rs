@@ -24,8 +24,7 @@ use crate::runtime::connection::{
     },
     request::PendingForward,
     stream::{
-        AdmissionPermits, BackendFailureReason, RejectionReason, StreamPhase,
-        TerminalReason,
+        AdmissionPermits, BackendFailureReason, RejectionReason, StreamPhase, TerminalReason,
     },
 };
 

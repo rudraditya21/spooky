@@ -8,9 +8,7 @@ use std::{
 use bytes::Bytes;
 use spooky_config::config::{ForwardedHeaderPolicy, UpstreamHostPolicy};
 use spooky_lb::upstream_pool::UpstreamPool;
-use tokio::{
-    sync::{mpsc, oneshot},
-};
+use tokio::sync::{mpsc, oneshot};
 use tracing::Span;
 
 use crate::{
@@ -218,16 +216,14 @@ impl RequestEnvelope {
             RequestExecutionState::DispatchReady(state) => state.request_body,
             RequestExecutionState::Admitted(state) => state.request_body,
             RequestExecutionState::AwaitingUpstream(state) => state.request_body,
-            RequestExecutionState::StreamingResponse(_) => {
-                RequestBodyState::from_runtime(
-                    self.request_body_runtime().request_fin_received,
-                    !self.request_body_runtime().body_buf.is_empty(),
-                    self.body_tx().is_some(),
-                )
-            }
-            RequestExecutionState::Terminal(state) => {
-                terminal_request_mode(state).initial_body_state().on_forward_closed()
-            }
+            RequestExecutionState::StreamingResponse(_) => RequestBodyState::from_runtime(
+                self.request_body_runtime().request_fin_received,
+                !self.request_body_runtime().body_buf.is_empty(),
+                self.body_tx().is_some(),
+            ),
+            RequestExecutionState::Terminal(state) => terminal_request_mode(state)
+                .initial_body_state()
+                .on_forward_closed(),
         }
     }
 
@@ -239,8 +235,7 @@ impl RequestEnvelope {
             RequestExecutionState::DispatchReady(state) => state.request_body = next,
             RequestExecutionState::Admitted(state) => state.request_body = next,
             RequestExecutionState::AwaitingUpstream(state) => state.request_body = next,
-            RequestExecutionState::StreamingResponse(_)
-            | RequestExecutionState::Terminal(_) => {}
+            RequestExecutionState::StreamingResponse(_) | RequestExecutionState::Terminal(_) => {}
         }
     }
 
@@ -413,8 +408,7 @@ impl RequestEnvelope {
         }
     }
 
-    pub fn clear_upstream_result_rx(&mut self) {
-    }
+    pub fn clear_upstream_result_rx(&mut self) {}
 
     pub(crate) fn response_chunk_rx_mut(&mut self) -> Option<&mut mpsc::Receiver<ResponseChunk>> {
         match &mut self.execution {
@@ -423,8 +417,7 @@ impl RequestEnvelope {
         }
     }
 
-    pub fn clear_response_chunk_rx(&mut self) {
-    }
+    pub fn clear_response_chunk_rx(&mut self) {}
 
     pub fn has_upstream_result_rx(&self) -> bool {
         matches!(&self.execution, RequestExecutionState::AwaitingUpstream(_))

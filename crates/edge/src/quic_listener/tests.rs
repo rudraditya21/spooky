@@ -45,8 +45,7 @@ use crate::{
         stream::{
             AdmissionPermits, AwaitingAuthState, DispatchReadyState, RequestBodyRuntime,
             RequestBodyState, RequestContext, RequestExecutionState, RequestMode,
-            ResponseEmissionState, RoutingSnapshot, StreamAdmissionState, StreamPhase,
-            TunnelMode,
+            ResponseEmissionState, RoutingSnapshot, StreamAdmissionState, StreamPhase, TunnelMode,
         },
     },
 };
@@ -1349,10 +1348,8 @@ fn non_connect_requires_request_completion_before_upstream_poll() {
         request_body: RequestBodyState::FinReceived,
         request_body_runtime: make_body_runtime(start, true),
         pending_forward: make_pending_forward("GET"),
-        auth_result_rx: oneshot::channel::<
-            crate::runtime::connection::auth::ExternalAuthResult,
-        >()
-        .1,
+        auth_result_rx: oneshot::channel::<crate::runtime::connection::auth::ExternalAuthResult>()
+            .1,
         auth_abort: tokio::runtime::Runtime::new()
             .expect("runtime")
             .spawn(async {})
@@ -2341,7 +2338,11 @@ fn abort_stream_sending_response_closes_chunk_channel() {
 
     let start = Instant::now();
     let mut req = make_awaiting_upstream_envelope(start, "GET", true);
-    req.transition_to_streaming_response(chunk_rx, ResponseEmissionState::HeadersSent, StatusCode::OK);
+    req.transition_to_streaming_response(
+        chunk_rx,
+        ResponseEmissionState::HeadersSent,
+        StatusCode::OK,
+    );
     req.set_pending_chunk(Some(
         crate::runtime::connection::response::ResponseChunk::End,
     ));
@@ -2393,8 +2394,14 @@ fn abort_stream_upstream_error_releases_all_resources() {
         },
     );
     req.transition_admitted_to_awaiting_upstream(None, oneshot::channel().1);
-    req.transition_to_streaming_response(chunk_rx, ResponseEmissionState::HeadersSent, StatusCode::OK);
-    req.set_pending_chunk(Some(crate::runtime::connection::response::ResponseChunk::End));
+    req.transition_to_streaming_response(
+        chunk_rx,
+        ResponseEmissionState::HeadersSent,
+        StatusCode::OK,
+    );
+    req.set_pending_chunk(Some(
+        crate::runtime::connection::response::ResponseChunk::End,
+    ));
 
     let phase = terminalize_stream(
         &mut req,
