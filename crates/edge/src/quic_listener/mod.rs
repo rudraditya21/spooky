@@ -84,7 +84,7 @@ use crate::{
             quic::{QuicConnection, QuicConnectionErrorSnapshot},
             request::RequestEnvelope,
             response::{ForwardResult, ForwardSuccess, ResponseChunk, UpstreamResult},
-            stream::{StreamPhase, TunnelMode},
+            stream::{CancellationReason, TerminalReason, TunnelMode},
         },
         health::{HealthClassification, outcome_from_status},
         listener::QUICListener,
@@ -133,7 +133,7 @@ pub(crate) use connection::purge_connection_routes;
 #[cfg(test)]
 use connection::resolve_primary_from_radix_prefix;
 pub(crate) use connection::{ConnectionRoutes, sweep_closed_connections};
-use forwarding::{ForwardingExecutionCtx, ForwardingSharedCtx, StreamProgressConfig, abort_stream};
+use forwarding::{ForwardingExecutionCtx, ForwardingSharedCtx, StreamProgressConfig};
 #[cfg(test)]
 use health_check::classify_active_health_check_response;
 pub(in crate::quic_listener) use protocol::{
@@ -604,7 +604,11 @@ impl QUICListener {
 
     fn release_connection_streams(connection: &mut QuicConnection, metrics: &Metrics) {
         for req in connection.streams.values_mut() {
-            abort_stream(req, metrics);
+            forwarding::terminalize_stream(
+                req,
+                TerminalReason::Cancelled(CancellationReason::ConnectionClosed),
+                metrics,
+            );
         }
         connection.streams.clear();
     }

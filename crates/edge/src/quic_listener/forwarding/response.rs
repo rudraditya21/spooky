@@ -920,6 +920,7 @@ impl QUICListener {
         h3: &mut quiche::h3::Connection,
         shared_ctx: &ForwardingSharedCtx<'_>,
     ) -> Result<bool, ProxyError> {
+        let metrics = shared_ctx.metrics.as_ref();
         match decision {
             ResponseStartDecision::ImmediateTerminal {
                 metadata,
@@ -941,7 +942,7 @@ impl QUICListener {
                     }
                 }
                 req.response_status = Some(metadata.status.as_u16());
-                req.transition_streaming_to_completed(CompletionReason::ImmediateResponse);
+                req.transition_streaming_to_completed(CompletionReason::ImmediateResponse, metrics);
                 Self::observe_response_start_transition(req, &observation, shared_ctx);
                 Ok(true)
             }
@@ -1012,6 +1013,7 @@ impl QUICListener {
                         Err(TryRecvError::Disconnected) => {
                             req.transition_streaming_to_backend_failed(
                                 BackendFailureReason::ResponseStreamAborted,
+                                metrics,
                             );
                             terminal = true;
                             break;
@@ -1056,6 +1058,7 @@ impl QUICListener {
                                 .observe(req.start.elapsed(), true);
                             req.transition_streaming_to_backend_failed(
                                 BackendFailureReason::ResponseWriteFailed,
+                                metrics,
                             );
                             terminal = true;
                             break;
@@ -1091,6 +1094,7 @@ impl QUICListener {
                             .observe(req.start.elapsed(), true);
                         req.transition_streaming_to_backend_failed(
                             BackendFailureReason::ResponseWriteFailed,
+                            metrics,
                         );
                         terminal = true;
                         break;
@@ -1130,6 +1134,7 @@ impl QUICListener {
                                 .observe(req.start.elapsed(), true);
                             req.transition_streaming_to_backend_failed(
                                 BackendFailureReason::ResponseWriteFailed,
+                                metrics,
                             );
                             terminal = true;
                             break;
@@ -1141,6 +1146,7 @@ impl QUICListener {
                         req.set_response_emission_state(ResponseEmissionState::EndPending);
                         req.transition_streaming_to_completed(
                             CompletionReason::ResponseStreamFinished,
+                            metrics,
                         );
                         terminal = true;
                         break;
@@ -1170,6 +1176,7 @@ impl QUICListener {
                             .observe(req.start.elapsed(), true);
                         req.transition_streaming_to_backend_failed(
                             BackendFailureReason::ResponseWriteFailed,
+                            metrics,
                         );
                         terminal = true;
                         break;
@@ -1320,6 +1327,7 @@ impl QUICListener {
                     }
                     req.transition_streaming_to_backend_failed(
                         BackendFailureReason::ResponseStreamAborted,
+                        metrics,
                     );
                     terminal = true;
                     break;

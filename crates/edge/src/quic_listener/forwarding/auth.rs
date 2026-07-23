@@ -20,7 +20,7 @@ use crate::runtime::connection::{
         AdmissionOutcomeClass, OutcomeBackendTarget, OutcomeRouteTarget, observe_admission_outcome,
     },
     request::PendingForward,
-    stream::RequestExecutionState,
+    stream::{RejectionReason, RequestExecutionState, TerminalReason, TimeoutReason},
 };
 
 const MAX_AUTH_BODY_BYTES: usize = 64 * 1024;
@@ -471,7 +471,6 @@ impl QUICListener {
             }
             ExternalAuthStateTransition::RejectedAuthDenied { decision } => {
                 req.response_status = Some(decision.status().as_u16());
-                req.discard_awaiting_auth_resources();
                 metrics.inc_policy_denied();
                 metrics.inc_external_auth_denied();
                 let _ = observe_admission_outcome(
@@ -495,6 +494,10 @@ impl QUICListener {
                     req.response_status.unwrap_or(0)
                 );
                 Self::send_external_auth_decision_response(h3, quic, stream_id, &decision)?;
+                req.transition_to_terminal_with_cleanup(
+                    TerminalReason::Rejected(RejectionReason::AuthDenied),
+                    metrics,
+                );
                 Ok(false)
             }
             ExternalAuthStateTransition::RejectedAuthUnavailable {
@@ -512,7 +515,6 @@ impl QUICListener {
                     );
                 }
                 req.response_status = Some(status.as_u16());
-                req.discard_awaiting_auth_resources();
                 let _ = observe_admission_outcome(
                     metrics,
                     OutcomeRouteTarget {
@@ -528,12 +530,15 @@ impl QUICListener {
                     AdmissionOutcomeClass::Failed { timed_out: false },
                 );
                 Self::send_simple_response(h3, quic, stream_id, status, body)?;
+                req.transition_to_terminal_with_cleanup(
+                    TerminalReason::Rejected(RejectionReason::AuthUnavailable),
+                    metrics,
+                );
                 Ok(false)
             }
             ExternalAuthStateTransition::TimedOutAuth { status, body } => {
                 metrics.inc_external_auth_timeout();
                 req.response_status = Some(status.as_u16());
-                req.discard_awaiting_auth_resources();
                 let _ = observe_admission_outcome(
                     metrics,
                     OutcomeRouteTarget {
@@ -549,6 +554,10 @@ impl QUICListener {
                     AdmissionOutcomeClass::Failed { timed_out: true },
                 );
                 Self::send_simple_response(h3, quic, stream_id, status, body)?;
+                req.transition_to_terminal_with_cleanup(
+                    TerminalReason::TimedOut(TimeoutReason::ExternalAuth),
+                    metrics,
+                );
                 Ok(false)
             }
         }

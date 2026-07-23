@@ -19,37 +19,42 @@ pub(in crate::quic_listener) use self::resolve::RouteResolutionRequest as TestRo
 use super::*;
 use crate::runtime::connection::{
     outcome::{
-        BackendRequestFinishInput, OutcomeBackendTarget, OutcomeRouteTarget,
-        finish_backend_request_accounting, observe_admission_outcome, observe_proxy_error_outcome,
+        OutcomeBackendTarget, OutcomeRouteTarget, observe_admission_outcome,
+        observe_proxy_error_outcome,
     },
     request::PendingForward,
-    stream::{AdmissionPermits, StreamAdmissionState},
+    stream::{
+        AdmissionPermits, BackendFailureReason, RejectionReason, StreamAdmissionState, StreamPhase,
+        TerminalReason,
+    },
 };
 
-pub(super) fn abort_stream(req: &mut RequestEnvelope, metrics: &Metrics) -> StreamPhase {
-    let phase = req.phase();
-    if req.backend_request_started() && !req.backend_request_finished() {
-        finish_backend_request_accounting(BackendRequestFinishInput {
-            upstream_pool: req.upstream_pool.as_ref(),
-            backend_index: req.backend_index,
-            elapsed: req.start.elapsed(),
-            status: req.response_status.or(Some(503)),
-        });
-        req.set_backend_request_state(true, true);
+pub(super) fn terminalize_stream(
+    req: &mut RequestEnvelope,
+    reason: TerminalReason,
+    metrics: &Metrics,
+) -> StreamPhase {
+    req.transition_to_terminal_with_cleanup(reason, metrics)
+}
+
+pub(super) fn backend_failure_reason_for_proxy_error(err: &ProxyError) -> BackendFailureReason {
+    match err {
+        ProxyError::Timeout => BackendFailureReason::UpstreamTimeout,
+        ProxyError::Tls(_) => BackendFailureReason::UpstreamTls,
+        ProxyError::Transport(_) | ProxyError::Pool(_) => BackendFailureReason::UpstreamTransport,
+        ProxyError::Protocol(_) => BackendFailureReason::UpstreamProtocol,
+        ProxyError::Bridge(_) => BackendFailureReason::UpstreamBridge,
     }
-    if req.body_buf_bytes() > 0 {
-        metrics.release_request_buffer(req.body_buf_bytes());
-        req.set_body_buf_bytes(0);
+}
+
+pub(super) fn rejection_reason_for_status(status: http::StatusCode) -> RejectionReason {
+    match status {
+        http::StatusCode::PAYLOAD_TOO_LARGE => RejectionReason::RequestBodyTooLarge,
+        http::StatusCode::TOO_MANY_REQUESTS => RejectionReason::RateLimited,
+        http::StatusCode::SERVICE_UNAVAILABLE => RejectionReason::Overloaded,
+        http::StatusCode::BAD_REQUEST => RejectionReason::ValidationFailed,
+        _ => RejectionReason::ValidationFailed,
     }
-    req.body_buf_mut().clear();
-    req.clear_body_tx();
-    req.discard_awaiting_auth_resources();
-    req.clear_upstream_result_rx();
-    req.clear_response_chunk_rx();
-    req.set_pending_chunk(None);
-    req.clear_pending_forward();
-    req.clear_dispatch_permits();
-    phase
 }
 
 // Shared forwarding dependencies passed through extracted submodules.
@@ -250,6 +255,11 @@ impl QUICListener {
                 http::StatusCode::INTERNAL_SERVER_ERROR,
                 b"missing deferred forward snapshot\n",
             )?;
+            terminalize_stream(
+                req,
+                TerminalReason::Rejected(RejectionReason::ValidationFailed),
+                metrics,
+            );
             return Ok(false);
         };
         let Some(upstream_name) = req.upstream_name.clone() else {
@@ -269,6 +279,11 @@ impl QUICListener {
                 http::StatusCode::INTERNAL_SERVER_ERROR,
                 b"missing upstream route\n",
             )?;
+            terminalize_stream(
+                req,
+                TerminalReason::Rejected(RejectionReason::ValidationFailed),
+                metrics,
+            );
             return Ok(false);
         };
 
@@ -334,6 +349,11 @@ impl QUICListener {
                 resilience
                     .adaptive_admission
                     .observe(req.start.elapsed(), true);
+                terminalize_stream(
+                    req,
+                    TerminalReason::Rejected(RejectionReason::Overloaded),
+                    metrics,
+                );
                 return Ok(false);
             }
             crate::quic_listener::admission::PostAuthAdmissionExecution::Rejected(
@@ -368,6 +388,11 @@ impl QUICListener {
                         .adaptive_admission
                         .observe(req.start.elapsed(), true);
                 }
+                terminalize_stream(
+                    req,
+                    TerminalReason::Rejected(rejection_reason_for_status(decision.status)),
+                    metrics,
+                );
                 return Ok(false);
             }
         };
@@ -405,6 +430,11 @@ impl QUICListener {
                 http::StatusCode::BAD_GATEWAY,
                 b"unknown backend endpoint\n",
             )?;
+            terminalize_stream(
+                req,
+                TerminalReason::BackendFailed(BackendFailureReason::DispatchSpawnFailed),
+                metrics,
+            );
             return Ok(false);
         };
 
@@ -460,6 +490,11 @@ impl QUICListener {
                     resilience
                         .adaptive_admission
                         .observe(req.start.elapsed(), true);
+                    terminalize_stream(
+                        req,
+                        TerminalReason::Rejected(RejectionReason::ValidationFailed),
+                        metrics,
+                    );
                     return Ok(false);
                 }
             }
@@ -503,6 +538,11 @@ impl QUICListener {
                 resilience
                     .adaptive_admission
                     .observe(req.start.elapsed(), true);
+                terminalize_stream(
+                    req,
+                    TerminalReason::BackendFailed(BackendFailureReason::DispatchSpawnFailed),
+                    metrics,
+                );
                 return Ok(false);
             }
         };
@@ -768,7 +808,15 @@ impl QUICListener {
                         };
                         if !keep_stream {
                             if let Some(req) = connection.streams.get_mut(&stream_id) {
-                                abort_stream(req, &metrics);
+                                if !req.execution.is_terminal() {
+                                    terminalize_stream(
+                                        req,
+                                        TerminalReason::Cancelled(
+                                            CancellationReason::OperatorAbort,
+                                        ),
+                                        &metrics,
+                                    );
+                                }
                             }
                             connection.streams.remove(&stream_id);
                             continue;
@@ -905,7 +953,13 @@ impl QUICListener {
                                     b"request body not allowed for this request\n",
                                 )?;
                                 if let Some(req) = connection.streams.get_mut(&stream_id) {
-                                    abort_stream(req, &metrics);
+                                    terminalize_stream(
+                                        req,
+                                        TerminalReason::Rejected(
+                                            RejectionReason::RequestBodyNotAllowed,
+                                        ),
+                                        &metrics,
+                                    );
                                 }
                                 connection.streams.remove(&stream_id);
                                 resilience.adaptive_admission.observe(elapsed, true);
@@ -931,7 +985,13 @@ impl QUICListener {
                                     REQUEST_BODY_TOO_LARGE_BODY,
                                 )?;
                                 if let Some(req) = connection.streams.get_mut(&stream_id) {
-                                    abort_stream(req, &metrics);
+                                    terminalize_stream(
+                                        req,
+                                        TerminalReason::Rejected(
+                                            RejectionReason::RequestBodyTooLarge,
+                                        ),
+                                        &metrics,
+                                    );
                                 }
                                 connection.streams.remove(&stream_id);
                                 resilience.adaptive_admission.observe(elapsed, true);
@@ -971,7 +1031,11 @@ impl QUICListener {
                                     .adaptive_admission
                                     .observe(req.start.elapsed(), true);
                                 if let Some(req) = connection.streams.get_mut(&stream_id) {
-                                    abort_stream(req, &metrics);
+                                    terminalize_stream(
+                                        req,
+                                        TerminalReason::Rejected(RejectionReason::Overloaded),
+                                        &metrics,
+                                    );
                                 }
                                 connection.streams.remove(&stream_id);
                                 break;
@@ -1013,7 +1077,11 @@ impl QUICListener {
                                     .observe(req.start.elapsed(), true);
                             }
                             if let Some(req) = connection.streams.get_mut(&stream_id) {
-                                abort_stream(req, &metrics);
+                                terminalize_stream(
+                                    req,
+                                    TerminalReason::Rejected(RejectionReason::ValidationFailed),
+                                    &metrics,
+                                );
                             }
                             connection.streams.remove(&stream_id);
                             let _ = Self::send_simple_response(
@@ -1042,7 +1110,11 @@ impl QUICListener {
                 }
                 Ok((stream_id, quiche::h3::Event::Reset(error_code))) => {
                     if let Some(req) = connection.streams.get_mut(&stream_id) {
-                        let phase = abort_stream(req, &metrics);
+                        let phase = terminalize_stream(
+                            req,
+                            TerminalReason::Cancelled(CancellationReason::ClientReset),
+                            &metrics,
+                        );
                         debug!(
                             "stream {} reset by client (error_code={}, phase={:?}): resources released",
                             stream_id, error_code, phase

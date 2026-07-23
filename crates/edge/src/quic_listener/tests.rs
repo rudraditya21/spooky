@@ -23,12 +23,15 @@ use spooky_errors::{
 use tempfile::tempdir;
 
 use super::{
-    ConnectionRoutes, TokenBucket, abort_stream, can_poll_upstream_result,
-    classify_active_health_check_response, collect_h3_trailers, connection_header_tokens,
-    is_bodyless_request_mode, is_connect_tunnel_response, purge_connection_routes,
-    resolve_primary_from_radix_prefix, should_strip_bootstrap_request_header,
-    should_strip_bootstrap_response_header, should_strip_h3_response_header,
-    sweep_closed_connections,
+    ConnectionRoutes, TokenBucket, can_poll_upstream_result, classify_active_health_check_response,
+    collect_h3_trailers, connection_header_tokens, is_bodyless_request_mode,
+    is_connect_tunnel_response, purge_connection_routes, resolve_primary_from_radix_prefix,
+    should_strip_bootstrap_request_header, should_strip_bootstrap_response_header,
+    should_strip_h3_response_header, sweep_closed_connections,
+};
+use crate::quic_listener::forwarding::terminalize_stream;
+use crate::runtime::connection::stream::{
+    BackendFailureReason, CancellationReason, TerminalReason,
 };
 use crate::{
     REQUEST_ID_COUNTER,
@@ -1968,7 +1971,11 @@ fn abort_stream_receiving_request_releases_permits() {
     );
     *req.body_tx_mut() = Some(body_tx);
 
-    let phase = abort_stream(&mut req, &metrics);
+    let phase = terminalize_stream(
+        &mut req,
+        TerminalReason::Cancelled(CancellationReason::ClientReset),
+        &metrics,
+    );
 
     assert_eq!(phase, StreamPhase::ReceivingRequest);
 
@@ -2062,7 +2069,11 @@ fn abort_stream_waiting_for_auth_clears_async_auth_state() {
             crate::runtime::connection::auth::ExternalAuthFailureDisposition::FailClosed,
     });
 
-    let phase = abort_stream(&mut req, &metrics);
+    let phase = terminalize_stream(
+        &mut req,
+        TerminalReason::Cancelled(CancellationReason::ClientReset),
+        &metrics,
+    );
 
     assert_eq!(phase, StreamPhase::ReceivingRequest);
     assert_ne!(req.admission_state(), StreamAdmissionState::WaitingForAuth);
@@ -2088,7 +2099,11 @@ fn abort_stream_awaiting_upstream_cancels_oneshot() {
     let mut req = make_envelope(StreamPhase::AwaitingUpstream);
     req.set_upstream_result_rx(Some(result_rx));
 
-    let phase = abort_stream(&mut req, &metrics);
+    let phase = terminalize_stream(
+        &mut req,
+        TerminalReason::Cancelled(CancellationReason::ClientReset),
+        &metrics,
+    );
 
     assert_eq!(phase, StreamPhase::AwaitingUpstream);
     assert!(
@@ -2122,7 +2137,11 @@ fn abort_stream_sending_response_closes_chunk_channel() {
         crate::runtime::connection::response::ResponseChunk::End,
     ));
 
-    let phase = abort_stream(&mut req, &metrics);
+    let phase = terminalize_stream(
+        &mut req,
+        TerminalReason::Cancelled(CancellationReason::ClientReset),
+        &metrics,
+    );
 
     assert_eq!(phase, StreamPhase::SendingResponse);
     assert!(
@@ -2163,7 +2182,11 @@ fn abort_stream_upstream_error_releases_all_resources() {
         crate::runtime::connection::response::ResponseChunk::End,
     ));
 
-    let phase = abort_stream(&mut req, &metrics);
+    let phase = terminalize_stream(
+        &mut req,
+        TerminalReason::BackendFailed(BackendFailureReason::UpstreamTransport),
+        &metrics,
+    );
 
     assert_eq!(phase, StreamPhase::SendingResponse);
     assert_eq!(
@@ -2199,8 +2222,16 @@ fn abort_stream_is_idempotent() {
     let mut req = make_envelope(StreamPhase::ReceivingRequest);
     req.set_dispatch_permits(Some(permit), None, None, None);
 
-    abort_stream(&mut req, &metrics);
-    abort_stream(&mut req, &metrics); // second call must be a no-op
+    terminalize_stream(
+        &mut req,
+        TerminalReason::Cancelled(CancellationReason::ConnectionClosed),
+        &metrics,
+    );
+    terminalize_stream(
+        &mut req,
+        TerminalReason::Cancelled(CancellationReason::ConnectionClosed),
+        &metrics,
+    ); // second call must be a no-op
 
     assert_eq!(
         global_sem.available_permits(),

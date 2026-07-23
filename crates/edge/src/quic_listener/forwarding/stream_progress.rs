@@ -5,7 +5,7 @@ use crate::runtime::connection::{
         RequestBodyGuardrailInput, checked_request_body_ingress, evaluate_request_body_timeouts,
     },
     response::ForwardingPolicyTelemetry,
-    stream::RequestBodyState,
+    stream::{CompletionReason, RequestBodyState, TimeoutReason},
 };
 
 fn record_forwarding_policy_metrics(metrics: &Metrics, policy: &ForwardingPolicyTelemetry) {
@@ -49,7 +49,11 @@ impl QUICListener {
             RequestBodyGuardrailInput {
                 elapsed: Duration::ZERO,
                 idle_for: Duration::ZERO,
-                bytes_received: req.body_bytes_received(),
+                // The ingress path already advanced total bytes_received for this
+                // downstream read before chunk buffering begins. Subtract the
+                // current chunk here so total-body cap validation is not applied
+                // twice when backpressure forces buffering.
+                bytes_received: req.body_bytes_received().saturating_sub(chunk_len),
                 buffered_bytes: req.body_buf_bytes(),
                 next_chunk_bytes: chunk_len,
                 declared_content_length: None,
@@ -156,7 +160,16 @@ impl QUICListener {
             return req.transition_request_body_forward_closed();
         }
 
-        req.refresh_request_body_state()
+        let next = req.refresh_request_body_state();
+        if matches!(next, RequestBodyState::FinReceived) && req.body_tx().is_some() {
+            // A finished request can drain its last buffered chunk in this call.
+            // Close the upstream body sender immediately so the backend sees EOF
+            // without waiting for another progress pass that may never re-enter
+            // the request-body branch.
+            return req.transition_request_body_forward_closed();
+        }
+
+        next
     }
 
     /// Advance all in-flight streams without blocking.
@@ -239,7 +252,11 @@ impl QUICListener {
                         .adaptive_admission
                         .observe(req.start.elapsed(), true);
                     if let Some(req) = streams.get_mut(&stream_id) {
-                        abort_stream(req, metrics);
+                        terminalize_stream(
+                            req,
+                            TerminalReason::TimedOut(TimeoutReason::RequestBodyTotal),
+                            metrics,
+                        );
                     }
                     streams.remove(&stream_id);
                     continue;
@@ -278,7 +295,11 @@ impl QUICListener {
                         .adaptive_admission
                         .observe(req.start.elapsed(), true);
                     if let Some(req) = streams.get_mut(&stream_id) {
-                        abort_stream(req, metrics);
+                        terminalize_stream(
+                            req,
+                            TerminalReason::TimedOut(TimeoutReason::RequestBodyIdle),
+                            metrics,
+                        );
                     }
                     streams.remove(&stream_id);
                     continue;
@@ -305,7 +326,11 @@ impl QUICListener {
                     .adaptive_admission
                     .observe(req.start.elapsed(), true);
                 if let Some(req) = streams.get_mut(&stream_id) {
-                    abort_stream(req, metrics);
+                    terminalize_stream(
+                        req,
+                        TerminalReason::TimedOut(TimeoutReason::TotalRequest),
+                        metrics,
+                    );
                 }
                 streams.remove(&stream_id);
                 continue;
@@ -335,7 +360,13 @@ impl QUICListener {
                 };
                 if !keep_stream {
                     if let Some(req) = streams.get_mut(&stream_id) {
-                        abort_stream(req, metrics);
+                        if !req.execution.is_terminal() {
+                            terminalize_stream(
+                                req,
+                                TerminalReason::Cancelled(CancellationReason::OperatorAbort),
+                                metrics,
+                            );
+                        }
                     }
                     streams.remove(&stream_id);
                     continue;
@@ -417,7 +448,13 @@ impl QUICListener {
                         if immediate_terminal {
                             if let Some(req) = streams.get_mut(&stream_id) {
                                 if !req.execution.is_terminal() {
-                                    abort_stream(req, metrics);
+                                    terminalize_stream(
+                                        req,
+                                        TerminalReason::Completed(
+                                            CompletionReason::ImmediateResponse,
+                                        ),
+                                        metrics,
+                                    );
                                 }
                             }
                             streams.remove(&stream_id);
@@ -425,6 +462,7 @@ impl QUICListener {
                         }
                     }
                     Err(err) => {
+                        let failure_reason = backend_failure_reason_for_proxy_error(&err);
                         if let Some(req) = streams.get(&stream_id) {
                             if let Err(protocol_err) = Self::handle_forward_result(
                                 h3,
@@ -444,7 +482,11 @@ impl QUICListener {
                                 .observe(req.start.elapsed(), true);
                         }
                         if let Some(req) = streams.get_mut(&stream_id) {
-                            abort_stream(req, metrics);
+                            terminalize_stream(
+                                req,
+                                TerminalReason::BackendFailed(failure_reason),
+                                metrics,
+                            );
                         }
                         streams.remove(&stream_id);
                         continue;
@@ -461,7 +503,11 @@ impl QUICListener {
             if terminal {
                 if let Some(req) = streams.get_mut(&stream_id) {
                     if !req.execution.is_terminal() {
-                        abort_stream(req, metrics);
+                        terminalize_stream(
+                            req,
+                            TerminalReason::Cancelled(CancellationReason::OperatorAbort),
+                            metrics,
+                        );
                     }
                 }
                 streams.remove(&stream_id);
